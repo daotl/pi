@@ -467,4 +467,48 @@ describe("session context edits", () => {
 			content: [expect.objectContaining({ type: "toolCall", id: "call" })],
 		});
 	});
+
+	it.each([null, undefined])("replaces legacy assistant content %s without inventing calls", (content) => {
+		const session = SessionManager.inMemory();
+		const source = session.appendMessage({ ...assistant(""), content } as unknown as AssistantMessage);
+		const replacement = assistant("repaired");
+		session.replaceMessages([{ entryId: source, message: replacement }]);
+		expect(session.buildSessionProjection().messages).toEqual([replacement]);
+	});
+
+	it("moves invalidated boundaries past soft-deleted followers without reviving summarized history", () => {
+		const session = SessionManager.inMemory();
+		session.appendMessage({ role: "user", content: "summarized user", timestamp: 1 });
+		const original = {
+			...assistant(""),
+			content: [{ type: "toolCall" as const, id: "call", name: "read", arguments: {} }],
+		};
+		const source = session.appendMessage(original);
+		const stale = session.appendMessage({
+			role: "toolResult",
+			toolCallId: "call",
+			toolName: "read",
+			content: [{ type: "text", text: "stale" }],
+			isError: false,
+			timestamp: 2,
+		});
+		const hidden = session.appendMessage({ role: "user", content: "hidden", timestamp: 3 });
+		session.appendMessage({ role: "user", content: "visible follower", timestamp: 4 });
+		session.softDeleteUnits([{ entryId: hidden }]);
+		session.appendCompaction("summary", stale, 100);
+		session.replaceMessages([{ entryId: source, message: { ...original, content: [] } }]);
+		expect(session.buildSessionProjection().messages).toEqual([
+			expect.objectContaining({ role: "compactionSummary", summary: "summary" }),
+			expect.objectContaining({ role: "user", content: "visible follower" }),
+		]);
+		const branch = session.getBranch();
+		expect(branch.find((entry) => entry.type === "compaction")).toMatchObject({
+			firstKeptEntryId: branch.find(
+				(entry) =>
+					entry.type === "message" &&
+					entry.message.role === "user" &&
+					entry.message.content === "visible follower",
+			)?.id,
+		});
+	});
 });

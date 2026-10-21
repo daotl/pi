@@ -2225,8 +2225,10 @@ export class SessionManager {
 			const replacement = replacementMap.get(entry.id);
 			if (entry.type === "message" && entry.message.role === "assistant" && replacement) {
 				const calls =
-					replacement.role === "assistant" ? replacement.content.filter((block) => block.type === "toolCall") : [];
-				for (const call of entry.message.content) {
+					replacement.role === "assistant"
+						? (replacement.content ?? []).filter((block) => block.type === "toolCall")
+						: [];
+				for (const call of entry.message.content ?? []) {
 					if (call.type !== "toolCall") continue;
 					if (
 						!calls.some(
@@ -2275,8 +2277,10 @@ export class SessionManager {
 			}
 			const newId = generateId(this.byId);
 			idMap.set(entry.id, newId);
-			for (const removedId of pendingRemovedIds) boundaryIds.set(removedId, newId);
-			pendingRemovedIds.length = 0;
+			if (entry.deletedAt === undefined) {
+				for (const removedId of pendingRemovedIds) boundaryIds.set(removedId, newId);
+				pendingRemovedIds.length = 0;
+			}
 
 			const newEntry: SessionEntry = { ...entry, id: newId, parentId: this.leafId };
 			delete newEntry.supersededBy;
