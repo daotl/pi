@@ -107,6 +107,36 @@ describe("atomic session file rewrite", () => {
 		expect(SessionManager.open(file, dir, dir).getEntries()).toEqual([]);
 	});
 
+	it("restores a selected subtree and labels after failed descendant removal", () => {
+		const { session, user, file } = createSession();
+		const removed = session.getLeafId()!;
+		session.appendLabelChange(removed, "removed subtree");
+		session.branch(user);
+		const sibling = session.appendMessage(assistantMsg("sibling"));
+		session.branch(removed);
+		const held = session.getEntry(removed);
+		const entries = structuredClone(session.getEntries());
+		const tree = structuredClone(session.getTree());
+		const projection = structuredClone(session.buildSessionProjection());
+		const bytes = fs.readFileSync(file);
+		const failure = new Error("subtree rename failure");
+		vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+			throw failure;
+		});
+		expect(() => session.removeEntriesWithDescendants([removed])).toThrow(failure);
+		expect(session.getEntries()).toEqual(entries);
+		expect(session.getTree()).toEqual(tree);
+		expect(session.buildSessionProjection()).toEqual(projection);
+		expect(session.getLeafId()).toBe(removed);
+		expect(session.getEntry(removed)).toBe(held);
+		expect(fs.readFileSync(file)).toEqual(bytes);
+		expect(session.removeEntriesWithDescendants([removed])).toBe(2);
+		expect(session.getLeafId()).toBe(user);
+		expect(session.getEntry(removed)).toBeUndefined();
+		expect(session.getEntry(sibling)).toBeDefined();
+		expect(SessionManager.open(file, dir, dir).getEntries()).toEqual(session.getEntries());
+	});
+
 	it("restores live soft-deletion flags and held tool maps when persistence fails", () => {
 		const { session, user, file } = createSession();
 		const assistant = session.getLeafEntry();

@@ -2142,6 +2142,8 @@ export class SessionManager {
 			}
 		}
 
+		const previousEntries = this.fileEntries;
+		const previousLeaf = this.leafId;
 		if (this.leafId && removedIds.has(this.leafId)) {
 			let ancestor = this.byId.get(this.leafId)?.parentId ?? null;
 			while (ancestor && removedIds.has(ancestor)) {
@@ -2170,7 +2172,14 @@ export class SessionManager {
 			}
 		}
 
-		this._rewriteFile();
+		try {
+			this._rewriteFile();
+		} catch (error) {
+			this.fileEntries = previousEntries;
+			this._buildIndex();
+			this.leafId = previousLeaf;
+			throw error;
+		}
 		return removedIds.size;
 	}
 
