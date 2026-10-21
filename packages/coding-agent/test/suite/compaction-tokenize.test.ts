@@ -224,4 +224,70 @@ describe("compaction tokenization", () => {
 		expect(usage!.percent).not.toBeNull();
 		expect(usage!.tokens).toBeGreaterThan(0);
 	});
+	it.each([
+		{ mode: "manual", keepRecentTokens: 1 },
+		{ mode: "manual", keepRecentTokens: 1000000 },
+		{ mode: "automatic", keepRecentTokens: 1 },
+		{ mode: "automatic", keepRecentTokens: 1000000 },
+	] as const)(
+		"stops cancelled $mode preparation before hooks or empty results (budget $keepRecentTokens)",
+		async ({ mode, keepRecentTokens }) => {
+			let hookCalls = 0;
+			const harness = await createHarness({
+				settings: { compaction: { enabled: true, keepRecentTokens }, retry: { enabled: false } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_before_compact", () => {
+							hookCalls++;
+							return { cancel: true };
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			seed(harness);
+			let markStarted = () => {};
+			const started = new Promise<void>((resolve) => {
+				markStarted = resolve;
+			});
+			let release = () => {};
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			vi.stubGlobal("fetch", async () => {
+				markStarted();
+				await gate;
+				return new Response("no endpoint", { status: 404 });
+			});
+			harness.setResponses([
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "maximum context length exceeded" }),
+			]);
+			const run =
+				mode === "manual" ? harness.session.compact({ keepRecentTokens }) : harness.session.prompt("overflow");
+			const outcome = run.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			try {
+				await Promise.race([
+					started,
+					outcome.then(() => {
+						throw new Error("Preparation tokenizer did not start");
+					}),
+				]);
+				harness.session.abortCompaction();
+				release();
+				const result = await outcome;
+				if (mode === "manual") expect(result).toBeInstanceOf(Error);
+				expect(hookCalls).toBe(0);
+				expect(harness.eventsOfType("compaction_end")).toEqual([
+					expect.objectContaining({ result: undefined, aborted: true, willRetry: false }),
+				]);
+				expect(harness.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
+			} finally {
+				release();
+				await outcome;
+			}
+		},
+	);
 });

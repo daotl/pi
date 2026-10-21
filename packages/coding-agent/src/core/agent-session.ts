@@ -4356,6 +4356,7 @@ export class AgentSession {
 					this._compactionAbortController.signal,
 				),
 			);
+			signal.throwIfAborted();
 			if (!preparation) {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
@@ -4719,6 +4720,7 @@ export class AgentSession {
 				undefined,
 				this._createCompactionTokenCounter({ model: requestModel, apiKey, headers, env }, abortController.signal),
 			);
+			abortController.signal.throwIfAborted();
 			if (!preparation) {
 				// Session needs migration: the tail could not be mapped to kept entries.
 				this._autoCompactionAbortController = undefined;
