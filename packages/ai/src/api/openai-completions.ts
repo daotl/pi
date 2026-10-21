@@ -1324,11 +1324,15 @@ export function convertMessages(
 			const signedReasoningDetails = thinkingBlocks
 				.map((block) => parseOpenAIReasoningDetails(block.thinkingSignature))
 				.find((details) => details !== undefined);
-			const legacyReasoningDetails = toolCalls
-				.map((toolCall) => parseLegacyEncryptedReasoningDetail(toolCall.thoughtSignature))
-				.filter((detail): detail is OpenAIEncryptedReasoningDetail => detail !== undefined);
+			// Legacy encrypted details belong to the exact provider/API/model origin.
+			const isSameModel = msg.provider === model.provider && msg.api === model.api && msg.model === model.id;
+			const legacyReasoningDetails = isSameModel
+				? toolCalls
+						.map((toolCall) => parseLegacyEncryptedReasoningDetail(toolCall.thoughtSignature))
+						.filter((detail): detail is OpenAIEncryptedReasoningDetail => detail !== undefined)
+				: undefined;
 			const preservedReasoningDetails =
-				signedReasoningDetails ?? (legacyReasoningDetails.length > 0 ? legacyReasoningDetails : undefined);
+				signedReasoningDetails ?? (legacyReasoningDetails?.length ? legacyReasoningDetails : undefined);
 
 			const nonEmptyThinkingBlocks = thinkingBlocks.filter((block) => block.thinking.trim().length > 0);
 			if (nonEmptyThinkingBlocks.length > 0) {

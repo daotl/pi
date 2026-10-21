@@ -93,15 +93,19 @@ export function transformMessages<TApi extends Api>(
 		// Assistant messages need transformation check
 		if (msg.role === "assistant") {
 			const assistantMsg = msg as AssistantMessage;
+			const isSameModel =
+				assistantMsg.provider === model.provider &&
+				assistantMsg.api === model.api &&
+				assistantMsg.model === model.id;
 
 			const transformedContent = assistantMsg.content.flatMap((block) => {
 				if (block.type === "thinking") {
-					// Keep thinking blocks with signatures (needed for replay) even if the
-					// thinking text is empty (OpenAI encrypted reasoning).
-					if (block.thinkingSignature) return block;
-					// Skip empty thinking blocks, keep others as thinking.
+					// Opaque/redacted reasoning is replayable only by its originating model.
+					if (block.redacted) return isSameModel ? block : [];
+					if (isSameModel && block.thinkingSignature) return block;
 					if (!block.thinking || block.thinking.trim() === "") return [];
-					return block;
+					if (isSameModel) return block;
+					return { type: "text", text: block.thinking } satisfies TextContent;
 				}
 
 				if (block.type === "text") {

@@ -1521,8 +1521,8 @@ The library supports seamless handoffs between different LLM providers within th
 When messages from one provider are sent to a different provider, the library automatically transforms them for compatibility:
 
 - **User and tool result messages** are passed through unchanged
-- **Assistant messages from the same provider/API** are preserved as-is
-- **Assistant messages from different providers** have their thinking blocks converted to text with `<thinking>` tags
+- **Assistant reasoning from the exact same provider/API/model** retains native replay metadata
+- **Foreign visible reasoning** becomes ordinary text without thinking tags; foreign redacted or opaque-only reasoning is omitted from the outgoing request, not removed from stored history
 - **Tool calls and regular text** are preserved unchanged
 
 ```typescript
@@ -1543,7 +1543,7 @@ const claude = models.getModel('anthropic', 'claude-sonnet-4-5')!;
 context.messages.push({ role: 'user', content: 'What is 25 * 18?', timestamp: Date.now() });
 context.messages.push(await models.completeSimple(claude, context, { reasoning: 'medium' }));
 
-// Switch to GPT-5 - it will see Claude's thinking as <thinking> tagged text
+// Switch to GPT-5 - it will see Claude's visible reasoning as ordinary text
 const gpt5 = models.getModel('openai', 'gpt-5-mini')!;
 context.messages.push({ role: 'user', content: 'Is that calculation correct?', timestamp: Date.now() });
 context.messages.push(await models.complete(gpt5, context));
@@ -1554,7 +1554,7 @@ context.messages.push({ role: 'user', content: 'What was the original question?'
 const geminiResponse = await models.complete(gemini, context);
 ```
 
-All providers can handle messages from other providers — text, tool calls and results (including images), thinking blocks (transformed to tagged text), and aborted messages with partial content. This enables flexible workflows: start with a fast model, switch to a more capable one for complex reasoning, or maintain continuity across provider outages.
+Providers normalize foreign text, tool calls and results (including supported images) for replay. Visible foreign reasoning becomes ordinary text; native encrypted/redacted reasoning is retained only for its originating provider/API/model. The stored conversation remains unchanged.
 
 ## System Messages
 

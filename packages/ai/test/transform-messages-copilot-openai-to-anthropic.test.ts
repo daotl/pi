@@ -1,6 +1,9 @@
+import type { MessageCreateParamsStreaming } from "@anthropic-ai/sdk/resources/beta/messages/messages.js";
 import { describe, expect, it } from "vitest";
+import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
 import { transformMessages } from "../src/api/transform-messages.ts";
-import type { AssistantMessage, Message, Model, ToolCall } from "../src/types.ts";
+import type { AssistantMessage, Message, Model } from "../src/types.ts";
+import { normalizeContext } from "../src/utils/transcript.ts";
 
 // Normalize function matching what anthropic.ts uses
 function anthropicNormalizeToolCallId(
@@ -46,97 +49,83 @@ function makeAssistantMessage(content: AssistantMessage["content"]): AssistantMe
 	};
 }
 
+async function captureAnthropicPayload(
+	model: Model<"anthropic-messages">,
+	assistant: AssistantMessage,
+): Promise<MessageCreateParamsStreaming> {
+	let payload: MessageCreateParamsStreaming | undefined;
+	await streamAnthropic(model, normalizeContext({ messages: [assistant] }), {
+		apiKey: "isolated-test-key",
+		onPayload(value) {
+			payload = value as MessageCreateParamsStreaming;
+			throw new Error("Captured before network dispatch");
+		},
+	}).result();
+	if (!payload) throw new Error("Anthropic payload was not captured");
+	return payload;
+}
+
 describe("OpenAI to Anthropic session migration for Copilot Claude", () => {
-	it("preserves signed thinking blocks when source model differs", () => {
-		const model = makeCopilotClaudeModel();
-		const messages: Message[] = [
-			{ role: "user", content: "hello", timestamp: Date.now() },
+	// Replay metadata is native only to an exact provider/API/model origin. Foreign
+	// visible reasoning remains ordinary text; redacted and opaque blocks are omitted.
+	it.each<Partial<Pick<AssistantMessage, "api" | "provider" | "model">>>([
+		{ api: "openai-completions", provider: "github-copilot", model: "claude-sonnet-4.6" },
+		{ api: "openai-responses", provider: "github-copilot", model: "gpt-5" },
+		{ api: "anthropic-messages", provider: "other-provider", model: "claude-sonnet-4.6" },
+		{ api: "anthropic-messages", provider: "github-copilot", model: "other-model" },
+	])("sends foreign visible reasoning as text without opaque replay data: %o", async (source) => {
+		const assistant: AssistantMessage = {
+			...makeAssistantMessage([
+				{ type: "thinking", thinking: "Visible reasoning", thinkingSignature: "reasoning_content" },
+				{ type: "thinking", thinking: "Unsigned reasoning" },
+				{ type: "thinking", thinking: "[Reasoning redacted]", thinkingSignature: "opaque", redacted: true },
+				{ type: "thinking", thinking: "", thinkingSignature: "encrypted-only" },
+				{ type: "text", text: "Answer" },
+			]),
+			...source,
+		};
+		const stored = structuredClone(assistant);
+		const payload = await captureAnthropicPayload(makeCopilotClaudeModel(), assistant);
+
+		expect(payload.messages).toEqual([
 			{
 				role: "assistant",
 				content: [
-					{
-						type: "thinking",
-						thinking: "Let me think about this...",
-						thinkingSignature: "reasoning_content",
-					},
-					{ type: "text", text: "Hi there!" },
+					{ type: "text", text: "Visible reasoning" },
+					{ type: "text", text: "Unsigned reasoning" },
+					{ type: "text", text: "Answer" },
 				],
-				api: "openai-completions",
-				provider: "github-copilot",
-				model: "gpt-4o",
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "stop",
-				timestamp: Date.now(),
 			},
-		];
-
-		const result = transformMessages(messages, model, anthropicNormalizeToolCallId);
-		const assistantMsg = result.find((m) => m.role === "assistant") as AssistantMessage;
-
-		// transformMessages keeps thinking blocks with signatures (needed for
-		// replay/prefill continuation) regardless of model switching; any
-		// downgrade for the target model happens in the API layer.
-		const textBlocks = assistantMsg.content.filter((b) => b.type === "text");
-		const thinkingBlocks = assistantMsg.content.filter((b) => b.type === "thinking");
-		expect(thinkingBlocks).toHaveLength(1);
-		expect(textBlocks.length).toBeGreaterThanOrEqual(1);
+		]);
+		expect(assistant).toEqual(stored);
 	});
 
-	it("preserves thoughtSignature on tool calls when source model differs", () => {
+	it("replays native signed and redacted reasoning unchanged", async () => {
 		const model = makeCopilotClaudeModel();
-		const messages: Message[] = [
-			{ role: "user", content: "run a command", timestamp: Date.now() },
+		const assistant: AssistantMessage = {
+			...makeAssistantMessage([
+				{ type: "thinking", thinking: "Native reasoning", thinkingSignature: "native-signature" },
+				{ type: "thinking", thinking: "", thinkingSignature: "empty-visible-signature" },
+				{ type: "thinking", thinking: "[Reasoning redacted]", thinkingSignature: "opaque", redacted: true },
+			]),
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+		};
+		const stored = structuredClone(assistant);
+		const payload = await captureAnthropicPayload(model, assistant);
+
+		expect(payload.messages).toEqual([
 			{
 				role: "assistant",
 				content: [
-					{
-						type: "toolCall",
-						id: "call_123",
-						name: "bash",
-						arguments: { command: "ls" },
-						thoughtSignature: JSON.stringify({ type: "reasoning.encrypted", id: "call_123", data: "encrypted" }),
-					},
+					{ type: "thinking", thinking: "Native reasoning", signature: "native-signature" },
+					{ type: "thinking", thinking: "", signature: "empty-visible-signature" },
+					{ type: "redacted_thinking", data: "opaque" },
 				],
-				api: "openai-responses",
-				provider: "github-copilot",
-				model: "gpt-5",
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "toolUse",
-				timestamp: Date.now(),
 			},
-			{
-				role: "toolResult",
-				toolCallId: "call_123",
-				toolName: "bash",
-				content: [{ type: "text", text: "output" }],
-				isError: false,
-				timestamp: Date.now(),
-			},
-		];
-
-		const result = transformMessages(messages, model, anthropicNormalizeToolCallId);
-		const assistantMsg = result.find((m) => m.role === "assistant") as AssistantMessage;
-		const toolCall = assistantMsg.content.find((b) => b.type === "toolCall") as ToolCall;
-
-		// Kept for replay/prefill continuation; the API layer decides how to
-		// serialize or drop foreign signatures for the target model.
-		expect(toolCall.thoughtSignature).toBe(
-			JSON.stringify({ type: "reasoning.encrypted", id: "call_123", data: "encrypted" }),
-		);
+		]);
+		expect(assistant).toEqual(stored);
 	});
 
 	it("adds synthetic tool results for trailing orphaned tool calls", () => {

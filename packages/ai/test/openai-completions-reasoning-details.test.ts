@@ -153,9 +153,53 @@ describe("openai-completions reasoning_details streaming", () => {
 		if (!toolCall || toolCall.type !== "toolCall") throw new Error("Expected tool call");
 		toolCall.thoughtSignature = JSON.stringify(reasoningDetail);
 
+		const stored = structuredClone(assistantMessage);
 		await runOpenAICompletionsStream([assistantMessage]);
 
 		expect(getAssistantPayload(mockState.payloads[1])?.reasoning_details).toEqual([reasoningDetail]);
+		expect(getAssistantPayload(mockState.payloads[1])).toMatchObject({
+			tool_calls: [
+				{
+					id: "call_1",
+					type: "function",
+					function: { name: "read", arguments: '{"path":"README.md"}' },
+				},
+			],
+		});
+		expect(assistantMessage).toEqual(stored);
+	});
+
+	it.each<[string, Partial<Pick<AssistantMessage, "provider" | "api" | "model">>]>([
+		["provider", { provider: "google" }],
+		["API", { api: "google-generative-ai" }],
+		["model", { model: "google/gemini-other" }],
+	])("omits legacy encrypted tool reasoning from a different source %s", async (_field, source) => {
+		mockState.chunkSets = [
+			[toolCallChunk(), chunk({}, "tool_calls")],
+			[chunk({ content: "ok" }), chunk({}, "stop")],
+		];
+
+		const assistantMessage = await runOpenAICompletionsStream();
+		const toolCall = assistantMessage.content.find((block) => block.type === "toolCall");
+		if (!toolCall) throw new Error("Expected tool call");
+		toolCall.thoughtSignature = JSON.stringify(reasoningDetail);
+		Object.assign(assistantMessage, source);
+		const stored = structuredClone(assistantMessage);
+
+		await runOpenAICompletionsStream([assistantMessage]);
+
+		const payload = getAssistantPayload(mockState.payloads[1]);
+		expect(payload).toMatchObject({
+			tool_calls: [
+				{
+					id: "call_1",
+					type: "function",
+					function: { name: "read", arguments: '{"path":"README.md"}' },
+				},
+			],
+		});
+		expect(payload).not.toHaveProperty("reasoning_details");
+		expect(assistantMessage).toEqual(stored);
 	});
 
 	it("preserves signed text and summary reasoning_details in their original sequence", async () => {
