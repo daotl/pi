@@ -468,18 +468,22 @@ export async function findCutPoint(
 	// Default: keep from the first valid cut point (keeps the most history).
 	const keepAllIndex = cutPoints[0];
 	const candidates: number[] = [];
+	let countCut = startIndex;
 
 	// Message-count budget: keep the last N context-visible entries.
-	if (keepRecentMessages !== undefined && keepRecentMessages > 0) {
+	if (keepRecentMessages === 0) {
+		countCut = cutPoints[cutPoints.length - 1];
+		candidates.push(countCut);
+	} else if (keepRecentMessages !== undefined && keepRecentMessages > 0) {
 		let keptCount = 0;
-		let countCut = keepAllIndex;
+		countCut = keepAllIndex;
 		for (let i = endIndex - 1; i >= startIndex; i--) {
 			const entry = entries[i];
-			const messageTokens = sessionEntryToContextMessages(entry).reduce(
-				(sum, message) => sum + estimateTokens(message),
-				0,
-			);
-			if (messageTokens === 0) continue;
+			if (
+				entry.type === "compaction" ||
+				!sessionEntryToContextMessages(entry).some((message) => message.role !== "system")
+			)
+				continue;
 			keptCount++;
 			if (keptCount >= keepRecentMessages) {
 				// Find the closest valid cut point at or before this entry.
@@ -496,12 +500,15 @@ export async function findCutPoint(
 	}
 
 	// Token budget: keep as much recent context as fits within keepRecentTokens.
-	if (keepRecentTokens !== undefined && keepRecentTokens > 0) {
+	if (keepRecentTokens !== undefined) {
 		let accumulatedTokens = 0;
-		let tokenCut = keepAllIndex;
-		for (let i = endIndex - 1; i >= startIndex; i--) {
+		let tokenCut = keepRecentTokens === 0 ? cutPoints[cutPoints.length - 1] : keepAllIndex;
+		// Older token counts cannot tighten the known message boundary.
+		for (let i = endIndex - 1; i >= countCut; i--) {
 			const entry = entries[i];
-			const contextMessages = sessionEntryToContextMessages(entry);
+			if (entry.type === "compaction") continue;
+			const contextMessages = sessionEntryToContextMessages(entry).filter((message) => message.role !== "system");
+			if (contextMessages.length === 0) continue;
 			const messageTokens = tokenCounter
 				? await tokenCounter(contextMessages)
 				: contextMessages.reduce((sum, message) => sum + estimateTokens(message), 0);
@@ -897,14 +904,21 @@ async function findProjectedCutPoint(
 	// Default: keep from the first valid cut point (keeps the most history).
 	const keepAllIndex = cutPoints[0];
 	const candidates: number[] = [];
+	let countCut = startIndex;
 
 	// Message-count budget: keep the last N context-visible entries.
-	if (keepRecentMessages !== undefined && keepRecentMessages > 0) {
+	if (keepRecentMessages === 0) {
+		countCut = cutPoints[cutPoints.length - 1];
+		candidates.push(countCut);
+	} else if (keepRecentMessages !== undefined && keepRecentMessages > 0) {
 		let keptCount = 0;
-		let countCut = keepAllIndex;
+		countCut = keepAllIndex;
 		for (let i = endIndex - 1; i >= startIndex; i--) {
-			const messageTokens = entries[i].messages.reduce((sum, message) => sum + estimateTokens(message), 0);
-			if (messageTokens === 0) continue;
+			if (
+				entries[i].sourceEntry.type === "compaction" ||
+				!entries[i].messages.some((message) => message.role !== "system")
+			)
+				continue;
 			keptCount++;
 			if (keptCount >= keepRecentMessages) {
 				for (let c = cutPoints.length - 1; c >= 0; c--) {
@@ -921,11 +935,13 @@ async function findProjectedCutPoint(
 
 	// Token budget: keep as much recent context as fits within keepRecentTokens.
 	let exceededBudget = false;
-	if (keepRecentTokens !== undefined && keepRecentTokens > 0) {
+	if (keepRecentTokens !== undefined) {
 		let accumulatedTokens = 0;
-		let tokenCut = keepAllIndex;
-		for (let i = endIndex - 1; i >= startIndex; i--) {
-			const contextMessages = entries[i].messages;
+		let tokenCut = keepRecentTokens === 0 ? cutPoints[cutPoints.length - 1] : keepAllIndex;
+		for (let i = endIndex - 1; i >= countCut; i--) {
+			if (entries[i].sourceEntry.type === "compaction") continue;
+			const contextMessages = entries[i].messages.filter((message) => message.role !== "system");
+			if (contextMessages.length === 0) continue;
 			const messageTokens = tokenCounter
 				? await tokenCounter(contextMessages)
 				: contextMessages.reduce((sum, message) => sum + estimateTokens(message), 0);

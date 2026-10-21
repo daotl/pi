@@ -409,6 +409,81 @@ describe("findCutPoint", () => {
 		expect((await findCutPoint(entries, 0, entries.length, 2, 4)).firstKeptEntryIndex).toBe(4);
 	});
 
+	it.each([
+		{ tokens: 0, messages: undefined },
+		{ tokens: undefined, messages: 0 },
+	])("retains the newest atomic tool group for zero budgets: $tokens/$messages", async ({ tokens, messages }) => {
+		const old = createMessageEntry(createUserMessage("old"));
+		const user = createMessageEntry(createUserMessage("current"));
+		const call = createMessageEntry({
+			...createAssistantMessage(""),
+			content: [{ type: "toolCall", id: "zero-call", name: "read", arguments: { path: "file" } }],
+			stopReason: "toolUse",
+		});
+		const result = createMessageEntry({
+			role: "toolResult",
+			toolCallId: "zero-call",
+			toolName: "read",
+			content: [{ type: "text", text: "result" }],
+			isError: false,
+			timestamp: 1,
+		});
+		const entries = [old, user, call, result];
+		expect(await findCutPoint(entries, 0, entries.length, tokens, messages)).toEqual({
+			firstKeptEntryIndex: 2,
+			turnStartIndex: 1,
+			isSplitTurn: true,
+		});
+		const preparation = await prepareCompaction(entries, DEFAULT_COMPACTION_SETTINGS, {
+			keepRecentTokens: tokens,
+			keepRecentMessages: messages,
+		});
+		expect(preparation?.firstKeptEntryId).toBe(call.id);
+		expect(preparation?.messagesToSummarize).toEqual([old.message]);
+		expect(preparation?.turnPrefixMessages).toEqual([user.message]);
+	});
+
+	it("counts empty conversation contributions, not prompt deltas, in message budgets", async () => {
+		const entries = [
+			createMessageEntry(createUserMessage("old")),
+			createMessageEntry(createUserMessage("")),
+			createMessageEntry({ role: "system", content: "large prompt".repeat(100), timestamp: 1 }),
+			createMessageEntry(createAssistantMessage("")),
+		];
+		expect((await findCutPoint(entries, 0, entries.length, undefined, 2)).firstKeptEntryIndex).toBe(1);
+		const preparation = await prepareCompaction(entries, DEFAULT_COMPACTION_SETTINGS, { keepRecentMessages: 2 });
+		expect(preparation?.firstKeptEntryId).toBe(entries[1].id);
+		expect(preparation?.messagesToSummarize).toEqual([entries[0].message]);
+	});
+
+	it("stops token counting at the message cutoff and uses a stricter token cutoff", async () => {
+		const entries = ["older", "boundary", "newer", "newest"].map((text) =>
+			createMessageEntry(createUserMessage(text)),
+		);
+		for (const tokens of [100, 1]) {
+			const counted: AgentMessage[][] = [];
+			const counter = async (messages: AgentMessage[]) => {
+				counted.push(messages);
+				if (messages[0] === entries[0].message) throw new Error("history outside message budget counted");
+				return 1;
+			};
+			const expected = tokens === 1 ? 3 : 2;
+			expect((await findCutPoint(entries, 0, entries.length, tokens, 2, counter)).firstKeptEntryIndex).toBe(
+				expected,
+			);
+			expect(counted).toEqual([[entries[3].message], [entries[2].message]]);
+			counted.length = 0;
+			const preparation = await prepareCompaction(
+				entries,
+				DEFAULT_COMPACTION_SETTINGS,
+				{ keepRecentTokens: tokens, keepRecentMessages: 2 },
+				counter,
+			);
+			expect(preparation?.firstKeptEntryId).toBe(entries[expected].id);
+			expect(counted).toEqual([[entries[3].message], [entries[2].message]]);
+		}
+	});
+
 	// Regression test for #9740.
 	it("should fall back to the latest valid cut point before oversized trailing tool results", async () => {
 		const oldUser = createMessageEntry(createUserMessage("old history"));
@@ -554,6 +629,21 @@ describe("prepareCompaction", () => {
 		expect(preparation?.isSplitTurn).toBe(true);
 		expect(preparation?.messagesToSummarize).toEqual([]);
 		expect(preparation?.turnPrefixMessages).toEqual([user.message]);
+	});
+	it("excludes prompt deltas from token retention counts", async () => {
+		const old = createMessageEntry(createUserMessage("old"));
+		const patch = createMessageEntry({ role: "system", content: "large prompt".repeat(100), timestamp: 1 });
+		const recent = createMessageEntry(createUserMessage("recent"));
+		const entries = [old, patch, recent];
+		const counted: AgentMessage[][] = [];
+		const counter = async (messages: AgentMessage[]) => {
+			counted.push(messages);
+			return messages.some((message) => message.role === "system") ? 1000 : 1;
+		};
+		expect(
+			await prepareCompaction(entries, DEFAULT_COMPACTION_SETTINGS, { keepRecentTokens: 2 }, counter),
+		).toBeUndefined();
+		expect(counted).toEqual([[recent.message], [old.message]]);
 	});
 });
 
