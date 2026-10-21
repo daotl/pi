@@ -1908,6 +1908,8 @@ export class SessionManager {
 			}
 		}
 
+		const previousEntries = this.fileEntries;
+		const previousLeaf = this.leafId;
 		this.fileEntries = this.fileEntries.filter((e) => !removedIds.has(e.id));
 		for (const id of removedIds) {
 			this.byId.delete(id);
@@ -1929,7 +1931,14 @@ export class SessionManager {
 			}
 		}
 
-		this._rewriteFile();
+		try {
+			this._rewriteFile();
+		} catch (error) {
+			this.fileEntries = previousEntries;
+			this._buildIndex();
+			this.leafId = previousLeaf;
+			throw error;
+		}
 		return removeCount;
 	}
 

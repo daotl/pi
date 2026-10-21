@@ -77,6 +77,34 @@ describe("atomic session file rewrite", () => {
 		expect(SessionManager.open(file, dir, dir).getEntries()).toEqual(session.getEntries());
 	});
 
+	it("restores removed descendants, labels and a non-tail selected leaf after failed tail removal", () => {
+		const { session, user, file } = createSession();
+		const firstAnswer = session.getLeafId()!;
+		session.appendLabelChange(firstAnswer, "first branch");
+		session.branch(user);
+		const selected = session.appendMessage(assistantMsg("selected answer"));
+		session.appendLabelChange(selected, "selected branch");
+		session.branch(selected);
+		const entries = structuredClone(session.getEntries());
+		const tree = structuredClone(session.getTree());
+		const projection = structuredClone(session.buildSessionProjection());
+		const bytes = fs.readFileSync(file);
+		const failure = new Error("tail removal rename failure");
+		vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+			throw failure;
+		});
+		expect(() => session.removeLastMessages(2)).toThrow(failure);
+		expect(session.getEntries()).toEqual(entries);
+		expect(session.getTree()).toEqual(tree);
+		expect(session.buildSessionProjection()).toEqual(projection);
+		expect(session.getLeafId()).toBe(selected);
+		expect(fs.readFileSync(file)).toEqual(bytes);
+		expect(SessionManager.open(file, dir, dir).getEntries()).toEqual(entries);
+		expect(session.removeLastMessages(2)).toBe(2);
+		expect(session.getEntries()).toEqual([]);
+		expect(SessionManager.open(file, dir, dir).getEntries()).toEqual([]);
+	});
+
 	it("restores live soft-deletion flags and held tool maps when persistence fails", () => {
 		const { session, user, file } = createSession();
 		const assistant = session.getLeafEntry();
