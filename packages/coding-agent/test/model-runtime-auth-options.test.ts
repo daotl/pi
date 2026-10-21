@@ -2,6 +2,7 @@ import { type AuthType, type CredentialStore, InMemoryCredentialStore } from "@e
 import { describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
+import { enableBuiltinProviders } from "./test-network-env.ts";
 
 function authOptions(runtime: ModelRuntime, type?: AuthType) {
 	return runtime
@@ -33,10 +34,9 @@ function testModel(id: string) {
 }
 
 describe("ModelRuntime auth options", () => {
-	// Tests using built-in providers require their registration; local-only
-	// mode (PI_DISABLE_CLOUD_PROVIDERS=1) hides them from the registry.
-	const cloudDisabled = process.env.PI_DISABLE_CLOUD_PROVIDERS === "1";
-	it.skipIf(cloudDisabled)("accepts a pi-ai CredentialStore", async () => {
+	// Built-in auth metadata is bundled; no provider request is needed.
+	it("accepts a pi-ai CredentialStore", async () => {
+		enableBuiltinProviders();
 		const credentials = new InMemoryCredentialStore();
 		await credentials.modify("anthropic", async () => ({ type: "api_key", key: "stored-key" }));
 		const runtime = await ModelRuntime.create({ credentials, modelsPath: null });
@@ -44,7 +44,8 @@ describe("ModelRuntime auth options", () => {
 		expect((await runtime.getAuth("anthropic"))?.auth.apiKey).toBe("stored-key");
 	});
 
-	it.skipIf(cloudDisabled)("scopes provider availability reads and records refresh failures", async () => {
+	it("scopes provider availability reads and records refresh failures", async () => {
+		enableBuiltinProviders();
 		const base = new InMemoryCredentialStore();
 		const reads: string[] = [];
 		let failReads = false;
@@ -73,7 +74,8 @@ describe("ModelRuntime auth options", () => {
 		expect(runtime.getError()).toBeUndefined();
 	});
 
-	it.skipIf(cloudDisabled)("projects provider-owned methods, names, and status", async () => {
+	it("projects provider-owned methods, names, and status", async () => {
+		enableBuiltinProviders();
 		const runtime = await ModelRuntime.create({ credentials: AuthStorage.inMemory(), modelsPath: null });
 		const options = authOptions(runtime);
 
@@ -108,7 +110,8 @@ describe("ModelRuntime auth options", () => {
 		expect(options.some((option) => option.provider.id === "openai-codex" && option.type === "api_key")).toBe(false);
 	});
 
-	it.skipIf(cloudDisabled)("attaches the provider's active auth status to every method option", async () => {
+	it("attaches the provider's active auth status to every method option", async () => {
+		enableBuiltinProviders();
 		const runtime = await ModelRuntime.create({
 			credentials: AuthStorage.inMemory({
 				anthropic: {
@@ -126,7 +129,8 @@ describe("ModelRuntime auth options", () => {
 		expect(await runtime.checkAuth("anthropic")).toMatchObject({ type: "oauth" });
 	});
 
-	it.skipIf(cloudDisabled)("distinguishes subscription OAuth from generic OAuth sign-in", async () => {
+	it("distinguishes subscription OAuth from generic OAuth sign-in", async () => {
+		enableBuiltinProviders();
 		const runtime = await ModelRuntime.create({
 			credentials: AuthStorage.inMemory({
 				anthropic: {

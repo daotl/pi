@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
+import { enableBuiltinProviders } from "./test-network-env.ts";
 
 interface CapturedRequest {
 	url: string;
@@ -46,10 +47,10 @@ async function createCloudflareRuntime(): Promise<{ modelRuntime: ModelRuntime; 
 
 const CLOUDFLARE_COMPAT_URL = "https://gateway.ai.cloudflare.com/v1/test-account/test-gateway/compat/chat/completions";
 
-// Cloudflare compat streaming needs the built-in cloudflare provider;
-// local-only mode (PI_DISABLE_CLOUD_PROVIDERS=1) hides it from the registry.
-describe.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")("ModelRegistry Cloudflare compat streaming", () => {
+// Bundled gateway metadata and a capturing fetch keep both request paths offline.
+describe("ModelRegistry Cloudflare compat streaming", () => {
 	it("materializes the Cloudflare endpoint through ModelRuntime streaming", async () => {
+		enableBuiltinProviders();
 		const { modelRuntime } = await createCloudflareRuntime();
 		const model = modelRuntime.getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6");
 		expect(model).toBeDefined();
@@ -65,6 +66,7 @@ describe.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")("ModelRegistry C
 	});
 
 	it("materializes the Cloudflare endpoint after extension-style auth resolution", async () => {
+		enableBuiltinProviders();
 		const { modelRegistry } = await createCloudflareRuntime();
 		const model = modelRegistry.find("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6");
 		expect(model).toBeDefined();
