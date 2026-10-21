@@ -473,10 +473,12 @@ function parseTrailingSpecialBlocks(
 	let end = content.length;
 
 	while (true) {
-		while (end > 0 && /\s/.test(content[end - 1])) end--;
+		// Ignore separator whitespace only when locating a trailing special block.
+		let tagEnd = end;
+		while (tagEnd > 0 && /\s/.test(content[tagEnd - 1])) tagEnd--;
 		const closeText = `</${tagName}>`;
-		if (end < closeText.length || content.slice(end - closeText.length, end) !== closeText) break;
-		const closeStart = end - closeText.length;
+		if (tagEnd < closeText.length || content.slice(tagEnd - closeText.length, tagEnd) !== closeText) break;
+		const closeStart = tagEnd - closeText.length;
 		const open = findPreviousOpeningTag(content, closeStart, tagName);
 		if (!open) break;
 

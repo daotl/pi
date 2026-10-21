@@ -51,3 +51,28 @@ for (const format of ["edit", "swipe"] as const) {
 		});
 	});
 }
+
+describe("user edit trailing whitespace", () => {
+	it.each(["hello\n", "hello \t\n"])("preserves trailing bytes in %j", async (content) => {
+		const harness = await createHarness();
+		try {
+			harness.sessionManager.appendMessage({ role: "system", content: "baseline", timestamp: 0 });
+			const message = { role: "user" as const, content, timestamp: 1 };
+			const id = harness.sessionManager.appendMessage(message);
+			harness.session.refreshContext();
+			const timestamp = harness.sessionManager.getEntry(id)!.timestamp;
+			for (const xml of [formatMessageForEdit(0, message), formatMessageForSwipe(timestamp, message)]) {
+				if (xml === null) throw new Error("Trailing text was refused");
+				const parsed = parseMessageEditsAndSwipes(xml);
+				expect([...parsed.edits, ...parsed.swipes][0].content).toEqual([{ type: "text", text: content }]);
+			}
+			const xml = formatMessageForEdit(0, message)!;
+			harness.session.applyMessageEdits(xml);
+			expect(harness.session.messages.findLast((item) => item.role === "user")?.content).toEqual([
+				{ type: "text", text: content },
+			]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+});
