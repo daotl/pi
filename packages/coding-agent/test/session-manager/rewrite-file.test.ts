@@ -45,6 +45,48 @@ describe("atomic session file rewrite", () => {
 		return { session, user, file };
 	}
 
+	it("remaps a compaction boundary past invalidated results and restores it on failure", () => {
+		const session = SessionManager.create(dir, dir);
+		session.appendMessage(userMsg("question"));
+		const original = {
+			...assistantMsg(""),
+			content: [{ type: "toolCall" as const, id: "call", name: "read", arguments: { path: "old" } }],
+		};
+		const source = session.appendMessage(original);
+		const stale = session.appendMessage({
+			role: "toolResult",
+			toolCallId: "call",
+			toolName: "read",
+			content: [{ type: "text", text: "stale" }],
+			isError: false,
+			timestamp: 3,
+		});
+		const compactionId = session.appendCompaction("summary", stale, 100);
+		const held = session.getEntry(compactionId);
+		const file = session.getSessionFile()!;
+		const entries = structuredClone(session.getEntries());
+		const projection = structuredClone(session.buildSessionProjection());
+		const leaf = session.getLeafId();
+		const bytes = fs.readFileSync(file);
+		const replace = () => session.replaceMessages([{ entryId: source, message: { ...original, content: [] } }]);
+		vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+			throw new Error("boundary rename failure");
+		});
+		expect(replace).toThrow(Error);
+		expect(session.getEntries()).toEqual(entries);
+		expect(session.buildSessionProjection()).toEqual(projection);
+		expect(session.getLeafId()).toBe(leaf);
+		expect(session.getEntry(compactionId)).toBe(held);
+		expect(fs.readFileSync(file)).toEqual(bytes);
+		replace();
+		const selected = session.getLeafEntry();
+		expect(selected).toMatchObject({ type: "compaction", firstKeptEntryId: selected?.id });
+		expect(session.getBranch().some((entry) => entry.id === stale)).toBe(false);
+		expect(SessionManager.open(file, dir, dir).buildSessionProjection().messages).toEqual(
+			session.buildSessionProjection().messages,
+		);
+	});
+
 	it.each(["initial", "flushed"] as const)("does not publish a failed %s append", (mode) => {
 		const session = SessionManager.create(dir, dir);
 		session.appendSystemPrompt("original");

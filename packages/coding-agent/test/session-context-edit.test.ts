@@ -367,4 +367,104 @@ describe("session context edits", () => {
 		expect(JSON.stringify(preparation?.messagesToSummarize)).not.toContain("OMIT-ME");
 		expect(JSON.stringify(preparation?.turnPrefixMessages)).not.toContain("OMIT-ME");
 	});
+
+	it.each(["arguments", "name", "removed"] as const)(
+		"drops only current-turn results invalidated by changed call %s",
+		(change) => {
+			const session = SessionManager.inMemory();
+			session.appendMessage({ role: "user", content: "question", timestamp: 1 });
+			const original = {
+				...assistant(""),
+				content: [{ type: "toolCall" as const, id: "reused", name: "read", arguments: { path: "old" } }],
+			};
+			const source = session.appendMessage(original);
+			session.appendMessage({ role: "system", content: "transparent delta", timestamp: 2 });
+			const stale = session.appendMessage({
+				role: "toolResult",
+				toolCallId: "reused",
+				toolName: "read",
+				content: [{ type: "text", text: "STALE" }],
+				isError: false,
+				timestamp: 3,
+			});
+			session.appendContextEdit(stale, { content: "STALE EDIT" });
+			session.appendMessage({
+				...assistant(""),
+				content: [{ type: "toolCall", id: "reused", name: "read", arguments: { path: "later" } }],
+			});
+			session.appendMessage({
+				role: "toolResult",
+				toolCallId: "reused",
+				toolName: "read",
+				content: [{ type: "text", text: "later result" }],
+				isError: false,
+				timestamp: 4,
+			});
+			const replacement = {
+				...original,
+				content:
+					change === "removed"
+						? []
+						: [
+								{
+									...original.content[0],
+									...(change === "arguments" ? { arguments: { path: "new" } } : { name: "write" }),
+								},
+							],
+			};
+			session.replaceMessages([{ entryId: source, message: replacement }]);
+			expect(
+				session
+					.buildSessionProjection()
+					.messages.filter((message) => message.role === "toolResult")
+					.map(text),
+			).toEqual(["later result"]);
+			expect(session.getEntry(stale)).toBeDefined();
+			expect(session.getBranch().some((entry) => entry.type === "context_edit")).toBe(false);
+		},
+	);
+
+	it("keeps results for structurally unchanged calls after an explicit replacement", () => {
+		const session = SessionManager.inMemory();
+		const original = {
+			...assistant(""),
+			content: [
+				{
+					type: "toolCall" as const,
+					id: "call",
+					name: "read",
+					arguments: { path: "old", options: { a: 1, b: 2 } },
+				},
+			],
+		};
+		const source = session.appendMessage(original);
+		session.appendMessage({
+			role: "toolResult",
+			toolCallId: "call",
+			toolName: "read",
+			content: [{ type: "text", text: "valid" }],
+			isError: false,
+			timestamp: 2,
+		});
+		session.appendContextEdit(source, { content: "obsolete projected edit" });
+		session.replaceMessages([
+			{
+				entryId: source,
+				message: {
+					...original,
+					content: [{ ...original.content[0], arguments: { options: { b: 2, a: 1 }, path: "old" } }],
+				},
+			},
+		]);
+		expect(
+			session
+				.buildSessionProjection()
+				.messages.filter((message) => message.role === "toolResult")
+				.map(text),
+		).toEqual(["valid"]);
+		expect(session.buildSessionProjection().messages[0]).toMatchObject({
+			role: "assistant",
+			content: [expect.objectContaining({ type: "toolCall", id: "call" })],
+		});
+	});
 });

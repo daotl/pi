@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { type AgentMessage, isHarnessMessage } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
@@ -2210,6 +2211,45 @@ export class SessionManager {
 		}
 		if (firstReplaceIdx < 0) return;
 
+		const removedIds = new Set<string>();
+		const invalidCallIds = new Set<string>();
+		for (let i = firstReplaceIdx; i < path.length; i++) {
+			const entry = path[i];
+			if (
+				entry.type === "custom_message" ||
+				(entry.type === "message" &&
+					(entry.message.role === "user" || entry.message.role === "custom" || entry.message.role === "assistant"))
+			) {
+				invalidCallIds.clear();
+			}
+			const replacement = replacementMap.get(entry.id);
+			if (entry.type === "message" && entry.message.role === "assistant" && replacement) {
+				const calls =
+					replacement.role === "assistant" ? replacement.content.filter((block) => block.type === "toolCall") : [];
+				for (const call of entry.message.content) {
+					if (call.type !== "toolCall") continue;
+					if (
+						!calls.some(
+							(next) =>
+								next.id === call.id &&
+								next.name === call.name &&
+								isDeepStrictEqual(next.arguments, call.arguments),
+						)
+					) {
+						invalidCallIds.add(call.id);
+					}
+				}
+			}
+			if (
+				entry.type === "message" &&
+				entry.message.role === "toolResult" &&
+				invalidCallIds.has(entry.message.toolCallId)
+			)
+				removedIds.add(entry.id);
+			if (entry.type === "context_edit" && (replacementMap.has(entry.targetId) || removedIds.has(entry.targetId)))
+				removedIds.add(entry.id);
+		}
+
 		// A rewrite may fail after cloning and reference remapping. Snapshot only after validation.
 		const previousEntries = this.persist && this.sessionFile ? this.fileEntries.slice() : undefined;
 		const previousValues = previousEntries?.map((entry) => ({ entry, value: { ...entry } }));
@@ -2223,12 +2263,20 @@ export class SessionManager {
 		}
 
 		const idMap = new Map<string, string>();
+		const boundaryIds = new Map<string, string>();
+		const pendingRemovedIds: string[] = [];
 
 		// Clone the tail, replacing target messages and updating branch summary fromId.
 		for (let i = firstReplaceIdx; i < path.length; i++) {
 			const entry = path[i];
+			if (removedIds.has(entry.id)) {
+				pendingRemovedIds.push(entry.id);
+				continue;
+			}
 			const newId = generateId(this.byId);
 			idMap.set(entry.id, newId);
+			for (const removedId of pendingRemovedIds) boundaryIds.set(removedId, newId);
+			pendingRemovedIds.length = 0;
 
 			const newEntry: SessionEntry = { ...entry, id: newId, parentId: this.leafId };
 			delete newEntry.supersededBy;
@@ -2251,10 +2299,11 @@ export class SessionManager {
 		// Only new clones belong to this edit; historical branches keep their references.
 		for (const id of idMap.values()) {
 			const entry = this.byId.get(id)!;
-			if (entry.type === "compaction" && entry.firstKeptEntryId && idMap.has(entry.firstKeptEntryId)) {
-				entry.firstKeptEntryId = idMap.get(entry.firstKeptEntryId)!;
-			} else if (entry.type === "branch_summary" && idMap.has(entry.fromId)) {
-				entry.fromId = idMap.get(entry.fromId)!;
+			if (entry.type === "compaction") {
+				entry.firstKeptEntryId =
+					idMap.get(entry.firstKeptEntryId) ?? boundaryIds.get(entry.firstKeptEntryId) ?? entry.firstKeptEntryId;
+			} else if (entry.type === "branch_summary") {
+				entry.fromId = idMap.get(entry.fromId) ?? boundaryIds.get(entry.fromId) ?? entry.fromId;
 			} else if ((entry.type === "label" || entry.type === "context_edit") && idMap.has(entry.targetId)) {
 				entry.targetId = idMap.get(entry.targetId)!;
 			}
