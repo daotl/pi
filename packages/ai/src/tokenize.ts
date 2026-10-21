@@ -9,14 +9,16 @@
  * caller can fall back to an estimate.
  */
 
-import type { Model } from "./types.ts";
+import type { Api, Model, ProviderHeaders } from "./types.ts";
+import { providerHeadersToRecord } from "./utils/headers.ts";
 import { getPiUserAgent } from "./utils/pi-user-agent.ts";
 import { type RetryPolicy, retryDelayMs } from "./utils/retry.ts";
+import { sleep } from "./utils/sleep.ts";
 
 export interface CountTokensOptions {
 	text: string;
 	apiKey?: string;
-	headers?: Record<string, string>;
+	headers?: ProviderHeaders;
 	env?: Record<string, string>;
 	/** Custom fetch (for tests). Defaults to global fetch. */
 	fetch?: typeof globalThis.fetch;
@@ -31,7 +33,7 @@ export interface CountChatTokensOptions {
 	/** The chat messages exactly as they would be sent to /v1/chat/completions. */
 	messages: unknown[];
 	apiKey?: string;
-	headers?: Record<string, string>;
+	headers?: ProviderHeaders;
 	env?: Record<string, string>;
 	/** Custom fetch (for tests). Defaults to global fetch. */
 	fetch?: typeof globalThis.fetch;
@@ -41,16 +43,26 @@ export interface CountChatTokensOptions {
 	timeoutMs?: number;
 }
 
+function usableTokenizerBaseUrl(baseUrl: string): boolean {
+	if (!baseUrl || /[{}\s]/.test(baseUrl)) return false;
+	try {
+		const url = new URL(baseUrl);
+		return url.protocol === "http:" || url.protocol === "https:";
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Derive the `/tokenize` URL from a model base URL.
  *
  * llama.cpp serves `/tokenize` at the server root while the OpenAI-compatible
  * base URL often ends in `/v1`. Strip a trailing `/vN` before appending. Returns
- * undefined for empty base URLs.
+ * undefined for empty, unresolved, or non-HTTP(S) base URLs.
  */
 export function tokenizeEndpointUrl(baseUrl: string): string | undefined {
 	const trimmed = baseUrl.replace(/\/+$/, "");
-	if (!trimmed) return undefined;
+	if (!usableTokenizerBaseUrl(trimmed)) return undefined;
 	const root = /\/v\d+$/.test(trimmed) ? trimmed.replace(/\/v\d+$/, "") : trimmed;
 	return `${root}/tokenize`;
 }
@@ -61,19 +73,18 @@ export function tokenizeEndpointUrl(baseUrl: string): string | undefined {
  * llama.cpp (and other OpenAI-compatible servers) expose an input-token counting
  * variant of the chat endpoint. Unlike `/tokenize`, it applies the chat template
  * and handles multimodal content (images, audio), so the count matches what a
- * real inference request would produce. Returns undefined for empty base URLs.
+ * real inference request would produce. Returns undefined for unusable base URLs.
  */
 export function chatTokenizeEndpointUrl(baseUrl: string): string | undefined {
 	const trimmed = baseUrl.replace(/\/+$/, "");
-	if (!trimmed) return undefined;
+	if (!usableTokenizerBaseUrl(trimmed)) return undefined;
 	return `${trimmed}/chat/completions/input_tokens`;
 }
 
 /**
- * Thrown by {@link countTokens} when the tokenize request failed for a transient
- * reason: connection refused, network error, timeout, or a non-404 HTTP error.
- * A clear 404 means the endpoint is not supported and is not a transient failure
- * (countTokens returns undefined instead, so the caller falls back to an estimate).
+ * Thrown when an optional tokenizer request fails transiently: network error,
+ * timeout, HTTP 408/429, or a server failure. Other 4xx responses mean the
+ * endpoint is unavailable and return undefined instead of entering retry loops.
  */
 export class TokenizeTransientError extends Error {
 	constructor(message: string) {
@@ -85,64 +96,67 @@ export class TokenizeTransientError extends Error {
 /**
  * Count the tokens `text` occupies according to the model server's own tokenizer.
  *
- * Returns the exact token count when the server exposes `/tokenize`, or undefined
- * when the endpoint is not supported (clear 404, missing token array, no text,
- * or aborted). Transient failures (connection refused, network error, timeout,
- * non-404 HTTP errors) throw {@link TokenizeTransientError} so callers that expect
- * the endpoint to exist can retry instead of silently using a fallback estimate.
+ * Returns the exact count, or undefined for an unavailable endpoint, unusable
+ * completed response, empty text, or caller cancellation. Transport failures,
+ * timeouts, HTTP 408/429 and server errors throw TokenizeTransientError.
  */
-export async function countTokens(model: Model<any>, options: CountTokensOptions): Promise<number | undefined> {
+export async function countTokens(model: Model<Api>, options: CountTokensOptions): Promise<number | undefined> {
 	const url = tokenizeEndpointUrl(model.baseUrl);
 	if (!url || !options.text) return undefined;
 
-	const headers: Record<string, string> = {
-		"Content-Type": "application/json",
-		"User-Agent": getPiUserAgent(),
-		...model.headers,
-	};
-	// Only add an Authorization header from the API key when the caller did not
-	// already supply one (e.g. a pre-resolved Bearer token in options.headers).
-	const hasAuthHeader = Object.keys(headers).some((k) => k.toLowerCase() === "authorization");
-	if (options.apiKey && !hasAuthHeader) {
-		headers.Authorization = `Bearer ${options.apiKey}`;
-	}
-	if (options.headers) {
-		Object.assign(headers, options.headers);
-	}
+	const headers = providerHeadersToRecord(
+		{
+			"Content-Type": "application/json",
+			"User-Agent": getPiUserAgent(),
+			...(options.apiKey ? { Authorization: `Bearer ${options.apiKey}` } : {}),
+		},
+		model.headers,
+		options.headers,
+	);
 
 	const fetchFn = options.fetch ?? globalThis.fetch;
 	const timeout = options.timeoutMs ?? 30000;
 
+	if (options.signal?.aborted) return undefined;
+	const controller = new AbortController();
+	const onAbort = () => controller.abort();
+	options.signal?.addEventListener("abort", onAbort, { once: true });
+	const timer = setTimeout(() => controller.abort(), timeout);
 	try {
-		const controller = new AbortController();
-		const onAbort = () => controller.abort();
-		if (options.signal) {
-			if (options.signal.aborted) return undefined;
-			options.signal.addEventListener("abort", onAbort, { once: true });
-		}
-		const timer = setTimeout(() => controller.abort(), timeout);
 		const res = await fetchFn(url, {
 			method: "POST",
 			headers,
 			body: JSON.stringify({ content: options.text }),
 			signal: controller.signal,
 		});
-		clearTimeout(timer);
-		if (options.signal) options.signal.removeEventListener("abort", onAbort);
 
 		if (!res.ok) {
-			// A clear 404 means the endpoint is not there; not a transient failure.
-			if (res.status === 404) return undefined;
+			try {
+				await res.body?.cancel();
+			} catch {
+				// Disposal must not replace the HTTP failure classification.
+			}
+			if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) return undefined;
 			throw new TokenizeTransientError(`tokenize endpoint returned ${res.status}`);
 		}
-		const data = (await res.json()) as { tokens?: unknown };
+		if (res.status === 204) return undefined;
+		let data: { tokens?: unknown };
+		try {
+			data = (await res.json()) as { tokens?: unknown };
+		} catch (error) {
+			if (error instanceof SyntaxError) return undefined;
+			throw error;
+		}
 		if (Array.isArray(data?.tokens)) return data.tokens.length;
-		// 200 without a token array: the endpoint is present but not usable for counting.
+		// A completed but unusable response is not a transient transport error.
 		return undefined;
 	} catch (error) {
 		if (options.signal?.aborted) return undefined;
 		if (error instanceof TokenizeTransientError) throw error;
 		throw new TokenizeTransientError(error instanceof Error ? error.message : String(error));
+	} finally {
+		clearTimeout(timer);
+		options.signal?.removeEventListener("abort", onAbort);
 	}
 }
 
@@ -153,97 +167,82 @@ export async function countTokens(model: Model<any>, options: CountTokensOptions
  * The request body carries the exact messages that would be sent to
  * `/chat/completions` (system message, tool calls, images), so the count includes
  * everything the inference request would consume - including multimodal content
- * that `/tokenize` cannot count. Returns undefined when the endpoint is missing
- * (clear 404), the body is empty, or the response lacks `input_tokens`, so the
- * caller can fall back to an estimate.
+ * that `/tokenize` cannot count. Unavailable endpoints and unusable completed
+ * responses return undefined, so the caller can fall back to an estimate.
  */
-export async function countChatTokens(model: Model<any>, options: CountChatTokensOptions): Promise<number | undefined> {
+export async function countChatTokens(model: Model<Api>, options: CountChatTokensOptions): Promise<number | undefined> {
 	const url = chatTokenizeEndpointUrl(model.baseUrl);
 	if (!url || options.messages.length === 0) return undefined;
 
-	const headers: Record<string, string> = {
-		"Content-Type": "application/json",
-		"User-Agent": getPiUserAgent(),
-		...model.headers,
-	};
-	const hasAuthHeader = Object.keys(headers).some((k) => k.toLowerCase() === "authorization");
-	if (options.apiKey && !hasAuthHeader) {
-		headers.Authorization = `Bearer ${options.apiKey}`;
-	}
-	if (options.headers) {
-		Object.assign(headers, options.headers);
-	}
+	const headers = providerHeadersToRecord(
+		{
+			"Content-Type": "application/json",
+			"User-Agent": getPiUserAgent(),
+			...(options.apiKey ? { Authorization: `Bearer ${options.apiKey}` } : {}),
+		},
+		model.headers,
+		options.headers,
+	);
 
 	const fetchFn = options.fetch ?? globalThis.fetch;
 	const timeout = options.timeoutMs ?? 30000;
 
+	if (options.signal?.aborted) return undefined;
+	const controller = new AbortController();
+	const onAbort = () => controller.abort();
+	options.signal?.addEventListener("abort", onAbort, { once: true });
+	const timer = setTimeout(() => controller.abort(), timeout);
 	try {
-		const controller = new AbortController();
-		const onAbort = () => controller.abort();
-		if (options.signal) {
-			if (options.signal.aborted) return undefined;
-			options.signal.addEventListener("abort", onAbort, { once: true });
-		}
-		const timer = setTimeout(() => controller.abort(), timeout);
 		const res = await fetchFn(url, {
 			method: "POST",
 			headers,
 			body: JSON.stringify({ messages: options.messages, model: model.id }),
 			signal: controller.signal,
 		});
-		clearTimeout(timer);
-		if (options.signal) options.signal.removeEventListener("abort", onAbort);
 
 		if (!res.ok) {
-			// A clear 404 means the endpoint is not there; not a transient failure.
-			if (res.status === 404) return undefined;
+			try {
+				await res.body?.cancel();
+			} catch {
+				// Disposal must not replace the HTTP failure classification.
+			}
+			if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) return undefined;
 			throw new TokenizeTransientError(`chat tokenize endpoint returned ${res.status}`);
 		}
-		const data = (await res.json()) as { input_tokens?: unknown };
+		if (res.status === 204) return undefined;
+		let data: { input_tokens?: unknown };
+		try {
+			data = (await res.json()) as { input_tokens?: unknown };
+		} catch (error) {
+			if (error instanceof SyntaxError) return undefined;
+			throw error;
+		}
 		if (typeof data?.input_tokens === "number") return data.input_tokens;
-		// 200 without input_tokens: the endpoint is present but not usable for counting.
+		// A completed but unusable response is not a transient transport error.
 		return undefined;
 	} catch (error) {
 		if (options.signal?.aborted) return undefined;
 		if (error instanceof TokenizeTransientError) throw error;
 		throw new TokenizeTransientError(error instanceof Error ? error.message : String(error));
+	} finally {
+		clearTimeout(timer);
+		options.signal?.removeEventListener("abort", onAbort);
 	}
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) {
-			reject(new Error("Aborted"));
-			return;
-		}
-		const timeout = setTimeout(resolve, ms);
-		signal?.addEventListener(
-			"abort",
-			() => {
-				clearTimeout(timeout);
-				reject(new Error("Aborted"));
-			},
-			{ once: true },
-		);
-	});
 }
 
 /**
  * Count tokens via `/tokenize`, retrying transient failures with the same
  * exponential-backoff policy used by assistant calls.
  *
- * A clear 404 (endpoint not supported) is terminal: the function returns undefined
- * so the caller falls back to an estimate without retrying. Transient failures
- * (connection refused, timeout, network error, non-404 HTTP errors) retry up to
- * `policy.maxRetries` times. When `policy.maxRetries` is Infinity (the default),
- * it keeps retrying indefinitely until the endpoint succeeds, returns a 404, or
- * the signal aborts - matching the unbounded retry behavior of assistant calls.
+ * Unavailable endpoints are terminal and return undefined. Transient network,
+ * timeout, HTTP 408/429, and server failures retry up to policy.maxRetries times.
+ * Infinity keeps retrying until success, unavailability, or caller cancellation.
  *
  * Returns undefined after exhausting retries (or on abort), so the caller falls
  * back to an estimate rather than failing the whole operation.
  */
 export async function countTokensWithRetry(
-	model: Model<any>,
+	model: Model<Api>,
 	options: CountTokensOptions,
 	policy: RetryPolicy | undefined,
 ): Promise<number | undefined> {
@@ -257,7 +256,7 @@ export async function countTokensWithRetry(
 			if (attempt >= maxAttempts) return undefined;
 			attempt++;
 			try {
-				await sleep(retryDelayMs(policy!, attempt), options.signal);
+				await sleep(retryDelayMs(policy!, attempt), options.signal ?? new AbortController().signal);
 			} catch (sleepError) {
 				// Abort during the backoff sleep is terminal: stop retrying.
 				if (options.signal?.aborted) return undefined;
