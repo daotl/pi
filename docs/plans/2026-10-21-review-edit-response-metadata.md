@@ -17,3 +17,5 @@ Accept optional additional AssistantMessage metadata while retaining the existin
 Message edit, swipe and lexical suites: **85 passed** with one worker. Actual apply paths verify response identity/effort/termination metadata survives while body changes and stopReason remains current upstream aborted semantics. No standalone disk reopen or provider replay proof is claimed for this unit.
 
 `npm run check` passed (1713 files; two changed files formatted). Post-format owning suites passed **85 tests** again.
+
+Follow-up on descendant 6d7b8475a: explicitly ran `test/virtual-models.test.ts` and `test/suite/virtual-models.test.ts` with one worker, **30 passed**. This is existing routing consumer regression coverage, not a new edited-response end-to-end routing scenario.
