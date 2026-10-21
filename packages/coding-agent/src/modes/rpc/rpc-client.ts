@@ -143,27 +143,31 @@ export class RpcClient {
 	 * Stop the RPC agent process.
 	 */
 	async stop(): Promise<void> {
-		if (!this.process) return;
+		const childProcess = this.process;
+		if (!childProcess) return;
 
 		this.stopReadingStdout?.();
 		this.stopReadingStdout = null;
-		this.process.kill("SIGTERM");
+		childProcess.kill("SIGTERM");
 
 		// Wait for process to exit
 		await new Promise<void>((resolve) => {
 			const timeout = setTimeout(() => {
-				this.process?.kill("SIGKILL");
+				childProcess.kill("SIGKILL");
 				resolve();
 			}, 1000);
 
-			this.process?.on("exit", () => {
+			childProcess.once("exit", () => {
 				clearTimeout(timeout);
 				resolve();
 			});
 		});
 
+		// The forced deadline can finish before the OS publishes the process exit event.
+		const error = this.exitError ?? new Error(`Agent process stopped. Stderr: ${this.stderr}`);
+		this.exitError = error;
+		this.rejectPendingRequests(error);
 		this.process = null;
-		this.pendingRequests.clear();
 	}
 
 	/**

@@ -18,6 +18,7 @@ async function withClient(run: (client: RpcClient) => Promise<void>) {
 		cliPath,
 		`
 import { createInterface } from "node:readline";
+process.on("SIGTERM", () => process.stdout.write(JSON.stringify({type:"agent_settled"})+"\\n"));
 let held;
 const reply = (command, data) => process.stdout.write(JSON.stringify({type:"response", id:command.id, command:command.type, success:true, data})+"\\n");
 createInterface({input:process.stdin}).on("line", line => {
@@ -92,6 +93,28 @@ describe("RpcClient request lifetime", () => {
 			});
 			await client.getMessages();
 			expect(events).not.toContain("response");
+		});
+	});
+	it("settles held requests when forced shutdown completes before the exit event", async () => {
+		await withClient(async (client) => {
+			const started = requestStarted(client);
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			let settled = false;
+			const result = client.compact().then(
+				(value) => ({ value }),
+				(error: unknown) => ({ error }),
+			);
+			void result.then(() => {
+				settled = true;
+			});
+			await started;
+			const stopping = client.stop();
+			// Synchronous advancement keeps the OS exit event behind the forced-stop deadline.
+			vi.advanceTimersByTime(1000);
+			await stopping;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(settled).toBe(true);
+			expect(await result).toMatchObject({ error: expect.any(Error) });
 		});
 	});
 });
