@@ -16,4 +16,8 @@ Set the test environment's catalog flag to `process.env.PI_DISABLE_CLOUD_PROVIDE
 
 The same child-process smoke now observes unset → skipped, explicit `1` → skipped, explicit `0` → passed. Each process uses an allowlisted environment, isolated home and synchronous HTTP/HTTPS/TCP/TLS/fetch deny hooks; the network-attempt marker remains absent. This runs the real existing registry test, not a copied config assertion. Only that exact catalog-dependent behavioral case executes; other cases remain filtered. No provider request or paid E2E execution is claimed.
 
-`npm run check` passed: 1719 files, no fixes applied; types, dependency/lock checks and browser smoke passed. No permanent test added for a config value; temporary smoke provides the execution evidence. Default-off suite activation and remaining test-local metadata helpers still require separate migration accounting.
+`npm run check` passed: 1719 files, no fixes applied; types, dependency/lock checks and browser smoke passed. The initial temporary smoke provided the execution evidence at `0d7f082e4`. Default-off suite activation and remaining test-local metadata helpers still require separate migration accounting.
+
+## Durable regression follow-up
+
+`scripts/coding-agent-catalog-override.test.mjs` retains the child-process behavioral contract in the root's authoritative `scripts/*.test.mjs` suite: default and explicit `1` skip the selected existing registry behavior, explicit `0` executes and passes it. The test requires exactly that case to execute, allowlists the child environment, denies network transports, and verifies no network-attempt marker. **3 passed** on the fixed source. This is retained post-fix regression coverage; the earlier temporary smoke, not this follow-up run, supplied the RED. The test does not read config source text or assert copied configuration values.
