@@ -16,6 +16,8 @@ The pre-existing literal user swipe fixture lacked a parent anchor and previousl
 
 ## Verification
 
-Safety, actual AgentSession edit/swipe and lexical suites: **106 passed**. Command-method controls assert unsent draft unchanged for mixed safe/unsafe substring and swipe selections; copy keeps refused match content. Positive signed reasoning/literal text round trip and existing Responses replay stay intact. This is real method/state proof with prototype UI seam, not a full physical TUI visual test. Current full integration before this unit was7968passed0failed999skipped; no claim this new unit has passed full suite yet.
+Safety, actual AgentSession edit/swipe and lexical suites: **106 passed**. Command-method controls assert unsent draft unchanged for mixed safe/unsafe substring and swipe selections; copy keeps refused match content. Positive signed reasoning/literal text round trip and existing Responses replay stay intact. This is real method/state proof with prototype UI seam, not a full physical TUI visual test. Full integration before this unit was **7968 passed / 0 failed / 999 skipped**.
 
 `npm run check` passed (1715 files; two changed files formatted). Post-format owning suites: **106 passed**.
+
+Fixed-tree `./test.sh` at203737d0f subsequently passed **7979 passed / 0 failed / 999 skipped** (artifact2013), including Node/Vitest totals and packed SDK/CLI consumer smoke. Protected749 user build artifacts retain their saved SHA256 values. This verifies the current integration, not completion of pending migration groups.
