@@ -23,6 +23,6 @@ No URL, HTTP status, completed-JSON classification, retry-budget or retry-sleep 
 ## Verification
 
 - Native response-lifetime, header and existing tokenizer suites after repair: **35 passed** across three files.
-- The pending-cancel regression would reject the independently identified disposal hang; the original source fails because it never disposes the body. Native stalled-body cases use actual fetch/HTTP rather than a synthetic body rejection.
+- The pending-cancel case verifies that the repaired counter initiates cancellation and settles without waiting for its unresolved promise. No await-cancellation mutant was executed; sensitivity to that independently identified hang is inferred from the watchdog, not recorded as observed RED. The observed original-source failure was missing body disposal. Native stalled-body cases use actual fetch/HTTP rather than a synthetic body rejection.
 
 - `npm run check`: passed with 1706 files, formatting the source and new regression. Post-format owning suites again passed **35 tests**. Normal commit hooks provide final no-fixes verification.
