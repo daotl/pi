@@ -109,24 +109,26 @@ export async function countTokens(model: Model<any>, options: CountTokensOptions
 	const fetchFn = options.fetch ?? globalThis.fetch;
 	const timeout = options.timeoutMs ?? 30000;
 
+	if (options.signal?.aborted) return undefined;
+	const controller = new AbortController();
+	const onAbort = () => controller.abort();
+	options.signal?.addEventListener("abort", onAbort, { once: true });
+	const timer = setTimeout(() => controller.abort(), timeout);
 	try {
-		const controller = new AbortController();
-		const onAbort = () => controller.abort();
-		if (options.signal) {
-			if (options.signal.aborted) return undefined;
-			options.signal.addEventListener("abort", onAbort, { once: true });
-		}
-		const timer = setTimeout(() => controller.abort(), timeout);
 		const res = await fetchFn(url, {
 			method: "POST",
 			headers,
 			body: JSON.stringify({ content: options.text }),
 			signal: controller.signal,
 		});
-		clearTimeout(timer);
-		if (options.signal) options.signal.removeEventListener("abort", onAbort);
 
 		if (!res.ok) {
+			// Disposal is best-effort and must not block HTTP classification.
+			try {
+				void res.body?.cancel().catch(() => {});
+			} catch {
+				/* Preserve the HTTP failure. */
+			}
 			// A clear 404 means the endpoint is not there; not a transient failure.
 			if (res.status === 404) return undefined;
 			throw new TokenizeTransientError(`tokenize endpoint returned ${res.status}`);
@@ -139,6 +141,9 @@ export async function countTokens(model: Model<any>, options: CountTokensOptions
 		if (options.signal?.aborted) return undefined;
 		if (error instanceof TokenizeTransientError) throw error;
 		throw new TokenizeTransientError(error instanceof Error ? error.message : String(error));
+	} finally {
+		clearTimeout(timer);
+		options.signal?.removeEventListener("abort", onAbort);
 	}
 }
 
@@ -170,24 +175,26 @@ export async function countChatTokens(model: Model<any>, options: CountChatToken
 	const fetchFn = options.fetch ?? globalThis.fetch;
 	const timeout = options.timeoutMs ?? 30000;
 
+	if (options.signal?.aborted) return undefined;
+	const controller = new AbortController();
+	const onAbort = () => controller.abort();
+	options.signal?.addEventListener("abort", onAbort, { once: true });
+	const timer = setTimeout(() => controller.abort(), timeout);
 	try {
-		const controller = new AbortController();
-		const onAbort = () => controller.abort();
-		if (options.signal) {
-			if (options.signal.aborted) return undefined;
-			options.signal.addEventListener("abort", onAbort, { once: true });
-		}
-		const timer = setTimeout(() => controller.abort(), timeout);
 		const res = await fetchFn(url, {
 			method: "POST",
 			headers,
 			body: JSON.stringify({ messages: options.messages, model: model.id }),
 			signal: controller.signal,
 		});
-		clearTimeout(timer);
-		if (options.signal) options.signal.removeEventListener("abort", onAbort);
 
 		if (!res.ok) {
+			// Disposal is best-effort and must not block HTTP classification.
+			try {
+				void res.body?.cancel().catch(() => {});
+			} catch {
+				/* Preserve the HTTP failure. */
+			}
 			// A clear 404 means the endpoint is not there; not a transient failure.
 			if (res.status === 404) return undefined;
 			throw new TokenizeTransientError(`chat tokenize endpoint returned ${res.status}`);
@@ -200,6 +207,9 @@ export async function countChatTokens(model: Model<any>, options: CountChatToken
 		if (options.signal?.aborted) return undefined;
 		if (error instanceof TokenizeTransientError) throw error;
 		throw new TokenizeTransientError(error instanceof Error ? error.message : String(error));
+	} finally {
+		clearTimeout(timer);
+		options.signal?.removeEventListener("abort", onAbort);
 	}
 }
 
