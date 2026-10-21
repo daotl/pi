@@ -17,3 +17,5 @@ Skip failed assistants unless they are the final conversational assistant in exp
 Transform prefill, Completions prefill serialization/reasoning-details, Azure reasoning and Copilot-to-Anthropic transform suites initially **40 passed**. Additional actual converter control proves ordinary aborted partial is absent from serialized assistant items and explicit prefill remains trailing. No live provider HTTP or end-to-end Agent continuation claim.
 
 `npm run check` passed (1714 files; three changed files formatted). Final five AI suites: **41 passed**; existing AgentSession continuation, retry/continue lifecycle and prompt suites: **36 passed**. These consumer regressions do not establish the still-pending durable/echo repair groups.
+
+Follow-up after 263ad30dd strengthens ordinary converter output to the exact retained user item, not only absence of assistant. Prefill serialization + transform suites: **18 passed**. Original transform regressions already assert retained patch/later assistant/result sequences; this closes the narrower converter negative-control gap.

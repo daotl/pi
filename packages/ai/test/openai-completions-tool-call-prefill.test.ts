@@ -153,9 +153,8 @@ describe("openai-completions convertMessages tool-call prefill", () => {
 			stopReason: "aborted" as const,
 		};
 		const context = buildContext(failed);
-		expect(convertMessages(buildModel(), context, compat).filter((message) => message.role === "assistant")).toEqual(
-			[],
-		);
+		const ordinary = convertMessages(buildModel(), context, compat);
+		expect(ordinary).toEqual([{ role: "user", content: "Read the file" }]);
 		const continued = convertMessages(buildModel(), context, compat, { prefill: true });
 		expect(asAssistant(continued.at(-1))).toMatchObject({ role: "assistant", content: "failed partial" });
 	});
