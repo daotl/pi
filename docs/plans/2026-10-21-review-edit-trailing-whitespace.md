@@ -17,3 +17,5 @@ Use a temporary tagEnd to ignore whitespace only while finding a special closing
 Order/safety/actual AgentSession edit/swipe/lexical suites: **118 passed**. Both edit/swipe parser outputs retain exact trailing bytes; actual id0 edit stores the unchanged user content. New fixture uses a real system parent so user swipe formatting has a legitimate group anchor. Full integration will run after this bounded commit, not claimed here.
 
 `npm run check` passed (1716 files; regression formatted). Post-format owning suites: **118 passed**.
+
+Fixed-tree `./test.sh` atce8b1ff8d passed **7991 passed / 0 failed / 999 skipped** (artifact2036). Prior same-tree attempt had one existing footer watcher timing failure, preserved in aggregate accounting; no product/time-limit change was made.

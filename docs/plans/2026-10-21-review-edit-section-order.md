@@ -17,3 +17,5 @@ Find section boundaries using existing furthest-close/adjacent-section rules, pa
 Five order/safety/actual AgentSession edit/swipe/lexical suites: **116 passed**. New controls format/parse/apply each order for edit and pi_swipe and assert exact content arrays; embedded tool closing-tag argument survives. Existing literal nested tag, nonobject argument, ambiguous refusal and native Responses replay cases pass. No trailing whitespace policy, mixed-edit transaction, physical UI or live provider claim.
 
 `npm run check` passed (1716 files; two changed files formatted). Post-format owning suites: **116 passed**.
+
+Combined parser/whitespace fixed-tree `./test.sh` atce8b1ff8d passed **7991 passed / 0 failed / 999 skipped** (artifact2036), including SDK/CLI consumer smoke. Previous aggregate attempt reported one existing footer reftable watcher timeout; exact single watcher case then passed524ms and the unchanged-tree aggregate passed. No watcher source/timeout change or confirmed root-cause claim.
