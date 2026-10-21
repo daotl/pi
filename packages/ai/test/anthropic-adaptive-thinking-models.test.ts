@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { getModels, getProviders } from "../src/compat.ts";
 import type { Api, Model } from "../src/types.ts";
 
@@ -26,27 +26,28 @@ function getAllModels(): Model<Api>[] {
 }
 
 describe("Anthropic adaptive thinking model metadata", () => {
-	// Cloud catalog is intentionally hidden in local-only mode
-	// (PI_DISABLE_CLOUD_PROVIDERS=1); nothing to assert then.
-	it.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")(
-		"marks built-in Anthropic Messages models that use adaptive thinking",
-		() => {
-			const flaggedModels = getAllModels()
-				.filter((model): model is Model<"anthropic-messages"> => model.api === "anthropic-messages")
-				.filter((model) => model.compat?.forceAdaptiveThinking === true)
-				.map((model) => `${model.provider}/${model.id}`)
-				.sort();
+	afterEach(() => {
+		vi.unstubAllEnvs();
+	});
 
-			expect(flaggedModels).toEqual(expect.arrayContaining([...EXPECTED_CURRENT_ADAPTIVE_THINKING_MODELS].sort()));
-			expect(flaggedModels).toEqual(
-				flaggedModels.filter(
-					(modelId) =>
-						// Regression for #9323: Fireworks uses catalog effort metadata and
-						// verified fallbacks, not a fixed set of adaptive model names.
-						modelId.startsWith("fireworks/") ||
-						/(opus[-.](4[-.][678]|5)|sonnet[-.]4[-.]6|sonnet[-.]5|fable[-.]5|kimi-coding\/)/.test(modelId),
-				),
-			);
-		},
-	);
+	it("marks built-in Anthropic Messages models that use adaptive thinking", () => {
+		vi.stubEnv("PI_DISABLE_CLOUD_PROVIDERS", "0");
+		expect(getProviders()).toContain("anthropic");
+		const flaggedModels = getAllModels()
+			.filter((model): model is Model<"anthropic-messages"> => model.api === "anthropic-messages")
+			.filter((model) => model.compat?.forceAdaptiveThinking === true)
+			.map((model) => `${model.provider}/${model.id}`)
+			.sort();
+
+		expect(flaggedModels).toEqual(expect.arrayContaining([...EXPECTED_CURRENT_ADAPTIVE_THINKING_MODELS].sort()));
+		expect(flaggedModels).toEqual(
+			flaggedModels.filter(
+				(modelId) =>
+					// Regression for #9323: Fireworks uses catalog effort metadata and
+					// verified fallbacks, not a fixed set of adaptive model names.
+					modelId.startsWith("fireworks/") ||
+					/(opus[-.](4[-.][678]|5)|sonnet[-.]4[-.]6|sonnet[-.]5|fable[-.]5|kimi-coding\/)/.test(modelId),
+			),
+		);
+	});
 });

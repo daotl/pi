@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { lazyApi } from "../src/api/lazy.ts";
 import { envApiKeyAuth } from "../src/auth/helpers.ts";
 import type { AuthContext, AuthEvent } from "../src/auth/types.ts";
@@ -53,22 +53,20 @@ const DEFAULT_IMAGE_RESIZE = {
 };
 
 describe("builtin providers", () => {
+	afterEach(() => {
+		vi.unstubAllEnvs();
+	});
+
 	it("builtinModels registers every builtin provider with models", async () => {
+		vi.stubEnv("PI_DISABLE_CLOUD_PROVIDERS", "0");
 		const models = builtinModels();
 		const providers = models.getProviders();
 		expect(providers.length).toBe(builtinProviders().length);
 
-		// In local-only mode (PI_DISABLE_CLOUD_PROVIDERS=1) cloud providers are
-		// intentionally hidden, so cloud catalog assertions do not apply.
-		if (process.env.PI_DISABLE_CLOUD_PROVIDERS !== "1") {
-			expect(providers.map((p) => p.id)).toContain("anthropic");
-
-			const anthropic = models.getModel("anthropic", "claude-haiku-4-5");
-			expect(anthropic?.api).toBe("anthropic-messages");
-
-			const all = models.getModels();
-			expect(all.length).toBeGreaterThan(500);
-		}
+		expect(providers.map((p) => p.id)).toContain("anthropic");
+		const anthropic = models.getModel("anthropic", "claude-haiku-4-5");
+		expect(anthropic?.api).toBe("anthropic-messages");
+		expect(models.getModels().length).toBeGreaterThan(500);
 
 		for (const provider of providers) {
 			const list = models.getAllModels(provider.id);
@@ -107,18 +105,16 @@ describe("builtin providers", () => {
 		expect(getBuiltinModel("anthropic", "claude-haiku-4-5").compat?.supportsStrictTools).toBe(true);
 	});
 
-	it.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")(
-		"keeps the conservative resize profile on every vision model",
-		() => {
-			const visionModels = getBuiltinProviders()
-				.flatMap((provider) => getBuiltinModels(provider))
-				.filter((model) => model.input.includes("image"));
-			expect(visionModels.length).toBeGreaterThan(0);
-			for (const model of visionModels) {
-				expect(model.inputLimits?.images?.resize).toEqual(DEFAULT_IMAGE_RESIZE);
-			}
-		},
-	);
+	it("keeps the conservative resize profile on every vision model", () => {
+		vi.stubEnv("PI_DISABLE_CLOUD_PROVIDERS", "0");
+		const visionModels = getBuiltinProviders()
+			.flatMap((provider) => getBuiltinModels(provider))
+			.filter((model) => model.input.includes("image"));
+		expect(visionModels.length).toBeGreaterThan(0);
+		for (const model of visionModels) {
+			expect(model.inputLimits?.images?.resize).toEqual(DEFAULT_IMAGE_RESIZE);
+		}
+	});
 
 	it("records known direct-provider image request limits", () => {
 		expect(getBuiltinModel("anthropic", "claude-haiku-4-5").inputLimits).toMatchObject({
@@ -167,144 +163,134 @@ describe("builtin providers", () => {
 		expect(getSupportedThinkingLevels(getBuiltinModel("google", "gemma-4-31b-it"))).toEqual(["minimal", "high"]);
 	});
 
-	it.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")(
-		"enables mid-conversation system messages only for verified models",
-		() => {
-			const models = builtinModels();
-			const supported = [
-				["moonshotai", "kimi-k2.6"],
-				["moonshotai", "kimi-k2.7-code"],
-				["moonshotai", "kimi-k2.7-code-highspeed"],
-				["moonshotai", "kimi-k3"],
-				["moonshotai-cn", "kimi-k2.6"],
-				["moonshotai-cn", "kimi-k2.7-code"],
-				["moonshotai-cn", "kimi-k2.7-code-highspeed"],
-				["moonshotai-cn", "kimi-k3"],
-				["fireworks", "accounts/fireworks/models/kimi-k3"],
-				["fireworks", "accounts/fireworks/routers/kimi-k3-fast"],
-				["openai", "gpt-5.4"],
-				["openai", "gpt-5.5"],
-				["openai", "gpt-6-astra"],
-				["openai-codex", "gpt-5.5"],
-				["anthropic", "claude-opus-5"],
-				["opencode", "gpt-5.4"],
-				["opencode", "gpt-5.6-terra"],
-				["opencode-go", "gpt-5.6-luna"],
-				["opencode", "claude-opus-4-8"],
-				["opencode", "claude-opus-5"],
-				["opencode", "kimi-k3"],
-				["opencode-go", "kimi-k3"],
-				["github-copilot", "gpt-5.6-terra"],
-				["github-copilot", "claude-opus-5"],
-				["github-copilot", "claude-opus-4.8"],
-				["github-copilot", "kimi-k3"],
-				["deepseek", "deepseek-v4-pro"],
-				["openrouter", "openai/gpt-5.6-terra"],
-			] as const;
-			const unsupported = [
-				["fireworks", "accounts/fireworks/models/nemotron-3-ultra-nvfp4"],
-				["openai", "gpt-4.1"],
-				["openai", "gpt-5.2"],
-				["anthropic", "claude-sonnet-4-5"],
-				["google", "gemini-2.5-pro"],
-				["opencode", "gpt-5.2"],
-				["opencode", "claude-sonnet-4-5"],
-				["github-copilot", "claude-sonnet-4.6"],
-				["deepseek", "deepseek-flash"],
-				["openrouter", "anthropic/claude-opus-5"],
-				["openrouter", "moonshotai/kimi-k3"],
-				["openrouter", "openai/gpt-5.6-terra:batch"],
-			] as const;
-			for (const [provider, modelId] of supported) {
-				expect(models.getModel(provider, modelId), `${provider}/${modelId}`).toHaveProperty(
-					"compat.supportsMidConvoSystemMessages",
-					true,
-				);
-			}
-			for (const [provider, modelId] of unsupported) {
-				expect(models.getModel(provider, modelId), `${provider}/${modelId}`).not.toHaveProperty(
-					"compat.supportsMidConvoSystemMessages",
-				);
-			}
-		},
-	);
+	it("enables mid-conversation system messages only for verified models", () => {
+		vi.stubEnv("PI_DISABLE_CLOUD_PROVIDERS", "0");
+		const models = builtinModels();
+		const supported = [
+			["moonshotai", "kimi-k2.6"],
+			["moonshotai", "kimi-k2.7-code"],
+			["moonshotai", "kimi-k2.7-code-highspeed"],
+			["moonshotai", "kimi-k3"],
+			["moonshotai-cn", "kimi-k2.6"],
+			["moonshotai-cn", "kimi-k2.7-code"],
+			["moonshotai-cn", "kimi-k2.7-code-highspeed"],
+			["moonshotai-cn", "kimi-k3"],
+			["fireworks", "accounts/fireworks/models/kimi-k3"],
+			["fireworks", "accounts/fireworks/routers/kimi-k3-fast"],
+			["openai", "gpt-5.4"],
+			["openai", "gpt-5.5"],
+			["openai", "gpt-6-astra"],
+			["openai-codex", "gpt-5.5"],
+			["anthropic", "claude-opus-5"],
+			["opencode", "gpt-5.4"],
+			["opencode", "gpt-5.6-terra"],
+			["opencode-go", "gpt-5.6-luna"],
+			["opencode", "claude-opus-4-8"],
+			["opencode", "claude-opus-5"],
+			["opencode", "kimi-k3"],
+			["opencode-go", "kimi-k3"],
+			["github-copilot", "gpt-5.6-terra"],
+			["github-copilot", "claude-opus-5"],
+			["github-copilot", "claude-opus-4.8"],
+			["github-copilot", "kimi-k3"],
+			["deepseek", "deepseek-v4-pro"],
+			["openrouter", "openai/gpt-5.6-terra"],
+		] as const;
+		const unsupported = [
+			["fireworks", "accounts/fireworks/models/nemotron-3-ultra-nvfp4"],
+			["openai", "gpt-4.1"],
+			["openai", "gpt-5.2"],
+			["anthropic", "claude-sonnet-4-5"],
+			["google", "gemini-2.5-pro"],
+			["opencode", "gpt-5.2"],
+			["opencode", "claude-sonnet-4-5"],
+			["github-copilot", "claude-sonnet-4.6"],
+			["deepseek", "deepseek-flash"],
+			["openrouter", "anthropic/claude-opus-5"],
+			["openrouter", "moonshotai/kimi-k3"],
+			["openrouter", "openai/gpt-5.6-terra:batch"],
+		] as const;
+		for (const [provider, modelId] of supported) {
+			expect(models.getModel(provider, modelId), `${provider}/${modelId}`).toHaveProperty(
+				"compat.supportsMidConvoSystemMessages",
+				true,
+			);
+		}
+		for (const [provider, modelId] of unsupported) {
+			expect(models.getModel(provider, modelId), `${provider}/${modelId}`).not.toHaveProperty(
+				"compat.supportsMidConvoSystemMessages",
+			);
+		}
+	});
 
-	it.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")(
-		"routes proxied tool changes through verified transports only",
-		() => {
-			const models = builtinModels();
-			for (const [provider, modelId] of [
-				["opencode", "gpt-5.6-terra"],
-				["github-copilot", "gpt-5.6-terra"],
-			] as const) {
-				// Proxies pass `additional_tools` through to OpenAI but are not verified for tool search.
-				expect(models.getModel(provider, modelId)?.compat, `${provider}/${modelId}`).toMatchObject({
-					supportsAdditionalTools: true,
-				});
-				expect(models.getModel(provider, modelId)?.compat, `${provider}/${modelId}`).not.toHaveProperty(
-					"supportsToolSearch",
-				);
-			}
-			// Proxied Anthropic endpoints reject `tool_addition`/`tool_removal` blocks.
-			for (const provider of ["opencode", "github-copilot"] as const) {
-				expect(models.getModel(provider, "claude-opus-5")?.compat, provider).not.toHaveProperty(
-					"supportsMidConvoToolChanges",
-				);
-			}
-			expect(models.getModel("anthropic", "claude-opus-5")?.compat).toMatchObject({
-				supportsMidConvoToolChanges: true,
+	it("routes proxied tool changes through verified transports only", () => {
+		vi.stubEnv("PI_DISABLE_CLOUD_PROVIDERS", "0");
+		const models = builtinModels();
+		for (const [provider, modelId] of [
+			["opencode", "gpt-5.6-terra"],
+			["github-copilot", "gpt-5.6-terra"],
+		] as const) {
+			// Proxies pass `additional_tools` through to OpenAI but are not verified for tool search.
+			expect(models.getModel(provider, modelId)?.compat, `${provider}/${modelId}`).toMatchObject({
+				supportsAdditionalTools: true,
 			});
-			// Kimi-style tool-bearing system messages survive Moonshot and OpenCode but not Copilot.
-			for (const provider of ["moonshotai", "moonshotai-cn", "opencode", "opencode-go"] as const) {
-				expect(models.getModel(provider, "kimi-k3")?.compat, provider).toMatchObject({
-					supportsMidConvoToolAdditions: true,
-				});
-			}
-			for (const provider of ["moonshotai", "moonshotai-cn"] as const) {
-				for (const modelId of ["kimi-k2.6", "kimi-k2.7-code", "kimi-k2.7-code-highspeed"] as const) {
-					expect(models.getModel(provider, modelId)?.compat, `${provider}/${modelId}`).not.toHaveProperty(
-						"supportsMidConvoToolAdditions",
-					);
-				}
-			}
-			expect(models.getModel("github-copilot", "kimi-k3")?.compat).not.toHaveProperty(
-				"supportsMidConvoToolAdditions",
+			expect(models.getModel(provider, modelId)?.compat, `${provider}/${modelId}`).not.toHaveProperty(
+				"supportsToolSearch",
 			);
-			expect(models.getModel("openrouter", "openai/gpt-5.6-terra")?.compat).not.toHaveProperty(
-				"supportsMidConvoToolAdditions",
+		}
+		// Proxied Anthropic endpoints reject `tool_addition`/`tool_removal` blocks.
+		for (const provider of ["opencode", "github-copilot"] as const) {
+			expect(models.getModel(provider, "claude-opus-5")?.compat, provider).not.toHaveProperty(
+				"supportsMidConvoToolChanges",
 			);
-		},
-	);
-
-	it.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")(
-		"uses official Kimi K3 pricing for Moonshot providers",
-		() => {
-			const models = builtinModels();
-			for (const provider of ["moonshotai", "moonshotai-cn"]) {
-				expect(models.getModel(provider, "kimi-k3")?.cost).toEqual({
-					input: 3,
-					output: 15,
-					cacheRead: 0.3,
-					cacheWrite: 0,
-				});
+		}
+		expect(models.getModel("anthropic", "claude-opus-5")?.compat).toMatchObject({
+			supportsMidConvoToolChanges: true,
+		});
+		// Kimi-style tool-bearing system messages survive Moonshot and OpenCode but not Copilot.
+		for (const provider of ["moonshotai", "moonshotai-cn", "opencode", "opencode-go"] as const) {
+			expect(models.getModel(provider, "kimi-k3")?.compat, provider).toMatchObject({
+				supportsMidConvoToolAdditions: true,
+			});
+		}
+		for (const provider of ["moonshotai", "moonshotai-cn"] as const) {
+			for (const modelId of ["kimi-k2.6", "kimi-k2.7-code", "kimi-k2.7-code-highspeed"] as const) {
+				expect(models.getModel(provider, modelId)?.compat, `${provider}/${modelId}`).not.toHaveProperty(
+					"supportsMidConvoToolAdditions",
+				);
 			}
-		},
-	);
+		}
+		expect(models.getModel("github-copilot", "kimi-k3")?.compat).not.toHaveProperty("supportsMidConvoToolAdditions");
+		expect(models.getModel("openrouter", "openai/gpt-5.6-terra")?.compat).not.toHaveProperty(
+			"supportsMidConvoToolAdditions",
+		);
+	});
 
-	it.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")(
-		"uses API-equivalent implied pricing for Kimi Coding subscription models",
-		() => {
-			const models = builtinModels();
-			const expectedCosts = {
-				k3: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 },
-				"kimi-for-coding-highspeed": { input: 1.9, output: 8, cacheRead: 0.38, cacheWrite: 0 },
-			};
+	it("uses official Kimi K3 pricing for Moonshot providers", () => {
+		vi.stubEnv("PI_DISABLE_CLOUD_PROVIDERS", "0");
+		const models = builtinModels();
+		for (const provider of ["moonshotai", "moonshotai-cn"]) {
+			expect(models.getModel(provider, "kimi-k3")?.cost).toEqual({
+				input: 3,
+				output: 15,
+				cacheRead: 0.3,
+				cacheWrite: 0,
+			});
+		}
+	});
 
-			for (const [modelId, cost] of Object.entries(expectedCosts)) {
-				expect(models.getModel("kimi-coding", modelId)?.cost).toEqual(cost);
-			}
-		},
-	);
+	it("uses API-equivalent implied pricing for Kimi Coding subscription models", () => {
+		vi.stubEnv("PI_DISABLE_CLOUD_PROVIDERS", "0");
+		const models = builtinModels();
+		const expectedCosts = {
+			k3: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 },
+			"kimi-for-coding-highspeed": { input: 1.9, output: 8, cacheRead: 0.38, cacheWrite: 0 },
+		};
+
+		for (const [modelId, cost] of Object.entries(expectedCosts)) {
+			expect(models.getModel("kimi-coding", modelId)?.cost).toEqual(cost);
+		}
+	});
 
 	it("resolves Anthropic bearer auth from env with auth token precedence", async () => {
 		const models = createModels({
