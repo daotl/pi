@@ -109,7 +109,7 @@ Cancelling a queued compaction during asynchronous summary authentication or str
 
 A manual compact queued during a retryable response runs at the completed boundary before automatic retry events or backoff. Successful or failed compaction does not create an extra retry grant: disabled and exhausted policies remain exhausted. Cancelling the compaction suppresses the interrupted run's retry.
 
-If compaction is cancelled while finding its cut point, preparation stops before `session_before_compact` handlers run. A started automatic compaction still emits its aborted completion event when no usable preparation remains.
+If compaction is cancelled while finding its cut point, preparation stops before `session_before_compact` handlers run. A started automatic compaction emits its aborted completion event whether preparation produced a usable candidate or not.
 
 ### Split user-message spans
 
