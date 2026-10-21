@@ -2248,13 +2248,14 @@ export class SessionManager {
 			this.leafId = newId;
 		}
 
-		// Update references in all entries that point into the cloned tail.
-		for (const entry of this.fileEntries) {
+		// Only new clones belong to this edit; historical branches keep their references.
+		for (const id of idMap.values()) {
+			const entry = this.byId.get(id)!;
 			if (entry.type === "compaction" && entry.firstKeptEntryId && idMap.has(entry.firstKeptEntryId)) {
 				entry.firstKeptEntryId = idMap.get(entry.firstKeptEntryId)!;
 			} else if (entry.type === "branch_summary" && idMap.has(entry.fromId)) {
 				entry.fromId = idMap.get(entry.fromId)!;
-			} else if (entry.type === "label" && idMap.has(entry.targetId)) {
+			} else if ((entry.type === "label" || entry.type === "context_edit") && idMap.has(entry.targetId)) {
 				entry.targetId = idMap.get(entry.targetId)!;
 			}
 		}
@@ -2418,8 +2419,9 @@ export class SessionManager {
 			this.leafId = newId;
 		}
 
-		// Update references in all entries that point into the cloned tail.
-		for (const entry of this.fileEntries) {
+		// Only new clones belong to this removal; historical branches keep their references.
+		for (const id of idMap.values()) {
+			const entry = this.byId.get(id)!;
 			if (entry.type === "compaction" && entry.firstKeptEntryId) {
 				if (idMap.has(entry.firstKeptEntryId)) {
 					entry.firstKeptEntryId = idMap.get(entry.firstKeptEntryId)!;
@@ -2436,7 +2438,7 @@ export class SessionManager {
 					const newFollower = follower ? idMap.get(follower) : undefined;
 					if (newFollower) entry.fromId = newFollower;
 				}
-			} else if (entry.type === "label" && idMap.has(entry.targetId)) {
+			} else if ((entry.type === "label" || entry.type === "context_edit") && idMap.has(entry.targetId)) {
 				entry.targetId = idMap.get(entry.targetId)!;
 			}
 		}

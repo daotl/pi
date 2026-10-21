@@ -164,6 +164,39 @@ describe("atomic session file rewrite", () => {
 		expect(SessionManager.open(file, dir, dir).getEntries()).toEqual(session.getEntries());
 	});
 
+	it.each(["replace", "remove"] as const)("keeps old branch references while remapping the %s clone", (operation) => {
+		const { session, user, file } = createSession();
+		const assistant = session.getLeafId()!;
+		const compaction = session.appendCompaction("old summary", assistant, 100);
+		const edit = session.appendContextEdit(assistant, { content: "projected answer" });
+		const label = session.appendLabelChange(assistant, "original label");
+		session.branch(assistant);
+		const sibling = session.appendCompaction("sibling summary", assistant, 100);
+		session.branch(label);
+		const oldProjection = structuredClone(session.buildSessionProjection().messages);
+		if (operation === "replace") session.replaceMessages([{ entryId: user, message: userMsg("edited user") }]);
+		else expect(session.removeEntries([user])).toBe(1);
+		const branch = session.getBranch();
+		const clone = branch.find((entry) => entry.type === "message" && entry.message.role === "assistant")!;
+		expect(clone.id).not.toBe(assistant);
+		expect(branch.find((entry) => entry.type === "compaction")).toMatchObject({ firstKeptEntryId: clone.id });
+		expect(branch.find((entry) => entry.type === "context_edit")).toMatchObject({ targetId: clone.id });
+		expect(branch.find((entry) => entry.type === "label")).toMatchObject({ targetId: clone.id });
+		expect(session.buildSessionProjection().messages).toContainEqual(
+			expect.objectContaining({
+				role: "assistant",
+				content: [{ type: "text", text: "projected answer" }],
+			}),
+		);
+		expect(session.getEntry(compaction)).toMatchObject({ firstKeptEntryId: assistant });
+		expect(session.getEntry(sibling)).toMatchObject({ firstKeptEntryId: assistant });
+		expect(session.getEntry(edit)).toMatchObject({ targetId: assistant });
+		expect(session.getEntry(label)).toMatchObject({ targetId: assistant });
+		const reopened = SessionManager.open(file, dir, dir);
+		reopened.branch(label);
+		expect(reopened.buildSessionProjection().messages).toEqual(oldProjection);
+	});
+
 	it("preserves held tool content and deletion map when partial shred fails", () => {
 		const { session, file } = createSession();
 		const held = session.getLeafEntry();
