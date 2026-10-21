@@ -74,6 +74,21 @@ describe("parseScheduleWhen", () => {
 		expect(parseScheduleWhen("2000-01-01 00:00")).toBeUndefined();
 	});
 
+	test.each(["2999-02-30 10:00", "2999-13-01 10:00", "2999-01-00 10:00", "24:00", "12:60", "12:00:60"])(
+		"rejects normalized invalid local date/time %s",
+		(spec) => {
+			expect(parseScheduleWhen(spec)).toBeUndefined();
+		},
+	);
+
+	test("accepts a leap-century day but rejects a non-leap-century day", () => {
+		expect(parseScheduleWhen("2400-02-29 10:00")).toEqual({
+			type: "time",
+			at: new Date(2400, 1, 29, 10, 0, 0).getTime(),
+		});
+		expect(parseScheduleWhen("2300-02-29 10:00")).toBeUndefined();
+	});
+
 	test("date-less time in the future today schedules for today", () => {
 		const now = new Date();
 		const future = new Date(now.getTime() + 60_000);
@@ -232,6 +247,31 @@ describe("InteractiveMode /schedule command dispatch", () => {
 		};
 		await schedulePrototype.handleScheduleCommand.call(context, "cancel 3");
 		expect(cancelScheduledMessageById).toHaveBeenCalledWith(3);
+	});
+
+	test("does not arm a timer or accept an impossible calendar date", async () => {
+		const context: ScheduleCommandContext = {
+			showStatus: vi.fn(),
+			scheduledMessages: [],
+			nextScheduleId: 1,
+			session: { isIdle: true },
+			cancelScheduledMessages: vi.fn(),
+			cancelScheduledMessageById: vi.fn(),
+			listScheduledMessages: vi.fn(),
+			scheduledMessageDescription: schedulePrototype.scheduledMessageDescription,
+			quotedListText: schedulePrototype.quotedListText,
+			deliverScheduledEntry: vi.fn(),
+		};
+		const timer = vi.spyOn(globalThis, "setTimeout");
+		try {
+			await schedulePrototype.handleScheduleCommand.call(context, "2999-02-30 10:00\nnever deliver");
+			expect(context.scheduledMessages).toEqual([]);
+			expect(context.nextScheduleId).toBe(1);
+			expect(timer).not.toHaveBeenCalled();
+			expect(context.deliverScheduledEntry).not.toHaveBeenCalled();
+		} finally {
+			timer.mockRestore();
+		}
 	});
 });
 

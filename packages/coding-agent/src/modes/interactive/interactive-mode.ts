@@ -480,16 +480,16 @@ export function parseScheduleWhen(spec: string): ScheduledTrigger | undefined {
 		const hourNum = Number.parseInt(hour, 10);
 		const minuteNum = Number.parseInt(minute, 10);
 		const secondNum = second ? Number.parseInt(second, 10) : 0;
+		if (hourNum > 23 || minuteNum > 59 || secondNum > 59) return undefined;
 		let at: number;
 		if (year) {
-			at = new Date(
-				Number.parseInt(year, 10),
-				Number.parseInt(month, 10) - 1,
-				Number.parseInt(day, 10),
-				hourNum,
-				minuteNum,
-				secondNum,
-			).getTime();
+			const yearNum = Number.parseInt(year, 10);
+			const monthIndex = Number.parseInt(month, 10) - 1;
+			const dayNum = Number.parseInt(day, 10);
+			const date = new Date(yearNum, monthIndex, dayNum, hourNum, minuteNum, secondNum);
+			if (date.getFullYear() !== yearNum || date.getMonth() !== monthIndex || date.getDate() !== dayNum)
+				return undefined;
+			at = date.getTime();
 		} else {
 			// Date-less: resolve against today; a time already passed today maps
 			// to the next day, otherwise it is today.
