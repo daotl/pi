@@ -2348,6 +2348,10 @@ export class SessionManager {
 			}
 		}
 
+		const previousEntries = this.persist && this.sessionFile ? this.fileEntries.slice() : undefined;
+		const previousValues = previousEntries?.map((entry) => ({ entry, value: { ...entry } }));
+		const previousLeaf = this.leafId;
+
 		const branchPoint = path[firstAffectedIdx].parentId;
 		if (branchPoint) {
 			this.branch(branchPoint);
@@ -2450,7 +2454,22 @@ export class SessionManager {
 			}
 		}
 
-		this._rewriteFile();
+		try {
+			this._rewriteFile();
+		} catch (error) {
+			if (previousEntries && previousValues) {
+				for (const { entry, value } of previousValues) {
+					for (const key of Object.keys(entry)) {
+						if (!Object.hasOwn(value, key)) Reflect.deleteProperty(entry, key);
+					}
+					Object.assign(entry, value);
+				}
+				this.fileEntries = previousEntries;
+				this._buildIndex();
+				this.leafId = previousLeaf;
+			}
+			throw error;
+		}
 		return removedSet.size + removedToolCallCount;
 	}
 

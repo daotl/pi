@@ -137,6 +137,82 @@ describe("atomic session file rewrite", () => {
 		expect(SessionManager.open(file, dir, dir).getEntries()).toEqual(session.getEntries());
 	});
 
+	it("restores cloned aliases and retained metadata after failed selected removal", () => {
+		const { session, user, file } = createSession();
+		const held = session.getLeafEntry()!;
+		session.appendCompaction("summary", held.id, 100);
+		session.appendLabelChange(held.id, "bookmark");
+		const entries = structuredClone(session.getEntries());
+		const projection = structuredClone(session.buildSessionProjection());
+		const tree = structuredClone(session.getTree());
+		const leaf = session.getLeafId();
+		const bytes = fs.readFileSync(file);
+		const failure = new Error("selected removal rename failure");
+		vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+			throw failure;
+		});
+		expect(() => session.removeEntries([user])).toThrow(failure);
+		expect(session.getEntries()).toEqual(entries);
+		expect(session.buildSessionProjection()).toEqual(projection);
+		expect(session.getTree()).toEqual(tree);
+		expect(session.getLeafId()).toBe(leaf);
+		expect(session.getEntry(held.id)).toBe(held);
+		expect(held.supersededBy).toBeUndefined();
+		expect(fs.readFileSync(file)).toEqual(bytes);
+		expect(session.removeEntries([user])).toBe(1);
+		expect(session.getBranch().some((entry) => entry.id === user)).toBe(false);
+		expect(SessionManager.open(file, dir, dir).getEntries()).toEqual(session.getEntries());
+	});
+
+	it("preserves held tool content and deletion map when partial shred fails", () => {
+		const { session, file } = createSession();
+		const held = session.getLeafEntry();
+		if (!held || held.type !== "message" || held.message.role !== "assistant") throw new Error("Missing assistant");
+		held.message = {
+			...held.message,
+			content: [
+				{ type: "text", text: "keep" },
+				{ type: "toolCall", id: "one", name: "read", arguments: {} },
+				{ type: "toolCall", id: "two", name: "read", arguments: {} },
+			],
+		};
+		session.softDeleteUnits([{ entryId: held.id, toolCallId: "one" }]);
+		const message = held.message;
+		const content = message.content;
+		const deletionMap = held.deletedToolCalls;
+		const entries = structuredClone(session.getEntries());
+		const projection = structuredClone(session.buildSessionProjection());
+		const bytes = fs.readFileSync(file);
+		const remove = () => session.removeEntries([], new Map([[held.id, new Set(["one"])]]));
+		const failure = new Error("partial shred rename failure");
+		vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+			throw failure;
+		});
+		expect(remove).toThrow(failure);
+		expect(session.getEntries()).toEqual(entries);
+		expect(session.buildSessionProjection()).toEqual(projection);
+		expect(session.getLeafId()).toBe(held.id);
+		expect(session.getEntry(held.id)).toBe(held);
+		expect(held.message).toBe(message);
+		expect(held.message.content).toBe(content);
+		expect(held.deletedToolCalls).toBe(deletionMap);
+		expect(fs.readFileSync(file)).toEqual(bytes);
+		expect(remove()).toBe(1);
+		const selected = session.getLeafEntry();
+		expect(selected).toMatchObject({
+			type: "message",
+			message: {
+				content: [
+					{ type: "text", text: "keep" },
+					{ type: "toolCall", id: "two", name: "read", arguments: {} },
+				],
+			},
+		});
+		if (!selected || selected.type !== "message") throw new Error("Missing selected assistant");
+		expect(selected.deletedToolCalls).toBeUndefined();
+		expect(SessionManager.open(file, dir, dir).getEntries()).toEqual(session.getEntries());
+	});
+
 	it("restores live soft-deletion flags and held tool maps when persistence fails", () => {
 		const { session, user, file } = createSession();
 		const assistant = session.getLeafEntry();
