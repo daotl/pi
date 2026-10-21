@@ -322,7 +322,7 @@ export class RpcClient {
 	 * Compact session context.
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
-		const response = await this.send({ type: "compact", customInstructions });
+		const response = await this.send({ type: "compact", customInstructions }, 0);
 		return this.getData(response);
 	}
 
@@ -524,11 +524,13 @@ export class RpcClient {
 		try {
 			const data = JSON.parse(line);
 
-			// Check if it's a response to a pending request
-			if (data.type === "response" && data.id && this.pendingRequests.has(data.id)) {
-				const pending = this.pendingRequests.get(data.id)!;
-				this.pendingRequests.delete(data.id);
-				pending.resolve(data as RpcResponse);
+			// Late responses still belong to the response channel, never the event stream.
+			if (data.type === "response") {
+				const pending = this.pendingRequests.get(data.id);
+				if (pending) {
+					this.pendingRequests.delete(data.id);
+					pending.resolve(data as RpcResponse);
+				}
 				return;
 			}
 
@@ -553,7 +555,7 @@ export class RpcClient {
 		this.pendingRequests.clear();
 	}
 
-	private async send(command: RpcCommandBody): Promise<RpcResponse> {
+	private async send(command: RpcCommandBody, timeoutMs = 30000): Promise<RpcResponse> {
 		const childProcess = this.process;
 		const stdin = childProcess?.stdin;
 		if (!childProcess || !stdin) {
@@ -577,10 +579,13 @@ export class RpcClient {
 		const fullCommand = { ...command, id } as RpcCommand;
 
 		return new Promise((resolve, reject) => {
-			const timeout = setTimeout(() => {
-				this.pendingRequests.delete(id);
-				reject(new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.stderr}`));
-			}, 30000);
+			const timeout =
+				timeoutMs > 0
+					? setTimeout(() => {
+							this.pendingRequests.delete(id);
+							reject(new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.stderr}`));
+						}, timeoutMs)
+					: undefined;
 
 			this.pendingRequests.set(id, {
 				resolve: (response) => {
