@@ -15,25 +15,38 @@ for (const format of ["edit", "swipe"] as const) {
 					...fauxAssistantMessage([
 						{ type: "thinking", thinking: "reasoning", thinkingSignature: signature },
 						{ type: "text", text: "answer" },
+						...(format === "swipe"
+							? [{ type: "toolCall" as const, id: "call", name: "read", arguments: {} }]
+							: []),
 					]),
 					api: "openai-responses",
 					provider: "openai",
 					model: "fixture",
 				};
 				const entryId = harness.sessionManager.appendMessage(message);
-				harness.sessionManager.appendMessage({ role: "user", content: "later", timestamp: 2 });
+				harness.sessionManager.appendMessage(
+					format === "edit"
+						? { role: "user", content: "later", timestamp: 2 }
+						: {
+								role: "toolResult",
+								toolCallId: "call",
+								toolName: "read",
+								content: [{ type: "text", text: "result" }],
+								isError: false,
+								timestamp: 2,
+							},
+				);
 				harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 				const entry = harness.sessionManager.getEntry(entryId);
 				if (!entry) throw new Error("Missing assistant entry");
-				if (format === "swipe") {
-					harness.sessionManager.branch(entryId);
-					harness.session.refreshContext();
-				}
 				const xml =
 					format === "edit" ? formatMessageForEdit(1, message) : formatMessageForSwipe(entry.timestamp, message);
 				if (xml === null) throw new Error("Unexpected formatting refusal");
 				harness.session.applyMessageEdits(xml);
 				const stored = harness.session.messages.find((message) => message.role === "assistant");
+				expect(stored?.role === "assistant" ? stored.stopReason : undefined).toBe(
+					format === "swipe" ? "toolUse" : "stop",
+				);
 				expect(stored?.role === "assistant" ? stored.content[0] : undefined).toMatchObject({
 					thinkingSignature: signature,
 				});
