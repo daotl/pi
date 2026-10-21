@@ -1583,7 +1583,7 @@ export class InteractiveMode {
 		}
 
 		// Load HEARTBEAT.md from the project root, if present (new or resumed session).
-		if (this.sessionManager) {
+		if (this.sessionManager && this.settingsManager.isProjectTrusted()) {
 			const cwd = this.sessionManager.getCwd();
 			const heartbeatFile = path.resolve(cwd, "HEARTBEAT.md");
 			await this.loadHeartbeatsFromPath(heartbeatFile, "HEARTBEAT.md", true);

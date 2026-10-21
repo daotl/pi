@@ -2,6 +2,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { resolveProjectTrusted } from "../src/core/project-trust.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../src/core/trust-manager.ts";
 
 describe("ProjectTrustStore", () => {
@@ -34,6 +35,45 @@ describe("ProjectTrustStore", () => {
 		expect(store.get(childDir)).toBe(false);
 		store.set(childDir, null);
 		expect(store.get(childDir)).toBe(true);
+	});
+
+	it("requires trust for a heartbeat only in the active project root", () => {
+		writeFileSync(join(cwd, "HEARTBEAT.md"), "/heartbeat 5m\nproject instruction\n");
+		expect(hasTrustRequiringProjectResources(cwd)).toBe(true);
+		const child = join(cwd, "child");
+		mkdirSync(child);
+		expect(hasTrustRequiringProjectResources(child)).toBe(false);
+	});
+
+	it("asks before trusting heartbeat scheduling and honors stored denial", async () => {
+		writeFileSync(join(cwd, "HEARTBEAT.md"), "/heartbeat 1s\nproject instruction\n");
+		let selection = "Do not trust (this session only)";
+		const prompts: string[] = [];
+		const options = {
+			cwd,
+			trustStore: new ProjectTrustStore(agentDir),
+			defaultProjectTrust: "ask" as const,
+			projectTrustContext: {
+				cwd,
+				mode: "tui" as const,
+				hasUI: true,
+				ui: {
+					select: async (prompt: string) => {
+						prompts.push(prompt);
+						return selection;
+					},
+					confirm: async () => false,
+					input: async () => undefined,
+					notify: () => {},
+				},
+			},
+		};
+		expect(await resolveProjectTrusted(options)).toBe(false);
+		selection = "Trust (this session only)";
+		expect(await resolveProjectTrusted(options)).toBe(true);
+		options.trustStore.set(cwd, false);
+		expect(await resolveProjectTrusted(options)).toBe(false);
+		expect(prompts).toHaveLength(2);
 	});
 
 	it("detects trust-requiring project resources", () => {

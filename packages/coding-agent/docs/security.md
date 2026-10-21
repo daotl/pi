@@ -41,6 +41,7 @@ Pi requires a project-trust decision when it finds any of these resources from t
 - `.pi/extensions`, `.pi/skills`, `.pi/prompts`, or `.pi/themes`
 - `.pi/SYSTEM.md` or `.pi/APPEND_SYSTEM.md`
 - project `.agents/skills` in the current directory or an ancestor directory
+- root `HEARTBEAT.md`, whose automatic loading can schedule model prompts
 
 A bare `.pi` directory does not require project trust.
 
@@ -51,8 +52,11 @@ Granting project trust allows Pi to load:
 - extensions, skills, prompt templates, themes, and system-prompt files under `.pi`
 - missing packages configured through project settings
 - project-local and project-package extensions
+- automatic heartbeat scheduling from root `HEARTBEAT.md`
 
 Declining project trust skips those protected resources, except for the initial `sessionDir` lookup described above.
+
+Explicit `/heartbeat load` and command-line `--heartbeat` remain user-requested actions and do not require automatic project-file loading to be trusted.
 
 Context files such as `AGENTS.override.md`, `AGENTS.md`, and `CLAUDE.md` load regardless of project trust unless you disable context loading. Treat instructions in a folder as untrusted input even when you decline project trust.
 
