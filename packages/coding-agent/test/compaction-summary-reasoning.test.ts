@@ -1,4 +1,4 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, type Model, normalizeContext, type TranscriptContext } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -168,6 +168,39 @@ describe("generateSummary reasoning options", () => {
 		expect(context.messages.filter((message) => message.role === "system")).toEqual([
 			{ role: "system", content: "CANONICAL", timestamp: 1 },
 		]);
+	});
+
+	it("applies the live Agent prefix once to history but not generated summary instructions", async () => {
+		const agent = new Agent({
+			incomingMessagePrefix: "[summary] ",
+			streamFn: () => {
+				throw new Error("unused normal request");
+			},
+		});
+		await generateSummaryWithUsage(
+			messages,
+			createModel(false),
+			2000,
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			agent,
+		);
+		const context = completeSimpleMock.mock.calls[0][1] as TranscriptContext;
+		expect(context.messages.filter((message) => message.role === "user")[0]).toMatchObject({
+			content: "[summary] Summarize this.",
+		});
+		expect(JSON.stringify(context.messages.at(-1))).not.toContain("[summary]");
+		expect(messages[0]).toMatchObject({ content: "Summarize this." });
 	});
 
 	it("rejects tool calls from conversation summaries", async () => {

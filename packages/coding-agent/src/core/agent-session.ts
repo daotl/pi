@@ -4162,7 +4162,7 @@ export class AgentSession {
 		let contextTokens: number | undefined;
 		if (auth) {
 			try {
-				const llmMessages = await this.agent.convertToLlm(sessionContext.messages);
+				const llmMessages = await this.agent.convertForRequest(sessionContext.messages);
 				// The chat tokenize endpoint applies the chat template and counts
 				// multimodal content, so send the exact messages a real inference
 				// request would use. If the converted messages do not already carry a
@@ -4205,7 +4205,7 @@ export class AgentSession {
 	private _createCompactionTokenCounter(auth: RequestAuth, signal: AbortSignal): TokenCounter {
 		this._syncSummaryBlockMaxTokens();
 		return async (messages) => {
-			const llmMessages = await this.agent.convertToLlm(messages);
+			const llmMessages = await this.agent.convertForRequest(messages);
 			let text = "";
 			let imageCount = 0;
 			for (const m of llmMessages) {

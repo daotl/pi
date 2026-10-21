@@ -1,4 +1,4 @@
-import type { StreamFn } from "@earendil-works/pi-agent-core";
+import { Agent, type StreamFn } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
@@ -63,6 +63,30 @@ describe("branch summarization", () => {
 
 		expect(requestOptions?.maxTokens).toBe(4096);
 		expect(requestOptions?.toolChoice).toBeUndefined();
+	});
+
+	it("uses the live Agent request prefix for branch history only", async () => {
+		const agent = new Agent({
+			incomingMessagePrefix: "[branch] ",
+			streamFn: () => {
+				throw new Error("unused normal request");
+			},
+		});
+		let sent: unknown;
+		await generateBranchSummary(entries, {
+			model,
+			agent,
+			signal: new AbortController().signal,
+			streamFn: (_model, context) => {
+				sent = context.messages;
+				const stream = createAssistantMessageEventStream();
+				stream.end(response([{ type: "text", text: "summary" }]));
+				return stream;
+			},
+		});
+		expect(sent).toContainEqual(expect.objectContaining({ role: "user", content: "[branch] Abandoned request" }));
+		expect(JSON.stringify(sent)).not.toContain("[branch] Do not continue");
+		expect(entries[0]).toMatchObject({ message: { content: "Abandoned request" } });
 	});
 
 	it("clamps the branch summary output cap to the model limit", async () => {

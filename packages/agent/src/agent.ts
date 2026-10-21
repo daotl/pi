@@ -136,8 +136,8 @@ export interface AgentOptions {
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
 	/**
-	 * Prefix prepended to the text of user messages created from string input.
-	 * Applied only when prompt() is called with a string (not pre-built messages).
+	 * Prefix prepended to historical and new user text at request conversion time.
+	 * Stored messages and the raw convertToLlm converter remain unchanged.
 	 * Can be updated at runtime via the incomingMessagePrefix getter/setter.
 	 */
 	incomingMessagePrefix?: string;
@@ -201,6 +201,21 @@ function extractText(message: Extract<AgentMessage, { role: "assistant" }>): str
 		.join("");
 }
 
+/** Prefix user text for a request without changing stored messages or block metadata. */
+export function prefixUserMessages(messages: AgentMessage[], prefix: string | undefined): AgentMessage[] {
+	if (!prefix) return messages;
+	return messages.map((message) => {
+		if (message.role !== "user") return message;
+		if (typeof message.content === "string") return { ...message, content: prefix + message.content };
+		return {
+			...message,
+			content: message.content.map((block) =>
+				block.type === "text" ? { ...block, text: prefix + block.text } : block,
+			),
+		};
+	});
+}
+
 /**
  * Whether a streamed assistant message fully contains a prefill: its
  * reasoning and text start with the prefill's (at least as long), and its
@@ -255,6 +270,11 @@ export class Agent {
 	private readonly followUpQueue: PendingMessageQueue;
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
+
+	/** Convert with the current request prefix; raw converters remain safe to capture and wrap. */
+	public readonly convertForRequest = (messages: AgentMessage[]): Message[] | Promise<Message[]> => {
+		return this.convertToLlm(prefixUserMessages(messages, this._incomingMessagePrefix));
+	};
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 	public streamFunction: StreamFn;
 	public getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
@@ -281,7 +301,7 @@ export class Agent {
 	private activeRun?: ActiveRun;
 	private _pendingPrefill?: AgentMessage;
 	private _prefillVerified = false;
-	/** Prefix prepended to user message text created from string input. */
+	/** Live prefix applied to user text only at effective request conversion. */
 	private _incomingMessagePrefix: string | undefined;
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
@@ -363,7 +383,7 @@ export class Agent {
 		return this.followUpQueue.mode;
 	}
 
-	/** Prefix prepended to user message text created from string input. */
+	/** Prefix applied to historical and new user text without changing stored messages. */
 	set incomingMessagePrefix(prefix: string | undefined) {
 		this._incomingMessagePrefix = prefix;
 	}
@@ -696,7 +716,7 @@ export class Agent {
 							return await this.prepareNextTurn?.(this.signal);
 						}
 					: undefined,
-			convertToLlm: this.convertToLlm,
+			convertToLlm: this.convertForRequest,
 			transformContext: this.transformContext,
 			getApiKey: this.getApiKey,
 			getSteeringMessages: async () => {

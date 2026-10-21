@@ -66,6 +66,8 @@ AgentMessage[] → transformContext() → AgentMessage[] → convertToLlm() → 
 1. **transformContext**: Prune old messages, inject external context
 2. **convertToLlm**: Filter out UI-only messages, convert custom types to LLM format
 
+`agent.convertToLlm` is the raw replaceable converter; capturing, wrapping and restoring it does not add a prefix or recurse. `agent.convertForRequest(messages)` applies the current `incomingMessagePrefix` once before that converter. Agent loops and direct summaries use request conversion after `transformContext`; stored user messages remain unchanged. `prefixUserMessages` is exported for integrations that own prefix settings themselves.
+
 ## Event Flow
 
 The agent emits events for UI updates. Understanding the event sequence helps build responsive interfaces.

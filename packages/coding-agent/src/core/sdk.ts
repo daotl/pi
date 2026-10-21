@@ -1,5 +1,11 @@
 import { join } from "node:path";
-import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
+import {
+	Agent,
+	type AgentMessage,
+	prefixUserMessages,
+	setDefaultStreamFn,
+	type ThinkingLevel,
+} from "@earendil-works/pi-agent-core";
 import type { ModelsSimpleStreamOptions } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
@@ -279,22 +285,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// messages at conversion time (keeps stored messages clean for UI rendering),
 	// then filters images if blockImages is enabled (defense-in-depth).
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
-		// Apply incoming message prefix to user messages at conversion time
-		// (keeps stored messages clean for UI rendering)
-		const framePrefix = settingsManager.getIncomingMessagePrefix();
-		const messagesWithPrefix =
-			framePrefix !== undefined
-				? messages.map((msg) => {
-						if (msg.role === "user" && Array.isArray(msg.content)) {
-							const newContent = msg.content.map((c) =>
-								c.type === "text" ? { type: "text" as const, text: framePrefix + c.text } : c,
-							);
-							return { ...msg, content: newContent };
-						}
-						return msg;
-					})
-				: messages;
-		const converted = convertToLlm(messagesWithPrefix);
+		// SDK settings stay live for direct summaries/counts too; do not enable the Agent prefix twice.
+		const converted = convertToLlm(prefixUserMessages(messages, settingsManager.getIncomingMessagePrefix()));
 		// Check setting dynamically so mid-session changes take effect
 		if (!settingsManager.getBlockImages()) {
 			return converted;

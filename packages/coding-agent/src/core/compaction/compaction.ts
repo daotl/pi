@@ -611,7 +611,7 @@ async function buildAgentSummarizationContext(
 		);
 	}
 	const transformed = agent?.transformContext ? await agent.transformContext(source, signal) : source;
-	const converted = agent ? await agent.convertToLlm(transformed) : convertToLlm(transformed);
+	const converted = agent ? await agent.convertForRequest(transformed) : convertToLlm(transformed);
 	const baseline = converted[0];
 	if (agent && baseline?.role === "system" && baseline.toolsAdded === undefined) {
 		return [{ ...baseline, toolsAdded: agent.state.tools.slice() }, ...converted.slice(1)];

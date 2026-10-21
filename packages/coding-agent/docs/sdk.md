@@ -69,6 +69,8 @@ A steering message enters after the current assistant turn and its tool calls. A
 
 `abort()` stops the active operation and waits for the session to become idle. `waitForIdle()` waits without aborting it.
 
+`incomingMessagePrefix` is read from the supplied `SettingsManager` on each SDK context conversion. Historical and new string/array user text receive the current prefix without changing stored history, text metadata or images. The SDK uses the shared `prefixUserMessages` helper in its converter so direct summaries and token counts follow the same setting. Do not also set the Agent prefix to the same value; that would apply it twice. Cache warming replays the already converted original request, not a newly prefixed one.
+
 ## Subscribing to events
 
 Subscribe before prompting when the host needs streamed output:

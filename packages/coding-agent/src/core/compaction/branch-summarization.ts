@@ -335,7 +335,9 @@ export async function generateBranchSummary(
 	// message so nothing is inserted before the existing prefix.
 	const effectiveSystemPrompt = agent ? agent.state.systemPrompt : (systemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT);
 	const llmMessages = agent
-		? await agent.convertToLlm(agent.transformContext ? await agent.transformContext(messages, signal) : messages)
+		? await agent.convertForRequest(
+				agent.transformContext ? await agent.transformContext(messages, signal) : messages,
+			)
 		: convertToLlm(messages);
 	const tools = agent ? agent.state.tools.slice() : undefined;
 
