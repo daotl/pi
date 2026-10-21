@@ -623,6 +623,7 @@ export function buildContextEntries(
 	}
 
 	const latestCompaction = compactions[compactions.length - 1];
+	const latestCompactionIndex = visiblePath.indexOf(latestCompaction);
 	const visibleCompactions = filterSummariesToBlockLimit(compactions, options?.summaryBlockMaxTokens);
 
 	let keptStart = visiblePath.findIndex((entry) => entry.id === latestCompaction.firstKeptEntryId);
@@ -635,14 +636,19 @@ export function buildContextEntries(
 	// Entries kept verbatim: every non-compaction entry from the latest
 	// compaction's firstKeptEntryId to the end of the path. Compaction entries
 	// are excluded here because they are represented by the summaries block.
-	// Mid-conversation system messages are also excluded: the checkpoint system
-	// message (carried by the compaction entry) folds them all in, so keeping
-	// them here would duplicate the folded content.
+	// The current checkpoint folds earlier deltas, not later prompt/tool updates.
+	// Legacy compactions without a checkpoint must retain their system messages.
 	const contextEntries: SessionEntry[] = [...visibleCompactions];
 	for (let i = keptStart; i < visiblePath.length; i++) {
 		const entry = visiblePath[i];
 		if (entry.type === "compaction") continue;
-		if (entry.type === "message" && entry.message.role === "system") continue;
+		if (
+			latestCompaction.systemMessage &&
+			i < latestCompactionIndex &&
+			entry.type === "message" &&
+			entry.message.role === "system"
+		)
+			continue;
 		contextEntries.push(entry);
 	}
 	return contextEntries.map(filterDeletedToolCallBlocks);
@@ -690,14 +696,22 @@ export function buildSessionProjection(
 	for (const entry of contextEntries) {
 		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
 	}
+	const latestCompaction = getLatestCompactionEntry(contextEntries);
 	const projectedEntries = contextEntries.map(
-		(sourceEntry): ProjectedSessionEntry => ({
+		(sourceEntry, index): ProjectedSessionEntry => ({
 			sourceEntry,
-			// With the "no folding" model every visible compaction keeps its own
-			// summary message, so each contributes a checkpoint and summary. Older
-			// compactions are not consumed into the newest one; they stay as the
-			// summaries block (bounded by summaryBlockMaxTokens upstream).
-			messages: projectContextEntry(sourceEntry, edits.get(sourceEntry.id)),
+			// One current checkpoint precedes the retained summaries, oldest first.
+			messages:
+				sourceEntry.type === "compaction"
+					? [
+							...(index === 0 && latestCompaction?.systemMessage ? [latestCompaction.systemMessage] : []),
+							createCompactionSummaryMessage(
+								sourceEntry.summary,
+								sourceEntry.tokensBefore,
+								sourceEntry.timestamp,
+							),
+						]
+					: projectContextEntry(sourceEntry, edits.get(sourceEntry.id)),
 		}),
 	);
 	return {
@@ -1135,12 +1149,12 @@ export class SessionManager {
 	private leafId: string | null = null;
 	/** Max tokens for the compaction summaries block in the prefix (see
 	 * BuildContextOptions.summaryBlockMaxTokens). Settable by the session owner. */
-	private summaryBlockMaxTokens: number = DEFAULT_SUMMARY_BLOCK_MAX_TOKENS;
+	private summaryBlockMaxTokens: number | undefined = DEFAULT_SUMMARY_BLOCK_MAX_TOKENS;
 
 	/** Set the maximum total tokens allowed for the compaction summaries block in
 	 * the context prefix. Pass undefined to keep all summaries. */
 	setSummaryBlockMaxTokens(tokens: number | undefined): void {
-		this.summaryBlockMaxTokens = tokens ?? DEFAULT_SUMMARY_BLOCK_MAX_TOKENS;
+		this.summaryBlockMaxTokens = tokens;
 	}
 
 	private constructor(
@@ -1808,13 +1822,15 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionProjection(options?: BuildContextOptions): SessionProjection {
-		return buildSessionProjection(this.getEntries(), this.leafId, this.byId, options);
+		const effectiveOptions =
+			options && Object.hasOwn(options, "summaryBlockMaxTokens")
+				? options
+				: { ...options, summaryBlockMaxTokens: this.summaryBlockMaxTokens };
+		return buildSessionProjection(this.getEntries(), this.leafId, this.byId, effectiveOptions);
 	}
 
 	buildSessionContext(): SessionContext {
-		const { messages, thinkingLevel, model } = this.buildSessionProjection({
-			summaryBlockMaxTokens: this.summaryBlockMaxTokens,
-		});
+		const { messages, thinkingLevel, model } = this.buildSessionProjection();
 		return { messages, thinkingLevel, model };
 	}
 
