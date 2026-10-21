@@ -20,6 +20,8 @@ export class Text implements Component {
 	private cachedText?: string;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
+	private cachedPadEnabled?: boolean;
+	private cachedWrapEnabled?: boolean;
 
 	constructor(text: string = "", paddingX: number = 1, paddingY: number = 1, customBgFn?: (text: string) => string) {
 		this.text = text;
@@ -49,8 +51,16 @@ export class Text implements Component {
 	}
 
 	render(width: number): string[] {
-		// Check cache
-		if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width) {
+		const padEnabled = isPadLinesToWidth();
+		const wrapEnabled = shouldWrapLinesToWidth();
+		// Render policy can change without a new width or explicit invalidation.
+		if (
+			this.cachedLines &&
+			this.cachedText === this.text &&
+			this.cachedWidth === width &&
+			this.cachedPadEnabled === padEnabled &&
+			this.cachedWrapEnabled === wrapEnabled
+		) {
 			return this.cachedLines;
 		}
 
@@ -60,6 +70,8 @@ export class Text implements Component {
 			this.cachedText = this.text;
 			this.cachedWidth = width;
 			this.cachedLines = result;
+			this.cachedPadEnabled = padEnabled;
+			this.cachedWrapEnabled = wrapEnabled;
 			return result;
 		}
 
@@ -69,8 +81,6 @@ export class Text implements Component {
 		// Whether the traditional full-width line filling is enabled. When disabled
 		// (default) lines are wrapped at the full terminal width and written without
 		// outer margins or trailing padding, so copy/paste selection stays clean.
-		const padEnabled = isPadLinesToWidth();
-		const wrapEnabled = shouldWrapLinesToWidth();
 
 		// Reduce margins when necessary so content and padding fit within the available width.
 		const paddingX = padEnabled ? Math.min(this.paddingX, Math.max(0, Math.floor((width - 1) / 2))) : 0;
@@ -115,6 +125,8 @@ export class Text implements Component {
 		this.cachedText = this.text;
 		this.cachedWidth = width;
 		this.cachedLines = result;
+		this.cachedPadEnabled = padEnabled;
+		this.cachedWrapEnabled = wrapEnabled;
 
 		return result.length > 0 ? result : [""];
 	}

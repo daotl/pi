@@ -4,6 +4,7 @@ import { applyBackgroundToLine, isPadLinesToWidth, padLineToWidth } from "../uti
 type RenderCache = {
 	childLines: string[];
 	width: number;
+	padEnabled: boolean;
 	bgSample: string | undefined;
 	separatorBgSample: string | undefined;
 	lines: string[];
@@ -65,6 +66,7 @@ export class Box implements Component {
 
 	private matchCache(
 		width: number,
+		padEnabled: boolean,
 		childLines: string[],
 		bgSample: string | undefined,
 		separatorBgSample: string | undefined,
@@ -73,6 +75,7 @@ export class Box implements Component {
 		return (
 			!!cache &&
 			cache.width === width &&
+			cache.padEnabled === padEnabled &&
 			cache.bgSample === bgSample &&
 			cache.separatorBgSample === separatorBgSample &&
 			cache.childLines.length === childLines.length &&
@@ -145,7 +148,7 @@ export class Box implements Component {
 		const separatorBgSample = this.separatorBgFn ? this.separatorBgFn("test") : undefined;
 
 		// Check cache validity
-		if (this.matchCache(width, childLines, bgSample, separatorBgSample)) {
+		if (this.matchCache(width, padEnabled, childLines, bgSample, separatorBgSample)) {
 			return this.cache!.lines;
 		}
 
@@ -170,7 +173,7 @@ export class Box implements Component {
 		}
 
 		// Update cache
-		this.cache = { childLines, width, bgSample, separatorBgSample, lines: result };
+		this.cache = { childLines, width, padEnabled, bgSample, separatorBgSample, lines: result };
 
 		return result;
 	}

@@ -258,6 +258,8 @@ export class Markdown implements Component {
 	private cachedText?: string;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
+	private cachedPadEnabled?: boolean;
+	private cachedWrapEnabled?: boolean;
 	// Parsed tokens depend only on the source, so they survive theme and width invalidation.
 	private cachedTokens?: { source: string; tokens: Token[] };
 
@@ -289,16 +291,22 @@ export class Markdown implements Component {
 	}
 
 	render(width: number): string[] {
-		// Check cache
-		if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width) {
+		const padEnabled = isPadLinesToWidth();
+		const wrapEnabled = shouldWrapLinesToWidth();
+		// Render policy can change without a new width or explicit invalidation.
+		if (
+			this.cachedLines &&
+			this.cachedText === this.text &&
+			this.cachedWidth === width &&
+			this.cachedPadEnabled === padEnabled &&
+			this.cachedWrapEnabled === wrapEnabled
+		) {
 			return this.cachedLines;
 		}
 
 		// Whether the traditional full-width line filling is enabled. When disabled
 		// (default) lines are wrapped at the full terminal width and written without
 		// outer margins or trailing padding, so copy/paste selection stays clean.
-		const padEnabled = isPadLinesToWidth();
-		const wrapEnabled = shouldWrapLinesToWidth();
 
 		// Calculate available width for content (subtract horizontal padding only when padding)
 		const contentWidth = padEnabled ? Math.max(1, width - this.paddingX * 2) : width;
@@ -311,6 +319,8 @@ export class Markdown implements Component {
 			this.cachedText = this.text;
 			this.cachedWidth = width;
 			this.cachedLines = result;
+			this.cachedPadEnabled = padEnabled;
+			this.cachedWrapEnabled = wrapEnabled;
 			return result;
 		}
 
@@ -393,6 +403,8 @@ export class Markdown implements Component {
 		this.cachedText = this.text;
 		this.cachedWidth = width;
 		this.cachedLines = result;
+		this.cachedPadEnabled = padEnabled;
+		this.cachedWrapEnabled = wrapEnabled;
 
 		return result.length > 0 ? result : [""];
 	}

@@ -184,3 +184,47 @@ describe("padLines (default off)", () => {
 		assert.ok(content.length > 1, "Text should wrap when wrapLines is enabled");
 	});
 });
+
+describe("render policy changes on existing components", () => {
+	const renderers = [
+		{ name: "Text", create: (content: string) => new Text(content, 1, 0) },
+		{ name: "Markdown", create: (content: string) => new Markdown(content, 1, 0, theme) },
+		{
+			name: "Box",
+			create: (content: string) => {
+				const box = new Box(1, 0);
+				box.addChild(new Text(content, 0, 0));
+				return box;
+			},
+		},
+	];
+	for (const { name, create } of renderers) {
+		it(`${name} applies padding toggles at unchanged width`, () => {
+			const component = create("hello");
+			assert.deepStrictEqual(component.render(10), ["hello"]);
+			setPadLinesToWidth(true);
+			assert.deepStrictEqual(component.render(10), [" hello    "]);
+			setPadLinesToWidth(false);
+			assert.deepStrictEqual(component.render(10), ["hello"]);
+		});
+		it(`${name} applies wrapping toggles at unchanged width`, () => {
+			const component = create("one two three four");
+			assert.deepStrictEqual(component.render(10), ["one two three four"]);
+			setWrapLinesToWidth(true);
+			assert.deepStrictEqual(component.render(10), ["one two", "three four"]);
+			setWrapLinesToWidth(false);
+			assert.deepStrictEqual(component.render(10), ["one two three four"]);
+		});
+	}
+	it("Box refreshes its own padding when child output is unchanged", () => {
+		const bg = (text: string) => `\x1b[45m${text}\x1b[49m`;
+		const box = new Box(0, 1);
+		box.addChild(new Text("hello", 0, 0, bg));
+		const content = bg("hello     ");
+		assert.deepStrictEqual(box.render(10), ["", content, ""]);
+		setPadLinesToWidth(true);
+		assert.deepStrictEqual(box.render(10), ["          ", content, "          "]);
+		setPadLinesToWidth(false);
+		assert.deepStrictEqual(box.render(10), ["", content, ""]);
+	});
+});
