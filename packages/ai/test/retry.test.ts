@@ -1,3 +1,4 @@
+import { getEventListeners } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { fauxAssistantMessage } from "../src/providers/faux.ts";
 import {
@@ -165,6 +166,32 @@ describe("retryAssistantCall", () => {
 		expect(onRetryFinished).not.toHaveBeenCalled();
 	});
 
+	it.each([
+		"429 rate limit reached: token limit per minute exceeded; retry in 2s",
+		"429: token limit per second exceeded; retry in 1s",
+	])("recovers from transient token-rate throttling: %s", async (errorMessage) => {
+		const produce = vi
+			.fn()
+			.mockResolvedValueOnce(fauxAssistantMessage("", { stopReason: "error", errorMessage }))
+			.mockResolvedValue(fauxAssistantMessage("recovered"));
+		const result = await retryAssistantCall(produce, enabled, undefined);
+		expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
+		expect(produce).toHaveBeenCalledTimes(2);
+	});
+
+	it.each(["context window exceeded", "token limit exceeded", "max tokens exceeded", "quota exceeded", "billing"])(
+		"keeps permanent %s terminal despite token-rate guidance",
+		async (limit) => {
+			const error = fauxAssistantMessage("", {
+				stopReason: "error",
+				errorMessage: `429: ${limit}; token limit per minute exceeded; retry in 2s`,
+			});
+			const produce = vi.fn().mockResolvedValueOnce(error).mockResolvedValue(fauxAssistantMessage("unexpected"));
+			expect(await retryAssistantCall(produce, enabled, undefined)).toBe(error);
+			expect(produce).toHaveBeenCalledTimes(1);
+		},
+	);
+
 	it("retries a transient error up to maxRetries then returns the final error", async () => {
 		const produce = vi.fn(async () => fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }));
 		const onRetryScheduled = vi.fn();
@@ -279,6 +306,26 @@ describe("retryAssistantCall", () => {
 		expect(res.errorMessage).toBeUndefined();
 		expect(produce).toHaveBeenCalledTimes(1);
 		expect(onRetryFinished).toHaveBeenCalledWith(false, 1, "terminated");
+	});
+
+	it.each([true, false])("releases abort listeners after completed retries (recovers: %s)", async (recovers) => {
+		const controller = new AbortController();
+		const counts: number[] = [];
+		let calls = 0;
+		const result = await retryAssistantCall(
+			async () => {
+				counts.push(getEventListeners(controller.signal, "abort").length);
+				calls++;
+				return recovers && calls === 4
+					? fauxAssistantMessage("recovered")
+					: fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 overloaded" });
+			},
+			enabled,
+			controller.signal,
+		);
+		expect(result.stopReason).toBe(recovers ? "stop" : "error");
+		expect(counts).toEqual([0, 0, 0, 0]);
+		expect(getEventListeners(controller.signal, "abort")).toEqual([]);
 	});
 });
 

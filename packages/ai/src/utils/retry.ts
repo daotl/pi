@@ -22,10 +22,10 @@ const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
 	"quota exceeded",
 	"billing",
 
-	// Context window / token limit errors - retrying won't help.
+	// Request-size limits are permanent; explicit token-rate limits remain transient.
 	"context size",
 	"context window",
-	"token limit",
+	"token limit(?! per (?:minute|second))",
 	"max tokens",
 
 	// Sign in with ChatGPT: the subscription's shared usage limit, which resets
@@ -158,15 +158,15 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 			reject(new RetrySleepAbortError());
 			return;
 		}
-		const timeout = setTimeout(resolve, ms);
-		signal?.addEventListener(
-			"abort",
-			() => {
-				clearTimeout(timeout);
-				reject(new RetrySleepAbortError());
-			},
-			{ once: true },
-		);
+		const onAbort = () => {
+			clearTimeout(timeout);
+			reject(new RetrySleepAbortError());
+		};
+		const timeout = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
 	});
 }
 
