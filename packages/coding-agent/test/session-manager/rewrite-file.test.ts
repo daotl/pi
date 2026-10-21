@@ -107,6 +107,34 @@ describe("atomic session file rewrite", () => {
 		expect(session.getEntry(user)?.deletedAt).toBeUndefined();
 	});
 
+	it("keeps selected tail, source aliases and references unchanged after failed replacement", () => {
+		const { session, user, file } = createSession();
+		const assistant = session.getLeafEntry();
+		if (!assistant) throw new Error("Missing assistant");
+		session.appendCompaction("summary", assistant.id, 100);
+		session.appendLabelChange(assistant.id, "bookmark");
+		const entries = structuredClone(session.getEntries());
+		const projection = structuredClone(session.buildSessionProjection());
+		const tree = structuredClone(session.getTree());
+		const leaf = session.getLeafId();
+		const bytes = fs.readFileSync(file);
+		const failure = new Error("replacement rename failure");
+		vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+			throw failure;
+		});
+		expect(() => session.replaceMessages([{ entryId: user, message: userMsg("edited") }])).toThrow(failure);
+		expect(session.getEntries()).toEqual(entries);
+		expect(session.buildSessionProjection()).toEqual(projection);
+		expect(session.getTree()).toEqual(tree);
+		expect(session.getLeafId()).toBe(leaf);
+		expect(assistant.supersededBy).toBeUndefined();
+		expect(fs.readFileSync(file)).toEqual(bytes);
+		session.replaceMessages([{ entryId: user, message: userMsg("edited") }]);
+		expect(
+			session.getBranch().find((entry) => entry.type === "message" && entry.message.role === "user"),
+		).toMatchObject({ message: { content: "edited" } });
+	});
+
 	it.each(["write", "fsync", "close", "rename"] as const)(
 		"preserves previous disk bytes and reopen behavior when %s fails",
 		async (stage) => {
