@@ -4316,6 +4316,7 @@ export class AgentSession {
 	 */
 	private async _runManualCompaction(options?: CompactOptions | string): Promise<CompactionResult> {
 		this._compactionAbortController = new AbortController();
+		const signal = this._compactionAbortController.signal;
 		this._emit({ type: "compaction_start", reason: "manual" });
 		let fromExtension = false;
 		let cancelledByExtension = false;
@@ -4461,7 +4462,7 @@ export class AgentSession {
 			return compactionResult;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			const aborted = this._compactionAbortController.signal.aborted || cancelledByExtension;
+			const aborted = signal.aborted || cancelledByExtension;
 			const errorMessage = aborted ? undefined : `Compaction failed: ${message}`;
 			this._clearManualCompactionState();
 			this._emit({
@@ -4479,6 +4480,7 @@ export class AgentSession {
 				willRetry: false,
 				fromExtension,
 			});
+			if (aborted) throw new Error("Compaction cancelled", { cause: error });
 			throw error;
 		} finally {
 			this._clearManualCompactionState();

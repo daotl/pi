@@ -1,13 +1,25 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
+	fauxProvider,
 	fauxToolCall,
+	InMemoryModelsStore,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
+import type { AgentSessionEvent } from "../../src/core/agent-session.ts";
+import { AuthStorage } from "../../src/core/auth-storage.ts";
+import { ModelRuntime } from "../../src/core/model-runtime.ts";
+import { createAgentSession } from "../../src/core/sdk.ts";
+import { SessionManager } from "../../src/core/session-manager.ts";
+import { SettingsManager } from "../../src/core/settings-manager.ts";
+import { createTestExtensionsResult, createTestResourceLoader } from "../utilities.ts";
 import { createHarness, getAssistantTexts, type Harness } from "./harness.ts";
 
 const SUMMARY_TEXT = "## Summary\n- The user started a task.";
@@ -19,7 +31,7 @@ const SUMMARY_TEXT = "## Summary\n- The user started a task.";
 function createWaitTool(): {
 	tool: AgentTool;
 	release: () => void;
-	waitForToolStart: (harness: Harness) => Promise<void>;
+	waitForToolStart: (harness: Pick<Harness, "session">) => Promise<void>;
 } {
 	let releaseTool: (() => void) | undefined;
 	const toolRelease = new Promise<void>((resolve) => {
@@ -38,7 +50,7 @@ function createWaitTool(): {
 			};
 		},
 	};
-	const waitForToolStart = (harness: Harness) =>
+	const waitForToolStart = (harness: Pick<Harness, "session">) =>
 		new Promise<void>((resolve) => {
 			const unsubscribe = harness.session.subscribe((event) => {
 				if (event.type === "tool_execution_start" && event.toolName === "wait") {
@@ -271,4 +283,143 @@ describe("AgentSession queued /compact", () => {
 		expect(harness.getPendingResponseCount()).toBe(1);
 		expect(harness.events.some((event) => event.type === "agent_settled")).toBe(true);
 	});
+	it.each(["cancel", "failure", "cancel-with-follow-up"] as const)(
+		"preserves queued compaction cancellation through SDK async stream setup (%s)",
+		async (outcome) => {
+			const tempDir = mkdtempSync(join(tmpdir(), "pi-queued-compact-sdk-"));
+			const { tool, release, waitForToolStart } = createWaitTool();
+			const faux = fauxProvider();
+			const events: AgentSessionEvent[] = [];
+			const requests: string[] = [];
+			let preparingSummary = false;
+			let summaryAuthCalls = 0;
+			let releaseSetup = () => {};
+			let prompt: Promise<void> | undefined;
+			const { promise: setupStarted, resolve: markSetupStarted } = Promise.withResolvers<AbortSignal>();
+			const modelRuntime = await ModelRuntime.create({
+				credentials: AuthStorage.inMemory(),
+				modelsStore: new InMemoryModelsStore(),
+				modelsPath: null,
+				allowModelNetwork: false,
+			});
+			modelRuntime.registerNativeProvider({
+				...faux.provider,
+				auth: {
+					apiKey: {
+						name: "Queued compaction test",
+						check: async () => ({ type: "api_key" }),
+						resolve: async ({ signal }) => {
+							// The first auth resolves the summary preflight. Hold the second,
+							// inside the SDK's standard stream wrapper and lazyStream setup.
+							if (preparingSummary && ++summaryAuthCalls === 2) {
+								let onAbort: (() => void) | undefined;
+								try {
+									await new Promise<void>((_resolve, reject) => {
+										releaseSetup = () => reject(new Error("summary setup rejected"));
+										onAbort = () => reject(signal.reason);
+										signal.addEventListener("abort", onAbort, { once: true });
+										markSetupStarted(signal);
+									});
+								} finally {
+									if (onAbort) signal.removeEventListener("abort", onAbort);
+								}
+							}
+							return { auth: { apiKey: "faux-key" } };
+						},
+					},
+				},
+			});
+			await modelRuntime.refresh({ allowNetwork: false });
+			const sessionManager = SessionManager.inMemory(tempDir);
+			const extensionsResult = await createTestExtensionsResult(
+				[
+					(pi) => {
+						pi.on("session_before_compact", () => {
+							preparingSummary = true;
+						});
+					},
+				],
+				tempDir,
+			);
+			const { session } = await createAgentSession({
+				cwd: tempDir,
+				agentDir: tempDir,
+				model: faux.getModel(),
+				modelRuntime,
+				sessionManager,
+				settingsManager: SettingsManager.inMemory({
+					compaction: { enabled: false, keepRecentTokens: 1 },
+					retry: { enabled: false },
+				}),
+				resourceLoader: createTestResourceLoader({ extensionsResult }),
+				tools: [tool.name],
+				customTools: [tool],
+			});
+			try {
+				session.subscribe((event) => events.push(event));
+				faux.setResponses([
+					fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+					(context) => {
+						requests.push(JSON.stringify(context.messages));
+						return fauxAssistantMessage("continued runnable work");
+					},
+				]);
+				if (outcome === "cancel-with-follow-up") {
+					faux.appendResponses([
+						(context) => {
+							requests.push(JSON.stringify(context.messages));
+							return fauxAssistantMessage("answered accepted follow-up");
+						},
+					]);
+				}
+				const toolStarted = waitForToolStart({ session });
+				prompt = session.prompt("start runnable task");
+				await toolStarted;
+				session.queueCompact();
+				release();
+				const setupSignal = await setupStarted;
+				expect(setupSignal.aborted).toBe(false);
+				expect(faux.state.callCount).toBe(1);
+				expect(events.filter((event) => event.type === "tool_execution_end")).toHaveLength(1);
+				if (outcome === "cancel-with-follow-up") await session.followUp("accepted next instruction");
+				if (outcome === "failure") releaseSetup();
+				else session.abortCompaction();
+				await prompt;
+
+				const compactionEnds = events.filter((event) => event.type === "compaction_end");
+				expect(compactionEnds).toHaveLength(1);
+				expect(compactionEnds[0]).toMatchObject({
+					reason: "manual",
+					aborted: outcome !== "failure",
+					result: undefined,
+				});
+				if (outcome === "failure") {
+					expect(compactionEnds[0].errorMessage).toBeDefined();
+					expect(requests).toHaveLength(1);
+					expect(requests[0]).toContain('"role":"toolResult"');
+				} else if (outcome === "cancel-with-follow-up") {
+					expect(requests).toHaveLength(2);
+					expect(requests[0]).not.toContain("accepted next instruction");
+					expect(requests[1]).toContain("accepted next instruction");
+					expect(session.getFollowUpMessages()).toEqual([]);
+				} else {
+					expect(requests).toEqual([]);
+					expect(faux.state.callCount).toBe(1);
+					expect(faux.getPendingResponseCount()).toBe(1);
+				}
+				expect(sessionManager.getBranch().some((entry) => entry.type === "compaction")).toBe(false);
+				expect(session.isCompacting).toBe(false);
+				expect(session.hasQueuedCompact).toBe(false);
+				expect(session.isIdle).toBe(true);
+				expect(events.at(-1)?.type).toBe("agent_settled");
+			} finally {
+				release();
+				releaseSetup();
+				await session.abort();
+				await prompt?.catch(() => {});
+				session.dispose();
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		},
+	);
 });
