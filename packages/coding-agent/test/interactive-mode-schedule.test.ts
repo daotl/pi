@@ -413,3 +413,33 @@ describe("InteractiveMode long scheduled deadlines", () => {
 		}
 	});
 });
+
+describe("deferred scheduled actions remain cancellable", () => {
+	function context() {
+		return {
+			scheduledMessages: [{ id: 2, text: "pending", when: { type: "settled" as const } }],
+			deferredScheduledActions: [{ id: 3, text: "deferred", when: { type: "settled" as const }, isContinue: true }],
+			showStatus: vi.fn(),
+			scheduledMessageDescription: (entry: ScheduledMessage) => `${entry.id}:${entry.text}`,
+		};
+	}
+	test("lists deferred and pending actions without losing their IDs", () => {
+		const state = context();
+		Reflect.get(InteractiveMode.prototype, "listScheduledMessages").call(state);
+		const output = String(state.showStatus.mock.calls[0][0]);
+		expect(output).toContain("2:pending");
+		expect(output).toContain("3:deferred");
+	});
+	test("cancels a deferred action by ID", () => {
+		const state = context();
+		Reflect.get(InteractiveMode.prototype, "cancelScheduledMessageById").call(state, 3);
+		expect(state.deferredScheduledActions).toEqual([]);
+		expect(state.scheduledMessages.map((entry) => entry.id)).toEqual([2]);
+	});
+	test("cancels newest IDs across pending and deferred queues", () => {
+		const state = context();
+		Reflect.get(InteractiveMode.prototype, "cancelScheduledMessages").call(state, 1);
+		expect(state.deferredScheduledActions).toEqual([]);
+		expect(state.scheduledMessages.map((entry) => entry.id)).toEqual([2]);
+	});
+});

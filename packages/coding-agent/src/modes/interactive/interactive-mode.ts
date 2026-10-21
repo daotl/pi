@@ -6043,12 +6043,14 @@ export class InteractiveMode {
 			this.showStatus("Usage: /schedule -N to cancel the last N scheduled messages");
 			return;
 		}
-		let removed = 0;
-		while (removed < count && this.scheduledMessages.length > 0) {
-			const entry = this.scheduledMessages.pop();
-			if (entry?.timer) clearTimeout(entry.timer);
-			removed++;
+		const pending = [...this.scheduledMessages, ...this.deferredScheduledActions].sort((a, b) => b.id - a.id);
+		const cancelled = new Set(pending.slice(0, count).map((entry) => entry.id));
+		for (const entry of pending) {
+			if (cancelled.has(entry.id) && entry.timer) clearTimeout(entry.timer);
 		}
+		this.scheduledMessages = this.scheduledMessages.filter((entry) => !cancelled.has(entry.id));
+		this.deferredScheduledActions = this.deferredScheduledActions.filter((entry) => !cancelled.has(entry.id));
+		const removed = cancelled.size;
 		if (removed === 0) {
 			this.showStatus("No scheduled messages to cancel");
 			return;
@@ -6058,22 +6060,26 @@ export class InteractiveMode {
 
 	/** List active scheduled messages in status (id, action, trigger). */
 	private listScheduledMessages(): void {
-		if (this.scheduledMessages.length === 0) {
+		const pending = [...this.scheduledMessages, ...(this.deferredScheduledActions ?? [])].sort((a, b) => a.id - b.id);
+		if (pending.length === 0) {
 			this.showStatus("No scheduled messages");
 			return;
 		}
-		const lines = this.scheduledMessages.map((entry) => `  ${entry.id}: ${this.scheduledMessageDescription(entry)}`);
+		const lines = pending.map((entry) => `  ${entry.id}: ${this.scheduledMessageDescription(entry)}`);
 		this.showStatus(`Scheduled messages:\n${lines.join("\n")}`);
 	}
 
 	/** Cancel one scheduled message by the id shown by /schedule list. */
 	private cancelScheduledMessageById(id: number): void {
-		const index = this.scheduledMessages.findIndex((entry) => entry.id === id);
+		const entries = this.scheduledMessages.some((entry) => entry.id === id)
+			? this.scheduledMessages
+			: (this.deferredScheduledActions ?? []);
+		const index = entries.findIndex((entry) => entry.id === id);
 		if (index === -1) {
 			this.showStatus(`No scheduled message with id ${id}`);
 			return;
 		}
-		const [entry] = this.scheduledMessages.splice(index, 1);
+		const [entry] = entries.splice(index, 1);
 		if (entry.timer) clearTimeout(entry.timer);
 		this.showStatus(`Cancelled scheduled message ${id}`);
 	}
