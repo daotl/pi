@@ -357,6 +357,19 @@ describe("atomic session file rewrite", () => {
 		expect(fs.readdirSync(dir)).toEqual([file.slice(dir.length + 1)]);
 	});
 
+	it("rewrites a symbolic link target without splitting the session file", () => {
+		const { user, file } = createSession();
+		const alias = join(dir, "session-link.jsonl");
+		fs.symlinkSync(file, alias);
+		const session = SessionManager.open(alias, dir, dir);
+		session.softDeleteUnits([{ entryId: user }]);
+		expect(fs.lstatSync(alias).isSymbolicLink()).toBe(true);
+		expect(SessionManager.open(file, dir, dir).getEntry(user)?.deletedAt).toBeDefined();
+		const next = session.appendMessage(userMsg("continued through alias"));
+		expect(SessionManager.open(file, dir, dir).getLeafId()).toBe(next);
+		expect(fs.readFileSync(alias)).toEqual(fs.readFileSync(file));
+	});
+
 	it("does not overwrite or clean up a foreign file when exclusive temporary open fails", async () => {
 		const { session, user, file } = createSession();
 		const previous = fs.readFileSync(file);

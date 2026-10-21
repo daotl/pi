@@ -23,6 +23,7 @@ import {
 	openSync,
 	readdirSync,
 	readSync,
+	realpathSync,
 	renameSync,
 	type Stats,
 	statSync,
@@ -1283,8 +1284,9 @@ export class SessionManager {
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const mode = existsSync(this.sessionFile) ? statSync(this.sessionFile).mode & 0o7777 : undefined;
-		const temporaryFile = `${this.sessionFile}.${randomUUID()}.tmp`;
+		const destination = existsSync(this.sessionFile) ? realpathSync(this.sessionFile) : this.sessionFile;
+		const mode = existsSync(destination) ? statSync(destination).mode & 0o7777 : undefined;
+		const temporaryFile = `${destination}.${randomUUID()}.tmp`;
 		// A failed exclusive open owns no file and must not clean up another writer.
 		let fd: number | undefined = openSync(temporaryFile, "wx", mode);
 		try {
@@ -1295,7 +1297,7 @@ export class SessionManager {
 			fsyncSync(fd);
 			closeSync(fd);
 			fd = undefined;
-			renameSync(temporaryFile, this.sessionFile);
+			renameSync(temporaryFile, destination);
 		} catch (error) {
 			if (fd !== undefined) {
 				try {
