@@ -2012,10 +2012,22 @@ export class SessionManager {
 		if (count < 1) return [];
 		const deleted = this.getDeletedUnits();
 		const restored: Array<{ entryId: string; toolCallId?: string }> = [];
+		const previous = new Map<
+			SessionEntry,
+			{ deletedAt?: string; toolCalls?: Record<string, string>; values?: Record<string, string> }
+		>();
 		for (const unit of deleted) {
 			if (restored.length >= count) break;
 			const entry = this.byId.get(unit.entryId);
 			if (!entry) continue;
+			if (this.persist && this.sessionFile && !previous.has(entry)) {
+				const toolCalls = entry.type === "message" ? entry.deletedToolCalls : undefined;
+				previous.set(entry, {
+					deletedAt: entry.deletedAt,
+					toolCalls,
+					values: toolCalls ? { ...toolCalls } : undefined,
+				});
+			}
 			if (unit.toolCallId !== undefined) {
 				if (entry.type !== "message" || !entry.deletedToolCalls) continue;
 				delete entry.deletedToolCalls[unit.toolCallId];
@@ -2029,7 +2041,19 @@ export class SessionManager {
 			}
 		}
 		if (restored.length > 0) {
-			this._rewriteFile();
+			try {
+				this._rewriteFile();
+			} catch (error) {
+				for (const [entry, saved] of previous) {
+					if (saved.deletedAt !== undefined) entry.deletedAt = saved.deletedAt;
+					else delete entry.deletedAt;
+					if (entry.type === "message" && saved.toolCalls) {
+						Object.assign(saved.toolCalls, saved.values);
+						entry.deletedToolCalls = saved.toolCalls;
+					}
+				}
+				throw error;
+			}
 		}
 		return restored;
 	}
@@ -2040,14 +2064,21 @@ export class SessionManager {
 	 */
 	restoreDeletedEntryIds(entryIds: string[]): number {
 		let restored = 0;
+		const previous = new Map<SessionEntry, string>();
 		for (const entryId of entryIds) {
 			const entry = this.byId.get(entryId);
 			if (!entry || entry.deletedAt === undefined) continue;
+			if (this.persist && this.sessionFile && !previous.has(entry)) previous.set(entry, entry.deletedAt);
 			delete entry.deletedAt;
 			restored++;
 		}
 		if (restored > 0) {
-			this._rewriteFile();
+			try {
+				this._rewriteFile();
+			} catch (error) {
+				for (const [entry, deletedAt] of previous) entry.deletedAt = deletedAt;
+				throw error;
+			}
 		}
 		return restored;
 	}

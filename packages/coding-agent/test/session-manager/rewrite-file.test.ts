@@ -77,6 +77,36 @@ describe("atomic session file rewrite", () => {
 		expect(session.softDeleteUnits([{ entryId: assistant.id, toolCallId: "two" }, { entryId: user }])).toBe(2);
 	});
 
+	it.each(["latest", "selected"] as const)("keeps deletion state after failed %s restore", (mode) => {
+		const { session, user, file } = createSession();
+		const assistant = session.getLeafEntry();
+		if (!assistant || assistant.type !== "message" || assistant.message.role !== "assistant")
+			throw new Error("Missing assistant");
+		assistant.message = {
+			...assistant.message,
+			content: [{ type: "toolCall", id: "one", name: "read", arguments: {} }],
+		};
+		session.softDeleteUnits([{ entryId: assistant.id, toolCallId: "one" }, { entryId: user }]);
+		const heldMap = assistant.deletedToolCalls;
+		const entries = structuredClone(session.getEntries());
+		const projection = structuredClone(session.buildSessionProjection());
+		const bytes = fs.readFileSync(file);
+		const failure = new Error("restore rename failure");
+		vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+			throw failure;
+		});
+		const restore = () =>
+			mode === "latest" ? session.restoreDeletedUnits(2) : session.restoreDeletedEntryIds([user]);
+		expect(restore).toThrow(failure);
+		expect(session.getEntries()).toEqual(entries);
+		expect(session.buildSessionProjection()).toEqual(projection);
+		expect(assistant.deletedToolCalls).toBe(heldMap);
+		expect(fs.readFileSync(file)).toEqual(bytes);
+		expect(SessionManager.open(file, dir, dir).buildSessionProjection()).toEqual(projection);
+		restore();
+		expect(session.getEntry(user)?.deletedAt).toBeUndefined();
+	});
+
 	it.each(["write", "fsync", "close", "rename"] as const)(
 		"preserves previous disk bytes and reopen behavior when %s fails",
 		async (stage) => {
