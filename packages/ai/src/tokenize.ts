@@ -9,14 +9,15 @@
  * caller can fall back to an estimate.
  */
 
-import type { Model } from "./types.ts";
+import type { Model, ProviderHeaders } from "./types.ts";
+import { providerHeadersToRecord } from "./utils/headers.ts";
 import { getPiUserAgent } from "./utils/pi-user-agent.ts";
 import { type RetryPolicy, retryDelayMs } from "./utils/retry.ts";
 
 export interface CountTokensOptions {
 	text: string;
 	apiKey?: string;
-	headers?: Record<string, string>;
+	headers?: ProviderHeaders;
 	env?: Record<string, string>;
 	/** Custom fetch (for tests). Defaults to global fetch. */
 	fetch?: typeof globalThis.fetch;
@@ -31,7 +32,7 @@ export interface CountChatTokensOptions {
 	/** The chat messages exactly as they would be sent to /v1/chat/completions. */
 	messages: unknown[];
 	apiKey?: string;
-	headers?: Record<string, string>;
+	headers?: ProviderHeaders;
 	env?: Record<string, string>;
 	/** Custom fetch (for tests). Defaults to global fetch. */
 	fetch?: typeof globalThis.fetch;
@@ -95,20 +96,15 @@ export async function countTokens(model: Model<any>, options: CountTokensOptions
 	const url = tokenizeEndpointUrl(model.baseUrl);
 	if (!url || !options.text) return undefined;
 
-	const headers: Record<string, string> = {
-		"Content-Type": "application/json",
-		"User-Agent": getPiUserAgent(),
-		...model.headers,
-	};
-	// Only add an Authorization header from the API key when the caller did not
-	// already supply one (e.g. a pre-resolved Bearer token in options.headers).
-	const hasAuthHeader = Object.keys(headers).some((k) => k.toLowerCase() === "authorization");
-	if (options.apiKey && !hasAuthHeader) {
-		headers.Authorization = `Bearer ${options.apiKey}`;
-	}
-	if (options.headers) {
-		Object.assign(headers, options.headers);
-	}
+	const headers = providerHeadersToRecord(
+		{
+			"Content-Type": "application/json",
+			"User-Agent": getPiUserAgent(),
+			...(options.apiKey ? { Authorization: `Bearer ${options.apiKey}` } : {}),
+		},
+		model.headers,
+		options.headers,
+	);
 
 	const fetchFn = options.fetch ?? globalThis.fetch;
 	const timeout = options.timeoutMs ?? 30000;
@@ -161,18 +157,15 @@ export async function countChatTokens(model: Model<any>, options: CountChatToken
 	const url = chatTokenizeEndpointUrl(model.baseUrl);
 	if (!url || options.messages.length === 0) return undefined;
 
-	const headers: Record<string, string> = {
-		"Content-Type": "application/json",
-		"User-Agent": getPiUserAgent(),
-		...model.headers,
-	};
-	const hasAuthHeader = Object.keys(headers).some((k) => k.toLowerCase() === "authorization");
-	if (options.apiKey && !hasAuthHeader) {
-		headers.Authorization = `Bearer ${options.apiKey}`;
-	}
-	if (options.headers) {
-		Object.assign(headers, options.headers);
-	}
+	const headers = providerHeadersToRecord(
+		{
+			"Content-Type": "application/json",
+			"User-Agent": getPiUserAgent(),
+			...(options.apiKey ? { Authorization: `Bearer ${options.apiKey}` } : {}),
+		},
+		model.headers,
+		options.headers,
+	);
 
 	const fetchFn = options.fetch ?? globalThis.fetch;
 	const timeout = options.timeoutMs ?? 30000;
