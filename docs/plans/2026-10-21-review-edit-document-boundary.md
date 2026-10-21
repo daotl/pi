@@ -16,3 +16,5 @@ Require openTag.start===pos at each top-level iteration after whitespace. Keep p
 Five safety/order/actual AgentSession edit/swipe/lexical suites: **119 passed**. New regression asserts whole-document parse rejection, apply returns no mutation and full history remains unchanged. Apply/history checks are post-fix controls because the RED stops at parser equality. Existing nested tags/body prose, valid adjacent multi-block documents, attributes and provider replay controls pass. No physical TUI or live provider request claim.
 
 `npm run check` passed (1719 files; two changed files formatted). Post-format owning suites: **119 passed**. Independent source-only follow-up confirmed the exact finding corrected and literal body scanning unchanged; no independent test execution claim.
+
+Fixed-tree authoritative `./test.sh` at7c48959fd passed **8005 passed / 0 failed / 999 skipped** (artifact2092), including packed SDK/CLI smoke. All749 protected user build artifacts still match their saved SHA256 manifest. This is current integration proof, not completion of the remaining44-commit migration behavior inventory.
