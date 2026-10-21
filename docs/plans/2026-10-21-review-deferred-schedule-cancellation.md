@@ -17,3 +17,5 @@ List both queues in ID order. Cancel by ID from its owning queue. For -N choose 
 Schedule, scheduled-edit and heartbeat suites: **105 passed**. New controls exercise real list/cancel methods against pending/deferred state and assert retained/removed IDs; list output assertion checks user-visible identifier/payload, not incidental prose. Existing long-deadline cancellation remains covered. No initialized TUI/drain/preflight proof claimed.
 
 `npm run check` passed (1717 files; test formatted). Post-format owning suites: **105 passed**.
+
+Fixed-tree `./test.sh` at47c63bed0 passed **7998 passed / 0 failed / 999 skipped** (artifact2052); no changes occurred during that run.

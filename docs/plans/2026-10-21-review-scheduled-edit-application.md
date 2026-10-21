@@ -17,3 +17,5 @@ Return boolean acceptance from the existing UI helper. Scheduled caller uses cle
 Scheduled edit application, schedule, heartbeat and actual AgentSession edit suites: **175 passed**. New integration uses real AgentSession edits behind prototype UI methods; draft state and accepted changed user content are asserted, failed/no-op history remains unchanged, continue is invoked once only for accepted edit. Existing editor control proves rejected text stays and accepted edit clears. This is UI method/state proof, not physical terminal interaction; no provider/network request.
 
 `npm run check` passed (1717 files; test formatted). Post-format owning suites: **175 passed**.
+
+Fixed scheduler source tree47c63bed0 passed authoritative `./test.sh`: **7998 passed / 0 failed / 999 skipped** (artifact2052), including existing packed SDK/CLI consumer smoke. This is combined verification with deferred cancellation, not completion of remaining scheduler claim/preflight/cadence groups.
