@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { RADIUS_PROVIDER_ID } from "../src/core/radius.ts";
-import { allowNetwork } from "./test-network-env.ts";
+import { allowNetwork, enableBuiltinProviders } from "./test-network-env.ts";
 
 function radiusOAuthCredential(gatewayBaseUrl: string) {
 	return {
@@ -49,10 +49,9 @@ afterEach(() => {
 });
 
 describe("Radius provider", () => {
-	// The radius provider is part of the built-in provider set; local-only
-	// mode (PI_DISABLE_CLOUD_PROVIDERS=1) hides it from the registry.
-	const cloudDisabled = process.env.PI_DISABLE_CLOUD_PROVIDERS === "1";
-	it.skipIf(cloudDisabled)("restores the legacy credential catalog without network access", async () => {
+	// Bundled provider metadata; fetches below are mocked or explicitly disabled.
+	it("restores the legacy credential catalog without network access", async () => {
+		enableBuiltinProviders();
 		const runtime = await ModelRuntime.create({
 			credentials: AuthStorage.inMemory({
 				[RADIUS_PROVIDER_ID]: radiusOAuthCredential("https://radius.example.com/v1"),
@@ -68,7 +67,8 @@ describe("Radius provider", () => {
 		expect(runtime.hasConfiguredAuth(RADIUS_PROVIDER_ID)).toBe(true);
 	});
 
-	it.skipIf(cloudDisabled)("fetches and stores the catalog for configured Radius auth", async () => {
+	it("fetches and stores the catalog for configured Radius auth", async () => {
+		enableBuiltinProviders();
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(
 			new Response(JSON.stringify(radiusConfig("https://radius.example.com/v1")), {
 				status: 200,
@@ -99,7 +99,8 @@ describe("Radius provider", () => {
 		expect(radiusRequest?.[1]?.headers).toMatchObject({ authorization: "Bearer access-token" });
 	});
 
-	it.skipIf(cloudDisabled)("does not refresh catalogs over the network by default", async () => {
+	it("does not refresh catalogs over the network by default", async () => {
+		enableBuiltinProviders();
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected catalog fetch"));
 		const runtime = await ModelRuntime.create({
 			credentials: AuthStorage.inMemory({
