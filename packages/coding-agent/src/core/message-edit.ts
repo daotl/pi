@@ -70,28 +70,30 @@ function parseTag(tagText: string): { name: string; attributes: Record<string, s
 	return { name, attributes, isClosing };
 }
 
+const FORMAT_TAG_START = /<\/?(?:pi_edit|pi_swipe|pi_content|pi_tool_call|pi_image|pi_reasoning_content)(?=[\s/>])/g;
+
 function findNextTag(text: string, pos: number): TagMatch | undefined {
-	const start = text.indexOf("<", pos);
-	if (start === -1) return undefined;
-
-	let i = start + 1;
-	let inQuote: string | undefined;
-	while (i < text.length) {
-		const ch = text[i];
-		if (inQuote) {
-			if (ch === inQuote) inQuote = undefined;
-		} else if (ch === '"' || ch === "'") {
-			inQuote = ch;
-		} else if (ch === ">") {
-			break;
+	FORMAT_TAG_START.lastIndex = pos;
+	for (let match = FORMAT_TAG_START.exec(text); match !== null; match = FORMAT_TAG_START.exec(text)) {
+		const start = match.index;
+		let i = start + match[0].length;
+		let inQuote: string | undefined;
+		while (i < text.length) {
+			const ch = text[i];
+			// Formatter escapes attribute angles; a nested '<' denotes literal prose.
+			if (ch === "<") break;
+			if (inQuote) {
+				if (ch === inQuote) inQuote = undefined;
+			} else if (ch === '"' || ch === "'") inQuote = ch;
+			else if (ch === ">") {
+				const parsed = parseTag(text.slice(start, i + 1));
+				return { ...parsed, start, end: i + 1 };
+			}
+			i++;
 		}
-		i++;
+		FORMAT_TAG_START.lastIndex = start + 1;
 	}
-	if (i >= text.length) return undefined;
-
-	const tagText = text.slice(start, i + 1);
-	const parsed = parseTag(tagText);
-	return { ...parsed, start, end: i + 1 };
+	return undefined;
 }
 
 function findBlockClose(text: string, startPos: number, tagName: string): { start: number; end: number } | undefined {
@@ -430,25 +432,82 @@ export function formatMessageContent(message: AgentMessage): string | null {
 
 /**
  * Format an existing message as an edit XML block with the given id.
- * Returns `null` for roles that are not directly editable (e.g. toolResult).
+ * Returns null for non-editable roles or content/replay metadata the format cannot preserve.
  */
 export function formatMessageForEdit(id: number, message: AgentMessage): string | null {
 	const content = formatMessageContent(message);
 	if (content === null) return null;
 	const role = message.role === "user" ? "user" : "assistant";
-	return `<pi_edit id="${id}" role="${role}">${content}</pi_edit>`;
+	const xml = `<pi_edit id="${id}" role="${role}">${content}</pi_edit>`;
+	return roundTripsExactly(xml, message) ? xml : null;
 }
 
 /**
  * Format an existing message as a `<pi_swipe>` block for in-place editing of
  * one swipe version. The timestamp identifies the version on apply and keeps
- * its position stable. Returns `null` for roles that are not editable.
+ * its position stable. Returns null if content/replay metadata would be lost.
  */
 export function formatMessageForSwipe(timestamp: string, message: AgentMessage): string | null {
 	const content = formatMessageContent(message);
 	if (content === null) return null;
 	const role = message.role === "user" ? "user" : "assistant";
-	return `<pi_swipe timestamp="${escapeXmlAttr(timestamp)}" role="${role}">${content}</pi_swipe>`;
+	const xml = `<pi_swipe timestamp="${escapeXmlAttr(timestamp)}" role="${role}">${content}</pi_swipe>`;
+	return roundTripsExactly(xml, message) ? xml : null;
+}
+
+type EditableBlock = TextContent | ThinkingContent | ToolCall | ImageContent;
+
+/** Compare representable content while retaining all provider replay fields. */
+function editableContentKey(content: string | readonly EditableBlock[] | readonly { type: string }[]): string {
+	const blocks: unknown[] = [];
+	let text = "";
+	const flush = (): void => {
+		if (text.length > 0) blocks.push({ type: "text", text });
+		text = "";
+	};
+	const items = typeof content === "string" ? [{ type: "text", text: content } as TextContent] : content;
+	for (const item of items as readonly EditableBlock[]) {
+		if (item.type === "text") {
+			if (item.textSignature !== undefined) {
+				flush();
+				blocks.push({ type: "text", text: item.text, textSignature: item.textSignature });
+			} else text += item.text;
+			continue;
+		}
+		flush();
+		if (item.type === "thinking") {
+			blocks.push({
+				type: "thinking",
+				thinking: item.thinking,
+				signature: item.thinkingSignature,
+				redacted: item.redacted === true,
+			});
+		} else if (item.type === "toolCall") {
+			blocks.push({
+				type: "toolCall",
+				id: item.id,
+				name: item.name,
+				arguments: item.arguments,
+				thoughtSignature: item.thoughtSignature,
+				namespace: item.namespace,
+				raw: item.raw,
+			});
+		} else if (item.type === "image") blocks.push({ type: "image", data: item.data, mimeType: item.mimeType });
+	}
+	flush();
+	return JSON.stringify(blocks);
+}
+
+function roundTripsExactly(xml: string, message: AgentMessage): boolean {
+	if (message.role !== "user" && message.role !== "assistant") return false;
+	try {
+		const parsed = parseMessageEditsAndSwipes(xml);
+		const blocks = [...parsed.edits, ...parsed.swipes];
+		return blocks.length === 1 && editableContentKey(blocks[0].content) === editableContentKey(message.content);
+	} catch {
+		// Literal text may resemble malformed edit markup; refuse without changing it.
+		return false;
+	}
 }
 
 function formatUserMessageContent(message: UserMessage): string {

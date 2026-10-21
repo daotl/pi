@@ -65,6 +65,7 @@ for (const format of ["edit", "swipe"] as const) {
 		it("retains an unbalanced literal less-than in the message body", async () => {
 			const harness = await createHarness();
 			try {
+				harness.sessionManager.appendMessage({ role: "system", content: "baseline", timestamp: 0 });
 				const original = { role: "user" as const, content: "if x < y &lt; stays literal", timestamp: 1 };
 				const id = harness.sessionManager.appendMessage(original);
 				harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;

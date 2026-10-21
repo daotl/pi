@@ -7376,9 +7376,11 @@ export class InteractiveMode {
 			for (const index of indices) {
 				const version = group.versions[index - 1];
 				const xml = formatMessageForSwipe(version.timestamp, version.message);
-				if (xml !== null) {
-					blocks.push(xml);
+				if (xml === null) {
+					this.showStatus("Selected swipe cannot be edited without losing content or replay metadata");
+					return;
 				}
+				blocks.push(xml);
 			}
 			if (blocks.length === 0) {
 				this.showStatus("Selected swipe cannot be edited");
@@ -7397,9 +7399,11 @@ export class InteractiveMode {
 			const blocks: string[] = [];
 			for (const match of matches) {
 				const xml = formatMessageForEdit(match.index, match.message);
-				if (xml !== null) {
-					blocks.push(xml);
+				if (xml === null) {
+					this.showStatus("Selected message cannot be edited without losing content or replay metadata");
+					return;
 				}
+				blocks.push(xml);
 			}
 			if (blocks.length === 0) {
 				this.showStatus("Selected message cannot be edited");
@@ -8609,7 +8613,7 @@ export class InteractiveMode {
 		const { message, editableIndex } = match;
 		if (message.role === "user" || message.role === "assistant") {
 			if (multiple && editableIndex !== undefined) {
-				return formatMessageForEdit(editableIndex, message) ?? undefined;
+				return formatMessageForEdit(editableIndex, message) ?? formatMessageContent(message) ?? undefined;
 			}
 			return formatMessageContent(message) ?? undefined;
 		}

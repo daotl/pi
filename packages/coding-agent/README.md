@@ -252,6 +252,8 @@ Configure delivery in [settings](docs/settings.md): `steeringMode` and `followUp
 
 Assistant blocks support `pi_reasoning_content`, `pi_content`, and `pi_tool_call` sections; user blocks support plain text and `pi_image`. Deleting all sections of a block deletes the message.
 
+Edit formatting refuses messages whose content or provider replay metadata cannot survive an unchanged XML round trip. A substring or swipe selection is refused as a whole if any selected message is unsafe; the existing draft stays intact. Multi-message copy keeps such messages as plain content rather than dropping them. Ordinary comparisons, HTML-like text, and literal entities remain body text.
+
 ### Swipes
 
 The latest response (or a user message at the tail) has **swipe versions**: alternative branches that share the same parent entry. `/swipe` manages them:
