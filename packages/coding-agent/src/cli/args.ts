@@ -21,7 +21,7 @@ export interface Args {
 	thinking?: ThinkingLevel;
 	continue?: boolean;
 	resume?: boolean;
-	/** Heartbeat specs preset at launch (repeatable, message-less beats). */
+	/** Interactive-only heartbeat specs preset at launch (repeatable, message-less beats). */
 	heartbeat?: string[];
 	help?: boolean;
 	version?: boolean;
@@ -304,7 +304,7 @@ ${chalk.bold("Options:")}
   --mode <mode>                  Output mode: text (default), json, or rpc
   --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
-  --heartbeat <spec>             Preset a recurring wake-up heartbeat (repeatable; e.g. 3h or 15:23)
+  --heartbeat <spec>             Preset an interactive-only recurring wake-up (repeatable; e.g. 3h or 15:23)
   --resume, -r                   Select a session to resume
   --session <path|id>            Use specific session file or partial UUID
   --session-id <id>              Use exact project session ID, creating it if missing

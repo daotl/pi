@@ -652,6 +652,10 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
+	if ((parsed.heartbeat?.length ?? 0) > 0 && appMode !== "interactive" && !isPlainRuntimeMetadataCommand(parsed)) {
+		console.error(chalk.red("Error: --heartbeat only supports interactive mode"));
+		process.exit(1);
+	}
 	const shouldTakeOverStdout = appMode !== "interactive" && !isPlainRuntimeMetadataCommand(parsed);
 	if (shouldTakeOverStdout) {
 		takeOverStdout();
