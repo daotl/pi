@@ -114,6 +114,13 @@ test("runner defaults cloud catalogs off and isolates credentials and e2e opt-in
 	assertIsolated(result);
 });
 
+test("runner forwards explicit cloud catalog metadata without credentials or e2e opt-in", (t) => {
+	const result = runRunner(t, { catalogOverride: "0" });
+	assert.equal(result.status, 0, result.stdout + result.stderr);
+	assert.equal(result.childEnv.PI_DISABLE_CLOUD_PROVIDERS, "0");
+	assertIsolated(result);
+});
+
 test("runner totals root Node, TUI Node, and ANSI Vitest tests without counting suites twice", (t) => {
 	const result = runRunner(t);
 	assert.equal(result.status, 0, result.stdout + result.stderr);

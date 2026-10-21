@@ -60,7 +60,7 @@ test_env=(
 	"NPM_CONFIG_GLOBALCONFIG=$test_root/npm-globalconfig"
 	"NPM_CONFIG_CACHE=$test_root/cache/npm"
 	"PI_NO_LOCAL_LLM=1"
-	"PI_DISABLE_CLOUD_PROVIDERS=1"
+	"PI_DISABLE_CLOUD_PROVIDERS=${PI_DISABLE_CLOUD_PROVIDERS:-1}"
 	"AWS_EC2_METADATA_DISABLED=true"
 )
 
@@ -76,10 +76,8 @@ for name in CI GITHUB_ACTIONS; do
 	[[ -z "$value" ]] || test_env+=("$name=$value")
 done
 
-# NOTE: behavior-changing PI_* vars (PI_OFFLINE, PI_SKIP_VERSION_CHECK) are
-# intentionally NOT unset: tests gate themselves on these vars. PI_DISABLE_CLOUD_PROVIDERS
-# is set to 1 by default so cloud-provider tests never run unless a developer
-# explicitly overrides it (e.g. PI_DISABLE_CLOUD_PROVIDERS=0 ./test.sh).
+# Cloud catalog metadata remains disabled by default. Preserve an explicit override,
+# but never forward API credentials, ambient NODE_OPTIONS or PI_E2E_TESTS.
 
 # Unset API keys (see packages/ai/src/stream.ts getEnvApiKey)
 unset ANTHROPIC_API_KEY
