@@ -28,7 +28,7 @@ createInterface({input:process.stdin}).on("line", line => {
   process.stdout.write(JSON.stringify({type:"agent_start"})+"\\n");
  } else {
   if(held){reply(held,held.type==="compact"?{summary:"completed summary",firstKeptEntryId:"kept",tokensBefore:99}:{});held=undefined;}
-  reply(command,command.type==="get_messages"?[]:{});
+  reply(command,command.type==="get_messages"?{messages:[]}:{});
  }
 });
 `,
