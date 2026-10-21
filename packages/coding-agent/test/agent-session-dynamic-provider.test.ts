@@ -11,9 +11,7 @@ import type { ExtensionFactory } from "../src/core/sdk.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
-
-// Dynamic provider overrides target built-in providers; local-only mode
-// (PI_DISABLE_CLOUD_PROVIDERS=1) hides them from the registry.
+import { enableBuiltinProviders } from "./test-network-env.ts";
 
 function nativeAnthropicProvider(baseUrl: string): Provider {
 	const model = { ...getModel("anthropic", "claude-sonnet-4-5")!, baseUrl };
@@ -37,11 +35,13 @@ function nativeAnthropicProvider(baseUrl: string): Provider {
 	};
 }
 
-describe.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")("AgentSession dynamic provider registration", () => {
+// Prompts terminate in a capturing stream stub; catalog activation does not permit network I/O.
+describe("AgentSession dynamic provider registration", () => {
 	let tempDir: string;
 	let agentDir: string;
 
 	beforeEach(() => {
+		enableBuiltinProviders();
 		tempDir = join(tmpdir(), `pi-dynamic-provider-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		agentDir = join(tempDir, "agent");
 		mkdirSync(agentDir, { recursive: true });

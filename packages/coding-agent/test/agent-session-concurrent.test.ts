@@ -26,6 +26,7 @@ import {
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
 } from "../src/core/system-prompt.ts";
+import { enableBuiltinProviders } from "./test-network-env.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
 
 // Mock stream that mimics AssistantMessageEventStream
@@ -62,14 +63,13 @@ function createAssistantMessage(text: string): AssistantMessage {
 	};
 }
 
-// Streaming prompt flows require a registered provider; local-only mode
-// (PI_DISABLE_CLOUD_PROVIDERS=1) hides all built-in providers. Ungated tests
-// would leave a queued prompt continuation that rejects after test end.
-describe.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")("AgentSession concurrent prompt guard", () => {
+// Every Agent uses a scripted stream; only bundled provider metadata is required.
+describe("AgentSession concurrent prompt guard", () => {
 	let session: AgentSession;
 	let tempDir: string;
 
 	beforeEach(async () => {
+		enableBuiltinProviders();
 		tempDir = join(tmpdir(), `pi-concurrent-test-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
 	});

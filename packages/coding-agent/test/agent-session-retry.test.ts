@@ -10,6 +10,7 @@ import { AuthStorage } from "../src/core/auth-storage.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
+import { enableBuiltinProviders } from "./test-network-env.ts";
 import { createTestResourceLoader } from "./utilities.ts";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -50,13 +51,13 @@ type SessionWithExtensionEmitHook = {
 	_emitExtensionEvent: (event: AgentEvent) => Promise<void>;
 };
 
-// Retry flows require a registered provider; local-only mode
-// (PI_DISABLE_CLOUD_PROVIDERS=1) hides all built-in providers.
-describe.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")("AgentSession retry", () => {
+// Scripted responses exercise retry lifecycle without provider requests.
+describe("AgentSession retry", () => {
 	let session: AgentSession;
 	let tempDir: string;
 
 	beforeEach(async () => {
+		enableBuiltinProviders();
 		tempDir = join(tmpdir(), `pi-retry-test-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
 	});
