@@ -169,8 +169,8 @@ export function convertResponsesMessages<TApi extends Api>(
 		const normalizedCallId = normalizeIdPart(callId);
 		const isForeignToolCall = source.provider !== model.provider || source.api !== model.api;
 		let normalizedItemId = isForeignToolCall ? buildForeignResponsesItemId(itemId) : normalizeIdPart(itemId);
-		// OpenAI Responses API requires item id to start with "fc"
-		if (!normalizedItemId.startsWith("fc_")) {
+		// Preserve native function/custom item IDs; foreign IDs are rebuilt above.
+		if (!normalizedItemId.startsWith("fc_") && !normalizedItemId.startsWith("ctc_")) {
 			normalizedItemId = normalizeIdPart(`fc_${normalizedItemId}`);
 		}
 		return `${normalizedCallId}|${normalizedItemId}`;
