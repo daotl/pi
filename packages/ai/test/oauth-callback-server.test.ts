@@ -30,7 +30,7 @@ function pendingPrompt(onPrompt?: (prompt: AuthPrompt) => void): (prompt: AuthPr
 }
 
 describe.sequential("OAuth callback server", () => {
-	const servers: { close(): void }[] = [];
+	const servers: { close(): Promise<void> }[] = [];
 	const start = async <T>(options: Partial<Parameters<typeof startOAuthCallbackServer<T>>[0]> = {}) => {
 		const server = await startOAuthCallbackServer<T>({
 			providerName: "Example",
@@ -45,8 +45,8 @@ describe.sequential("OAuth callback server", () => {
 		return server;
 	};
 
-	afterEach(() => {
-		for (const server of servers.splice(0)) server.close();
+	afterEach(async () => {
+		for (const server of servers.splice(0)) await server.close();
 	});
 
 	it("ignores stray requests and resolves with the completed code", async () => {
@@ -163,7 +163,7 @@ describe.sequential("OAuth callback server", () => {
 			if (!address || typeof address === "string") throw new Error("blocker did not bind to TCP");
 			await expect(start<string>({ port: address.port })).rejects.toMatchObject({ code: "EADDRINUSE" });
 		} finally {
-			blocker.close();
+			await new Promise<void>((resolve) => blocker.close(() => resolve()));
 		}
 	});
 });
@@ -192,7 +192,7 @@ describe.sequential("waitForCallbackOrManualInput", () => {
 			await expect(result).resolves.toEqual({ type: "callback", value: "from-browser" });
 			expect(manualSignal?.aborted).toBe(true);
 		} finally {
-			server.close();
+			await server.close();
 		}
 	});
 
@@ -215,7 +215,7 @@ describe.sequential("waitForCallbackOrManualInput", () => {
 			);
 			expect(result).toEqual({ type: "manual", input: "pasted" });
 		} finally {
-			server.close();
+			await server.close();
 		}
 	});
 
@@ -249,7 +249,7 @@ describe.sequential("waitForCallbackOrManualInput", () => {
 			);
 			await expect(result).rejects.toThrow("prompt cancelled");
 		} finally {
-			server.close();
+			await server.close();
 		}
 	});
 });

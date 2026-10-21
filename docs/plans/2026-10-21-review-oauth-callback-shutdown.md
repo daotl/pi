@@ -17,3 +17,5 @@ Await the existing close promise in those three finally blocks. Keep optional Co
 OAuth login shutdown, shared callback server, OpenRouter, Codex and Radius suites: **41 passed** with one worker. New control runs each real provider login through cancellation with a real loopback callback server; its port is invocation-owned/ephemeral, and a delayed close wrapper exposes settlement ordering deterministically. After releasing shutdown, login rejects and an actual replacement TCP server binds the same port. Existing provider suites cover successful browser/manual/device flows and exchange failures. Remote discovery/exchange are stubbed; no real OAuth credentials or external auth requests.
 
 `npm run check` passed (1714 files; test formatted). Post-format owning suites: **41 passed**.
+
+Follow-up updates all existing shared callback test owners to await Promise<void> shutdown in afterEach/finally, including the native port blocker. Same five suites: **41 passed**. This is fixture lifecycle completion, not another production fix or RED claim.
