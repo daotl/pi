@@ -721,7 +721,10 @@ describe("default model selection", () => {
 	});
 
 	test("built-in chat providers have defaults in their generated catalogs", () => {
-		for (const provider of getBuiltinProviders()) {
+		vi.stubEnv("PI_DISABLE_CLOUD_PROVIDERS", "0");
+		const providers = getBuiltinProviders();
+		expect(providers).toContain("openai");
+		for (const provider of providers) {
 			const chatModels = getBuiltinModels(provider);
 			const defaultId = defaultModelPerProvider[provider];
 			if (chatModels.length === 0) {
@@ -734,6 +737,26 @@ describe("default model selection", () => {
 			).toBe(true);
 		}
 	});
+
+	test.each(["azure-openai-responses", "github-copilot"] as const)(
+		"selects the catalog default for %s instead of catalog order",
+		async (provider) => {
+			vi.stubEnv("PI_DISABLE_CLOUD_PROVIDERS", "0");
+			const catalog = getBuiltinModels(provider);
+			const expected = catalog.find((model) => model.id === "gpt-5.4");
+			if (!expected) throw new Error(`Missing current ${provider} default candidate`);
+			const alternative = catalog.find((model) => model.id !== expected.id);
+			if (!alternative) throw new Error(`Missing ${provider} catalog-order control`);
+			const result = await findInitialModel({
+				scopedModels: [],
+				isContinuing: false,
+				modelRuntime: { getAvailableSnapshot: () => [alternative, expected] } as unknown as Parameters<
+					typeof findInitialModel
+				>[0]["modelRuntime"],
+			});
+			expect(result.model).toBe(expected);
+		},
+	);
 
 	test("ai-gateway default tracks current model", () => {
 		expect(defaultModelPerProvider["vercel-ai-gateway"]).toBe("zai/glm-5.1");
