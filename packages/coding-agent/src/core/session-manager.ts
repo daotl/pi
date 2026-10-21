@@ -1929,9 +1929,25 @@ export class SessionManager {
 	softDeleteUnits(units: Array<{ entryId: string; toolCallId?: string }>): number {
 		const base = Date.now();
 		let marked = 0;
+		const previous = new Map<
+			SessionEntry,
+			{
+				deletedAt: string | undefined;
+				toolCalls: Record<string, string> | undefined;
+				values: Record<string, string> | undefined;
+			}
+		>();
 		for (const unit of units) {
 			const target = this.byId.get(unit.entryId);
 			if (!target || target.deletedAt !== undefined) continue;
+			if (this.persist && this.sessionFile && !previous.has(target)) {
+				const toolCalls = target.type === "message" ? target.deletedToolCalls : undefined;
+				previous.set(target, {
+					deletedAt: target.deletedAt,
+					toolCalls,
+					values: toolCalls ? { ...toolCalls } : undefined,
+				});
+			}
 			if (unit.toolCallId !== undefined) {
 				if (target.type !== "message" || target.message.role !== "assistant") continue;
 				(target as SessionMessageEntry).deletedToolCalls ??= {};
@@ -1945,7 +1961,22 @@ export class SessionManager {
 			}
 		}
 		if (marked > 0) {
-			this._rewriteFile();
+			try {
+				this._rewriteFile();
+			} catch (error) {
+				for (const [entry, saved] of previous) {
+					if (saved.deletedAt === undefined) delete entry.deletedAt;
+					else entry.deletedAt = saved.deletedAt;
+					if (entry.type === "message") {
+						if (saved.toolCalls) {
+							for (const key of Object.keys(saved.toolCalls)) delete saved.toolCalls[key];
+							Object.assign(saved.toolCalls, saved.values);
+							entry.deletedToolCalls = saved.toolCalls;
+						} else delete entry.deletedToolCalls;
+					}
+				}
+				throw error;
+			}
 		}
 		return marked;
 	}
