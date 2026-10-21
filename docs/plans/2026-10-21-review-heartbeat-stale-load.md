@@ -21,3 +21,11 @@ The larger backup heartbeat suite is not imported. Atomic save and startup trust
 The owning heartbeat suite after repair passed **64 tests**. Deferred reads are released and awaited before mock/temp cleanup. Existing normal file load/save and scheduler cases remain unchanged.
 
 `npm run check` passed with 1706 files and `No fixes applied`, including TypeScript and browser smoke.
+
+## Independent follow-up audit and real lifecycle coverage
+
+An independent source review confirmed the exact `2093b87` repair and found no introduced production defect. The original prototype replacement case is valid owner-identity unit coverage, not runtime replacement proof.
+
+The additional suite uses actual `AgentSessionRuntime.newSession()` and `InteractiveMode.stop()` on an initialized VirtualTerminal host. Four content/failure cases leave no outgoing heartbeat, ticker or stale status; a fresh real file load succeeds after replacement. Combined follow-up verification with existing heartbeat/RPC suites: **73 passed** across five files. All file writes use harness-owned absolute temporary paths.
+
+Boundary: guards apply after clear/rebind or owner identity replacement. Standalone runtime.dispose() does not itself change heartbeat generation, and the pre-apply replacement interval is not newly guarded by this repair. No disposal-alone or pre-apply suppression guarantee is claimed.
