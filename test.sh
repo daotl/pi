@@ -153,11 +153,11 @@ env -i "${test_env[@]}" npm test 2>&1 | tee "$summary_file"
 run_status=${PIPESTATUS[0]}
 set -e
 
-# Aggregate per-package vitest tallies. Every package prints lines shaped like:
-#   Test Files  241 passed | 11 skipped (252)
-#       Tests  2025 passed | 143 skipped (2168)
-# We sum the passed/failed/skipped numbers across all packages for a single total.
+# Sum Vitest tallies and Node final counters, not individual outcomes or suites.
+# Node cancellations are failures; TODO outcomes count as skipped.
+set +e
 awk '
+{ gsub(sprintf("%c", 27) "\\[[0-9;]*m", "") }
 /^[[:space:]]+Tests[[:space:]]/ {
 	line = $0
 	# Normalize the count labels so we can total them regardless of order.
@@ -172,12 +172,18 @@ awk '
 	}
 	TP += passed; TF += failed; TS += skipped
 }
+/^(#|ℹ)[[:space:]]+(pass|fail|cancelled|skipped|todo)[[:space:]]+[0-9]+[[:space:]]*$/ {
+	if ($2 == "pass") TP += $3
+	else if ($2 == "fail" || $2 == "cancelled") TF += $3
+	else TS += $3
+}
 END {
 	printf "\n=== TOTAL: %d passed, %d failed, %d skipped ===\n", TP, TF, TS
 	if (TF > 0) exit 1
 }
 ' "$summary_file"
 summary_status=$?
+set -e
 
 # Prefer the npm test exit status; fall back to the aggregate when npm did not
 # report a failure explicitly.
