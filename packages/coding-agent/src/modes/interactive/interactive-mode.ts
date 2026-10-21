@@ -3752,7 +3752,7 @@ export class InteractiveMode {
 					this.showStatus("Cannot edit messages while compaction is in progress");
 					return;
 				}
-				await this.handleApplyMessageEdits(text);
+				await this.handleApplyMessageEdits(text, { clearEditor: true });
 				return;
 			}
 
@@ -6138,9 +6138,7 @@ export class InteractiveMode {
 	private runScheduledAction(entry: ScheduledMessage): void {
 		void (async () => {
 			try {
-				if (entry.isEdit) {
-					await this.handleApplyMessageEdits(entry.text);
-				}
+				if (entry.isEdit && !(await this.handleApplyMessageEdits(entry.text, { clearEditor: false }))) return;
 				await this.handleContinueCommand();
 			} catch (error: unknown) {
 				this.showError(error instanceof Error ? error.message : String(error));
@@ -7431,18 +7429,17 @@ export class InteractiveMode {
 	}
 
 	/**
-	 * Apply `<pi_edit>` / `<pi_swipe>` XML blocks from the editor and refresh
-	 * the chat. The editor text is cleared only when edits are actually
-	 * applied; on failure the text is left so the user can fix it.
+	 * Apply edit/swipe XML and refresh the chat. Only accepted editor-origin
+	 * edits clear the editor; scheduled edits preserve the user's unsent draft.
 	 */
-	private async handleApplyMessageEdits(text: string): Promise<void> {
+	private async handleApplyMessageEdits(text: string, options: { clearEditor: boolean }): Promise<boolean> {
 		try {
 			const result = this.session.applyMessageEdits(text);
 			if (result.edited === 0 && result.added === 0 && result.versioned === 0 && result.swiped === 0) {
 				this.showStatus("No edits to apply");
-				return;
+				return false;
 			}
-			this.editor.setText("");
+			if (options.clearEditor) this.editor.setText("");
 			this.chatContainer.clear();
 			this.renderInitialMessages();
 			const parts: string[] = [];
@@ -7451,8 +7448,10 @@ export class InteractiveMode {
 			if (result.versioned > 0) parts.push(`created ${result.versioned} swipe${result.versioned === 1 ? "" : "s"}`);
 			if (result.swiped > 0) parts.push(`swipe-edited ${result.swiped}`);
 			this.showStatus(parts.join(", "));
+			return true;
 		} catch (error: unknown) {
 			this.showError(error instanceof Error ? error.message : String(error));
+			return false;
 		}
 	}
 
