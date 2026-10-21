@@ -67,6 +67,8 @@ Use `--no-session` for an ephemeral run. An ephemeral session cannot be resumed 
 
 Use `--session` when you already know the session path or ID. Use `--fork` to create a new session from an existing session before interactive mode starts.
 
+If persisting deferred bash output or context-only extension messages fails, the active prompt or continuation reports the storage error and releases its run ownership. Successfully appended records are not replayed; records not yet written remain pending for the next accepted prompt. This recovery state is in memory and does not survive a process crash before it is written.
+
 ## Export or share a session
 
 Use `/export` to write the current session as HTML or JSONL. Use `/share` to upload it and get a viewer link. Pi uses a Radius artifact when Radius authentication is configured; otherwise, it uses a private GitHub gist.

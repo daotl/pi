@@ -3006,14 +3006,17 @@ export class AgentSession {
 				await this.agent.continue();
 			}
 		} finally {
-			if (this._agentRunAbortRequested) this._finishCancelledRetry();
-			this._failedResponse = undefined;
-			this._runSystemPromptOptions = undefined;
-			this._flushPendingBashMessages();
-			this._pendingPrefill = undefined;
-			this._prefillRestorePoint = undefined;
-			this._flushPendingCustomMessages();
-			await this._emitAgentSettled();
+			try {
+				if (this._agentRunAbortRequested) this._finishCancelledRetry();
+				this._failedResponse = undefined;
+				this._runSystemPromptOptions = undefined;
+				this._pendingPrefill = undefined;
+				this._prefillRestorePoint = undefined;
+				this._flushPendingBashMessages();
+				this._flushPendingCustomMessages();
+			} finally {
+				await this._emitAgentSettled();
+			}
 		}
 	}
 
@@ -3060,12 +3063,16 @@ export class AgentSession {
 				await this.agent.continue();
 			}
 		} finally {
-			this._systemPromptOverride = undefined;
-			this._flushPendingBashMessages();
-			this._pendingPrefill = undefined;
-			this._prefillRestorePoint = undefined;
-			this._prefillTrailingEntries = [];
-			await this._emitAgentSettled();
+			try {
+				this._systemPromptOverride = undefined;
+				this._pendingPrefill = undefined;
+				this._prefillRestorePoint = undefined;
+				this._prefillTrailingEntries = [];
+				this._flushPendingBashMessages();
+				this._flushPendingCustomMessages();
+			} finally {
+				await this._emitAgentSettled();
+			}
 		}
 	}
 
@@ -3723,10 +3730,9 @@ export class AgentSession {
 	private _flushPendingCustomMessages(): void {
 		if (this._pendingCustomMessages.length === 0) return;
 
-		const pending = this._pendingCustomMessages;
-		this._pendingCustomMessages = [];
-		for (const appMessage of pending) {
-			this._appendCustomMessage(appMessage);
+		while (this._pendingCustomMessages.length > 0) {
+			this._appendCustomMessage(this._pendingCustomMessages[0]);
+			this._pendingCustomMessages.shift();
 		}
 	}
 
@@ -5683,10 +5689,10 @@ export class AgentSession {
 	private _flushPendingBashMessages(): void {
 		if (this._pendingBashMessages.length === 0) return;
 
-		for (const bashMessage of this._pendingBashMessages) {
-			this.sessionManager.appendMessage(bashMessage);
+		while (this._pendingBashMessages.length > 0) {
+			this.sessionManager.appendMessage(this._pendingBashMessages[0]);
+			this._pendingBashMessages.shift();
 		}
-		this._pendingBashMessages = [];
 		this._refreshFinalizedContext();
 	}
 
