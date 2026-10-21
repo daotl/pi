@@ -82,6 +82,93 @@ describe("AgentSession queued /compact", () => {
 		}
 	});
 
+	it.each(["none", "success", "failure"] as const)(
+		"does not reuse a cancelled retry grant after %s queued compaction",
+		async (compactOutcome) => {
+			let summaryPending = false;
+			const harness = await createHarness({
+				settings: {
+					compaction: { enabled: false, keepRecentTokens: 1 },
+					retry: { enabled: true, maxRetries: 1, baseDelayMs: 10_000 },
+				},
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_before_compact", (event) => {
+							if (compactOutcome === "failure") {
+								summaryPending = true;
+								return;
+							}
+							return {
+								compaction: {
+									summary: SUMMARY_TEXT,
+									firstKeptEntryId: event.preparation.firstKeptEntryId,
+									tokensBefore: event.preparation.tokensBefore,
+								},
+							};
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("older answer")]);
+			await harness.session.prompt("older request ".repeat(20));
+			const ordinaryStream = harness.session.agent.streamFunction;
+			harness.session.agent.streamFunction = (model, context, options) => {
+				if (summaryPending) {
+					summaryPending = false;
+					const stream = createAssistantMessageEventStream();
+					stream.push({
+						type: "error",
+						reason: "error",
+						error: fauxAssistantMessage("", {
+							stopReason: "error",
+							errorMessage: "invalid summary request",
+						}),
+					});
+					return stream;
+				}
+				return ordinaryStream(model, context, options);
+			};
+			const { promise: retryStarted, resolve: markRetryStarted } = Promise.withResolvers<void>();
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "auto_retry_start") markRetryStarted();
+			});
+			let requests = 0;
+			harness.setResponses([
+				() => {
+					requests++;
+					if (compactOutcome !== "none") harness.session.queueCompact();
+					return fauxAssistantMessage("", { stopReason: "error", errorMessage: "Connection error." });
+				},
+				() => {
+					requests++;
+					return fauxAssistantMessage("unwanted resumed task");
+				},
+			]);
+			const prompt = harness.session.prompt("retry this request");
+			try {
+				await Promise.race([
+					retryStarted,
+					prompt.then(() => {
+						throw new Error("Retry did not start");
+					}),
+				]);
+				expect(harness.session.isRetrying).toBe(true);
+				harness.session.abortRetry();
+				await prompt;
+				expect(requests).toBe(1);
+				expect(getAssistantTexts(harness)).not.toContain("unwanted resumed task");
+				expect(harness.session.isRetrying).toBe(false);
+				expect(harness.session.isIdle).toBe(true);
+				expect(harness.session.hasQueuedCompact).toBe(false);
+			} finally {
+				unsubscribe();
+				await harness.session.abort();
+				await prompt.catch(() => {});
+			}
+		},
+	);
+
 	it.each([
 		{ policy: "control", enabled: true, maxRetries: 1, compact: false, cancel: false, expectedRequests: 2 },
 		{ policy: "disabled", enabled: false, maxRetries: 1, compact: true, cancel: false, expectedRequests: 1 },

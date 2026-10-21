@@ -3237,9 +3237,9 @@ export class AgentSession {
 			this._retryAttempt = 0;
 		}
 
-		// Without a retry grant, resume only the interrupted runnable boundary.
+		// A retry grant is consumed by _prepareRetry; a cancelled or revoked grant cannot resume via compaction.
 		if (queuedCompactResume !== undefined) {
-			return queuedCompactResume || this.agent.hasQueuedMessages();
+			return (!retryGranted && queuedCompactResume) || this.agent.hasQueuedMessages();
 		}
 
 		if (await this._checkCompaction(message, true, toolResults)) {
