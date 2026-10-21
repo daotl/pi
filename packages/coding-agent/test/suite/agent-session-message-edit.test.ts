@@ -455,6 +455,41 @@ describe("AgentSession.applyMessageEdits", () => {
 		},
 	);
 
+	it.each(["version", "swipe"] as const)("retains response attribution through %s edits", async (mode) => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const original: AssistantMessage = {
+			...fauxAssistantMessage("original"),
+			responseModel: "physical-response-model",
+			responseId: "response-123",
+			thinkingLevel: "high",
+			providerThinkingLevel: "native-high",
+			rawStopReason: "provider-stop",
+			endTurn: true,
+		};
+		harness.sessionManager.appendMessage({ role: "user", content: "question", timestamp: 1 });
+		harness.sessionManager.appendMessage(original);
+		harness.session.refreshContext();
+		const timestamp = harness.session.getSwipeGroup()!.versions[0].timestamp;
+		const xml =
+			mode === "version"
+				? '<pi_edit id="0" role="assistant">edited</pi_edit>'
+				: `<pi_swipe timestamp="${timestamp}" role="assistant">edited</pi_swipe>`;
+		harness.session.applyMessageEdits(xml);
+		const edited = harness.session.messages.findLast((entry) => entry.role === "assistant");
+		expect(edited).toMatchObject({
+			responseModel: original.responseModel,
+			responseId: original.responseId,
+			thinkingLevel: "high",
+			providerThinkingLevel: "native-high",
+			rawStopReason: "provider-stop",
+			endTurn: true,
+			content: [{ type: "text", text: "edited" }],
+			stopReason: "aborted",
+			timestamp: original.timestamp,
+		});
+	});
+
 	it("preserves harness messages when editing earlier messages", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

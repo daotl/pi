@@ -498,7 +498,8 @@ function formatAssistantMessageContent(message: AssistantMessage): string {
  */
 export function editBlockToMessage(
 	block: ParsedEditBlock | ParsedSwipeBlock,
-	baseAssistant?: Pick<AssistantMessage, "api" | "provider" | "model" | "usage" | "timestamp">,
+	baseAssistant?: Pick<AssistantMessage, "api" | "provider" | "model" | "usage" | "timestamp"> &
+		Partial<AssistantMessage>,
 ): Message {
 	const timestamp = baseAssistant?.timestamp ?? Date.now();
 
@@ -519,14 +520,10 @@ export function editBlockToMessage(
 
 	if (baseAssistant) {
 		return {
+			...baseAssistant,
 			role: "assistant",
 			content: assistantContent,
-			api: baseAssistant.api,
-			provider: baseAssistant.provider,
-			model: baseAssistant.model,
-			usage: baseAssistant.usage,
 			stopReason,
-			timestamp: baseAssistant.timestamp,
 		};
 	}
 
