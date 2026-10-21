@@ -1301,6 +1301,7 @@ export function convertMessages(
 				});
 			}
 		} else if (msg.role === "assistant") {
+			const isPrefillMessage = options?.prefill === true && i === transformedMessages.length - 1;
 			// Some providers don't accept null content, use empty string instead
 			const assistantMsg: ChatCompletionAssistantMessageParamWithReasoning = {
 				role: "assistant",
@@ -1309,7 +1310,7 @@ export function convertMessages(
 
 			const assistantTextParts = msg.content
 				.filter(isTextContentBlock)
-				.filter((block) => block.text.trim().length > 0)
+				.filter((block) => isPrefillMessage || block.text.trim().length > 0)
 				.map(
 					(block) =>
 						({
@@ -1334,7 +1335,9 @@ export function convertMessages(
 			const preservedReasoningDetails =
 				signedReasoningDetails ?? (legacyReasoningDetails?.length ? legacyReasoningDetails : undefined);
 
-			const nonEmptyThinkingBlocks = thinkingBlocks.filter((block) => block.thinking.trim().length > 0);
+			const nonEmptyThinkingBlocks = thinkingBlocks.filter((block) =>
+				isPrefillMessage ? block.thinking.length > 0 : block.thinking.trim().length > 0,
+			);
 			if (nonEmptyThinkingBlocks.length > 0) {
 				if (compat.requiresThinkingAsText) {
 					// Convert thinking blocks to plain text (no tags to avoid model mimicking them)
@@ -1360,7 +1363,9 @@ export function convertMessages(
 							signature = "reasoning_content";
 						}
 						if (signature && isOpenAICompletionsReasoningField(signature)) {
-							assistantMsg[signature] = nonEmptyThinkingBlocks.map((block) => block.thinking).join("\n");
+							assistantMsg[signature] = nonEmptyThinkingBlocks
+								.map((block) => block.thinking)
+								.join(isPrefillMessage ? "" : "\n");
 						}
 					}
 				}
@@ -1380,7 +1385,6 @@ export function convertMessages(
 				// tokens. This supports both complete and partial tool calls. When
 				// raw is unavailable (e.g. a provider that does not emit `__raw`),
 				// fall back to structured `tool_calls` (complete calls only).
-				const isPrefillMessage = options?.prefill === true && i === transformedMessages.length - 1;
 				const hasRawTokens = toolCalls.every((tc) => typeof tc.raw === "string" && tc.raw.length > 0);
 				if (isPrefillMessage && hasRawTokens) {
 					(assistantMsg as { tool_calls_raw?: string }).tool_calls_raw = toolCalls.map((tc) => tc.raw!).join("");

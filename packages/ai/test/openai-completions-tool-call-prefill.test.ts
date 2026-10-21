@@ -286,4 +286,55 @@ describe("openai-completions convertMessages tool-call prefill", () => {
 		const last = asAssistant(assistants[0]);
 		expect(last.tool_calls_raw).toBe("<raw-call-1>");
 	});
+
+	it.each(["text", "thinking", "mixed"] as const)(
+		"preserves exact %s whitespace only for trailing prefill",
+		(kind) => {
+			const assistant = buildAssistant([
+				...(kind !== "thinking" ? [{ type: "text" as const, text: "\n\n" }] : []),
+				...(kind !== "text"
+					? [{ type: "thinking" as const, thinking: " \t\n", thinkingSignature: "reasoning_content" }]
+					: []),
+				...(kind === "mixed"
+					? [
+							{ type: "text" as const, text: "prefix" },
+							{ type: "thinking" as const, thinking: "reasoning", thinkingSignature: "reasoning_content" },
+							{ type: "text" as const, text: "\t " },
+						]
+					: []),
+				{ type: "toolCall", id: "call-1", name: "read_file", arguments: {}, raw: "<raw>" },
+			]);
+			const stored = structuredClone(assistant);
+			const wire = convertMessages(buildModel(), buildContext(assistant), compat, { prefill: true });
+			const sent = asAssistant(wire.at(-1));
+			expect(sent.content).toBe(kind === "thinking" ? null : kind === "mixed" ? "\n\nprefix\t " : "\n\n");
+			expect(sent.reasoning_content).toBe(
+				kind === "text" ? undefined : kind === "mixed" ? " \t\nreasoning" : " \t\n",
+			);
+			expect(sent.tool_calls_raw).toBe("<raw>");
+			const ordinary = asAssistant(
+				convertMessages(buildModel(), buildContext(assistant), compat).find(
+					(message) => message.role === "assistant",
+				),
+			);
+			expect(ordinary.content).toBe(kind === "mixed" ? "prefix" : null);
+			expect(ordinary.reasoning_content).toBe(kind === "mixed" ? "reasoning" : undefined);
+			expect(assistant).toEqual(stored);
+		},
+	);
+
+	it.each(["text", "thinking"] as const)("retains a whitespace-only %s prefill without tools", (kind) => {
+		const assistant = buildAssistant(
+			kind === "text"
+				? [{ type: "text", text: " \t\n" }]
+				: [{ type: "thinking", thinking: " \t\n", thinkingSignature: "reasoning_content" }],
+		);
+		const wire = convertMessages(buildModel(), buildContext(assistant), compat, { prefill: true });
+		expect(wire.at(-1)?.role).toBe("assistant");
+		const sent = asAssistant(wire.at(-1));
+		expect(kind === "text" ? sent.content : sent.reasoning_content).toBe(" \t\n");
+		expect(convertMessages(buildModel(), buildContext(assistant), compat)).toEqual([
+			{ role: "user", content: "Read the file" },
+		]);
+	});
 });
