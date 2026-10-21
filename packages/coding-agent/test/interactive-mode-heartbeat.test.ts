@@ -744,6 +744,118 @@ describe("InteractiveMode heartbeat persistence", () => {
 			}
 		});
 	});
+	it("saves the accepted snapshot even when heartbeats change during mkdir", async () => {
+		await withTempDir(async (dir) => {
+			const context = makeContext({
+				sessionManager: { getCwd: () => dir },
+				heartbeats: [mkEntry(1, "5m", "accepted instruction")],
+			});
+			const entered = Promise.withResolvers<void>();
+			const gate = Promise.withResolvers<void>();
+			const mkdir = fs.promises.mkdir.bind(fs.promises);
+			const mock = vi.spyOn(fs.promises, "mkdir").mockImplementationOnce(async (...args) => {
+				entered.resolve();
+				await gate.promise;
+				return mkdir(...args);
+			});
+			const save = context.saveHeartbeatsFromArg("save");
+			try {
+				await entered.promise;
+				context.heartbeats[0].text = "changed instruction";
+				context.heartbeats = [];
+				gate.resolve();
+				await save;
+				expect(fs.readFileSync(path.join(dir, "HEARTBEAT.md"), "utf8")).toBe(
+					"/heartbeat 5m\naccepted instruction\n",
+				);
+				expect(context.showStatus).toHaveBeenCalledWith("Saved 1 heartbeat to HEARTBEAT.md");
+			} finally {
+				gate.resolve();
+				await save;
+				mock.mockRestore();
+			}
+		});
+	});
+
+	it("preserves the previous file after a partial write fails and removes only its own temporary file", async () => {
+		await withTempDir(async (dir) => {
+			const target = path.join(dir, "HEARTBEAT.md");
+			fs.writeFileSync(target, "/heartbeat 3h\nprevious instruction\n");
+			fs.writeFileSync(path.join(dir, "foreign.tmp"), "foreign data");
+			const context = makeContext({
+				sessionManager: { getCwd: () => dir },
+				heartbeats: [mkEntry(1, "5m", "replacement")],
+			});
+			const open = fs.promises.open.bind(fs.promises);
+			const newWrite = vi.spyOn(fs.promises, "open").mockImplementationOnce(async (...args) => {
+				const file = await open(...args);
+				vi.spyOn(file, "writeFile").mockImplementationOnce(async () => {
+					await file.write("partial");
+					throw new Error("partial write failure");
+				});
+				return file;
+			});
+			try {
+				await context.saveHeartbeatsFromArg("save");
+				expect(fs.readFileSync(target, "utf8")).toBe("/heartbeat 3h\nprevious instruction\n");
+				expect(fs.readdirSync(dir).sort()).toEqual(["HEARTBEAT.md", "foreign.tmp"]);
+				expect(fs.readFileSync(path.join(dir, "foreign.tmp"), "utf8")).toBe("foreign data");
+				expect(context.showStatus).toHaveBeenCalledWith(expect.stringContaining("partial write failure"));
+			} finally {
+				newWrite.mockRestore();
+			}
+		});
+	});
+
+	it.each(["close", "rename"] as const)("preserves the previous file when %s fails", async (stage) => {
+		await withTempDir(async (dir) => {
+			const target = path.join(dir, "HEARTBEAT.md");
+			fs.writeFileSync(target, "previous");
+			const open = fs.promises.open.bind(fs.promises);
+			const mockedOpen = vi.spyOn(fs.promises, "open").mockImplementationOnce(async (...args) => {
+				const file = await open(...args);
+				if (stage === "close") {
+					const close = file.close.bind(file);
+					vi.spyOn(file, "close").mockImplementationOnce(async () => {
+						await close();
+						throw new Error("close failure");
+					});
+				}
+				return file;
+			});
+			const rename =
+				stage === "rename"
+					? vi.spyOn(fs.promises, "rename").mockRejectedValueOnce(new Error("rename failure"))
+					: undefined;
+			try {
+				const context = makeContext({
+					sessionManager: { getCwd: () => dir },
+					heartbeats: [mkEntry(1, "5m", "replacement")],
+				});
+				await context.saveHeartbeatsFromArg("save");
+				expect(fs.readFileSync(target, "utf8")).toBe("previous");
+				expect(fs.readdirSync(dir)).toEqual(["HEARTBEAT.md"]);
+				expect(context.showStatus).toHaveBeenCalledWith(expect.stringContaining(`${stage} failure`));
+			} finally {
+				mockedOpen.mockRestore();
+				rename?.mockRestore();
+			}
+		});
+	});
+	it.skipIf(process.platform === "win32")("preserves existing permissions on successful save", async () => {
+		await withTempDir(async (dir) => {
+			const target = path.join(dir, "HEARTBEAT.md");
+			fs.writeFileSync(target, "previous");
+			fs.chmodSync(target, 0o640);
+			const context = makeContext({
+				sessionManager: { getCwd: () => dir },
+				heartbeats: [mkEntry(1, "5m", "replacement")],
+			});
+			await context.saveHeartbeatsFromArg("save");
+			expect(fs.readFileSync(target, "utf8")).toBe("/heartbeat 5m\nreplacement\n");
+			expect(fs.statSync(target).mode & 0o7777).toBe(0o640);
+		});
+	});
 	it("saves all active heartbeats to a file", async () => {
 		await withTempDir(async (dir) => {
 			const context = makeContext({

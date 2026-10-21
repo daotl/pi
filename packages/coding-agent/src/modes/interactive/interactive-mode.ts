@@ -6615,18 +6615,53 @@ export class InteractiveMode {
 		const pathArg = spec.slice("save".length).trim();
 		const cwd = this.sessionManager.getCwd();
 		const target = this.resolveHeartbeatPath(pathArg, cwd);
-		if (this.heartbeats.length === 0) {
+		const count = this.heartbeats.length;
+		if (count === 0) {
 			this.showStatus("No active heartbeats to save");
 			return;
 		}
+		// An accepted save keeps its snapshot even if the schedule changes during IO.
+		const content = serializeHeartbeats(this.heartbeats);
+		const session = this.session;
+		const generation = this.heartbeatLoadGeneration;
 		const display = getCwdRelativePath(target, cwd) ?? target;
 		try {
 			await fs.promises.mkdir(path.dirname(target), { recursive: true });
-			await fs.promises.writeFile(target, serializeHeartbeats(this.heartbeats), "utf8");
-			this.showStatus(
-				`Saved ${this.heartbeats.length} heartbeat${this.heartbeats.length === 1 ? "" : "s"} to ${display}`,
-			);
+			let mode: number | undefined;
+			try {
+				mode = (await fs.promises.stat(target)).mode & 0o7777;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			const temporaryFile = `${target}.${crypto.randomUUID()}.tmp`;
+			// A failed exclusive open owns no file and must not clean up another writer.
+			const file = await fs.promises.open(temporaryFile, "wx", mode);
+			let closed = false;
+			try {
+				if (mode !== undefined) await file.chmod(mode);
+				await file.writeFile(content, "utf8");
+				await file.close();
+				closed = true;
+				await fs.promises.rename(temporaryFile, target);
+			} catch (error) {
+				if (!closed) {
+					try {
+						await file.close();
+					} catch {
+						/* Preserve the original failure. */
+					}
+				}
+				try {
+					await fs.promises.unlink(temporaryFile);
+				} catch {
+					/* Owned cleanup is best-effort. */
+				}
+				throw error;
+			}
+			if (this.session !== session || this.heartbeatLoadGeneration !== generation) return;
+			this.showStatus(`Saved ${count} heartbeat${count === 1 ? "" : "s"} to ${display}`);
 		} catch (error) {
+			if (this.session !== session || this.heartbeatLoadGeneration !== generation) return;
 			const message = error instanceof Error ? error.message : "unknown error";
 			this.showStatus(`Could not save heartbeats to ${display}: ${message}`);
 		}
