@@ -85,6 +85,7 @@ describe("atomic session file rewrite", () => {
 		const selected = session.appendMessage(assistantMsg("selected answer"));
 		session.appendLabelChange(selected, "selected branch");
 		session.branch(selected);
+		const heldSelected = session.getEntry(selected);
 		const entries = structuredClone(session.getEntries());
 		const tree = structuredClone(session.getTree());
 		const projection = structuredClone(session.buildSessionProjection());
@@ -98,6 +99,7 @@ describe("atomic session file rewrite", () => {
 		expect(session.getTree()).toEqual(tree);
 		expect(session.buildSessionProjection()).toEqual(projection);
 		expect(session.getLeafId()).toBe(selected);
+		expect(session.getEntry(selected)).toBe(heldSelected);
 		expect(fs.readFileSync(file)).toEqual(bytes);
 		expect(SessionManager.open(file, dir, dir).getEntries()).toEqual(entries);
 		expect(session.removeLastMessages(2)).toBe(2);

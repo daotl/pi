@@ -19,3 +19,5 @@ This is not generic transaction support; removeEntries/subtree/session-switch ca
 Rewrite/publication, remove-last-messages, soft-delete and labels suites: **45 passed** across four files. Regression includes a sibling branch, both labels and a selected leaf before trailing metadata. It checks restored entries/tree/projection/exact leaf and committed bytes, real reopen membership, then successful retry and empty reopen. Existing controls cover harness skipping, metadata placement and descendant removal.
 
 `npm run check` passed (1712 files; regression formatting applied). Post-format owning suites passed **45 tests** again.
+
+Follow-up: a held selected entry is now asserted with strict identity after failed rename, not merely deep equality. Rewrite/publication plus tail removal suites: **24 passed**. Original 09377762c verification did not contain that explicit identity assertion.
