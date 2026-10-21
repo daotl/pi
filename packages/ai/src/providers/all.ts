@@ -93,7 +93,7 @@ export function getBuiltinClassifierModel<
 
 export function getBuiltinProviders(): BuiltinProvider[] {
 	// Local-only mode: skip all cloud API providers
-	if (process.env.PI_DISABLE_CLOUD_PROVIDERS === "1") {
+	if (typeof process !== "undefined" && process.env.PI_DISABLE_CLOUD_PROVIDERS === "1") {
 		return [];
 	}
 	return Object.keys(MODELS) as BuiltinProvider[];
@@ -140,7 +140,7 @@ export function getAllBuiltinModels<TProvider extends BuiltinProvider>(provider:
  * Set PI_DISABLE_CLOUD_PROVIDERS=1 to return empty array (local-only mode). */
 export function builtinProviders(): Provider[] {
 	// Local-only mode: skip all cloud API providers
-	if (process.env.PI_DISABLE_CLOUD_PROVIDERS === "1") {
+	if (typeof process !== "undefined" && process.env.PI_DISABLE_CLOUD_PROVIDERS === "1") {
 		return [];
 	}
 	return [

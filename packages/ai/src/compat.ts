@@ -214,7 +214,17 @@ export function resetApiProviders(): void {
 
 registerBuiltInApiProviders();
 
-const compatModels = builtinModels();
+let compatModels: ReturnType<typeof builtinModels> | undefined;
+let compatCloudProvidersDisabled: boolean | undefined;
+
+function getCompatModels(): ReturnType<typeof builtinModels> {
+	const disabled = typeof process !== "undefined" && process.env.PI_DISABLE_CLOUD_PROVIDERS === "1";
+	if (!compatModels || compatCloudProvidersDisabled !== disabled) {
+		compatModels = builtinModels();
+		compatCloudProvidersDisabled = disabled;
+	}
+	return compatModels;
+}
 const AMBIENT_AUTH_MARKER = "<authenticated>";
 
 function hasExplicitApiKey(apiKey: string | undefined): apiKey is string {
@@ -237,7 +247,7 @@ function hasResolvedCloudflareAuth(options: StreamOptions | undefined): boolean 
 
 function getBuiltinProviderForModel(model: Model<Api>) {
 	if (getApiProvider(model.api) !== builtinApiProviderInstances.get(model.api)) return undefined;
-	const provider = compatModels.getProvider(model.provider);
+	const provider = getCompatModels().getProvider(model.provider);
 	return provider?.getModels().some((candidate) => candidate.api === model.api) ? provider : undefined;
 }
 
@@ -258,7 +268,7 @@ export function stream<TApi extends Api>(
 	const builtinProvider = getBuiltinProviderForModel(model);
 	if (builtinProvider) {
 		if (model.provider.startsWith("cloudflare-") && !hasResolvedCloudflareAuth(options)) {
-			return compatModels.stream(model, transcript, options as ModelsApiStreamOptions<TApi> | undefined);
+			return getCompatModels().stream(model, transcript, options as ModelsApiStreamOptions<TApi> | undefined);
 		}
 		return builtinProvider.stream(model, transcript, withEnvApiKey(model, options) as ApiStreamOptions<TApi>);
 	}
@@ -284,7 +294,7 @@ export function streamSimple<TApi extends Api>(
 	const builtinProvider = getBuiltinProviderForModel(model);
 	if (builtinProvider) {
 		if (model.provider.startsWith("cloudflare-") && !hasResolvedCloudflareAuth(options)) {
-			return compatModels.streamSimple(model, transcript, options);
+			return getCompatModels().streamSimple(model, transcript, options);
 		}
 		return builtinProvider.streamSimple(model, transcript, withEnvApiKey(model, options));
 	}
