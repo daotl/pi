@@ -1496,8 +1496,10 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			systemPrompt,
 			...(customPrompt !== undefined && { customPrompt }),
-			...(skills !== undefined && { skills }),
-			...(sections !== undefined && { sections }),
+			...(skills !== undefined && {
+				skills: skills.map((skill) => ({ ...skill, sourceInfo: { ...skill.sourceInfo } })),
+			}),
+			...(sections !== undefined && { sections: { ...sections } }),
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1523,8 +1525,8 @@ export class SessionManager {
 				return {
 					systemPrompt: entry.systemPrompt,
 					customPrompt: entry.customPrompt,
-					skills: entry.skills,
-					sections: entry.sections,
+					skills: entry.skills?.map((skill) => ({ ...skill, sourceInfo: { ...skill.sourceInfo } })),
+					sections: entry.sections ? { ...entry.sections } : undefined,
 				};
 			}
 		}
