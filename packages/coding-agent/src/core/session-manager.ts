@@ -1343,20 +1343,18 @@ export class SessionManager {
 	 * closing pi without chatting leaves no file behind. Starting at the user message (not the
 	 * first assistant reply) keeps the prompt on disk if the first turn never completes (#10000).
 	 */
-	private _hasConversation(): boolean {
-		return this.fileEntries.some(
-			(e) => e.type === "message" && (e.message.role === "user" || e.message.role === "assistant"),
-		);
+	private _hasConversation(entries: FileEntry[] = this.fileEntries): boolean {
+		return entries.some((e) => e.type === "message" && (e.message.role === "user" || e.message.role === "assistant"));
 	}
 
-	_persist(entry: SessionEntry): void {
+	_persist(entry: SessionEntry, entries: FileEntry[] = this.fileEntries): void {
 		if (!this.persist || !this.sessionFile) return;
 
 		if (!this.flushed) {
-			if (!this._hasConversation()) return;
+			if (!this._hasConversation(entries)) return;
 			const fd = openSync(this.sessionFile, "wx");
 			try {
-				for (const e of this.fileEntries) {
+				for (const e of entries) {
 					writeFileSync(fd, `${JSON.stringify(e)}\n`);
 				}
 			} finally {
@@ -1369,10 +1367,10 @@ export class SessionManager {
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
+		this._persist(entry, !this.flushed && this.persist ? [...this.fileEntries, entry] : this.fileEntries);
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
-		this._persist(entry);
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.

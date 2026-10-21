@@ -9,6 +9,7 @@ vi.mock("fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof fs>();
 	return {
 		...actual,
+		appendFileSync: vi.fn(actual.appendFileSync),
 		openSync: vi.fn(actual.openSync),
 		writeFileSync: vi.fn(actual.writeFileSync),
 		fsyncSync: vi.fn(actual.fsyncSync),
@@ -23,6 +24,7 @@ describe("atomic session file rewrite", () => {
 	beforeEach(async () => {
 		const actual = await vi.importActual<typeof fs>("fs");
 		vi.mocked(fs.openSync).mockReset().mockImplementation(actual.openSync);
+		vi.mocked(fs.appendFileSync).mockReset().mockImplementation(actual.appendFileSync);
 		vi.mocked(fs.writeFileSync).mockReset().mockImplementation(actual.writeFileSync);
 		vi.mocked(fs.fsyncSync).mockReset().mockImplementation(actual.fsyncSync);
 		vi.mocked(fs.closeSync).mockReset().mockImplementation(actual.closeSync);
@@ -42,6 +44,38 @@ describe("atomic session file rewrite", () => {
 		const file = session.getSessionFile()!;
 		return { session, user, file };
 	}
+
+	it.each(["initial", "flushed"] as const)("does not publish a failed %s append", (mode) => {
+		const session = SessionManager.create(dir, dir);
+		session.appendSystemPrompt("original");
+		if (mode === "flushed") session.appendMessage(userMsg("existing"));
+		const file = session.getSessionFile()!;
+		const entries = structuredClone(session.getEntries());
+		const projection = structuredClone(session.buildSessionProjection());
+		const leaf = session.getLeafId();
+		const bytes = fs.existsSync(file) ? fs.readFileSync(file) : undefined;
+		const failure = new Error("append publication failure");
+		if (mode === "initial")
+			vi.mocked(fs.openSync).mockImplementationOnce(() => {
+				throw failure;
+			});
+		else
+			vi.mocked(fs.appendFileSync).mockImplementationOnce(() => {
+				throw failure;
+			});
+		const append = () =>
+			mode === "initial" ? session.appendMessage(userMsg("accepted")) : session.appendSystemPrompt("accepted");
+		expect(append).toThrow(failure);
+		expect(session.getEntries()).toEqual(entries);
+		expect(session.buildSessionProjection()).toEqual(projection);
+		expect(session.getLeafId()).toBe(leaf);
+		expect(session.getSavedSystemPrompt()?.systemPrompt).toBe("original");
+		if (bytes) expect(fs.readFileSync(file)).toEqual(bytes);
+		else expect(fs.existsSync(file)).toBe(false);
+		const id = append();
+		expect(session.getLeafId()).toBe(id);
+		expect(SessionManager.open(file, dir, dir).getEntries()).toEqual(session.getEntries());
+	});
 
 	it("restores live soft-deletion flags and held tool maps when persistence fails", () => {
 		const { session, user, file } = createSession();
