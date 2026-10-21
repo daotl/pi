@@ -111,6 +111,8 @@ A manual compact queued during a retryable response runs at the completed bounda
 
 If compaction is cancelled while finding its cut point, preparation stops before `session_before_compact` handlers run. A started automatic compaction emits its aborted completion event whether preparation produced a usable candidate or not.
 
+A compact accepted after the final turn boundary, including from `agent_before_settle`, runs before `agent_settled` for both prompts and standalone continuations. It does not start another model request solely because it was queued late.
+
 ### Split user-message spans
 
 A user-message span starts with a user message and includes all turns until the next user message. Normally, compaction cuts at user-message boundaries.

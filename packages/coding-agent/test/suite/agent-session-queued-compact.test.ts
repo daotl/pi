@@ -82,6 +82,56 @@ describe("AgentSession queued /compact", () => {
 		}
 	});
 
+	it.each((["prompt", "continue"] as const).flatMap((mode) => [false, true].map((cancel) => ({ mode, cancel }))))(
+		"runs a compact accepted at the final $mode settle boundary (cancel $cancel)",
+		async ({ mode, cancel }) => {
+			let queueAtSettle = true;
+			const harness = await createHarness({
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 }, retry: { enabled: false } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("agent_before_settle", () => {
+							if (queueAtSettle) {
+								queueAtSettle = false;
+								harness.session.queueCompact();
+							}
+						});
+						pi.on("session_before_compact", (event) =>
+							cancel
+								? { cancel: true }
+								: {
+										compaction: {
+											summary: SUMMARY_TEXT,
+											firstKeptEntryId: event.preparation.firstKeptEntryId,
+											tokensBefore: event.preparation.tokensBefore,
+										},
+									},
+						);
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.sessionManager.appendMessage({ role: "user", content: "older request", timestamp: 1 });
+			harness.sessionManager.appendMessage(fauxAssistantMessage("older answer", { timestamp: 2 }));
+			if (mode === "continue")
+				harness.sessionManager.appendMessage({ role: "user", content: "pending request", timestamp: 3 });
+			harness.session.refreshContext();
+			harness.setResponses([fauxAssistantMessage("final answer")]);
+			if (mode === "prompt") await harness.session.prompt("new request");
+			else await harness.session.continue();
+			const checkpoints = harness.sessionManager.getBranch().filter((entry) => entry.type === "compaction");
+			if (cancel) expect(checkpoints).toEqual([]);
+			else expect(checkpoints).toMatchObject([{ summary: SUMMARY_TEXT }]);
+			expect(harness.session.hasQueuedCompact).toBe(false);
+			expect(harness.faux.state.callCount).toBe(1);
+			expect(harness.eventsOfType("compaction_end")).toHaveLength(1);
+			expect(harness.eventsOfType("compaction_end")[0]?.aborted).toBe(cancel);
+			const order = harness.events.map((event) => event.type);
+			expect(order.indexOf("compaction_end")).toBeLessThan(order.indexOf("agent_settled"));
+			expect(harness.session.isIdle).toBe(true);
+		},
+	);
+
 	it.each(["none", "success", "failure"] as const)(
 		"does not reuse a cancelled retry grant after %s queued compaction",
 		async (compactOutcome) => {

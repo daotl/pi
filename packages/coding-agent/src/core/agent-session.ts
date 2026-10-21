@@ -3002,9 +3002,8 @@ export class AgentSession {
 					await this._continueOnce();
 					continue;
 				}
-				if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
-				if (this._agentRunAbortRequested) break;
-				await this._continueOnce();
+				if (!(await this._continuePastSettleBoundary())) break;
+				await this.agent.continue();
 			}
 		} finally {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
@@ -3051,8 +3050,14 @@ export class AgentSession {
 		this._isAgentRunActive = true;
 		try {
 			await this._continueOnce(prefill);
-			while (await this._handlePostAgentRun()) {
-				await this._continueOnce();
+			while (!this._agentRunAbortRequested) {
+				if (await this._handlePostAgentRun()) {
+					if (this._agentRunAbortRequested) break;
+					await this._continueOnce();
+					continue;
+				}
+				if (!(await this._continuePastSettleBoundary())) break;
+				await this.agent.continue();
 			}
 		} finally {
 			this._systemPromptOverride = undefined;
@@ -3249,6 +3254,16 @@ export class AgentSession {
 		// The low-level loop drains both queues before agent_end. Messages queued by
 		// agent_end handlers require a fresh run before pre-settlement handlers fire.
 		return !this._agentRunAbortRequested && this.agent.hasQueuedMessages();
+	}
+
+	/** Consume a compact accepted after the final turn boundary before publishing settlement. */
+	private async _continuePastSettleBoundary(): Promise<boolean> {
+		if (this._agentRunAbortRequested) return false;
+		if (await this._runBeforeSettleBoundary()) return !this._agentRunAbortRequested;
+		if (this._agentRunAbortRequested) return false;
+		const queuedCompactResume = await this._runQueuedCompact();
+		if (queuedCompactResume === undefined || this._agentRunAbortRequested) return false;
+		return queuedCompactResume || this.agent.hasQueuedMessages();
 	}
 
 	private async _runBeforeSettleBoundary(): Promise<boolean> {
