@@ -89,6 +89,10 @@ npm run check         # Lint, format, and type check
 ./pi-test.sh         # Run pi from sources (can be run from any directory)
 ```
 
+`./test.sh` isolates credentials and leaves paid-provider E2E tests disabled. Explicit `PI_DISABLE_CLOUD_PROVIDERS=0 ./test.sh` enables bundled catalog metadata; the final `=== TOTAL ===` includes Node and Vitest results.
+
+Direct AI-package E2E runs require `PI_E2E_TESTS=1`. With the catalog flag unset, this opt-in also enables bundled provider catalogs so model probes are registered. Explicit catalog settings remain authoritative. Offline collection regressions deny network access and collect credential-free probes without executing them.
+
 ## Building standalone binaries from release source
 
 GitHub releases include a versioned source archive covered by the release's `SHA256SUMS` file. Extract it and run the same build script used for the official standalone binaries:

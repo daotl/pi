@@ -6,10 +6,10 @@ import { defaultExclude, defineConfig } from 'vitest/config';
 // them explicitly.
 const e2eExclude = process.env.PI_E2E_TESTS === '1' ? [] : ['test/**/*-e2e.test.ts'];
 
-// Cloud-provider unit tests (gated on PI_DISABLE_CLOUD_PROVIDERS=1) are disabled
-// by default; override with PI_DISABLE_CLOUD_PROVIDERS=0 to run them explicitly.
+// Cloud metadata stays disabled by default. Explicit E2E opt-in needs catalogs
+// to register provider probes; an explicit catalog flag remains authoritative.
 if (process.env.PI_DISABLE_CLOUD_PROVIDERS === undefined) {
-	process.env.PI_DISABLE_CLOUD_PROVIDERS = '1';
+	process.env.PI_DISABLE_CLOUD_PROVIDERS = process.env.PI_E2E_TESTS === '1' ? '0' : '1';
 }
 
 export default defineConfig({
