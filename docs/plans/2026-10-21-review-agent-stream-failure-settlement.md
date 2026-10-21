@@ -8,7 +8,7 @@ Local chain: `deede133ff5bc52ba82ea52f01ea27acd712a430` → `26cb5df97f1fbe62661
 
 The public event-stream adapters handle only a successful runner promise. Asynchronous request/next-turn preparation or provider iterator failure rejects outside the stream and leaves its iterator/result unsettled.
 
-The original current-source regression hit 10 test timeouts and 10 unhandled rejections; this is a liveness observation, not semantic assertion RED. A temporary bounded probe then produced 10 explicit unsettled-stream assertion failures with two normal controls passing. Those temporary 100 ms probes are not permanent tests. Permanent tests await both iterator and result and assert exact lifecycle/result semantics; the existing test runner's outer timeout detects non-settlement.
+The original current-source regression hit 10 test timeouts and 10 unhandled rejections; this is a liveness observation, not semantic assertion RED. A temporary 100 ms probe then produced 10 unsettled-stream assertions with two normal controls passing; its wall-clock threshold alone is not a deterministic liveness proof under arbitrary load. Those probes are not permanent tests. Source inspection and independent review confirmed the missing rejection handler; permanent tests await both iterator and result and assert complete lifecycle/result semantics, with the runner's outer timeout as a non-settlement safety bound.
 
 ## Final repair and independent correction
 

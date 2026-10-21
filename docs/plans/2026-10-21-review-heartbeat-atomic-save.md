@@ -8,7 +8,7 @@ Final local source: `6f9400463750fda6160b9b3b73d20ade24e7b7bb`, using the alread
 
 Save serializes mutable heartbeats after awaiting mkdir and writes directly over HEARTBEAT.md. Concurrent cancellation/edit can change an accepted save's bytes/count; partial write failure destroys previously saved instructions. There is no separate close/rename boundary to preserve the old file.
 
-Current-source owning suite: **4 failed / 64 passed**. The accepted snapshot became a newline after concurrent removal, a partial write replaced the old file with `partial`, and close/rename fault scenarios overwrote the previous file. The baseline partial-write probe used its then-current fs.promises.writeFile seam; the permanent regression removes that obsolete seam and injects the actual new FileHandle write failure.
+Current-source owning suite: **4 failed / 64 passed**. The accepted snapshot became a newline after concurrent removal, and a partial write replaced the old file with `partial`: these directly reproduced the two consumer-visible defects. The close/rename cases also failed because the old implementation never reached those newly proposed boundaries; they are post-repair fault controls, not independently triggered old-path close/rename failures. The baseline partial-write probe used fs.promises.writeFile; the permanent regression removes that obsolete seam and injects the actual new FileHandle write failure.
 
 ## Final repair
 
@@ -20,5 +20,6 @@ Keep the existing heartbeat file format, load behavior and scheduling semantics.
 
 - Initial repaired heartbeat and real lifecycle suites: **72 passed**.
 - Permanent partial-write test uses the actual FileHandle seam; close/rename failures preserve previous bytes and remove owned temporary files. Existing normal save/load roundtrips remain.
-- Permission-preserving successful overwrite is checked on non-Windows platforms. Existing unrelated sibling file is preserved on partial failure.
+- Permission-preserving successful overwrite is post-fix characterization on non-Windows platforms, not a failing-before regression. Existing unrelated sibling file is preserved on partial failure. Cleanup is best-effort: a failed unlink may leave the invocation-owned temp behind; removal under cleanup failure was not proved.
 - Final owning suites after removing the obsolete baseline seam and adding the permission control: **73 passed**. `npm run check` passed with 1708 files and formatted two changed files; post-format suites again passed **73 tests**. Normal hooks provide final no-fixes verification.
+- Save-owner status suppression and exclusive-open collision protection follow the implementation but were not separately fault-exercised by this unit's final suite. The independently verified load-owner lifecycle tests do not by themselves prove save-owner lifecycle behavior.

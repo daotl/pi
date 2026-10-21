@@ -8,13 +8,15 @@ Final local source: `6f1cfc1f5511b7ce600843d31eb72661587f9a80`, retained by late
 
 _rewriteFile opens the selected session file with w before serializing entries. A write/close failure can truncate or partially publish the only committed conversation. There is no atomic replacement boundary for deletion/edit operations.
 
-Current-source real-file regression: **5 failed / 1 passed**. Write failure left only the first JSONL record; close failure changed committed bytes despite throwing. Fsync/rename/exclusive-temp scenarios were not implemented and their failure expectations failed. The positive complete-rewrite/mode case passed.
+Current-source real-file regression: **5 failed / 1 passed**. Write failure left only the first JSONL record; close failure changed committed bytes despite throwing. Fsync/rename/exclusive-temp cases failed because those boundaries did not exist in the old implementation; they establish post-repair fault/ownership controls, not additional independently triggered old-path failures. The positive complete-rewrite/mode case passed.
 
 ## Final repair
 
 Create a unique sibling temp with exclusive wx, preserve existing permissions, serialize the complete current file entries, fsync, close and rename over the destination. Publish no partial destination bytes. Cleanup closes/unlinks only invocation-owned resources; a failed exclusive open owns nothing and cannot delete another writer's temporary file.
 
 Adapt only the existing file rewrite boundary. No new session schema, selection/leaf marker, swipe/soft-delete algorithm or upstream architecture replacement. Directory fsync/power-loss durability is not claimed.
+
+Descriptor close and owned-temp unlink during error cleanup are best-effort. If either cleanup operation itself fails, an owned resource/temp may remain; the tests do not establish cleanup success under those secondary failures. Existing permission preservation is a positive control, not a failing-before defect.
 
 ## Important remaining dependent work
 
