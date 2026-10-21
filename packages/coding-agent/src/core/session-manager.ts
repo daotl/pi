@@ -17,12 +17,16 @@ import {
 	closeSync,
 	createReadStream,
 	existsSync,
+	fchmodSync,
+	fsyncSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
 	readSync,
+	renameSync,
 	type Stats,
 	statSync,
+	unlinkSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
@@ -1265,13 +1269,33 @@ export class SessionManager {
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const fd = openSync(this.sessionFile, "w");
+		const mode = existsSync(this.sessionFile) ? statSync(this.sessionFile).mode & 0o7777 : undefined;
+		const temporaryFile = `${this.sessionFile}.${randomUUID()}.tmp`;
+		// A failed exclusive open owns no file and must not clean up another writer.
+		let fd: number | undefined = openSync(temporaryFile, "wx", mode);
 		try {
+			if (mode !== undefined) fchmodSync(fd, mode);
 			for (const entry of this.fileEntries) {
 				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
 			}
-		} finally {
+			fsyncSync(fd);
 			closeSync(fd);
+			fd = undefined;
+			renameSync(temporaryFile, this.sessionFile);
+		} catch (error) {
+			if (fd !== undefined) {
+				try {
+					closeSync(fd);
+				} catch {
+					/* Preserve the original persistence failure. */
+				}
+			}
+			try {
+				unlinkSync(temporaryFile);
+			} catch {
+				/* Owned cleanup is best-effort. */
+			}
+			throw error;
 		}
 	}
 
