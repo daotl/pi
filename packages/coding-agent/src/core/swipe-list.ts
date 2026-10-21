@@ -6,6 +6,7 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+// biome-ignore lint/correctness/noUnusedImports: Preserve the upstream import list during selective repair migration.
 import type { Message, ToolCall } from "@earendil-works/pi-ai";
 
 export type SwipeSection = "reasoning" | "content" | "tool";
