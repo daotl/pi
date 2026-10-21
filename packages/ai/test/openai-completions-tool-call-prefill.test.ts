@@ -123,6 +123,30 @@ describe("openai-completions convertMessages tool-call prefill", () => {
 		expect(messages.some((m) => m.role === "tool")).toBe(false);
 	});
 
+	it.each(["text", "tool"] as const)("serializes trailing system patches before a %s prefill", (kind) => {
+		const assistant = buildAssistant(
+			kind === "text"
+				? [{ type: "text", text: "partial" }]
+				: [{ type: "toolCall", id: "call-1", name: "read_file", arguments: {}, raw: "<raw>" }],
+		);
+		const wire = convertMessages(
+			buildModel(),
+			normalizeContext({
+				messages: [
+					{ role: "user", content: "question", timestamp: 1 },
+					assistant,
+					{ role: "system", content: "later instruction", timestamp: 3 },
+				],
+			}),
+			compat,
+			{ prefill: true },
+		);
+		expect(wire.at(-1)?.role).toBe("assistant");
+		expect(wire.slice(0, -1)).toContainEqual(expect.objectContaining({ content: "later instruction" }));
+		if (kind === "tool") expect(asAssistant(wire.at(-1)).tool_calls_raw).toBe("<raw>");
+		else expect(asAssistant(wire.at(-1)).content).toBe("partial");
+	});
+
 	it("sends reasoning_content alongside tool_calls_raw for the prefill", () => {
 		const assistant = buildAssistant([
 			{ type: "thinking", thinking: "I should read the file.", thinkingSignature: "reasoning_content" },

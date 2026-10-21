@@ -112,4 +112,18 @@ describe("transformMessages skipTrailingToolResultSynthesis", () => {
 		const lastAssistant = result[result.length - 1] as AssistantMessage;
 		expect(lastAssistant.content[0]).toMatchObject({ type: "toolCall", id: "call-trail" });
 	});
+
+	it.each(["text", "tool"] as const)("keeps trailing system patches before the %s prefill", (kind) => {
+		const assistant = makeAssistant(
+			kind === "text"
+				? [{ type: "text", text: "partial" }]
+				: [{ type: "toolCall", id: "call", name: "read", arguments: {} }],
+		);
+		const patch: Message = { role: "system", content: "later instruction", timestamp: 3 };
+		const messages: Message[] = [{ role: "user", content: "question", timestamp: 1 }, assistant, patch];
+		const stored = structuredClone(messages);
+		const result = transformMessages(messages, makeModel(), undefined, { skipTrailingToolResultSynthesis: true });
+		expect(result).toEqual([messages[0], patch, assistant]);
+		expect(messages).toEqual(stored);
+	});
 });

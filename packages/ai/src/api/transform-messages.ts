@@ -171,6 +171,10 @@ export function transformMessages<TApi extends Api>(
 		heldSystemMessages.length = 0;
 	};
 
+	let lastConversationalIndex = transformed.length - 1;
+	while (lastConversationalIndex >= 0 && transformed[lastConversationalIndex].role === "system")
+		lastConversationalIndex--;
+
 	for (let i = 0; i < transformed.length; i++) {
 		const msg = transformed[i];
 
@@ -192,7 +196,12 @@ export function transformMessages<TApi extends Api>(
 			existingToolResultIds.add(msg.toolCallId);
 			result.push(msg);
 		} else if (msg.role === "system") {
-			if (pendingToolCalls.length > 0) {
+			if (
+				pendingToolCalls.length > 0 ||
+				(options?.skipTrailingToolResultSynthesis &&
+					i > lastConversationalIndex &&
+					transformed[lastConversationalIndex]?.role === "assistant")
+			) {
 				heldSystemMessages.push(msg);
 			} else {
 				result.push(msg);
@@ -214,6 +223,9 @@ export function transformMessages<TApi extends Api>(
 	// be the trailing message).
 	if (!options?.skipTrailingToolResultSynthesis) {
 		closePendingToolCalls();
+	} else if (heldSystemMessages.length > 0) {
+		const prefillIndex = result.findLastIndex((message) => message.role === "assistant");
+		result.splice(prefillIndex >= 0 ? prefillIndex : result.length, 0, ...heldSystemMessages);
 	}
 
 	return result;
