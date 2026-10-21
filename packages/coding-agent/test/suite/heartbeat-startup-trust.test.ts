@@ -15,6 +15,7 @@ describe("startup heartbeat project trust", () => {
 		const offline = process.env.PI_OFFLINE;
 		process.env.PI_OFFLINE = "1";
 		const harness = await createHarness({ settings: { compaction: { enabled: false }, retry: { enabled: false } } });
+		const cwd = vi.spyOn(harness.sessionManager, "getCwd").mockReturnValue(harness.tempDir);
 		harness.settingsManager.setProjectTrusted(trusted);
 		fs.writeFileSync(
 			join(harness.sessionManager.getCwd(), "HEARTBEAT.md"),
@@ -72,6 +73,7 @@ describe("startup heartbeat project trust", () => {
 			internal.clearHeartbeats();
 			mode.stop();
 			harness.cleanup();
+			cwd.mockRestore();
 			if (offline === undefined) delete process.env.PI_OFFLINE;
 			else process.env.PI_OFFLINE = offline;
 		}

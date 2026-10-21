@@ -19,3 +19,5 @@ Trust manager/selector, actual InteractiveMode startup run path, heartbeat lifec
 Additional real resolveProjectTrusted test verifies heartbeat-only projects ask, session-only allow/deny works, and stored denial bypasses further prompts: five suites **84 passed**. A temporary exact disclosure assertion in that real selector flow passed (**1 passed / 3 skipped**) and was removed afterward; no permanent test pins wording. Disclosure is exercised smoke evidence, distinct from retained decision-policy regression.
 
 Final `npm run check` passed (1713 files; trust test formatting applied). Final post-format five owning suites: **84 passed**.
+
+Fixture correction: the shared harness manager defaults to process cwd while AgentSession uses tempDir. The startup test now binds manager getCwd to its owned tempDir; real read/parse/schedule remain exercised. Removed the exact generated package-root HEARTBEAT.md. Four relevant suites passed **80 tests** after isolation correction; no broader harness change.
