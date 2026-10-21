@@ -266,6 +266,75 @@ describe("AgentSession actionable boundaries", () => {
 		expect(snapshots.every((snapshot) => snapshot.includes("committed context"))).toBe(true);
 	});
 
+	it.each([
+		["setter", 0],
+		["setter", 1000],
+		["overrides", 0],
+		["overrides", 1000],
+	] as const)("uses a changed %s summary budget of %s in live and boundary contexts", async (update, budget) => {
+		let committed = false;
+		let previewSummaries: string[] = [];
+		const requests: string[] = [];
+		const harness = await createHarness({
+			settings: { compaction: { enabled: false, summaryBlockMaxTokens: budget === 0 ? 1000 : 0 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("turn_end", () => {
+						if (committed) return;
+						committed = true;
+						return { entries: [{ type: "compaction", summary: "committed handoff", firstKeptEntryId: null }] };
+					});
+					pi.on("turn_end", (event) => {
+						previewSummaries = event.context.contextEntries.flatMap((entry) =>
+							entry.sourceEntry.type === "compaction" ? [entry.sourceEntry.summary] : [],
+						);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.sessionManager.appendCompaction("oldest handoff", null, 0);
+		harness.sessionManager.appendCompaction("newer handoff", null, 0);
+		harness.session.refreshContext();
+		const beforeChange = harness.session.messages;
+		if (update === "setter") harness.settingsManager.setSummaryBlockMaxTokens(budget);
+		else harness.settingsManager.applyOverrides({ compaction: { summaryBlockMaxTokens: budget } });
+		const expected = budget === 0 ? ["newer handoff"] : ["oldest handoff", "newer handoff"];
+		const summaries = () =>
+			harness.session.messages.flatMap((message) => (message.role === "compactionSummary" ? [message.summary] : []));
+		expect(summaries()).toEqual(expected);
+		const heldMessages = harness.session.messages;
+		expect(heldMessages).not.toBe(beforeChange);
+		expect(harness.session.messages).toBe(heldMessages);
+		harness.setResponses(
+			["first", "second"].map((answer) => (context) => {
+				requests.push(context.messages.map(getMessageText).join("\n"));
+				return fauxAssistantMessage(answer);
+			}),
+		);
+		await harness.session.prompt("first after change");
+		const committedSummaries = budget === 0 ? ["committed handoff"] : [...expected, "committed handoff"];
+		expect(previewSummaries).toEqual(committedSummaries);
+		expect(summaries()).toEqual(committedSummaries);
+		await harness.session.prompt("next after commit");
+		for (const summary of ["oldest handoff", "newer handoff", "committed handoff"]) {
+			expect(requests[0].includes(summary)).toBe(expected.includes(summary));
+			expect(requests[1].includes(summary)).toBe(committedSummaries.includes(summary));
+		}
+		let summaryRequest: string | undefined;
+		harness.setResponses([
+			(context) => {
+				summaryRequest = context.messages.map(getMessageText).join("\n");
+				return fauxAssistantMessage("manual handoff");
+			},
+		]);
+		await harness.session.compact({ keepRecentMessages: 1 });
+		for (const summary of ["oldest handoff", "newer handoff", "committed handoff"]) {
+			expect(summaryRequest?.includes(summary)).toBe(committedSummaries.includes(summary));
+		}
+		expect(summaries()).toEqual(budget === 0 ? ["manual handoff"] : [...committedSummaries, "manual handoff"]);
+	});
+
 	it("continues from an agent_before_settle custom message before final settlement", async () => {
 		let requested = false;
 		const requests: string[] = [];

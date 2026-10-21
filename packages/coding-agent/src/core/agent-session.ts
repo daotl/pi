@@ -495,6 +495,8 @@ export class AgentSession {
 	 * real usage. Undefined when the server has no /tokenize (footer shows "?").
 	 */
 	private _postCompactionContextTokens: number | undefined = undefined;
+	private _summaryBlockMaxTokens: number;
+	private _contextSettingsChanged = false;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -604,7 +606,8 @@ export class AgentSession {
 		this.settingsManager = config.settingsManager;
 		// Keep the session's summaries-block limit in sync with the configured value so
 		// the LLM context and TUI views agree on which summaries are visible.
-		this.sessionManager.setSummaryBlockMaxTokens(this.settingsManager.getSummaryBlockMaxTokens());
+		this._summaryBlockMaxTokens = this.settingsManager.getSummaryBlockMaxTokens();
+		this.sessionManager.setSummaryBlockMaxTokens(this._summaryBlockMaxTokens);
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
@@ -889,6 +892,16 @@ export class AgentSession {
 		);
 	}
 
+	private _syncSummaryBlockMaxTokens(): boolean {
+		const tokens = this.settingsManager.getSummaryBlockMaxTokens();
+		if (tokens === this._summaryBlockMaxTokens) return this._contextSettingsChanged;
+		this._summaryBlockMaxTokens = tokens;
+		this.sessionManager.setSummaryBlockMaxTokens(tokens);
+		this._postCompactionContextTokens = undefined;
+		this._contextSettingsChanged = true;
+		return true;
+	}
+
 	/**
 	 * Projected messages, with the prefill appended back when a prefill continuation
 	 * is in flight. The prefill is removed from the transcript on capture, so a
@@ -896,6 +909,7 @@ export class AgentSession {
 	 * as the trailing assistant message (sent with return_prefill).
 	 */
 	private _projectedMessages(originalMessages?: AgentMessage[], projection?: SessionProjection): AgentMessage[] {
+		this._syncSummaryBlockMaxTokens();
 		const messages = projection?.messages ?? this.sessionManager.buildSessionProjection().messages;
 		// Preserve a trailing assistant prefill that only lives in the request
 		// context (pushed by runContinuation) and not in the projection (it was
@@ -937,6 +951,7 @@ export class AgentSession {
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
+		this._syncSummaryBlockMaxTokens();
 		const projection = this.sessionManager.buildSessionProjection();
 		// A virtual selection is checked in prepareRequest, against the model the request is routed to.
 		const model = this.model;
@@ -953,6 +968,7 @@ export class AgentSession {
 			const failed = this._failedResponse;
 			this._failedResponse = undefined;
 			const prepare = async () => {
+				this._syncSummaryBlockMaxTokens();
 				const projection = this.sessionManager.buildSessionProjection();
 				const canonicalContext = {
 					...request.context,
@@ -1125,11 +1141,13 @@ export class AgentSession {
 	// =========================================================================
 
 	private _refreshFinalizedContext(): void {
+		this._syncSummaryBlockMaxTokens();
 		const projection = this.sessionManager.buildSessionProjection();
 		for (const entry of projection.entries) {
 			for (const message of entry.messages) this._entryIdsByMessage.set(message, entry.sourceEntry.id);
 		}
 		this.agent.state.messages = projection.messages;
+		this._contextSettingsChanged = false;
 	}
 
 	private _applyBoundaryDrafts(manager: SessionManager, drafts: SessionBoundaryDraft[]): SessionEntry[] {
@@ -1174,9 +1192,11 @@ export class AgentSession {
 	}
 
 	private _createBoundaryPreviewManager(drafts: SessionBoundaryDraft[]): SessionManager {
+		if (this._syncSummaryBlockMaxTokens()) this._refreshFinalizedContext();
 		const header = this.sessionManager.getHeader();
 		if (!header) throw new Error("Session header is missing");
 		const manager = SessionManager.inMemory(this._cwd, undefined, [header, ...this.sessionManager.getBranch()]);
+		manager.setSummaryBlockMaxTokens(this._summaryBlockMaxTokens);
 		this._applyBoundaryDrafts(manager, drafts);
 		return manager;
 	}
@@ -1211,6 +1231,7 @@ export class AgentSession {
 	}
 
 	private _commitBoundaryDrafts(drafts: SessionBoundaryDraft[]): void {
+		this._syncSummaryBlockMaxTokens();
 		const appended = this._applyBoundaryDrafts(this.sessionManager, drafts);
 		this._refreshFinalizedContext();
 		for (const entry of appended) this._emit({ type: "entry_appended", entry });
@@ -1624,6 +1645,7 @@ export class AgentSession {
 
 	/** Full agent state */
 	get state(): AgentState {
+		if (this._syncSummaryBlockMaxTokens()) this._refreshFinalizedContext();
 		return this.agent.state;
 	}
 
@@ -1801,6 +1823,7 @@ export class AgentSession {
 
 	/** All messages including custom types like BashExecutionMessage */
 	get messages(): AgentMessage[] {
+		if (this._syncSummaryBlockMaxTokens()) this._refreshFinalizedContext();
 		return this.agent.state.messages;
 	}
 
@@ -4180,6 +4203,7 @@ export class AgentSession {
 	 * estimate only when the endpoint is unsupported or retries are exhausted.
 	 */
 	private _createCompactionTokenCounter(auth: RequestAuth, signal: AbortSignal): TokenCounter {
+		this._syncSummaryBlockMaxTokens();
 		return async (messages) => {
 			const llmMessages = await this.agent.convertToLlm(messages);
 			let text = "";
@@ -5246,7 +5270,7 @@ export class AgentSession {
 			this._usesDefaultTools ? (this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES) : [],
 		);
 		await this.settingsManager.reload();
-		this.sessionManager.setSummaryBlockMaxTokens(this.settingsManager.getSummaryBlockMaxTokens());
+		if (this._syncSummaryBlockMaxTokens()) this._refreshFinalizedContext();
 		this.syncQueueModesFromSettings();
 		resetApiProviders();
 		await this._resourceLoader.reload();
@@ -5970,6 +5994,7 @@ export class AgentSession {
 	}
 
 	getContextUsage(): ContextUsage | undefined {
+		this._syncSummaryBlockMaxTokens();
 		const model = this._limitsModel();
 		if (!model) return undefined;
 
