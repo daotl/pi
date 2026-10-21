@@ -162,6 +162,7 @@ export function buildSystemPromptSections(input: BuildSystemPromptOptions): Syst
 	promptSections.cwd = cwd.replace(/\\/g, "/");
 	for (const [name, content] of Object.entries(customSections)) {
 		if (content) promptSections[name] = content;
+		else delete promptSections[name];
 	}
 
 	const sections: SystemPromptSections = { preamble: promptSections.preamble };

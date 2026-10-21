@@ -90,6 +90,44 @@ describe("system prompt updates", () => {
 			plan_mode: null,
 		});
 	});
+	test("empty section overrides remove generated guidance from the same request", async () => {
+		let turn = 0;
+		const extension: ExtensionFactory = (pi) => {
+			pi.on("before_agent_start", (event) => {
+				if (++turn === 2) {
+					event.systemPromptOptions.sections.docs = "";
+					event.systemPromptOptions.sections.rules = "";
+				}
+			});
+		};
+		const harness = await createHarness({ extensionFactories: [extension] });
+		try {
+			const requests: TranscriptContext[] = [];
+			harness.setResponses(
+				["first", "second"].map((text) => (context: TranscriptContext) => {
+					requests.push(context);
+					return fauxAssistantMessage(text);
+				}),
+			);
+			await harness.session.prompt("first");
+			await harness.session.prompt("second");
+			const first = getCurrentSystemMessage(requests[0]!.messages);
+			const second = getCurrentSystemMessage(requests[1]!.messages);
+			expect(first?.sections?.docs).toBeDefined();
+			expect(first?.sections?.rules).toBeDefined();
+			expect(second?.sections).not.toHaveProperty("docs");
+			expect(second?.sections).not.toHaveProperty("rules");
+			expect(second?.sections?.preamble).toBe(first?.sections?.preamble);
+			expect(second?.sections?.tools).toBe(first?.sections?.tools);
+			expect(second?.sections?.cwd).toBe(first?.sections?.cwd);
+			expect(second?.toolsAdded).toEqual(first?.toolsAdded);
+			expect(harness.session.messages.filter((message) => message.role === "system").at(-1)).toMatchObject({
+				sections: { docs: null, rules: null },
+			});
+		} finally {
+			harness.cleanup();
+		}
+	});
 
 	test("keeps the preamble untagged and replaces it like any section", () => {
 		const previous = buildSystemPromptSections({ customPrompt: "You are A.", cwd: "/tmp" });
