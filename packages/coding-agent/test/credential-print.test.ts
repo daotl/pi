@@ -5,15 +5,11 @@ import { AuthCommandError, isAuthCommandHelp, parseAuthCommand } from "../src/cl
 import { resolveCredentialForPrint } from "../src/cli/credential-print.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
-
-// These tests exercise credential-print CLI logic through built-in cloud
-// providers (openai, kimi-coding, openai-codex). Cloud providers are hidden by
-// default (PI_DISABLE_CLOUD_PROVIDERS=1), so skip these unless cloud is enabled.
-const cloudDisabled = process.env.PI_DISABLE_CLOUD_PROVIDERS === "1";
-
 import { main } from "../src/main.ts";
+import { enableBuiltinProviders } from "./test-network-env.ts";
 
 async function createRuntime(credentials: AuthStorage): Promise<ModelRuntime> {
+	enableBuiltinProviders();
 	return ModelRuntime.create({
 		credentials,
 		modelsPath: null,
@@ -23,14 +19,14 @@ async function createRuntime(credentials: AuthStorage): Promise<ModelRuntime> {
 }
 
 describe("credential print commands", () => {
-	test.skipIf(cloudDisabled)("prints a resolved API key", async () => {
+	test("prints a resolved API key", async () => {
 		const runtime = await createRuntime(AuthStorage.inMemory({ openai: { type: "api_key", key: "test-api-key" } }));
 		const args = parseArgs(["--provider", "openai"]);
 
 		await expect(resolveCredentialForPrint(args, runtime, "api_key")).resolves.toBe("test-api-key");
 	});
 
-	test.skipIf(cloudDisabled)("prints bearer tokens resolved from an Authorization header", async () => {
+	test("prints bearer tokens resolved from an Authorization header", async () => {
 		const runtime = await createRuntime(
 			AuthStorage.inMemory({
 				"kimi-coding": {
@@ -46,7 +42,7 @@ describe("credential print commands", () => {
 		await expect(resolveCredentialForPrint(args, runtime, "bearer_token")).resolves.toBe("header-test-token");
 	});
 
-	test.skipIf(cloudDisabled)("refreshes an expired OAuth token before printing it", async () => {
+	test("refreshes an expired OAuth token before printing it", async () => {
 		const storage = AuthStorage.inMemory({
 			"openai-codex": {
 				type: "oauth",
@@ -72,7 +68,7 @@ describe("credential print commands", () => {
 		expect(await storage.read("openai-codex")).toMatchObject({ access: "fresh-test-token" });
 	});
 
-	test.skipIf(cloudDisabled)("reports unknown auth options like package commands", async () => {
+	test("reports unknown auth options like package commands", async () => {
 		const originalExitCode = process.exitCode;
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 		try {
@@ -90,50 +86,47 @@ describe("credential print commands", () => {
 		}
 	});
 
-	test.skipIf(cloudDisabled)(
-		"parses credential commands and rejects invalid arguments or credential types",
-		async () => {
-			const runtime = await createRuntime(
-				AuthStorage.inMemory({
-					"openai-codex": {
-						type: "oauth",
-						access: "test-token-not-to-be-printed",
-						refresh: "test-refresh-token",
-						expires: Date.now() + 60 * 60 * 1000,
-					},
-				}),
-			);
+	test("parses credential commands and rejects invalid arguments or credential types", async () => {
+		const runtime = await createRuntime(
+			AuthStorage.inMemory({
+				"openai-codex": {
+					type: "oauth",
+					access: "test-token-not-to-be-printed",
+					refresh: "test-refresh-token",
+					expires: Date.now() + 60 * 60 * 1000,
+				},
+			}),
+		);
 
-			expect(parseAuthCommand(["auth", "print-api-key", "--provider", "openai"])).toEqual({
-				kind: "api_key",
-				args: ["--provider", "openai"],
-				json: false,
-				credentials: false,
-				noRefresh: false,
-			});
-			expect(parseAuthCommand(["auth", "print-bearer-token"])).toMatchObject({ kind: "bearer_token" });
-			expect(parseAuthCommand(["auth", "print-bearer-token", "--min-expiry", "30m"])).toEqual({
-				kind: "bearer_token",
-				args: [],
-				json: false,
-				credentials: false,
-				noRefresh: false,
-				minExpiryMs: 30 * 60_000,
-			});
-			expect(() => parseAuthCommand(["auth", "print-api-key", "--min-expiry", "30m"])).toThrow(
-				"only supported by print-bearer-token",
-			);
-			expect(isAuthCommandHelp(["auth", "--help"])).toBe(true);
-			expect(isAuthCommandHelp(["auth", "print-api-key", "--help"])).toBe(true);
-			expect(isAuthCommandHelp(["auth", "print-bearer-token", "-h"])).toBe(true);
-			expect(isAuthCommandHelp(["auth", "check", "--help"])).toBe(true);
-			expect(() => parseAuthCommand(["auth", "unknown"])).toThrow(AuthCommandError);
-			await expect(resolveCredentialForPrint(parseArgs([]), runtime, "api_key")).rejects.toThrow(
-				"requires --provider <provider> or --model <model>",
-			);
-			await expect(
-				resolveCredentialForPrint(parseArgs(["--provider", "openai-codex"]), runtime, "api_key"),
-			).rejects.toThrow("configured with OAuth");
-		},
-	);
+		expect(parseAuthCommand(["auth", "print-api-key", "--provider", "openai"])).toEqual({
+			kind: "api_key",
+			args: ["--provider", "openai"],
+			json: false,
+			credentials: false,
+			noRefresh: false,
+		});
+		expect(parseAuthCommand(["auth", "print-bearer-token"])).toMatchObject({ kind: "bearer_token" });
+		expect(parseAuthCommand(["auth", "print-bearer-token", "--min-expiry", "30m"])).toEqual({
+			kind: "bearer_token",
+			args: [],
+			json: false,
+			credentials: false,
+			noRefresh: false,
+			minExpiryMs: 30 * 60_000,
+		});
+		expect(() => parseAuthCommand(["auth", "print-api-key", "--min-expiry", "30m"])).toThrow(
+			"only supported by print-bearer-token",
+		);
+		expect(isAuthCommandHelp(["auth", "--help"])).toBe(true);
+		expect(isAuthCommandHelp(["auth", "print-api-key", "--help"])).toBe(true);
+		expect(isAuthCommandHelp(["auth", "print-bearer-token", "-h"])).toBe(true);
+		expect(isAuthCommandHelp(["auth", "check", "--help"])).toBe(true);
+		expect(() => parseAuthCommand(["auth", "unknown"])).toThrow(AuthCommandError);
+		await expect(resolveCredentialForPrint(parseArgs([]), runtime, "api_key")).rejects.toThrow(
+			"requires --provider <provider> or --model <model>",
+		);
+		await expect(
+			resolveCredentialForPrint(parseArgs(["--provider", "openai-codex"]), runtime, "api_key"),
+		).rejects.toThrow("configured with OAuth");
+	});
 });
