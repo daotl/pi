@@ -147,6 +147,19 @@ describe("openai-completions convertMessages tool-call prefill", () => {
 		else expect(asAssistant(wire.at(-1)).content).toBe("partial");
 	});
 
+	it("drops aborted partial replay unless explicitly continuing its prefill", () => {
+		const failed = {
+			...buildAssistant([{ type: "text" as const, text: "failed partial" }]),
+			stopReason: "aborted" as const,
+		};
+		const context = buildContext(failed);
+		expect(convertMessages(buildModel(), context, compat).filter((message) => message.role === "assistant")).toEqual(
+			[],
+		);
+		const continued = convertMessages(buildModel(), context, compat, { prefill: true });
+		expect(asAssistant(continued.at(-1))).toMatchObject({ role: "assistant", content: "failed partial" });
+	});
+
 	it("sends reasoning_content alongside tool_calls_raw for the prefill", () => {
 		const assistant = buildAssistant([
 			{ type: "thinking", thinking: "I should read the file.", thinkingSignature: "reasoning_content" },

@@ -126,4 +126,34 @@ describe("transformMessages skipTrailingToolResultSynthesis", () => {
 		expect(result).toEqual([messages[0], patch, assistant]);
 		expect(messages).toEqual(stored);
 	});
+
+	it.each(["error", "aborted"] as const)("omits %s replay and only its own tool results", (stopReason) => {
+		const call: ToolCall = { type: "toolCall", id: "reused", name: "read", arguments: {} };
+		const failed = { ...makeAssistant([call]), stopReason };
+		const retry = makeAssistant([call]);
+		const toolResult = (text: string): ToolResultMessage => ({
+			role: "toolResult",
+			toolCallId: "reused",
+			toolName: "read",
+			content: [{ type: "text", text }],
+			isError: false,
+			timestamp: 3,
+		});
+		const rejected = toolResult("failed result");
+		const accepted = toolResult("later valid result");
+		const patch: Message = { role: "system", content: "keep patch", timestamp: 4 };
+		const input: Message[] = [failed, patch, rejected, retry, accepted];
+		const stored = structuredClone(input);
+		expect(transformMessages(input, makeModel())).toEqual([patch, retry, accepted]);
+		expect(input).toEqual(stored);
+	});
+
+	it.each(["error", "aborted"] as const)("keeps a trailing %s assistant only for explicit prefill", (stopReason) => {
+		const assistant = { ...makeAssistant([{ type: "text", text: "partial" }]), stopReason };
+		const patch: Message = { role: "system", content: "later instruction", timestamp: 3 };
+		expect(transformMessages([assistant, patch], makeModel())).toEqual([patch]);
+		expect(
+			transformMessages([assistant, patch], makeModel(), undefined, { skipTrailingToolResultSynthesis: true }),
+		).toEqual([patch, assistant]);
+	});
 });

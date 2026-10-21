@@ -174,6 +174,7 @@ export function transformMessages<TApi extends Api>(
 	let lastConversationalIndex = transformed.length - 1;
 	while (lastConversationalIndex >= 0 && transformed[lastConversationalIndex].role === "system")
 		lastConversationalIndex--;
+	const skippedToolCallIds = new Set<string>();
 
 	for (let i = 0; i < transformed.length; i++) {
 		const msg = transformed[i];
@@ -183,6 +184,15 @@ export function transformMessages<TApi extends Api>(
 			closePendingToolCalls();
 
 			const assistantMsg = msg as AssistantMessage;
+			// A new assistant owns its results, even when a provider reuses IDs.
+			skippedToolCallIds.clear();
+			if (
+				(assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") &&
+				(!options?.skipTrailingToolResultSynthesis || i < lastConversationalIndex)
+			) {
+				for (const block of assistantMsg.content) if (block.type === "toolCall") skippedToolCallIds.add(block.id);
+				continue;
+			}
 
 			// Track tool calls from this assistant message
 			const toolCalls = assistantMsg.content.filter((b) => b.type === "toolCall") as ToolCall[];
@@ -193,6 +203,7 @@ export function transformMessages<TApi extends Api>(
 
 			result.push(msg);
 		} else if (msg.role === "toolResult") {
+			if (skippedToolCallIds.has(msg.toolCallId)) continue;
 			existingToolResultIds.add(msg.toolCallId);
 			result.push(msg);
 		} else if (msg.role === "system") {
