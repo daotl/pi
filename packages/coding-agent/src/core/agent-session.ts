@@ -3053,7 +3053,8 @@ export class AgentSession {
 		this._isAgentRunActive = true;
 		try {
 			await this._continueOnce(prefill);
-			while (!this._agentRunAbortRequested) {
+			// Post-run handling restores an interrupted prefill even when the run was aborted.
+			while (true) {
 				if (await this._handlePostAgentRun()) {
 					if (this._agentRunAbortRequested) break;
 					await this._continueOnce();

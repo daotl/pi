@@ -159,6 +159,55 @@ describe("AgentSession continue with prefill", () => {
 		expect(getMessageText(harness.session.messages[2]!)).toBe("Partial response");
 	});
 
+	it.each(["Part", "Partial response continued"])(
+		"preserves prefill state after public abort with %j echoed",
+		async (echo) => {
+			const harness = await createHarness({
+				settings: { retry: { enabled: false }, compaction: { enabled: false } },
+			});
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("Partial response", { stopReason: "aborted" })]);
+			await harness.session.prompt("Hello");
+			setOpenaiCompletions(harness);
+			const started = Promise.withResolvers<void>();
+			const stream = new EventStream<AssistantMessageEvent, AssistantMessage>(
+				(event) => event.type === "done" || event.type === "error",
+				(event) => {
+					if (event.type === "done") return event.message;
+					if (event.type === "error") return event.error;
+					throw new Error("Unexpected event type");
+				},
+			);
+			let signal: AbortSignal | undefined;
+			const aborted = () =>
+				stream.push({
+					type: "error",
+					reason: "aborted",
+					error: fauxAssistantMessage(echo, { stopReason: "aborted" }),
+				});
+			harness.session.agent.streamFunction = (_model, _context, options) => {
+				signal = options?.signal;
+				signal?.addEventListener("abort", aborted, { once: true });
+				started.resolve();
+				return stream;
+			};
+			const running = harness.session.continue();
+			try {
+				await started.promise;
+				await harness.session.abort();
+				await running;
+				const expected = echo === "Part" ? "Partial response" : echo;
+				expect(harness.session.getLastAssistantText()).toBe(expected);
+				expect(getMessageText(harness.sessionManager.buildSessionContext().messages.at(-1))).toBe(expected);
+				expect(harness.session.isIdle).toBe(true);
+			} finally {
+				signal?.removeEventListener("abort", aborted);
+				stream.end(fauxAssistantMessage("Part", { stopReason: "aborted" }));
+				await running.catch(() => {});
+			}
+		},
+	);
+
 	it("keeps the streamed replacement when the abort arrives after the echo completed", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
