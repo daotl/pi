@@ -6019,15 +6019,13 @@ export class InteractiveMode {
 			return;
 		}
 
+		this.scheduledMessages.push(entry);
 		if (when.type === "time") {
 			entry.timer = setTimeout(
-				() => {
-					this.fireScheduledMessage(entry.id);
-				},
-				Math.max(when.at - Date.now(), 0),
+				() => this.fireScheduledMessage(entry.id),
+				Math.min(Math.max(when.at - Date.now(), 0), 2_147_483_647),
 			);
 		}
-		this.scheduledMessages.push(entry);
 
 		const action = isEdit ? "edit and continue" : isContinue ? "continue" : "message";
 		const description =
@@ -6106,7 +6104,15 @@ export class InteractiveMode {
 	private fireScheduledMessage(id: number): void {
 		const index = this.scheduledMessages.findIndex((entry) => entry.id === id);
 		if (index === -1) return;
-		const [entry] = this.scheduledMessages.splice(index, 1);
+		const entry = this.scheduledMessages[index];
+		if (entry.when.type === "time" && entry.when.at > Date.now()) {
+			entry.timer = setTimeout(
+				() => this.fireScheduledMessage(id),
+				Math.min(entry.when.at - Date.now(), 2_147_483_647),
+			);
+			return;
+		}
+		this.scheduledMessages.splice(index, 1);
 		if (entry.timer) clearTimeout(entry.timer);
 		this.deliverScheduledEntry(entry);
 	}

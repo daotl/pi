@@ -326,3 +326,50 @@ describe("InteractiveMode scheduled message listing and id cancellation", () => 
 		expect(showStatus).toHaveBeenCalledWith("No scheduled message with id 99");
 	});
 });
+
+describe("InteractiveMode long scheduled deadlines", () => {
+	test("re-arms bounded chunks without early delivery and preserves cancellation", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date(2026, 9, 12, 12));
+		const delivered: string[] = [];
+		const context: ScheduleCommandContext & { fireScheduledMessage(id: number): void } = {
+			scheduledMessages: [],
+			nextScheduleId: 1,
+			session: { isIdle: true },
+			showStatus: vi.fn(),
+			cancelScheduledMessages: vi.fn(),
+			listScheduledMessages: vi.fn(),
+			scheduledMessageDescription: schedulePrototype.scheduledMessageDescription,
+			quotedListText: schedulePrototype.quotedListText,
+			deliverScheduledEntry: (entry) => {
+				delivered.push(entry.text);
+			},
+			fireScheduledMessage(id) {
+				Reflect.get(InteractiveMode.prototype, "fireScheduledMessage").call(this, id);
+			},
+			cancelScheduledMessageById(id) {
+				schedulePrototype.cancelScheduledMessageById.call(this, id);
+			},
+		};
+		try {
+			await schedulePrototype.handleScheduleCommand.call(context, "60d\nlong");
+			await schedulePrototype.handleScheduleCommand.call(context, "30d\ncancelled");
+			await schedulePrototype.handleScheduleCommand.call(context, "0.001s\nshort");
+			await vi.advanceTimersByTimeAsync(1);
+			expect(delivered).toEqual(["short"]);
+			await vi.advanceTimersByTimeAsync(2_147_483_647);
+			expect(delivered).toEqual(["short"]);
+			context.cancelScheduledMessageById(2);
+			await vi.advanceTimersByTimeAsync(2_147_483_647);
+			expect(delivered).toEqual(["short"]);
+			await vi.advanceTimersByTimeAsync(60 * 86_400_000 - 2 * 2_147_483_647 - 2);
+			expect(delivered).toEqual(["short"]);
+			await vi.advanceTimersByTimeAsync(1);
+			expect(delivered).toEqual(["short", "long"]);
+			expect(context.scheduledMessages).toEqual([]);
+		} finally {
+			vi.clearAllTimers();
+			vi.useRealTimers();
+		}
+	});
+});
