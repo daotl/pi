@@ -414,6 +414,47 @@ describe("AgentSession.applyMessageEdits", () => {
 		expect((assistantMessage as { stopReason?: string }).stopReason).toBe("aborted");
 	});
 
+	it.each(["[]", "null", "42", '"value"', "true"])(
+		"rejects tool argument %s before mixed edits publish",
+		async (args) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("original answer")]);
+			await harness.session.prompt("original user");
+			const history = structuredClone(harness.sessionManager.getEntries());
+			const messages = structuredClone(harness.session.messages);
+			for (const prefix of ["", "<pi_content>answer</pi_content>"]) {
+				const xml = `<pi_edit id="1" role="user">must not publish</pi_edit><pi_edit id="0" role="assistant">${prefix}<pi_tool_call id="call" name="read">${args}</pi_tool_call></pi_edit>`;
+				expect(() => harness.session.applyMessageEdits(xml)).toThrow(Error);
+				expect(harness.sessionManager.getEntries()).toEqual(history);
+				expect(harness.session.messages).toEqual(messages);
+			}
+			const timestamp = harness.session.getSwipeGroup()!.versions[0].timestamp;
+			expect(() =>
+				harness.session.applyMessageEdits(
+					`<pi_swipe timestamp="${timestamp}" role="assistant"><pi_tool_call id="call" name="read">${args}</pi_tool_call></pi_swipe>`,
+				),
+			).toThrow(Error);
+			expect(harness.sessionManager.getEntries()).toEqual(history);
+			expect(harness.session.messages).toEqual(messages);
+		},
+	);
+
+	it.each(["", "<pi_content>answer</pi_content>"])(
+		"retains malformed JSON fallback through parser %s",
+		async (prefix) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("original")]);
+			await harness.session.prompt("question");
+			harness.session.applyMessageEdits(
+				`<pi_edit id="0" role="assistant">${prefix}<pi_tool_call id="call" name="read">{bad</pi_tool_call></pi_edit>`,
+			);
+			const message = harness.session.messages.findLast((entry) => entry.role === "assistant");
+			expect(message?.content).toContainEqual({ type: "toolCall", id: "call", name: "read", arguments: {} });
+		},
+	);
+
 	it("preserves harness messages when editing earlier messages", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

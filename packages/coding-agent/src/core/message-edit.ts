@@ -300,6 +300,19 @@ function parseInnerContent(
 	return blocks;
 }
 
+function parseToolCallArguments(text: string): JsonObject | undefined {
+	let args: unknown;
+	try {
+		args = JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+	if (args === null || typeof args !== "object" || Array.isArray(args)) {
+		throw new Error("Tool-call arguments must be a JSON object.");
+	}
+	return args as JsonObject;
+}
+
 /**
  * Parse special blocks (`<pi_tool_call>` / `<pi_image>`) from a region that
  * contains only special blocks (the content after a `<pi_content>` wrapper).
@@ -325,12 +338,7 @@ function parseSpecialBlocksForward(
 		const inner = region.slice(open.end, close.start);
 
 		if (role === "assistant") {
-			let args: JsonObject = {};
-			try {
-				args = JSON.parse(inner) as JsonObject;
-			} catch {
-				args = {};
-			}
+			const args = parseToolCallArguments(inner) ?? {};
 			const toolCall: ToolCall = {
 				type: "toolCall",
 				id: open.attributes.id ?? "",
@@ -366,12 +374,7 @@ function parseTrailingSpecialBlocks(
 
 		if (role === "assistant") {
 			const argsText = content.slice(open.end, closeStart);
-			let args: JsonObject = {};
-			try {
-				args = JSON.parse(argsText) as JsonObject;
-			} catch {
-				args = {};
-			}
+			const args = parseToolCallArguments(argsText) ?? {};
 			const toolCall: ToolCall = {
 				type: "toolCall",
 				id: open.attributes.id ?? "",
