@@ -367,6 +367,22 @@ describe("AgentSession compaction characterization", () => {
 		expect(requestOptions?.transport).toBe(harness.session.agent.transport);
 	});
 
+	it("sends the prepared system checkpoint once to the summary stream", async () => {
+		const harness = await createHarness({ settings: { compaction: { keepRecentTokens: 1 } } });
+		harnesses.push(harness);
+		harness.sessionManager.appendMessage({ role: "system", content: "CHECKPOINT-ONCE", timestamp: 1 });
+		seedCompactableSession(harness);
+		let captured: TranscriptContext | undefined;
+		useSummaryStreamFn(harness, "checkpoint summary", (context) => {
+			captured = context;
+		});
+		await harness.session.compact();
+		expect(captured?.messages.filter((message) => message.role === "system")).toEqual([
+			expect.objectContaining({ role: "system", content: "CHECKPOINT-ONCE" }),
+		]);
+		expect(getCurrentTools(captured?.messages ?? [])).toEqual(harness.session.agent.state.tools);
+	});
+
 	it("persists usage from pi-generated manual compaction", async () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);

@@ -20,7 +20,6 @@ import type {
 	Model,
 	SimpleStreamOptions,
 	SystemMessage,
-	Tool,
 	TranscriptContext,
 	Usage,
 } from "@earendil-works/pi-ai/compat";
@@ -591,50 +590,33 @@ export function getSummarizationFailure(response: AssistantMessage, label: strin
 	return undefined;
 }
 
-/**
- * Build a summarization context that mirrors a normal agent turn as closely as
- * possible. When an agent is supplied, use its transformContext/convertToLlm
- * pipeline and the saved chat-log system message (with tools, skills, and any
- * toolsAdded/toolsRemoved deltas) so the summarization prefix is byte-identical
- * to a normal chat turn and the provider KV cache is reused.
- */
+/** Build one complete summary transcript before applying the normal context pipeline. */
 async function buildAgentSummarizationContext(
 	agent: Agent | undefined,
 	messages: AgentMessage[],
 	signal: AbortSignal | undefined,
 	fallbackSystemPrompt: string | undefined,
-): Promise<{ systemMessage: SystemMessage; messages: Message[]; tools: Tool[] | undefined }> {
-	if (!agent) {
-		return {
-			systemMessage: {
-				role: "system",
-				content: fallbackSystemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT,
-				timestamp: 0,
-			},
-			messages: convertToLlm(messages),
-			tools: undefined,
-		};
+): Promise<Message[]> {
+	const source = structuredClone(messages);
+	if (source[0]?.role !== "system") {
+		const saved = agent ? getCurrentSystemMessage(agent.state.messages) : undefined;
+		source.unshift(
+			saved
+				? structuredClone(saved)
+				: {
+						role: "system",
+						content: fallbackSystemPrompt ?? agent?.state.systemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT,
+						timestamp: 0,
+					},
+		);
 	}
-
-	const transformed = agent.transformContext ? await agent.transformContext(messages, signal) : messages;
-	const llmMessages = await agent.convertToLlm(transformed);
-	// Use the saved chat-log system message (content and sections) rather than
-	// reloading the prompt, so the prefix matches the chat exactly. The resolved
-	// tool declarations live in agent.state.tools; carry them as toolsAdded so
-	// the provider request declares the same tools the chat does.
-	const contextMessages = agent.transformContext
-		? await agent.transformContext(agent.state.messages, signal)
-		: agent.state.messages;
-	const savedSystemMessage = getCurrentSystemMessage(contextMessages);
-	const systemMessage: SystemMessage = savedSystemMessage
-		? { ...savedSystemMessage, toolsAdded: agent.state.tools.slice() }
-		: {
-				role: "system",
-				content: agent.state.systemPrompt,
-				toolsAdded: agent.state.tools.slice(),
-				timestamp: 0,
-			};
-	return { systemMessage, messages: llmMessages, tools: agent.state.tools.slice() };
+	const transformed = agent?.transformContext ? await agent.transformContext(source, signal) : source;
+	const converted = agent ? await agent.convertToLlm(transformed) : convertToLlm(transformed);
+	const baseline = converted[0];
+	if (agent && baseline?.role === "system" && baseline.toolsAdded === undefined) {
+		return [{ ...baseline, toolsAdded: agent.state.tools.slice() }, ...converted.slice(1)];
+	}
+	return converted;
 }
 
 function createSummarizationOptions(
@@ -778,12 +760,7 @@ export async function generateSummaryWithUsage(
 	// convertToLlm exactly as a normal request would. The summarization
 	// instruction is appended as a final user message so nothing is inserted
 	// before the existing prefix.
-	const { systemMessage: effectiveSystemMessage, messages: llmMessages } = await buildAgentSummarizationContext(
-		agent,
-		currentMessages,
-		signal,
-		systemPrompt,
-	);
+	const llmMessages = await buildAgentSummarizationContext(agent, currentMessages, signal, systemPrompt);
 
 	const instructionText = `Do not continue the conversation above. Output only the structured summary requested below.\n\n${basePrompt}`;
 
@@ -810,7 +787,7 @@ export async function generateSummaryWithUsage(
 
 	const response = await completeSummarization(
 		model,
-		{ messages: [effectiveSystemMessage, ...summarizationMessages] } as TranscriptContext,
+		{ messages: summarizationMessages } as TranscriptContext,
 		completionOptions,
 		streamFn,
 		retry,

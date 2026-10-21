@@ -157,6 +157,19 @@ describe("generateSummary reasoning options", () => {
 		expect(prompt).toContain("The messages above are a conversation to summarize.");
 	});
 
+	it("uses a canonical system message instead of adding standalone fallback authority", async () => {
+		await generateSummary(
+			[{ role: "system", content: "CANONICAL", timestamp: 1 }, ...messages],
+			createModel(false),
+			2000,
+			"test-key",
+		);
+		const context = completeSimpleMock.mock.calls[0][1] as TranscriptContext;
+		expect(context.messages.filter((message) => message.role === "system")).toEqual([
+			{ role: "system", content: "CANONICAL", timestamp: 1 },
+		]);
+	});
+
 	it("rejects tool calls from conversation summaries", async () => {
 		completeSimpleMock.mockResolvedValueOnce(mockToolCallResponse);
 
