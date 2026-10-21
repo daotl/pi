@@ -164,6 +164,7 @@ const heartbeatPrototype = InteractiveMode.prototype as unknown as {
 	hasArmedIntervalBeat: (this: HeartbeatCommandContext) => boolean;
 	saveHeartbeatsFromArg: (this: HeartbeatCommandContext, spec: string) => Promise<void>;
 	loadHeartbeatsFromArg: (this: HeartbeatCommandContext, spec: string) => Promise<void>;
+	clearHeartbeats: (this: HeartbeatCommandContext) => void;
 	loadHeartbeatsFromPath: (
 		this: HeartbeatCommandContext,
 		resolvedPath: string,
@@ -189,6 +190,7 @@ type HeartbeatCommandContext = {
 	showStatus: (message: string) => void;
 	heartbeats: HeartbeatEntry[];
 	nextHeartbeatId: number;
+	heartbeatLoadGeneration: number;
 	session: { isStreaming: boolean; isCompacting: boolean };
 	sessionManager: { getCwd: () => string };
 	armHeartbeat: (entry: HeartbeatEntry) => void;
@@ -203,6 +205,7 @@ type HeartbeatCommandContext = {
 	fireHeartbeat: (id: number) => void;
 	saveHeartbeatsFromArg: (spec: string) => Promise<void>;
 	loadHeartbeatsFromArg: (spec: string) => Promise<void>;
+	clearHeartbeats: () => void;
 	loadHeartbeatsFromPath: (resolvedPath: string, displayPath: string, silentIfMissing: boolean) => Promise<void>;
 	resolveHeartbeatPath: (arg: string, cwd: string) => string;
 	parseHeartbeatIds: (spec: string, keyword: string) => number[] | null;
@@ -225,6 +228,7 @@ function makeContext(overrides: Partial<HeartbeatCommandContext> = {}): Heartbea
 		showStatus: vi.fn(),
 		heartbeats: [],
 		nextHeartbeatId: 1,
+		heartbeatLoadGeneration: 0,
 		lastActivityAt: Date.now(),
 		heartbeatTicker: undefined,
 		session: { isStreaming: false, isCompacting: false },
@@ -243,6 +247,7 @@ function makeContext(overrides: Partial<HeartbeatCommandContext> = {}): Heartbea
 		fireHeartbeat: vi.fn(),
 		saveHeartbeatsFromArg: vi.fn(),
 		loadHeartbeatsFromArg: vi.fn(),
+		clearHeartbeats: () => heartbeatPrototype.clearHeartbeats.call(context),
 		loadHeartbeatsFromPath: vi.fn(),
 		resolveHeartbeatPath: vi.fn(),
 		parseHeartbeatIds: vi.fn(),
@@ -713,6 +718,32 @@ describe("InteractiveMode heartbeat firing", () => {
 });
 
 describe("InteractiveMode heartbeat persistence", () => {
+	it.each(["clear", "replacement"] as const)("discards a stale pending load after %s", async (transition) => {
+		await withTempDir(async (dir) => {
+			const context = makeContext({ sessionManager: { getCwd: () => dir } });
+			const entered = Promise.withResolvers<void>();
+			const gate = Promise.withResolvers<string>();
+			const read = vi.spyOn(fs.promises, "readFile").mockImplementationOnce(async () => {
+				entered.resolve();
+				return gate.promise;
+			});
+			const load = context.loadHeartbeatsFromArg("load");
+			try {
+				await entered.promise;
+				if (transition === "clear") context.clearHeartbeats();
+				else context.session = { isStreaming: false, isCompacting: false };
+				gate.resolve("/heartbeat 5m\noutgoing instruction\n");
+				await load;
+				expect(context.heartbeats).toEqual([]);
+				expect(context.armHeartbeat).not.toHaveBeenCalled();
+				expect(context.showStatus).not.toHaveBeenCalled();
+			} finally {
+				gate.resolve("");
+				await load;
+				read.mockRestore();
+			}
+		});
+	});
 	it("saves all active heartbeats to a file", async () => {
 		await withTempDir(async (dir) => {
 			const context = makeContext({

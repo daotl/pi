@@ -879,6 +879,7 @@ export class InteractiveMode {
 	// Recurring heartbeats (/heartbeat)
 	private heartbeats: HeartbeatEntry[] = [];
 	private nextHeartbeatId = 1;
+	private heartbeatLoadGeneration = 0;
 
 	// Interval heartbeats are idle-based: they fire only after a fixed interval
 	// of continuous idle (no typing, no agent work/processing/waiting).
@@ -6651,14 +6652,18 @@ export class InteractiveMode {
 		displayPath: string,
 		silentIfMissing: boolean,
 	): Promise<void> {
+		const session = this.session;
+		const generation = this.heartbeatLoadGeneration;
 		let content: string;
 		try {
 			content = await fs.promises.readFile(resolvedPath, "utf8");
 		} catch {
+			if (this.session !== session || this.heartbeatLoadGeneration !== generation) return;
 			if (silentIfMissing) return;
 			this.showStatus(`Could not read heartbeats from ${displayPath}`);
 			return;
 		}
+		if (this.session !== session || this.heartbeatLoadGeneration !== generation) return;
 		const parsed = parseHeartbeatFile(content);
 		if (parsed.length === 0) {
 			if (silentIfMissing) return;
@@ -6678,6 +6683,7 @@ export class InteractiveMode {
 
 	/** Clear all heartbeats (session shutdown/restart). */
 	private clearHeartbeats(): void {
+		this.heartbeatLoadGeneration++;
 		for (const entry of this.heartbeats) {
 			if (entry.timer) clearTimeout(entry.timer);
 		}
