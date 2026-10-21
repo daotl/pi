@@ -8,6 +8,7 @@ import {
 	parseMessageEditsAndSwipes,
 } from "../src/core/message-edit.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
+import { createHarness } from "./suite/harness.ts";
 
 const lossyMessages: AgentMessage[] = [
 	{ role: "user", content: '<pi_image mimeType="image/png">not an image</pi_image>', timestamp: 1 },
@@ -93,5 +94,22 @@ describe("edit/copy selection safety", () => {
 	it("retains unsafe matches as plain content in a multiple-message copy", () => {
 		const message = lossyMessages[0];
 		expect(copyMatch.call({}, { message, editableIndex: 0 }, true)).toBe(formatMessageContent(message));
+	});
+
+	it("rejects unknown top-level markup instead of applying a partial document", async () => {
+		const harness = await createHarness();
+		try {
+			harness.sessionManager.appendMessage({ role: "user", content: "first original", timestamp: 1 });
+			harness.sessionManager.appendMessage({ role: "user", content: "second original", timestamp: 2 });
+			harness.session.refreshContext();
+			const history = structuredClone(harness.sessionManager.getEntries());
+			const input =
+				'<pi_edit id="1" role="user">first</pi_edit><pi_editor>discarded</pi_editor><pi_edit id="0" role="user">second</pi_edit>';
+			expect(parseMessageEditsAndSwipes(input)).toEqual({ edits: [], swipes: [] });
+			expect(harness.session.applyMessageEdits(input)).toEqual({ edited: 0, added: 0, versioned: 0, swiped: 0 });
+			expect(harness.sessionManager.getEntries()).toEqual(history);
+		} finally {
+			harness.cleanup();
+		}
 	});
 });

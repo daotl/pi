@@ -255,7 +255,13 @@ export function parseMessageEditsAndSwipes(text: string): { edits: ParsedEditBlo
 
 	while (pos < trimmed.length) {
 		const openTag = findNextTag(trimmed, pos);
-		if (!openTag || openTag.isClosing || (openTag.name !== "pi_edit" && openTag.name !== "pi_swipe")) return empty;
+		if (
+			!openTag ||
+			openTag.start !== pos ||
+			openTag.isClosing ||
+			(openTag.name !== "pi_edit" && openTag.name !== "pi_swipe")
+		)
+			return empty;
 
 		const role = openTag.attributes.role;
 		if (role !== "user" && role !== "assistant") return empty;
