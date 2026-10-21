@@ -141,6 +141,18 @@ describe("openai-completions reasoning_details streaming", () => {
 		expect(getAssistantPayload(mockState.payloads[1])?.reasoning_details).toEqual([reasoningDetail]);
 	});
 
+	it("replays encrypted reasoning without visible content or tool calls", async () => {
+		mockState.chunkSets = [
+			[chunk({ reasoning_details: [reasoningDetail] }), chunk({}, "stop")],
+			[chunk({ content: "continued" }), chunk({}, "stop")],
+		];
+		const assistant = await runOpenAICompletionsStream();
+		const stored = structuredClone(assistant);
+		await runOpenAICompletionsStream([assistant]);
+		expect(getAssistantPayload(mockState.payloads[1])?.reasoning_details).toEqual([reasoningDetail]);
+		expect(assistant).toEqual(stored);
+	});
+
 	it("falls back to encrypted tool-call signatures for older stored assistant messages", async () => {
 		mockState.chunkSets = [
 			[chunk({ reasoning_details: [reasoningDetail] }), toolCallChunk(), chunk({}, "tool_calls")],

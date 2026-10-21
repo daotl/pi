@@ -1430,7 +1430,13 @@ export function convertMessages(
 				content !== undefined &&
 				(typeof content === "string" ? content.length > 0 : content.length > 0);
 			const hasToolCallsRaw = typeof (assistantMsg as { tool_calls_raw?: string }).tool_calls_raw === "string";
-			if (!hasContent && !assistantMsg.tool_calls && !hasToolCallsRaw && nonEmptyThinkingBlocks.length === 0) {
+			if (
+				!hasContent &&
+				!assistantMsg.tool_calls &&
+				!hasToolCallsRaw &&
+				!preservedReasoningDetails &&
+				nonEmptyThinkingBlocks.length === 0
+			) {
 				continue;
 			}
 			params.push(assistantMsg);
