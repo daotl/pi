@@ -50,6 +50,8 @@ function escapeXmlAttr(text: string): string {
 	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+const XML_ATTR_ENTITIES: Record<string, string> = { "&amp;": "&", "&quot;": '"', "&lt;": "<", "&gt;": ">" };
+
 function parseTag(tagText: string): { name: string; attributes: Record<string, string>; isClosing: boolean } {
 	const isClosing = tagText.startsWith("</");
 	const inner = tagText.slice(isClosing ? 2 : 1, -1).trim();
@@ -62,7 +64,7 @@ function parseTag(tagText: string): { name: string; attributes: Record<string, s
 	while (match !== null) {
 		const attrName = match[1];
 		const attrValue = match[2] ?? match[3] ?? "";
-		attributes[attrName] = attrValue;
+		attributes[attrName] = attrValue.replace(/&(?:amp|quot|lt|gt);/g, (entity) => XML_ATTR_ENTITIES[entity]);
 		match = attrRegex.exec(attrString);
 	}
 	return { name, attributes, isClosing };

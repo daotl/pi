@@ -1,5 +1,5 @@
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/compat";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 function visibleTexts(harness: Harness): string[] {
@@ -10,6 +10,7 @@ describe("AgentSession swipe", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
+		vi.useRealTimers();
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
@@ -191,8 +192,10 @@ describe("AgentSession swipe", () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 
+		vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-10-21T12:00:00Z") });
 		harness.setResponses([fauxAssistantMessage("answer v1"), fauxAssistantMessage("answer v2")]);
 		await harness.session.prompt("question");
+		vi.setSystemTime(new Date("2026-10-21T12:00:01Z"));
 		await harness.session.regenerateSwipe(harness.session.getSwipeGroup()!);
 		expect(harness.session.getSwipeGroup()!.versions).toHaveLength(2);
 
