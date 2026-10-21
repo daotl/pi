@@ -167,6 +167,71 @@ function findLastClosingTagBefore(
 }
 
 /**
+ * Start of the first `tagName` opening that directly follows (after optional
+ * whitespace) a `</closeName>` at or after `fromPos`. Sections are formatted
+ * back to back, so only an adjacent opening starts the next section; a stray
+ * opening elsewhere inside raw text does not.
+ */
+function findAdjacentOpeningTag(text: string, fromPos: number, closeName: string, tagName: string): number | undefined {
+	let close = findFirstClosingTag(text, fromPos, closeName);
+	while (close) {
+		let next = close.end;
+		while (next < text.length && /\s/.test(text[next])) next++;
+		const tag = findNextTag(text, next);
+		if (tag?.start === next && tag.name === tagName && !tag.isClosing) return next;
+		close = findFirstClosingTag(text, close.end, closeName);
+	}
+	return undefined;
+}
+
+/**
+ * Closing tag of a section whose first closing is `firstClose`: the furthest
+ * closing still before the next section, so stray closing tags inside the raw
+ * body do not end it early. The next section starts at the first opening of a
+ * `boundaryTags` tag after `firstClose`, or at an `adjacentTags` opening that
+ * directly follows one of this section's closings.
+ */
+function findSectionClose(
+	text: string,
+	openEnd: number,
+	firstClose: { start: number; end: number },
+	sectionName: string,
+	boundaryTags: readonly string[],
+	adjacentTags: readonly string[],
+): { start: number; end: number } {
+	let boundary = text.length;
+	for (const tagName of boundaryTags) {
+		const open = findFirstOpeningTag(text, firstClose.end, tagName);
+		if (open && open.start < boundary) boundary = open.start;
+	}
+	for (const tagName of adjacentTags) {
+		const start = findAdjacentOpeningTag(text, firstClose.start, sectionName, tagName);
+		if (start !== undefined && start < boundary) boundary = start;
+	}
+	return findLastClosingTagBefore(text, openEnd, boundary, sectionName) ?? firstClose;
+}
+
+function reasoningBlock(thinking: string, attributes: Record<string, string>): ThinkingContent {
+	const block: ThinkingContent = { type: "thinking", thinking };
+	if (attributes.signature) block.thinkingSignature = attributes.signature;
+	if (attributes.redacted === "true") block.redacted = true;
+	return block;
+}
+
+function findToolCallClose(
+	text: string,
+	openEnd: number,
+): { close: { start: number; end: number }; args: JsonObject } | undefined {
+	let close = findFirstClosingTag(text, openEnd, "pi_tool_call");
+	while (close) {
+		const args = parseToolCallArguments(text.slice(openEnd, close.start));
+		if (args !== undefined) return { close, args };
+		close = findFirstClosingTag(text, close.end, "pi_tool_call");
+	}
+	return undefined;
+}
+
+/**
  * Returns true if the given text starts with a `<pi_edit>` or `<pi_swipe>`
  * tag (after optional leading whitespace). Messages that contain one later in
  * the text are treated as normal messages, not edit commands.
@@ -233,38 +298,35 @@ function parseInnerContent(
 	let rest = content;
 
 	if (role === "assistant") {
-		const leadingWhitespace = rest.match(/^\s*/)?.[0] ?? "";
-		// The formatted tag may carry attributes (`signature="..."` and/or
-		// `redacted="true"`), so match the opening tag with optional attributes
-		// rather than the exact attribute-less tag.
-		const reasoningOpenMatch = rest.slice(leadingWhitespace.length).match(/^<pi_reasoning_content(\s[^>]*)?>/);
-		if (reasoningOpenMatch) {
+		// Leading reasoning sections, one per thinking block. The formatted tag
+		// may carry attributes (`signature="..."` and/or `redacted="true"`), so
+		// match the opening tag with optional attributes.
+		while (true) {
+			const leadingWhitespace = rest.match(/^\s*/)?.[0] ?? "";
+			const reasoningOpenMatch = rest.slice(leadingWhitespace.length).match(/^<pi_reasoning_content(\s[^>]*)?>/);
+			if (!reasoningOpenMatch) break;
 			const openStart = leadingWhitespace.length;
 			const openEnd = openStart + reasoningOpenMatch[0].length;
 			// The first closing is found without treating any other tag as a
 			// boundary: until it is found, `<pi_content>` / `<pi_tool_call>` tags
 			// inside the reasoning text are stray content being discussed.
 			const firstClose = findFirstClosingTag(rest, openEnd, "pi_reasoning_content");
-			if (firstClose) {
-				// With the reasoning block confirmed, later sections become valid
-				// boundaries. The reasoning close is the furthest one that is still
-				// before the main content / tool call sections, so stray reasoning
-				// tags inside the reasoning text do not split it and stray tags in
-				// the main content are excluded.
-				const contentOpen = findFirstOpeningTag(rest, firstClose.end, "pi_content");
-				const toolOpen = findFirstOpeningTag(rest, firstClose.end, "pi_tool_call");
-				const boundary = Math.min(contentOpen?.start ?? rest.length, toolOpen?.start ?? rest.length);
-				const reasoningClose =
-					findLastClosingTagBefore(rest, openEnd, boundary, "pi_reasoning_content") ?? firstClose;
-				const thinking = rest.slice(openEnd, reasoningClose.start);
-				const reasoningOpen = findNextTag(rest, openStart);
-				const reasoningAttrs = reasoningOpen?.attributes ?? {};
-				const block: ThinkingContent = { type: "thinking", thinking };
-				if (reasoningAttrs.signature) block.thinkingSignature = reasoningAttrs.signature;
-				if (reasoningAttrs.redacted === "true") block.redacted = true;
-				blocks.push(block);
-				rest = rest.slice(reasoningClose.end);
-			}
+			if (!firstClose) break;
+			// With the reasoning block confirmed, later sections become valid
+			// boundaries, so stray reasoning tags inside the reasoning text do not
+			// split it and stray tags in later sections are excluded.
+			const reasoningClose = findSectionClose(
+				rest,
+				openEnd,
+				firstClose,
+				"pi_reasoning_content",
+				["pi_content", "pi_tool_call"],
+				["pi_reasoning_content"],
+			);
+			blocks.push(
+				reasoningBlock(rest.slice(openEnd, reasoningClose.start), findNextTag(rest, openStart)?.attributes ?? {}),
+			);
+			rest = rest.slice(reasoningClose.end);
 		}
 	}
 
@@ -275,7 +337,31 @@ function parseInnerContent(
 	// still supported below as a fallback.
 	const leadingWs = rest.match(/^\s*/)?.[0] ?? "";
 	const contentOpenMatch = rest.slice(leadingWs.length).match(/^<pi_content(\s[^>]*)?>/);
-	if (contentOpenMatch) {
+	const firstTag = findNextTag(rest, leadingWs.length);
+	let hasLeadingToolSections = false;
+	if (role === "assistant" && firstTag?.start === leadingWs.length && !firstTag.isClosing) {
+		let tag: TagMatch | undefined = firstTag;
+		while (tag?.name === "pi_tool_call" && !tag.isClosing) {
+			const tool = findToolCallClose(rest, tag.end);
+			if (!tool) break;
+			let nextPos = tool.close.end;
+			while (nextPos < rest.length && /\s/.test(rest[nextPos])) nextPos++;
+			tag = findNextTag(rest, nextPos);
+			if (!tag || tag.start !== nextPos || tag.isClosing) break;
+			if (tag.name === "pi_content" || tag.name === "pi_reasoning_content") {
+				hasLeadingToolSections = true;
+				break;
+			}
+		}
+	}
+	if (
+		role === "assistant" &&
+		firstTag?.start === leadingWs.length &&
+		!firstTag.isClosing &&
+		(firstTag.name === "pi_content" || hasLeadingToolSections)
+	) {
+		blocks.push(...parseSpecialBlocksForward(rest, specialTagName, role));
+	} else if (contentOpenMatch) {
 		const openStart = leadingWs.length;
 		const openEnd = openStart + contentOpenMatch[0].length;
 		const firstClose = findFirstClosingTag(rest, openEnd, "pi_content");
@@ -316,31 +402,51 @@ function parseToolCallArguments(text: string): JsonObject | undefined {
 }
 
 /**
- * Parse special blocks (`<pi_tool_call>` / `<pi_image>`) from a region that
- * contains only special blocks (the content after a `<pi_content>` wrapper).
- * Each block's closing tag is the furthest closing still before the next block
- * opening, so stray closing tags inside a block body (e.g. in tool call JSON)
- * are ignored.
+ * Parse formatted sections in order: assistant text/reasoning/tool calls or user
+ * images. Each block's closing tag is the furthest closing still before the next
+ * section opening, so stray closing tags inside raw bodies are ignored.
  */
 function parseSpecialBlocksForward(
 	region: string,
 	tagName: string,
 	role: "user" | "assistant",
-): (ToolCall | ImageContent)[] {
-	const blocks: (ToolCall | ImageContent)[] = [];
+): (TextContent | ThinkingContent | ToolCall | ImageContent)[] {
+	const blocks: (TextContent | ThinkingContent | ToolCall | ImageContent)[] = [];
+	const sectionNames = role === "assistant" ? [tagName, "pi_content", "pi_reasoning_content"] : [tagName];
+	const adjacentTags = role === "assistant" ? ["pi_reasoning_content"] : [];
 	let pos = 0;
 	while (pos < region.length) {
-		const open = findFirstOpeningTag(region, pos, tagName);
+		let open: { start: number; end: number; attributes: Record<string, string> } | undefined;
+		let sectionName = tagName;
+		for (const name of sectionNames) {
+			const candidate = findFirstOpeningTag(region, pos, name);
+			if (candidate && (!open || candidate.start < open.start)) {
+				open = candidate;
+				sectionName = name;
+			}
+		}
 		if (!open) break;
-		const firstClose = findFirstClosingTag(region, open.end, tagName);
-		if (!firstClose) break;
-		const nextOpen = findFirstOpeningTag(region, firstClose.end, tagName);
-		const boundary = nextOpen?.start ?? region.length;
-		const close = findLastClosingTagBefore(region, open.end, boundary, tagName) ?? firstClose;
+		const firstClose = findFirstClosingTag(region, open.end, sectionName);
+		if (!firstClose) {
+			if (sectionName === "pi_content") {
+				const text = region.slice(open.end);
+				if (text.trim().length > 0) blocks.push({ type: "text", text });
+			}
+			break;
+		}
+		const boundaryTags = sectionName === "pi_reasoning_content" ? ["pi_content", tagName] : [tagName];
+		let close = findSectionClose(region, open.end, firstClose, sectionName, boundaryTags, adjacentTags);
 		const inner = region.slice(open.end, close.start);
 
-		if (role === "assistant") {
-			const args = parseToolCallArguments(inner) ?? {};
+		if (sectionName === "pi_content") {
+			if (inner.trim().length > 0) blocks.push({ type: "text", text: inner });
+		} else if (sectionName === "pi_reasoning_content") {
+			blocks.push(reasoningBlock(inner, open.attributes));
+		} else if (role === "assistant") {
+			const tool = findToolCallClose(region, open.end);
+			const args = tool?.args ?? {};
+			// Invalid JSON retains the legacy furthest close before the next section.
+			if (tool) close = tool.close;
 			const toolCall: ToolCall = {
 				type: "toolCall",
 				id: open.attributes.id ?? "",
@@ -527,8 +633,15 @@ function formatUserMessageContent(message: UserMessage): string {
 function formatAssistantMessageContent(message: AssistantMessage): string {
 	let inner = "";
 	let textBuffer = "";
+	const flushText = (): void => {
+		if (textBuffer.length > 0) {
+			inner += `<pi_content>${textBuffer}</pi_content>`;
+			textBuffer = "";
+		}
+	};
 	for (const block of message.content) {
 		if (block.type === "thinking") {
+			flushText();
 			let attrs = "";
 			if (block.thinkingSignature) attrs += ` signature="${escapeXmlAttr(block.thinkingSignature)}"`;
 			if (block.redacted) attrs += ` redacted="true"`;
@@ -536,18 +649,13 @@ function formatAssistantMessageContent(message: AssistantMessage): string {
 		} else if (block.type === "text") {
 			textBuffer += block.text;
 		} else if (block.type === "toolCall") {
-			if (textBuffer.length > 0) {
-				inner += `<pi_content>${textBuffer}</pi_content>`;
-				textBuffer = "";
-			}
+			flushText();
 			let attrs = ` id="${escapeXmlAttr(block.id)}" name="${escapeXmlAttr(block.name)}"`;
 			if (block.thoughtSignature) attrs += ` thoughtSignature="${escapeXmlAttr(block.thoughtSignature)}"`;
 			inner += `<pi_tool_call${attrs}>${JSON.stringify(block.arguments)}</pi_tool_call>`;
 		}
 	}
-	if (textBuffer.length > 0) {
-		inner += `<pi_content>${textBuffer}</pi_content>`;
-	}
+	flushText();
 	return inner;
 }
 
