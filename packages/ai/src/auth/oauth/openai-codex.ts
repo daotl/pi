@@ -392,7 +392,7 @@ async function loginOpenAICodex(interaction: ProviderAuthInteraction): Promise<O
 		if (!code) throw new Error("Missing authorization code");
 		return await exchangeAuthorizationCodeForCredentials(code, verifier, REDIRECT_URI, interaction.signal);
 	} finally {
-		callback?.close();
+		await callback?.close();
 	}
 }
 

@@ -152,7 +152,7 @@ async function loginOpenRouter(interaction: ProviderAuthInteraction): Promise<OA
 		interaction.notify({ type: "progress", message: "Exchanging authorization code for an API key..." });
 		return await exchangeAuthorizationCode(code, verifier, interaction.signal);
 	} finally {
-		callback.close();
+		await callback.close();
 	}
 }
 

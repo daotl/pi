@@ -182,7 +182,7 @@ async function loginWithBrowser(
 		if (!credential) throw new Error("OAuth callback did not complete.");
 		return credential;
 	} finally {
-		callback.close();
+		await callback.close();
 	}
 }
 
