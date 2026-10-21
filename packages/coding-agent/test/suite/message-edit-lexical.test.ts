@@ -9,6 +9,7 @@ for (const format of ["edit", "swipe"] as const) {
 		it("decodes formatted reasoning attributes exactly once and preserves provider replay", async () => {
 			const harness = await createHarness();
 			try {
+				harness.sessionManager.appendMessage({ role: "user", content: "question", timestamp: 0 });
 				const signature = JSON.stringify({ type: "reasoning", id: "rs_1", encrypted_content: "opaque<&quot;>" });
 				const message = {
 					...fauxAssistantMessage([
@@ -24,6 +25,10 @@ for (const format of ["edit", "swipe"] as const) {
 				harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 				const entry = harness.sessionManager.getEntry(entryId);
 				if (!entry) throw new Error("Missing assistant entry");
+				if (format === "swipe") {
+					harness.sessionManager.branch(entryId);
+					harness.session.refreshContext();
+				}
 				const xml =
 					format === "edit" ? formatMessageForEdit(1, message) : formatMessageForSwipe(entry.timestamp, message);
 				if (xml === null) throw new Error("Unexpected formatting refusal");

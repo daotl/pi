@@ -519,6 +519,34 @@ export function editBlockToMessage(
 	const stopReason: AssistantMessage["stopReason"] = hasToolCall ? "toolUse" : "stop";
 
 	if (baseAssistant) {
+		const signaturePositions = new Map<string, number>();
+		for (const content of assistantContent) {
+			if (content.type !== "thinking" || content.thinkingSignature === undefined) continue;
+			const signature = content.thinkingSignature;
+			const previousPosition = signaturePositions.get(signature);
+			const position = baseAssistant.content?.findIndex(
+				(original, index) =>
+					index >= (previousPosition ?? 0) &&
+					original.type === "thinking" &&
+					original.thinkingSignature === signature,
+			);
+			if (position === undefined || (position < 0 && previousPosition === undefined)) continue;
+			const original = baseAssistant.content?.[position];
+			const editableReasoningField =
+				baseAssistant.api === "openai-completions" &&
+				original?.type === "thinking" &&
+				original.redacted !== true &&
+				content.redacted !== true &&
+				(signature === "reasoning_content" || signature === "reasoning" || signature === "reasoning_text");
+			if (
+				original?.type !== "thinking" ||
+				(!editableReasoningField && original.thinking !== content.thinking) ||
+				(original.redacted === true) !== (content.redacted === true)
+			) {
+				throw new Error("Cannot change signed reasoning while retaining its original signature.");
+			}
+			signaturePositions.set(signature, position + 1);
+		}
 		return {
 			...baseAssistant,
 			role: "assistant",

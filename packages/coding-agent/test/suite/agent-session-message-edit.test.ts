@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	editBlockToMessage,
 	formatMessageContent,
 	formatMessageForEdit,
 	isMessageEdit,
@@ -489,6 +490,100 @@ describe("AgentSession.applyMessageEdits", () => {
 			timestamp: original.timestamp,
 		});
 	});
+
+	it.each(["version", "swipe"] as const)("rejects changed opaque reasoning without publishing a %s", async (mode) => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const original: AssistantMessage = {
+			...fauxAssistantMessage(""),
+			api: "anthropic-messages",
+			content: [{ type: "thinking", thinking: "signed original", thinkingSignature: "opaque" }],
+		};
+		harness.sessionManager.appendMessage({ role: "user", content: "question", timestamp: 1 });
+		harness.sessionManager.appendMessage(original);
+		harness.session.refreshContext();
+		const history = structuredClone(harness.sessionManager.getEntries());
+		const leaf = harness.sessionManager.getLeafId();
+		const timestamp = harness.session.getSwipeGroup()!.versions[0].timestamp;
+		const body = '<pi_reasoning_content signature="opaque">changed</pi_reasoning_content>';
+		const xml =
+			mode === "version"
+				? `<pi_edit id="0" role="assistant">${body}</pi_edit>`
+				: `<pi_swipe timestamp="${timestamp}" role="assistant">${body}</pi_swipe>`;
+		expect(() => harness.session.applyMessageEdits(xml)).toThrow(Error);
+		expect(harness.sessionManager.getEntries()).toEqual(history);
+		expect(harness.sessionManager.getLeafId()).toBe(leaf);
+	});
+
+	it.each(["reasoning_content", "reasoning", "reasoning_text"])(
+		"keeps unredacted Completions selector %s editable",
+		async (signature) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			harness.sessionManager.appendMessage({ role: "user", content: "question", timestamp: 1 });
+			harness.sessionManager.appendMessage({
+				...fauxAssistantMessage(""),
+				api: "openai-completions",
+				content: [{ type: "thinking", thinking: "original", thinkingSignature: signature }],
+			});
+			harness.session.refreshContext();
+			harness.session.applyMessageEdits(
+				`<pi_edit id="0" role="assistant"><pi_reasoning_content signature="${signature}">changed</pi_reasoning_content></pi_edit>`,
+			);
+			expect(harness.session.messages.findLast((message) => message.role === "assistant")?.content).toEqual([
+				{ type: "thinking", thinking: "changed", thinkingSignature: signature },
+			]);
+		},
+	);
+
+	it("matches repeated signatures in occurrence order and permits new signatures", () => {
+		const base = {
+			...fauxAssistantMessage(""),
+			content: [
+				{ type: "thinking" as const, thinking: "first", thinkingSignature: "same" },
+				{ type: "thinking" as const, thinking: "second", thinkingSignature: "same" },
+			],
+		};
+		expect(editBlockToMessage({ id: 0, role: "assistant", content: base.content }, base).content).toEqual(
+			base.content,
+		);
+		expect(() =>
+			editBlockToMessage({ id: 0, role: "assistant", content: [base.content[1], base.content[0]] }, base),
+		).toThrow(Error);
+		expect(() =>
+			editBlockToMessage({ id: 0, role: "assistant", content: [...base.content, base.content[1]] }, base),
+		).toThrow(Error);
+		const added = [{ type: "thinking" as const, thinking: "new", thinkingSignature: "new-signature" }];
+		expect(editBlockToMessage({ id: 0, role: "assistant", content: added }, base).content).toEqual(added);
+	});
+
+	it.each([
+		{ api: "anthropic-messages", signature: "reasoning", before: false, after: false },
+		{ api: "openai-completions", signature: "opaque", before: false, after: false },
+		{ api: "openai-completions", signature: "reasoning", before: true, after: true },
+		{ api: "openai-completions", signature: "reasoning", before: false, after: true },
+	])(
+		"protects opaque/cross-API/redacted reasoning $api/$signature/$before/$after",
+		({ api, signature, before, after }) => {
+			const base = {
+				...fauxAssistantMessage(""),
+				api,
+				content: [
+					{ type: "thinking" as const, thinking: "original", thinkingSignature: signature, redacted: before },
+				],
+			};
+			expect(() =>
+				editBlockToMessage(
+					{
+						id: 0,
+						role: "assistant",
+						content: [{ type: "thinking", thinking: "changed", thinkingSignature: signature, redacted: after }],
+					},
+					base,
+				),
+			).toThrow(Error);
+		},
+	);
 
 	it("preserves harness messages when editing earlier messages", async () => {
 		const harness = await createHarness();
