@@ -19,3 +19,5 @@ Iterate idMap values and look up only new clone entries, rather than scanning al
 Rewrite/publication, context-edit, soft-delete, actual AgentSession swipe and message-edit suites: **121 passed**. Both replacement/removal controls assert new compaction/edit/label targets and edited projection; original/sibling references retain old IDs, and real reopen plus selecting the old branch reconstructs its original projected messages. No provider call.
 
 `npm run check` passed (1712 files; regression formatting applied). Post-format owning suites passed **121 tests** again.
+
+Follow-up adds direct branch_summary fromId assertions for the new clone, selected source and separate abandoned sibling summary in both replacement/removal cases. Selecting the original summary after real reopen retains original projected messages. Rewrite and tree suites passed **50 tests**. These are post-fix controls; add3423e4 did not include direct branch_summary assertions.

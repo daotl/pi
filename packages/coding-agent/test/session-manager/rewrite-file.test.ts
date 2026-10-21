@@ -171,8 +171,12 @@ describe("atomic session file rewrite", () => {
 		const edit = session.appendContextEdit(assistant, { content: "projected answer" });
 		const label = session.appendLabelChange(assistant, "original label");
 		session.branch(assistant);
-		const sibling = session.appendCompaction("sibling summary", assistant, 100);
+		const summary = session.branchWithSummary(assistant, "branch checkpoint");
 		session.branch(label);
+		const selectedSummary = session.branchWithSummary(label, "selected checkpoint");
+		session.branch(assistant);
+		const sibling = session.appendCompaction("sibling summary", assistant, 100);
+		session.branch(selectedSummary);
 		const oldProjection = structuredClone(session.buildSessionProjection().messages);
 		if (operation === "replace") session.replaceMessages([{ entryId: user, message: userMsg("edited user") }]);
 		else expect(session.removeEntries([user])).toBe(1);
@@ -182,6 +186,9 @@ describe("atomic session file rewrite", () => {
 		expect(branch.find((entry) => entry.type === "compaction")).toMatchObject({ firstKeptEntryId: clone.id });
 		expect(branch.find((entry) => entry.type === "context_edit")).toMatchObject({ targetId: clone.id });
 		expect(branch.find((entry) => entry.type === "label")).toMatchObject({ targetId: clone.id });
+		expect(branch.find((entry) => entry.type === "branch_summary")).toMatchObject({
+			fromId: branch.find((entry) => entry.type === "label")!.id,
+		});
 		expect(session.buildSessionProjection().messages).toContainEqual(
 			expect.objectContaining({
 				role: "assistant",
@@ -192,8 +199,10 @@ describe("atomic session file rewrite", () => {
 		expect(session.getEntry(sibling)).toMatchObject({ firstKeptEntryId: assistant });
 		expect(session.getEntry(edit)).toMatchObject({ targetId: assistant });
 		expect(session.getEntry(label)).toMatchObject({ targetId: assistant });
+		expect(session.getEntry(summary)).toMatchObject({ fromId: assistant });
+		expect(session.getEntry(selectedSummary)).toMatchObject({ fromId: label });
 		const reopened = SessionManager.open(file, dir, dir);
-		reopened.branch(label);
+		reopened.branch(selectedSummary);
 		expect(reopened.buildSessionProjection().messages).toEqual(oldProjection);
 	});
 
