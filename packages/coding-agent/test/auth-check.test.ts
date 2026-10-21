@@ -8,16 +8,12 @@ import { checkProviderAuth, createAuthCheckModelRuntime, getProviderCredential }
 import { parseAuthCommand } from "../src/cli/auth-command.ts";
 import { AuthStorage, ReadOnlyAuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
-
-// These tests exercise auth-check CLI logic through built-in cloud providers
-// (openai). Cloud providers are hidden by default (PI_DISABLE_CLOUD_PROVIDERS=1),
-// so skip them unless cloud is enabled. Pure argument/runtime-construction tests
-// at the bottom stay ungated.
-const cloudDisabled = process.env.PI_DISABLE_CLOUD_PROVIDERS === "1";
+import { enableBuiltinProviders } from "./test-network-env.ts";
 
 const tempDir = join(tmpdir(), `pi-test-auth-check-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 
 async function createRuntime(credentials: AuthStorage | ReadOnlyAuthStorage): Promise<ModelRuntime> {
+	enableBuiltinProviders();
 	return ModelRuntime.create({
 		credentials,
 		modelsPath: null,
@@ -37,7 +33,7 @@ describe("auth check command", () => {
 		if (existsSync(tempDir)) rmSync(tempDir, { recursive: true });
 	});
 
-	test.skipIf(cloudDisabled)("reports a configured provider as ready", async () => {
+	test("reports a configured provider as ready", async () => {
 		const runtime = await createRuntime(AuthStorage.inMemory({ openai: { type: "api_key", key: "test-key" } }));
 
 		await expect(checkProviderAuth(parseArgs(["--provider", "openai"]), runtime)).resolves.toEqual({
@@ -47,7 +43,7 @@ describe("auth check command", () => {
 		});
 	});
 
-	test.skipIf(cloudDisabled)("resolves the provider from --model", async () => {
+	test("resolves the provider from --model", async () => {
 		const runtime = await createRuntime(AuthStorage.inMemory({ openai: { type: "api_key", key: "test-key" } }));
 
 		await expect(checkProviderAuth(parseArgs(["--model", "openai/gpt-5.5"]), runtime)).resolves.toEqual({
@@ -60,7 +56,7 @@ describe("auth check command", () => {
 		).resolves.toMatchObject({ status: "ready", provider: "openai" });
 	});
 
-	test.skipIf(cloudDisabled)("reads credentials without refreshing OAuth when requested", async () => {
+	test("reads credentials without refreshing OAuth when requested", async () => {
 		const apiCredentials = AuthStorage.inMemory({ openai: { type: "api_key", key: "test-key" } });
 		const apiRuntime = await createRuntime(apiCredentials);
 		await expect(getProviderCredential("openai", apiRuntime, apiCredentials, { refresh: false })).resolves.toBe(
@@ -82,7 +78,7 @@ describe("auth check command", () => {
 		expect(refresh).not.toHaveBeenCalled();
 	});
 
-	test.skipIf(cloudDisabled)("refreshes OAuth by default", async () => {
+	test("refreshes OAuth by default", async () => {
 		const credentials = AuthStorage.inMemory({
 			"openai-codex": { type: "oauth", access: "old-token", refresh: "refresh-token", expires: 0 },
 		});
@@ -105,7 +101,7 @@ describe("auth check command", () => {
 		expect(refresh).toHaveBeenCalledOnce();
 	});
 
-	test.skipIf(cloudDisabled)("reports an unknown provider as not ready", async () => {
+	test("reports an unknown provider as not ready", async () => {
 		const runtime = await createRuntime(AuthStorage.inMemory());
 
 		await expect(checkProviderAuth(parseArgs(["--provider", "not-installed"]), runtime)).resolves.toEqual({
@@ -115,7 +111,7 @@ describe("auth check command", () => {
 		});
 	});
 
-	test.skipIf(cloudDisabled)("does not treat an unresolved stored environment reference as configured", async () => {
+	test("does not treat an unresolved stored environment reference as configured", async () => {
 		const authPath = join(tempDir, "auth.json");
 		writeFileSync(authPath, JSON.stringify({ openai: { type: "api_key", key: "$MISSING_AUTH_CHECK_KEY" } }), "utf-8");
 		const runtime = await createRuntime(new ReadOnlyAuthStorage(authPath));
@@ -127,7 +123,7 @@ describe("auth check command", () => {
 		});
 	});
 
-	test.skipIf(cloudDisabled)("reports malformed auth state as invalid", async () => {
+	test("reports malformed auth state as invalid", async () => {
 		const authPath = join(tempDir, "auth.json");
 		writeFileSync(authPath, "{invalid-json", "utf-8");
 		const runtime = await createRuntime(new ReadOnlyAuthStorage(authPath));
@@ -139,7 +135,7 @@ describe("auth check command", () => {
 		});
 	});
 
-	test.skipIf(cloudDisabled)("does not create an auth file or its parent directory", async () => {
+	test("does not create an auth file or its parent directory", async () => {
 		const authPath = join(tempDir, "agent", "auth.json");
 		const runtime = await createRuntime(new ReadOnlyAuthStorage(authPath));
 
@@ -170,7 +166,8 @@ describe("auth check command", () => {
 		});
 	});
 
-	test.skipIf(cloudDisabled)("creates an auth-check runtime without catalog storage", async () => {
+	test("creates an auth-check runtime without catalog storage", async () => {
+		enableBuiltinProviders();
 		const runtime = await createAuthCheckModelRuntime(AuthStorage.inMemory());
 		expect(runtime.getProvider("openai")).toBeDefined();
 	});
