@@ -6,6 +6,7 @@ import {
 	type Message,
 	type Model,
 	type SimpleStreamOptions,
+	type TranscriptContext,
 	type UserMessage,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -15,6 +16,7 @@ import {
 	agentLoopContinue,
 	isHarnessMessage,
 	runAgentLoop,
+	runAgentLoopContinue,
 	runToolCall,
 	stripTrailingHarnessMessages,
 } from "../src/agent-loop.ts";
@@ -196,15 +198,14 @@ describe("agentLoop with AgentMessage", () => {
 			model: createModel(),
 			convertToLlm: identityConverter,
 		};
+		let capturedContext: TranscriptContext | undefined;
 		const stream = agentLoop(
 			[initialSystem, createUserMessage("Hello")],
 			context,
 			config,
 			undefined,
 			(_model, providerContext) => {
-				// The provider receives a transcript: no top-level prompt or tool fields.
-				expect(Object.keys(providerContext)).toEqual(["messages"]);
-				expect(providerContext.messages[0]).toBe(initialSystem);
+				capturedContext = providerContext;
 				const response = new MockAssistantStream();
 				queueMicrotask(() => {
 					response.push({
@@ -217,7 +218,15 @@ describe("agentLoop with AgentMessage", () => {
 			},
 		);
 
-		await stream.result();
+		const messages = await stream.result();
+		expect(capturedContext).toBeDefined();
+		expect(Object.keys(capturedContext!)).toEqual(["messages"]);
+		expect(capturedContext!.messages[0]).toBe(initialSystem);
+		expect(messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "stop",
+			content: [{ type: "text", text: "done" }],
+		});
 	});
 
 	it("should handle custom message types via convertToLlm", async () => {
@@ -1975,6 +1984,244 @@ describe("agentLoop with AgentMessage", () => {
 		}
 
 		expect(llmCalls).toBe(1);
+	});
+});
+
+describe.each(["start", "continue"] as const)("low-level %s stream failures", (kind) => {
+	it.each(["request", "next-turn"] as const)(
+		"attributes a pre-partial failure after %s model selection",
+		async (phase) => {
+			const selected = createModel();
+			const routed = { ...selected, id: "routed-model", provider: "routed-provider" };
+			const context: AgentContext = { messages: [createUserMessage("run")], tools: [] };
+			const completed = createAssistantMessage([{ type: "text", text: "first turn" }]);
+			const config: AgentLoopConfig = {
+				model: selected,
+				convertToLlm: identityConverter,
+				prepareRequest: phase === "request" ? async () => ({ model: routed }) : undefined,
+				prepareNextTurn: phase === "next-turn" ? async () => ({ model: routed }) : undefined,
+				finishTurn: ({ message }) => (message === completed ? { action: "continue" } : undefined),
+			};
+			let calls = 0;
+			let failedModel: Model<string> | undefined;
+			const streamFn: StreamFn = async (requested) => {
+				if (phase === "next-turn" && calls++ === 0) {
+					const response = new MockAssistantStream();
+					queueMicrotask(() => response.push({ type: "done", reason: "stop", message: completed }));
+					return response;
+				}
+				failedModel = requested;
+				throw new Error("routed dispatch failure");
+			};
+			const stream =
+				kind === "start"
+					? agentLoop([createUserMessage("run")], { messages: [], tools: [] }, config, undefined, streamFn)
+					: agentLoopContinue(context, config, undefined, streamFn);
+			const messages = await stream.result();
+			expect(failedModel).toBe(routed);
+			expect(messages.at(-1)).toMatchObject({
+				api: routed.api,
+				provider: routed.provider,
+				model: routed.id,
+				stopReason: "error",
+				errorMessage: "routed dispatch failure",
+			});
+		},
+	);
+	it.each(["normal", "initial preparation failure", "next-turn preparation failure"] as const)(
+		"pairs turns and messages after %s",
+		async (scenario) => {
+			const prompt = createUserMessage("run");
+			const completed = createAssistantMessage([{ type: "text", text: "completed first turn" }]);
+			const final = createAssistantMessage([{ type: "text", text: "completed second turn" }]);
+			const context: AgentContext = { messages: kind === "continue" ? [prompt] : [], tools: [] };
+			const failure = new Error(scenario);
+			const config: AgentLoopConfig = {
+				model: createModel(),
+				convertToLlm: identityConverter,
+				prepareRequest: async () => {
+					if (scenario === "initial preparation failure") throw failure;
+				},
+				prepareNextTurn: async () => {
+					if (scenario === "next-turn preparation failure") throw failure;
+				},
+				finishTurn: ({ message }) => (message === completed ? { action: "continue" } : undefined),
+			};
+			let requests = 0;
+			const streamFn: StreamFn = () => {
+				const message = requests++ === 0 ? completed : final;
+				const response = new MockAssistantStream();
+				queueMicrotask(() => response.push({ type: "done", reason: "stop", message }));
+				return response;
+			};
+			const stream =
+				kind === "start"
+					? agentLoop([prompt], context, config, undefined, streamFn)
+					: agentLoopContinue(context, config, undefined, streamFn);
+			const events: AgentEvent[] = [];
+			const iteration = (async () => {
+				for await (const event of stream) events.push(event);
+			})();
+			const [, messages] = await Promise.all([iteration, stream.result()]);
+			const terminal = scenario === "normal" ? final : messages.at(-1);
+			if (scenario !== "normal") {
+				expect(terminal).toMatchObject({
+					role: "assistant",
+					content: [{ type: "text", text: "" }],
+					stopReason: "error",
+					errorMessage: failure.message,
+					usage: createUsage(),
+				});
+			}
+			expect(messages).toEqual([
+				...(kind === "start" ? [prompt] : []),
+				...(scenario === "initial preparation failure" ? [] : [completed]),
+				terminal,
+			]);
+			expect(events).toEqual([
+				{ type: "agent_start" },
+				{ type: "turn_start" },
+				...(kind === "start"
+					? [
+							{ type: "message_start", message: prompt },
+							{ type: "message_end", message: prompt },
+						]
+					: []),
+				...(scenario === "initial preparation failure"
+					? []
+					: [
+							{ type: "message_start", message: completed },
+							{ type: "message_end", message: completed },
+							{ type: "turn_end", message: completed, toolResults: [] },
+							{ type: "turn_start" },
+						]),
+				{ type: "message_start", message: terminal },
+				{ type: "message_end", message: terminal },
+				{ type: "turn_end", message: terminal, toolResults: [] },
+				{ type: "agent_end", messages },
+			]);
+			expect(requests).toBe(scenario === "normal" ? 2 : scenario === "initial preparation failure" ? 0 : 1);
+			if (scenario !== "normal") {
+				const runContext: AgentContext = { messages: kind === "continue" ? [prompt] : [], tools: [] };
+				requests = 0;
+				const run =
+					kind === "start"
+						? runAgentLoop([prompt], runContext, config, () => {}, undefined, streamFn)
+						: runAgentLoopContinue(runContext, config, () => {}, undefined, streamFn);
+				await expect(run).rejects.toBe(failure);
+			}
+		},
+	);
+
+	it("settles aborted preparation without dispatching the provider", async () => {
+		const controller = new AbortController();
+		const prompt = createUserMessage("run");
+		const context: AgentContext = { messages: kind === "continue" ? [prompt] : [], tools: [] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			prepareRequest: async () => {
+				controller.abort();
+				throw new Error("Preparation cancelled");
+			},
+		};
+		let dispatches = 0;
+		const streamFn: StreamFn = () => {
+			dispatches++;
+			throw new Error("Unexpected provider dispatch");
+		};
+		const stream =
+			kind === "start"
+				? agentLoop([prompt], context, config, controller.signal, streamFn)
+				: agentLoopContinue(context, config, controller.signal, streamFn);
+		const events: AgentEvent[] = [];
+		const iteration = (async () => {
+			for await (const event of stream) events.push(event);
+		})();
+		const [, messages] = await Promise.all([iteration, stream.result()]);
+		expect(messages).toEqual([
+			...(kind === "start" ? [prompt] : []),
+			expect.objectContaining({ stopReason: "aborted", errorMessage: "Preparation cancelled" }),
+		]);
+		expect(events.slice(-4)).toEqual([
+			{ type: "message_start", message: messages.at(-1) },
+			{ type: "message_end", message: messages.at(-1) },
+			{ type: "turn_end", message: messages.at(-1), toolResults: [] },
+			{ type: "agent_end", messages },
+		]);
+		expect(dispatches).toBe(0);
+	});
+
+	it.each(["error", "aborted"] as const)("closes the latest partial after iterator %s", async (reason) => {
+		const controller = new AbortController();
+		const prompt = createUserMessage("run");
+		const completed = createAssistantMessage([{ type: "text", text: "completed first turn" }]);
+		const initial = createAssistantMessage([]);
+		const partial: AssistantMessage = {
+			...initial,
+			content: [
+				{ type: "thinking", thinking: "partial reasoning", thinkingSignature: "reasoning-signature" },
+				{ type: "text", text: "partial answer", textSignature: "text-signature" },
+			],
+			usage: { ...createUsage(), output: 7, totalTokens: 7 },
+		};
+		const update: AssistantMessageEvent = {
+			type: "text_delta",
+			contentIndex: 1,
+			delta: "partial answer",
+			partial,
+		};
+		const context: AgentContext = { messages: kind === "continue" ? [prompt] : [], tools: [] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			finishTurn: ({ message }) => (message === completed ? { action: "continue" } : undefined),
+		};
+		let requests = 0;
+		const streamFn: StreamFn = () => {
+			const response = new MockAssistantStream();
+			if (requests++ === 0) {
+				queueMicrotask(() => response.push({ type: "done", reason: "stop", message: completed }));
+			} else {
+				response[Symbol.asyncIterator] = async function* (): AsyncGenerator<AssistantMessageEvent> {
+					yield { type: "start", partial: initial };
+					yield update;
+					if (reason === "aborted") controller.abort();
+					throw new Error("Iterator failed");
+				};
+			}
+			return response;
+		};
+		const stream =
+			kind === "start"
+				? agentLoop([prompt], context, config, controller.signal, streamFn)
+				: agentLoopContinue(context, config, controller.signal, streamFn);
+		const events: AgentEvent[] = [];
+		const iteration = (async () => {
+			for await (const event of stream) events.push(event);
+		})();
+		const [, messages] = await Promise.all([iteration, stream.result()]);
+		const failure = { ...partial, stopReason: reason, errorMessage: "Iterator failed" };
+		expect(messages).toEqual([...(kind === "start" ? [prompt] : []), completed, failure]);
+		expect(events).toEqual([
+			{ type: "agent_start" },
+			{ type: "turn_start" },
+			...(kind === "start"
+				? [
+						{ type: "message_start", message: prompt },
+						{ type: "message_end", message: prompt },
+					]
+				: []),
+			{ type: "message_start", message: completed },
+			{ type: "message_end", message: completed },
+			{ type: "turn_end", message: completed, toolResults: [] },
+			{ type: "turn_start" },
+			{ type: "message_start", message: initial },
+			{ type: "message_update", message: partial, assistantMessageEvent: update },
+			{ type: "message_end", message: failure },
+			{ type: "turn_end", message: failure, toolResults: [] },
+			{ type: "agent_end", messages },
+		]);
 	});
 });
 

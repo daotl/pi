@@ -65,6 +65,7 @@ export function stripTrailingHarnessMessages(messages: AgentMessage[]): AgentMes
 /**
  * Start an agent loop with a new prompt message.
  * The prompt is added to the context and events are emitted for it.
+ * Asynchronous failures close the current turn and resolve the stream with completed messages and an assistant error.
  */
 export function agentLoop(
 	prompts: AgentMessage[],
@@ -73,20 +74,12 @@ export function agentLoop(
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
 ): EventStream<AgentEvent, AgentMessage[]> {
-	const stream = createAgentStream();
+	const { stream, emit, endWithError, execution } = createAgentStream(config, signal);
 
-	void runAgentLoop(
-		prompts,
-		context,
-		config,
-		async (event) => {
-			stream.push(event);
-		},
-		signal,
-		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
+	void runAgentLoopInternal(prompts, context, config, emit, signal, streamFn, execution).then(
+		(messages) => stream.end(messages),
+		endWithError,
+	);
 
 	return stream;
 }
@@ -94,6 +87,7 @@ export function agentLoop(
 /**
  * Continue an agent loop from the current context without adding a new message.
  * Used for retries - context already has user message or tool results.
+ * Asynchronous failures settle the stream; invalid initial context still throws synchronously.
  *
  * **Important:** The last message in context must convert to a `user` or `toolResult` message
  * via `convertToLlm`. If it doesn't, the LLM provider will reject the request.
@@ -115,19 +109,12 @@ export function agentLoopContinue(
 	const effectiveContext =
 		effectiveMessages.length !== context.messages.length ? { ...context, messages: effectiveMessages } : context;
 
-	const stream = createAgentStream();
+	const { stream, emit, endWithError, execution } = createAgentStream(config, signal);
 
-	void runAgentLoopContinue(
-		effectiveContext,
-		config,
-		async (event) => {
-			stream.push(event);
-		},
-		signal,
-		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
+	void runAgentLoopContinueInternal(effectiveContext, config, emit, signal, streamFn, execution).then(
+		(messages) => stream.end(messages),
+		endWithError,
+	);
 
 	return stream;
 }
@@ -139,6 +126,18 @@ export async function runAgentLoop(
 	emit: AgentEventSink,
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
+): Promise<AgentMessage[]> {
+	return runAgentLoopInternal(prompts, context, config, emit, signal, streamFn);
+}
+
+async function runAgentLoopInternal(
+	prompts: AgentMessage[],
+	context: AgentContext,
+	config: AgentLoopConfig,
+	emit: AgentEventSink,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+	execution?: { model: AgentLoopConfig["model"] },
 ): Promise<AgentMessage[]> {
 	const initialMessages = declareToolChanges(context, prompts);
 	const newMessages: AgentMessage[] = [...initialMessages];
@@ -154,7 +153,7 @@ export async function runAgentLoop(
 		await emit({ type: "message_end", message });
 	}
 
-	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
+	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn(), execution);
 	return newMessages;
 }
 
@@ -164,6 +163,17 @@ export async function runAgentLoopContinue(
 	emit: AgentEventSink,
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
+): Promise<AgentMessage[]> {
+	return runAgentLoopContinueInternal(context, config, emit, signal, streamFn);
+}
+
+async function runAgentLoopContinueInternal(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	emit: AgentEventSink,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+	execution?: { model: AgentLoopConfig["model"] },
 ): Promise<AgentMessage[]> {
 	const effectiveMessages = stripTrailingHarnessMessages(context.messages);
 	if (effectiveMessages.length === 0) {
@@ -179,7 +189,7 @@ export async function runAgentLoopContinue(
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
 
-	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
+	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn(), execution);
 	return newMessages;
 }
 
@@ -206,11 +216,68 @@ function assertContinuableLastMessage(lastMessage: AgentMessage, config: AgentLo
 	}
 }
 
-function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
-	return new EventStream<AgentEvent, AgentMessage[]>(
+function createAgentStream(config: AgentLoopConfig, signal: AbortSignal | undefined) {
+	const stream = new EventStream<AgentEvent, AgentMessage[]>(
 		(event: AgentEvent) => event.type === "agent_end",
 		(event: AgentEvent) => (event.type === "agent_end" ? event.messages : []),
 	);
+	const completedMessages: AgentMessage[] = [];
+	let turnOpen = false;
+	let partialMessage: AssistantMessage | undefined;
+	const execution = { model: config.model };
+
+	const emit = (event: AgentEvent): void => {
+		switch (event.type) {
+			case "turn_start":
+				turnOpen = true;
+				break;
+			case "turn_end":
+				turnOpen = false;
+				break;
+			case "message_start":
+			case "message_update":
+				partialMessage = event.message.role === "assistant" ? event.message : undefined;
+				break;
+			case "message_end":
+				completedMessages.push(event.message);
+				partialMessage = undefined;
+				break;
+		}
+		stream.push(event);
+	};
+
+	const endWithError = (error: unknown): void => {
+		const message: AssistantMessage = partialMessage
+			? { ...partialMessage }
+			: {
+					role: "assistant",
+					content: [{ type: "text", text: "" }],
+					api: execution.model.api,
+					provider: execution.model.provider,
+					model: execution.model.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "error",
+					timestamp: Date.now(),
+				};
+		message.stopReason = signal?.aborted ? "aborted" : "error";
+		message.errorMessage = error instanceof Error ? error.message : String(error);
+		// Preparation can fail between turns; an interrupted response already has a message_start.
+		if (!turnOpen) emit({ type: "turn_start" });
+		if (!partialMessage) emit({ type: "message_start", message });
+		emit({ type: "message_end", message });
+		emit({ type: "turn_end", message, toolResults: [] });
+		emit({ type: "agent_end", messages: completedMessages });
+		stream.end(completedMessages);
+	};
+
+	return { stream, emit, endWithError, execution };
 }
 
 /**
@@ -223,6 +290,7 @@ async function runLoop(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFunction: StreamFn,
+	execution?: { model: AgentLoopConfig["model"] },
 ): Promise<void> {
 	let currentContext = initialContext;
 	let config = initialConfig;
@@ -253,6 +321,7 @@ async function runLoop(
 									? undefined
 									: nextTurnSnapshot.thinkingLevel,
 					};
+					if (execution) execution.model = config.model;
 				}
 				// Preparation can be long-running (for example, compaction). Pick up steering
 				// queued while it ran. Only poll again if the earlier poll returned nothing;
@@ -292,6 +361,7 @@ async function runLoop(
 								? undefined
 								: requestUpdate.thinkingLevel,
 				};
+				if (execution) execution.model = config.model;
 			}
 
 			// Stream assistant response
