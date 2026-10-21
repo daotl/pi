@@ -107,6 +107,8 @@ If recovery compaction fails or is cancelled, Pi keeps the omission edits, appen
 
 Cancelling a queued compaction during asynchronous summary authentication or stream setup does not restart the interrupted task, even when the provider wrapper reports a plain setup error. Genuine setup failures retain normal resume behavior; separately accepted steering and follow-up input keeps its ordinary delivery order.
 
+A manual compact queued during a retryable response runs at the completed boundary before automatic retry events or backoff. Successful or failed compaction does not create an extra retry grant: disabled and exhausted policies remain exhausted. Cancelling the compaction suppresses the interrupted run's retry.
+
 ### Split user-message spans
 
 A user-message span starts with a user message and includes all turns until the next user message. Normally, compaction cuts at user-message boundaries.

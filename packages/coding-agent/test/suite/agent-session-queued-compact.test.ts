@@ -82,6 +82,122 @@ describe("AgentSession queued /compact", () => {
 		}
 	});
 
+	it.each([
+		{ policy: "control", enabled: true, maxRetries: 1, compact: false, cancel: false, expectedRequests: 2 },
+		{ policy: "disabled", enabled: false, maxRetries: 1, compact: true, cancel: false, expectedRequests: 1 },
+		{ policy: "zero", enabled: true, maxRetries: 0, compact: true, cancel: false, expectedRequests: 1 },
+		{ policy: "one", enabled: true, maxRetries: 1, compact: true, cancel: false, expectedRequests: 2 },
+		{
+			policy: "unlimited",
+			enabled: true,
+			maxRetries: Number.POSITIVE_INFINITY,
+			compact: true,
+			cancel: false,
+			expectedRequests: 3,
+		},
+		{ policy: "cancel", enabled: true, maxRetries: 1, compact: true, cancel: true, expectedRequests: 1 },
+		{
+			policy: "failure",
+			enabled: true,
+			maxRetries: 1,
+			compact: true,
+			cancel: false,
+			failure: true,
+			expectedRequests: 2,
+		},
+		{
+			policy: "disabled-failure",
+			enabled: false,
+			maxRetries: 1,
+			compact: true,
+			cancel: false,
+			failure: true,
+			expectedRequests: 1,
+		},
+	])(
+		"compacts completed retryable boundary before backoff with $policy retry/cancellation policy",
+		async ({ enabled, maxRetries, compact, cancel, failure, expectedRequests }) => {
+			const order: string[] = [];
+			let summaryPending = false;
+			const harness = await createHarness({
+				settings: {
+					compaction: { enabled: false, keepRecentTokens: 1 },
+					retry: { enabled, maxRetries, baseDelayMs: 0 },
+				},
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_before_compact", (event) => {
+							if (cancel) return { cancel: true };
+							if (failure) {
+								summaryPending = true;
+								return;
+							}
+							return {
+								compaction: {
+									summary: SUMMARY_TEXT,
+									firstKeptEntryId: event.preparation.firstKeptEntryId,
+									tokensBefore: event.preparation.tokensBefore,
+								},
+							};
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.session.subscribe((event) => {
+				if (
+					event.type === "compaction_start" ||
+					event.type === "compaction_end" ||
+					event.type === "auto_retry_start"
+				)
+					order.push(event.type);
+			});
+			harness.setResponses([fauxAssistantMessage("older answer")]);
+			await harness.session.prompt("older request ".repeat(20));
+			const ordinaryStream = harness.session.agent.streamFunction;
+			harness.session.agent.streamFunction = (model, context, options) => {
+				if (summaryPending) {
+					summaryPending = false;
+					const stream = createAssistantMessageEventStream();
+					const error = fauxAssistantMessage("", { stopReason: "error", errorMessage: "invalid summary request" });
+					stream.push({ type: "error", reason: "error", error });
+					return stream;
+				}
+				return ordinaryStream(model, context, options);
+			};
+			let requests = 0;
+			harness.setResponses(
+				[0, 1, 2].map((attempt) => () => {
+					requests++;
+					order.push(`provider:${requests}`);
+					if (attempt === 0 && compact) harness.session.queueCompact();
+					return attempt < 2
+						? fauxAssistantMessage("", { stopReason: "error", errorMessage: "Connection error." })
+						: fauxAssistantMessage("bounded recovery");
+				}),
+			);
+			await harness.session.prompt("retry this request");
+			expect(requests).toBe(expectedRequests);
+			if (compact) {
+				expect(order.slice(0, 3)).toEqual(["provider:1", "compaction_start", "compaction_end"]);
+				expect(harness.eventsOfType("compaction_end")[0]?.aborted).toBe(cancel);
+				const outcome = harness.eventsOfType("compaction_end")[0];
+				if (failure || cancel) {
+					expect(outcome?.result).toBeUndefined();
+					expect(harness.sessionManager.getBranch().some((entry) => entry.type === "compaction")).toBe(false);
+				} else {
+					expect(outcome?.result?.summary).toBe(SUMMARY_TEXT);
+				}
+			} else expect(order).not.toContain("compaction_start");
+			expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual(
+				Array.from({ length: expectedRequests - 1 }, (_, attempt) => attempt + 1),
+			);
+			expect(harness.session.isIdle).toBe(true);
+			expect(harness.session.hasQueuedCompact).toBe(false);
+			if (expectedRequests === 3) expect(getAssistantTexts(harness)).toContain("bounded recovery");
+		},
+	);
+
 	it("runs a /compact queued while streaming at the turn boundary, then resumes the run", async () => {
 		const { tool: waitTool, release, waitForToolStart } = createWaitTool();
 		const harness = await createHarness({

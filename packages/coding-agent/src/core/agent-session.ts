@@ -3200,7 +3200,17 @@ export class AgentSession {
 			await this._runQueuedCompact();
 			return this.agent.hasQueuedMessages();
 		}
-		if (this._isRetryableError(message) && (await this._prepareRetry(message))) {
+		const retrySettings = this.settingsManager.getRetrySettings();
+		const retryGranted =
+			this._isRetryableError(message) && retrySettings.enabled && this._retryAttempt < retrySettings.maxRetries;
+		// Consume accepted manual work before retry events or backoff.
+		const queuedCompactResume = await this._runQueuedCompact(retryGranted);
+		if (this._agentRunAbortRequested || (retryGranted && queuedCompactResume === false)) {
+			this._finishCancelledRetry();
+			return false;
+		}
+
+		if (retryGranted && (await this._prepareRetry(message))) {
 			if (this._agentRunAbortRequested) {
 				this._finishCancelledRetry();
 				return false;
@@ -3227,11 +3237,7 @@ export class AgentSession {
 			this._retryAttempt = 0;
 		}
 
-		// A /compact queued while streaming runs here: the current message and
-		// its related tool calls have fully completed - the same boundary where
-		// steering messages are injected. After compacting, resume the run when
-		// it was interrupted mid-task or messages are still queued.
-		const queuedCompactResume = await this._runQueuedCompact();
+		// Without a retry grant, resume only the interrupted runnable boundary.
 		if (queuedCompactResume !== undefined) {
 			return queuedCompactResume || this.agent.hasQueuedMessages();
 		}
@@ -4289,11 +4295,11 @@ export class AgentSession {
 	 * compact was queued. A cancelled compaction does not resume the run;
 	 * a failed one does, so an interrupted task continues.
 	 */
-	private async _runQueuedCompact(): Promise<boolean | undefined> {
+	private async _runQueuedCompact(retryGranted = false): Promise<boolean | undefined> {
 		const queued = this._queuedCompact;
 		if (!queued) return undefined;
 		this._queuedCompact = undefined;
-		const resume = this._queuedCompactResume;
+		const resume = this._queuedCompactResume || retryGranted;
 		this._queuedCompactResume = false;
 		try {
 			await this._runManualCompaction(queued.options);
