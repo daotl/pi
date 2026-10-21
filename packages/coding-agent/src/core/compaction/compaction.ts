@@ -30,7 +30,6 @@ import {
 	buildSessionProjection,
 	type CompactionEntry,
 	DEFAULT_SUMMARY_BLOCK_MAX_TOKENS,
-	filterSummariesToBlockLimit,
 	type ProjectedSessionEntry,
 	type SessionEntry,
 	type SessionProjection,
@@ -86,20 +85,6 @@ function extractFileOperations(
 	}
 
 	return fileOps;
-}
-
-// ============================================================================
-// Message Extraction
-// ============================================================================
-
-/**
- * Extract AgentMessage from an entry if it produces one.
- * Returns undefined for entries that don't contribute to LLM context.
- */
-function getMessagesFromProjectedEntryForCompaction(entry: ProjectedSessionEntry): AgentMessage[] {
-	if (entry.sourceEntry.type === "compaction") return [];
-	// System messages are prompt state, not conversation; the compaction entry carries their replay.
-	return entry.messages.filter((message) => message.role !== "system");
 }
 
 /** Result from compact() - SessionManager adds uuid/parentUuid when saving */
@@ -1011,14 +996,12 @@ export async function prepareCompaction(
 		return undefined;
 	}
 
-	const projection = buildSessionProjection(pathEntries);
+	const projection = buildSessionProjection(pathEntries, undefined, undefined, {
+		summaryBlockMaxTokens: settings.summaryBlockMaxTokens,
+	});
 	const projectedEntries = projection.entries;
 	const sourceEntries = projectedEntries.map((entry) => entry.sourceEntry);
-	// The newest compaction is projected first. Older compaction entries can still
-	// occur in its retained raw range, but their projected contribution is empty.
-	// With the "no folding" model every compaction entry keeps its own summary
-	// message, so the projection lists them oldest-first. The most recent
-	// compaction is the last one, not the first.
+	// Summaries occupy the prefix oldest-first; new history starts after the newest.
 	const prevCompactionIndex = projectedEntries.findLastIndex(
 		(entry) => entry.sourceEntry.type === "compaction" && entry.messages.length > 0,
 	);
@@ -1056,34 +1039,22 @@ export async function prepareCompaction(
 
 	const messagesToSummarize = projectedEntries
 		.slice(boundaryStart, historyEnd)
-		.flatMap(getMessagesFromProjectedEntryForCompaction);
+		.flatMap((entry) => (entry.sourceEntry.type === "compaction" ? [] : entry.messages));
 	const turnPrefixMessages = cutPoint.isSplitTurn
 		? projectedEntries
 				.slice(cutPoint.turnStartIndex, cutPoint.firstKeptEntryIndex)
-				.flatMap(getMessagesFromProjectedEntryForCompaction)
+				.flatMap((entry) => (entry.sourceEntry.type === "compaction" ? [] : entry.messages))
 		: [];
 
-	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) return undefined;
+	if (
+		!messagesToSummarize.some((message) => message.role !== "system") &&
+		!turnPrefixMessages.some((message) => message.role !== "system")
+	)
+		return undefined;
 
-	// Prepend ALL visible previous summary messages (oldest first) so the
-	// summarization request carries exactly what the chat contains before
-	// compaction: system prompt plus the unaltered summaries block in its natural
-	// position, minus only the preserved tail, plus the summarization instruction
-	// at the end. The provider KV cache is prefix-based, so even a single byte of
-	// difference before the instruction forces a full re-prefill of the whole
-	// request. Previous summaries are context here, not re-folded into the new one.
-	// Collect ALL visible compaction entries from the full path, not just the
-	// projected sourceEntries: a projection consumes older compaction entries
-	// into the newest one, but the "no folding" behavior prepends every visible
-	// summary (oldest first) so the request prefix matches the chat exactly.
-	const compactions: CompactionEntry[] = pathEntries.filter(
-		(entry): entry is CompactionEntry => entry.type === "compaction",
-	);
-	const visibleCompactions = filterSummariesToBlockLimit(compactions, settings.summaryBlockMaxTokens);
-	const summaryMessages = visibleCompactions
-		.map((c) => sessionEntryToContextMessages(c)[0])
-		.filter((m): m is AgentMessage => m !== undefined);
-	messagesToSummarize.unshift(...summaryMessages);
+	// Reuse the visible checkpoint, summaries and later prompt/tool deltas.
+	// compact() appends the split-turn remainder before its instruction.
+	messagesToSummarize.unshift(...projectedEntries.slice(0, boundaryStart).flatMap((entry) => entry.messages));
 
 	// Extract file operations from edited model-visible messages and the previous compaction.
 	const fileOps = extractFileOperations(messagesToSummarize, sourceEntries, prevCompactionIndex);

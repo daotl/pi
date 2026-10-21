@@ -627,7 +627,7 @@ describe("prepareCompaction", () => {
 		expect(preparation).toBeDefined();
 		expect(preparation?.firstKeptEntryId).toBe(assistant.id);
 		expect(preparation?.isSplitTurn).toBe(true);
-		expect(preparation?.messagesToSummarize).toEqual([]);
+		expect(preparation?.messagesToSummarize).toEqual([system.message]);
 		expect(preparation?.turnPrefixMessages).toEqual([user.message]);
 	});
 	it("excludes prompt deltas from token retention counts", async () => {
@@ -784,6 +784,38 @@ describe("prepareCompaction with previous compaction", () => {
 		const summaries = preparation!.messagesToSummarize.filter((m) => m.role === "compactionSummary");
 		expect(summaries).toHaveLength(1);
 		expect((summaries[0] as any).summary).toBe("Second summary");
+	});
+
+	it("builds the next summary from the visible checkpoint and cumulative summaries", async () => {
+		const old = createMessageEntry(createUserMessage("old"));
+		const first = createCompactionEntry("first", old.id);
+		first.systemMessage = { role: "system", content: "stale checkpoint", timestamp: 1 };
+		const kept = createMessageEntry(createUserMessage("kept"));
+		const hidden = createCompactionEntry("deleted private summary", kept.id);
+		hidden.deletedAt = "2025-01-02T00:00:00Z";
+		const latest = createCompactionEntry("latest", kept.id);
+		latest.systemMessage = { role: "system", content: "current checkpoint", timestamp: 2 };
+		const patch = createMessageEntry({ role: "system", content: "later tools delta", timestamp: 3 });
+		const next = createMessageEntry(createUserMessage("next"));
+		const newest = createMessageEntry(createUserMessage("newest"));
+		const entries = [old, first, kept, hidden, latest, patch, next, newest];
+		for (const limit of [undefined, 0]) {
+			const preparation = await prepareCompaction(
+				entries,
+				{ ...DEFAULT_COMPACTION_SETTINGS, summaryBlockMaxTokens: limit },
+				{ keepRecentMessages: 1 },
+			);
+			expect(preparation?.firstKeptEntryId).toBe(newest.id);
+			expect(preparation?.previousSummary).toBe("latest");
+			expect(preparation?.messagesToSummarize).toEqual([
+				latest.systemMessage,
+				...(limit === undefined ? [expect.objectContaining({ role: "compactionSummary", summary: "first" })] : []),
+				expect.objectContaining({ role: "compactionSummary", summary: "latest" }),
+				kept.message,
+				patch.message,
+				next.message,
+			]);
+		}
 	});
 });
 
