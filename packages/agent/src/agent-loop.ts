@@ -33,7 +33,7 @@ export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
 /**
  * A harness message is an assistant message with no meaningful content:
- * no non-empty thinking, no non-empty text, and no tool calls. The harness
+ * no non-empty thinking or text, no replay signatures, and no tool calls. The harness
  * emits these for aborts, errors, and timeouts (e.g. `stopReason: "aborted"`
  * with empty content). They are user-facing notifications, not real assistant
  * turns, so they must not block continuation or be re-sent to the model.
@@ -44,8 +44,8 @@ export function isHarnessMessage(message: AgentMessage): boolean {
 	}
 	return !message.content.some(
 		(block) =>
-			(block.type === "thinking" && block.thinking.length > 0) ||
-			(block.type === "text" && block.text.length > 0) ||
+			(block.type === "thinking" && (block.thinking.length > 0 || !!block.thinkingSignature)) ||
+			(block.type === "text" && (block.text.length > 0 || !!block.textSignature)) ||
 			block.type === "toolCall",
 	);
 }

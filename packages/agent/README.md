@@ -184,6 +184,8 @@ selected input events
 
 `continue()` decides from the last non-system message. Trailing system patches do not turn a completed assistant into runnable context; empty and system-only transcripts reject without consuming queues. Empty harness notifications are dismissed across intervening system patches while those prompt/tool patches keep their order. A non-assistant tail continues from existing context: steering is polled at startup, while follow-up input waits until the response naturally stops.
 
+Empty text or thinking blocks with replay signatures are real assistant content, not dismissible harness notifications. They remain in history and continue to block a context-only retry of the preceding user request.
+
 ```typescript
 agent.followUp({ role: "user", content: "After the retry", timestamp: Date.now() });
 await agent.continue(); // The first request retries the existing user/toolResult tail.
