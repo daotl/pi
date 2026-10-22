@@ -1,7 +1,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { ExtensionContext } from "../../src/core/extensions/index.ts";
 import { type ModelRoute, type ModelRouteRequest, VIRTUAL_MODEL_STATE_ENTRY } from "../../src/core/virtual-models.ts";
 import { createHarness, type Harness, type HarnessOptions } from "./harness.ts";
@@ -296,19 +296,26 @@ describe("AgentSession virtual models", () => {
 		expect(dispatched()).toEqual(["faux/large:high", "faux/small:off"]);
 	});
 
-	it("projects the session once per request under a virtual selection", async () => {
-		const { harness } = await createRoutedHarness();
+	it("routes a tool continuation with its result while retaining the virtual selection", async () => {
+		const { harness, reasons, dispatched } = await createRoutedHarness();
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("echo", { text: "hi" }), { stopReason: "toolUse" }),
-			fauxAssistantMessage("done"),
+			(context) => {
+				expect(context.messages.at(-1)).toMatchObject({
+					role: "toolResult",
+					toolName: "echo",
+					isError: false,
+					content: [{ type: "text", text: "echoed" }],
+				});
+				return fauxAssistantMessage("done");
+			},
 		]);
-		const projections = vi.spyOn(harness.sessionManager, "buildSessionProjection");
-
 		await harness.session.prompt("hello");
-
-		// One per request, one between the turns, and one for the compaction check after
-		// the run.
-		expect(projections).toHaveBeenCalledTimes(4);
+		expect(reasons()).toEqual(["user", "continuation"]);
+		expect(dispatched()).toEqual(["faux/large:high", "faux/large:high"]);
+		expect(harness.session.getLastAssistantText()).toBe("done");
+		expect(harness.session.model).toMatchObject({ provider: "router", id: "auto" });
+		expect(harness.session.isIdle).toBe(true);
 	});
 
 	it("stores router state on the branch and passes it to later requests", async () => {

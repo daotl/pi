@@ -71,6 +71,10 @@ A steering message enters after the current assistant turn and its tool calls. A
 
 Canonical context edits remain authoritative on the next request. Ordinary projected assistant copies are not appended again as implicit prefills; an explicit direct-Agent prefill is retained even if earlier history contains the same text. Later tool-result requests use the finalized projection without reattaching the original partial.
 
+`session.continue(prefill?)` accepts an optional assistant prefix. Automatic capture leaves its original session entry and ordered suffix selected on disk while omitting that contribution only from live/request context. A verified terminal echo atomically replaces the original contribution after message hooks run; a complete echoed abort can also be stored. A truncated abort or failed continuation restores the original prefix and replayable recovery entries before another request dispatches.
+
+If restoration cannot be written, the run rejects and releases ownership, but retains the recovery state in memory. The next accepted prompt or continuation retries restoration first. An accepted tree navigation supersedes recovery on the abandoned branch. `message_end` listeners still run before persistence; a completed response rejected by a listener or storage failure retains its charge as a content-free error receipt rather than a published answer.
+
 `abort()` stops the active operation and waits for the session to become idle. `waitForIdle()` waits without aborting it.
 
 `incomingMessagePrefix` is read from the supplied `SettingsManager` on each SDK context conversion. Historical and new string/array user text receive the current prefix without changing stored history, text metadata or images. The SDK uses the shared `prefixUserMessages` helper in its converter so direct summaries and token counts follow the same setting. Do not also set the Agent prefix to the same value; that would apply it twice. Cache warming replays the already converted original request, not a newly prefixed one.

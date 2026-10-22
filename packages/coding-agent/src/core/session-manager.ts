@@ -1285,7 +1285,7 @@ export class SessionManager {
 		}
 	}
 
-	private _rewriteFile(): void {
+	private _rewriteFile(entries: FileEntry[] = this.fileEntries): void {
 		if (!this.persist || !this.sessionFile) return;
 		const destination = existsSync(this.sessionFile) ? realpathSync(this.sessionFile) : this.sessionFile;
 		const mode = existsSync(destination) ? statSync(destination).mode & 0o7777 : undefined;
@@ -1294,7 +1294,7 @@ export class SessionManager {
 		let fd: number | undefined = openSync(temporaryFile, "wx", mode);
 		try {
 			if (mode !== undefined) fchmodSync(fd, mode);
-			for (const entry of this.fileEntries) {
+			for (const entry of entries) {
 				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
 			}
 			fsyncSync(fd);
@@ -1316,6 +1316,66 @@ export class SessionManager {
 			}
 			throw error;
 		}
+	}
+
+	/** Publish prepared entries and indexes only after their atomic rewrite succeeds. */
+	private _commitEntries(entries: FileEntry[], leafId: string, supersededBy: ReadonlyMap<string, string>): void {
+		const staged = entries.map((entry) => {
+			const replacementId = entry.type !== "session" ? supersededBy.get(entry.id) : undefined;
+			return replacementId === undefined ? entry : { ...entry, supersededBy: replacementId };
+		});
+		const byId = new Map<string, SessionEntry>();
+		const labelsById = new Map<string, string>();
+		const labelTimestampsById = new Map<string, string>();
+		for (const entry of staged) {
+			if (entry.type !== "session") byId.set(entry.id, entry);
+		}
+		for (const entry of staged) {
+			if (entry.type !== "label" || !byId.has(entry.targetId)) continue;
+			if (entry.label) {
+				labelsById.set(entry.targetId, entry.label);
+				labelTimestampsById.set(entry.targetId, entry.timestamp);
+			} else {
+				labelsById.delete(entry.targetId);
+				labelTimestampsById.delete(entry.targetId);
+			}
+		}
+		this._rewriteFile(staged);
+		this.fileEntries = staged;
+		this.byId = byId;
+		this.labelsById = labelsById;
+		this.labelTimestampsById = labelTimestampsById;
+		this.leafId = leafId;
+		if (this.persist && this.sessionFile) this.flushed = true;
+	}
+
+	/** Clone branch-local references without modifying historical entries or their held references. */
+	private _cloneTailEntry(
+		entry: SessionEntry,
+		id: string,
+		parentId: string | null,
+		idMap: ReadonlyMap<string, string>,
+		boundaryIds?: ReadonlyMap<string, string>,
+	): SessionEntry {
+		const clone: SessionEntry = {
+			...entry,
+			id,
+			parentId,
+			usageSourceId: entry.usageSourceId ?? entry.id,
+		};
+		delete clone.supersededBy;
+		if (clone.type === "message" && clone.deletedToolCalls) {
+			clone.deletedToolCalls = { ...clone.deletedToolCalls };
+		}
+		if (clone.type === "compaction") {
+			clone.firstKeptEntryId =
+				idMap.get(clone.firstKeptEntryId) ?? boundaryIds?.get(clone.firstKeptEntryId) ?? clone.firstKeptEntryId;
+		} else if (clone.type === "branch_summary") {
+			clone.fromId = idMap.get(clone.fromId) ?? boundaryIds?.get(clone.fromId) ?? clone.fromId;
+		} else if (clone.type === "label" || clone.type === "context_edit") {
+			clone.targetId = idMap.get(clone.targetId) ?? clone.targetId;
+		}
+		return clone;
 	}
 
 	isPersisted(): boolean {
@@ -1396,6 +1456,109 @@ export class SessionManager {
 		};
 		this._appendEntry(entry);
 		return entry.id;
+	}
+
+	/**
+	 * Replace an assistant prefill at its canonical position with one newly billed response.
+	 * Preserve its complete active suffix and historical receipts, publishing nothing on failure.
+	 */
+	replaceAssistantContinuation(entryId: string, message: AssistantMessage): string {
+		const path = this.getBranch();
+		const index = path.findIndex((entry) => entry.id === entryId);
+		const target = path[index];
+		if (target?.type !== "message" || target.message.role !== "assistant") {
+			throw new Error(`Assistant prefill ${entryId} is not on the active branch`);
+		}
+		const entries = this.fileEntries.slice();
+		const ids = new Set(this.byId.keys());
+		const idMap = new Map<string, string>();
+		const boundaryIds = new Map<string, string>();
+		const pendingRemovedIds: string[] = [];
+		const tail: SessionEntry[] = [];
+		for (const entry of path.slice(index)) {
+			if (entry.type === "context_edit" && entry.targetId === entryId) {
+				pendingRemovedIds.push(entry.id);
+				continue;
+			}
+			const id = generateId(ids);
+			ids.add(id);
+			idMap.set(entry.id, id);
+			if (entry.deletedAt === undefined) {
+				for (const removedId of pendingRemovedIds) boundaryIds.set(removedId, id);
+				pendingRemovedIds.length = 0;
+			}
+			tail.push(entry);
+		}
+		let parentId = target.parentId;
+		for (const source of tail) {
+			const id = idMap.get(source.id)!;
+			const clone = this._cloneTailEntry(source, id, parentId, idMap, boundaryIds);
+			if (source.id === entryId && clone.type === "message") {
+				clone.message = message;
+				delete clone.usageSourceId;
+				clone.timestamp = new Date().toISOString();
+			}
+			entries.push(clone);
+			parentId = id;
+		}
+		this._commitEntries(entries, parentId!, idMap);
+		return idMap.get(entryId)!;
+	}
+
+	/** Restore a saved prefill and its ordered replayable suffix in one durable branch transaction. */
+	restoreAssistantPrefill(
+		parentId: string | null,
+		message: AssistantMessage,
+		prefillEntryId: string | undefined,
+		trailing: SessionEntry[],
+	): string {
+		if (parentId !== null && !this.byId.has(parentId)) {
+			throw new Error(`Entry ${parentId} not found`);
+		}
+		const original = prefillEntryId ? this.byId.get(prefillEntryId) : undefined;
+		const ids = new Set(this.byId.keys());
+		const idMap = new Map<string, string>();
+		const entries = this.fileEntries.slice();
+		const restoredId = generateId(ids);
+		ids.add(restoredId);
+		const prefix: SessionMessageEntry = {
+			...(original?.type === "message" ? original : {}),
+			type: "message",
+			id: prefillEntryId ?? restoredId,
+			parentId,
+			timestamp: new Date().toISOString(),
+			message,
+		};
+		if (prefillEntryId !== undefined) idMap.set(prefillEntryId, restoredId);
+		const replayable = trailing.filter((entry) => entry.type !== "message" || entry.message.role === "system");
+		const replayableIds = new Set(replayable.map((entry) => entry.id));
+		const pathIds = new Set(parentId === null ? [] : this.getBranch(parentId).map((entry) => entry.id));
+		pathIds.add(prefix.id);
+		const retained = replayable.filter(
+			(entry) => entry.type !== "context_edit" || pathIds.has(entry.targetId) || replayableIds.has(entry.targetId),
+		);
+		for (const source of retained) {
+			const id = generateId(ids);
+			ids.add(id);
+			idMap.set(source.id, id);
+		}
+		const restored = this._cloneTailEntry(prefix, restoredId, parentId, idMap);
+		if (!original) delete restored.usageSourceId;
+		entries.push(restored);
+		pathIds.add(restoredId);
+		for (const id of idMap.values()) pathIds.add(id);
+		parentId = restoredId;
+		for (const source of retained) {
+			const id = idMap.get(source.id)!;
+			const clone = this._cloneTailEntry(source, id, parentId, idMap);
+			if (clone.type === "compaction" && !pathIds.has(clone.firstKeptEntryId)) {
+				clone.firstKeptEntryId = restoredId;
+			}
+			entries.push(clone);
+			parentId = id;
+		}
+		this._commitEntries(entries, parentId, idMap);
+		return restoredId;
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */

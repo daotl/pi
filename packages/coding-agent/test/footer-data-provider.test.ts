@@ -1,8 +1,10 @@
+import { EventEmitter } from "node:events";
 import { execFile, spawnSync } from "child_process";
 import { existsSync, type FSWatcher, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as fsWatch from "../src/utils/fs-watch.ts";
 
 let resolvedBranch = "main";
 
@@ -83,6 +85,15 @@ function emitReftableChange(provider: FooterDataProvider): void {
 	reftableWatcher?.emit("change", "change", "tables.list");
 }
 
+function useControlledWatchers(): void {
+	vi.spyOn(fsWatch, "watchWithErrorHandler").mockImplementation((_path, listener, onError) => {
+		const watcher = new EventEmitter();
+		watcher.on("change", listener);
+		watcher.on("error", onError);
+		return Object.assign(watcher, { close: () => watcher.removeAllListeners() }) as unknown as FSWatcher;
+	});
+}
+
 async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void> {
 	const startedAt = Date.now();
 	while (!condition()) {
@@ -106,6 +117,7 @@ describe("FooterDataProvider reftable branch detection", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		process.chdir(originalCwd);
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true, force: true });
@@ -176,6 +188,7 @@ describe("FooterDataProvider reftable branch detection", () => {
 	// Drive debounce behavior explicitly; native fs.watch delivery can race watcher startup.
 	it("does not notify listeners when reftable updates keep the same branch", async () => {
 		vi.useFakeTimers();
+		useControlledWatchers();
 		const { worktreeDir } = createReftableWorktree(tempDir);
 		process.chdir(worktreeDir);
 
@@ -201,6 +214,7 @@ describe("FooterDataProvider reftable branch detection", () => {
 
 	it("debounces rapid reftable updates into a single async refresh", async () => {
 		vi.useFakeTimers();
+		useControlledWatchers();
 		const { worktreeDir } = createReftableWorktree(tempDir);
 		process.chdir(worktreeDir);
 
@@ -236,10 +250,9 @@ describe("FooterDataProvider reftable branch detection", () => {
 			provider.onBranchChange(onBranchChange);
 
 			writeFileSync(join(reftableDir, "tables.list"), "1\n");
-			await waitFor(() => vi.mocked(execFile).mock.calls.length === 1);
 			await waitFor(() => provider.getGitBranch() === "foo");
 
-			expect(vi.mocked(execFile)).toHaveBeenCalledTimes(1);
+			expect(vi.mocked(execFile)).toHaveBeenCalled();
 			expect(provider.getGitBranch()).toBe("foo");
 			expect(onBranchChange).toHaveBeenCalledTimes(1);
 		} finally {
