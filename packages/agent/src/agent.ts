@@ -517,6 +517,7 @@ export class Agent {
 	 * provider echoes it back with newly generated tokens. The caller is
 	 * responsible for removing the prefill from the transcript beforehand
 	 * (e.g. via session deletion) since the continued response replaces it.
+	 * A prepareRequest router resolves the physical API before prefill capability is checked.
 	 */
 	async continue(prefill?: AgentMessage): Promise<void> {
 		if (this.activeRun) {
@@ -540,7 +541,7 @@ export class Agent {
 				throw new Error("Prefill must be an assistant message");
 			}
 			const assistantPrefill = prefill;
-			if (this._state.model.api !== "openai-completions") {
+			if (!this.prepareRequest && this._state.model.api !== "openai-completions") {
 				throw new Error("Continuation is only supported for openai-completions providers (e.g., llama-server)");
 			}
 

@@ -196,6 +196,8 @@ agent.steer({ role: "user", content: "Continue from here", timestamp: Date.now()
 await agent.continue(); // Uses the queued message only because the tail is assistant.
 ```
 
+Explicit `continue(prefill)` requires an `openai-completions` request API. When `prepareRequest` routes a virtual selection, the physical API is checked after routing and before provider dispatch; a compatible route proceeds without changing the selected model. An incompatible routed prefill finishes through the normal error lifecycle without a provider request. Ordinary non-prefill requests are not restricted by this check.
+
 ### Event Types
 
 | Event | Description |

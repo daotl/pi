@@ -211,7 +211,7 @@ function assertContinuableLastMessage(lastMessage: AgentMessage, config: AgentLo
 	if (!config.returnPrefill) {
 		throw new Error("Cannot continue from message role: assistant");
 	}
-	if (config.model.api !== "openai-completions") {
+	if (!config.prepareRequest && config.model.api !== "openai-completions") {
 		throw new Error("Continuation is only supported for openai-completions providers (e.g., llama-server)");
 	}
 }
@@ -362,6 +362,10 @@ async function runLoop(
 								: requestUpdate.thinkingLevel,
 				};
 				if (execution) execution.model = config.model;
+			}
+			// Selection may be virtual; only the resolved request API determines prefill support.
+			if (config.returnPrefill && config.model.api !== "openai-completions") {
+				throw new Error("Continuation is only supported for openai-completions providers (e.g., llama-server)");
 			}
 
 			// Stream assistant response

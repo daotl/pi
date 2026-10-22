@@ -1374,17 +1374,27 @@ describe("Agent", () => {
 			expect(last.errorMessage).toContain("Prefill echo mismatch: tool call 0 name");
 		});
 
-		it("throws when model is not openai-completions", async () => {
+		it("rejects an unsupported prefill without a router before dispatch or history mutation", async () => {
+			let dispatches = 0;
 			const agent = new Agent({
-				streamFn: () => new MockAssistantStream(),
+				streamFn: () => {
+					dispatches++;
+					return new MockAssistantStream();
+				},
 			});
 
 			const prefill: AgentMessage = createAssistantMessage("Partial response");
-			agent.state.messages = [{ role: "user", content: "Hello", timestamp: Date.now() }];
-
-			await expect(agent.continue(prefill)).rejects.toThrow(
-				"Continuation is only supported for openai-completions providers",
-			);
+			const user: AgentMessage = { role: "user", content: "Hello", timestamp: Date.now() };
+			agent.state.messages = [user];
+			const events: AgentEvent[] = [];
+			agent.subscribe((event) => {
+				events.push(event);
+			});
+			await expect(agent.continue(prefill)).rejects.toBeInstanceOf(Error);
+			expect(dispatches).toBe(0);
+			expect(agent.state.messages).toEqual([user]);
+			expect(events).toEqual([]);
+			expect(agent.state.isStreaming).toBe(false);
 		});
 
 		it("throws when prefill is not an assistant message", async () => {
