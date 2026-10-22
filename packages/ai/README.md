@@ -1431,6 +1431,8 @@ If `compat` is not set, the library falls back to URL-based detection. If `compa
 
 `fauxProvider()` builds an in-memory provider with scripted responses for tests and demos:
 
+The faux transport is in-memory even when compatibility registration labels it `openai-completions`. Transport provenance distinguishes recognized scripted history from permission to use a direct HTTP tokenizer; an API label alone never grants that permission.
+
 ```typescript
 import {
   createModels,

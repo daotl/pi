@@ -8,6 +8,7 @@ import {
 	type AuthResult,
 	type ClassifierApi,
 	type Credential,
+	getProviderApiStreams,
 	type ImageApi,
 	isModelType,
 	lazyStream,
@@ -25,7 +26,9 @@ import {
 	type StreamOptions,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
-import { getApiProvider } from "@earendil-works/pi-ai/compat";
+import { isHistoryPreservingApi } from "@earendil-works/pi-ai/api/history-provenance";
+import { isDirectOpenAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { getApiProvider, isKnownApiProvider } from "@earendil-works/pi-ai/compat";
 import { classifierErrorResult, imageErrorResult } from "@earendil-works/pi-ai/utils/model-operations";
 import type { ModelConfig, ModelsJsonModel, ModelsJsonModelOverride, ModelsJsonProvider } from "./model-config.ts";
 import {
@@ -36,6 +39,19 @@ import {
 	resolveConfigValueOrThrow,
 	resolveHeadersOrThrow,
 } from "./resolve-config-value.ts";
+
+const requestHistoryPolicies = new WeakMap<
+	Provider["streamSimple"],
+	{ stream: Provider["stream"]; policy: (model: Model<Api>, direct: boolean) => boolean }
+>();
+
+/** @internal History attribution and direct tokenizer credential permission are separate capabilities. */
+export function canAttributeProviderHistory(provider: Provider, model: Model<Api>, direct = false): boolean {
+	const original = requestHistoryPolicies.get(provider.streamSimple);
+	if (original) return original.stream === provider.stream && original.policy(model, direct);
+	const streams = getProviderApiStreams(provider, model);
+	return streams !== undefined && (direct ? isDirectOpenAICompletionsApi(streams) : isHistoryPreservingApi(streams));
+}
 
 export interface ExtensionOAuthConfig {
 	name: string;
@@ -623,6 +639,14 @@ export function composeModelProvider(
 		stream: (model, context, options) => streamWith(model, context, options, false),
 		streamSimple: (model, context, options) => streamWith(model, context, options, true),
 	};
+	requestHistoryPolicies.set(provider.streamSimple, {
+		stream: provider.stream,
+		policy: (model, direct) => {
+			if (extension?.streamSimple && model.api === extension.api) return false;
+			if (base && supportsBaseApi(model)) return canAttributeProviderHistory(base, model, direct);
+			return isKnownApiProvider(model.api, direct);
+		},
+	});
 
 	const fetchDeferred = base?.fetchDeferred;
 	if (fetchDeferred) {

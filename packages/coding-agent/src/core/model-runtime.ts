@@ -72,6 +72,7 @@ import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.
 import {
 	type AuthStatus,
 	type CompatibilityRequestConfig,
+	canAttributeProviderHistory,
 	composeModelProvider,
 	configuredRequestAuthStatus,
 	type ProviderConfigInput,
@@ -521,6 +522,13 @@ export class ModelRuntime implements Models {
 
 	getRegisteredNativeProvider(providerId: string): Provider | undefined {
 		return this.nativeExtensionProviders.get(providerId);
+	}
+
+	/** @internal Re-evaluated against the live provider, never inferred from its API label. */
+	canAttributeRequestHistory(model: Model<Api>, direct = false): boolean {
+		if (isVirtualModel(model)) return false;
+		const provider = this.models.getProvider(model.provider);
+		return provider !== undefined && canAttributeProviderHistory(provider, model, direct);
 	}
 
 	/** @internal Compatibility fallback for ModelRegistry when provider auth is unconfigured. */

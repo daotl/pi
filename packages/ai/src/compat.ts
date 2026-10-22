@@ -100,6 +100,23 @@ type RegisteredApiProvider = {
 };
 
 const apiProviderRegistry = new Map<string, RegisteredApiProvider>();
+const knownApiProviders = new WeakMap<
+	ApiProviderInternal,
+	Pick<ApiProviderInternal, "stream" | "streamSimple"> & { direct: boolean }
+>();
+
+/** @internal Registered implementation identity, including the explicit offline faux transport. */
+export function isKnownApiProvider(api: Api, direct = false): boolean {
+	const provider = getApiProvider(api);
+	if (!provider) return false;
+	const original = knownApiProviders.get(provider);
+	return (
+		original !== undefined &&
+		(!direct || original.direct) &&
+		original.stream === provider.stream &&
+		original.streamSimple === provider.streamSimple
+	);
+}
 
 function wrapStream<TApi extends Api, TOptions extends StreamOptions>(
 	api: TApi,
@@ -163,6 +180,14 @@ export function registerFauxProvider(options: RegisterFauxProviderOptions = {}):
 	const core = createFauxCore(options);
 	const sourceId = `faux-provider-${Math.random().toString(36).slice(2, 10)}`;
 	registerApiProvider({ api: core.api, stream: core.stream, streamSimple: core.streamSimple }, sourceId);
+	const registered = getApiProvider(core.api);
+	if (registered) {
+		knownApiProviders.set(registered, {
+			stream: registered.stream,
+			streamSimple: registered.streamSimple,
+			direct: false,
+		});
+	}
 	return {
 		api: core.api,
 		models: core.models,
@@ -201,8 +226,16 @@ export function registerBuiltInApiProviders(): void {
 	for (const [api, streams] of BUILTIN_APIS) {
 		if (!getApiProvider(api)) {
 			registerApiProvider({ api, stream: streams.stream, streamSimple: streams.streamSimple });
+			const registered = getApiProvider(api);
+			if (registered) {
+				knownApiProviders.set(registered, {
+					stream: registered.stream,
+					streamSimple: registered.streamSimple,
+					direct: api === "openai-completions",
+				});
+				builtinApiProviderInstances.set(api, registered);
+			}
 		}
-		builtinApiProviderInstances.set(api, getApiProvider(api));
 	}
 }
 

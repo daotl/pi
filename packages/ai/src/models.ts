@@ -1023,6 +1023,17 @@ export interface CreateProviderOptions<TApi extends Api = Api> {
 	classifiers?: Partial<Record<ClassifierApi, ProviderClassifier>>;
 }
 
+const providerApiStreams = new WeakMap<
+	Provider["streamSimple"],
+	{ stream: Provider["stream"]; resolve: (model: Model<Api>) => ProviderStreams | undefined }
+>();
+
+/** @internal Underlying factory API; replacing either dispatch function invalidates provenance. */
+export function getProviderApiStreams(provider: Provider, model: Model<Api>): ProviderStreams | undefined {
+	const original = providerApiStreams.get(provider.streamSimple);
+	return original?.stream === provider.stream ? original.resolve(model) : undefined;
+}
+
 /**
  * Builds a provider from parts. Built-in provider factories and models.json
  * custom providers both go through this. A single `api` streams all chat
@@ -1117,6 +1128,7 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 		streamSimple: (model, context, options) =>
 			dispatch(model, (streams) => streams.streamSimple(model, context, options)),
 	};
+	providerApiStreams.set(provider.streamSimple, { stream: provider.stream, resolve: apiFor });
 
 	if (streams.some((entry) => entry.fetchDeferred !== undefined)) {
 		provider.fetchDeferred = (model, handle, options) =>
