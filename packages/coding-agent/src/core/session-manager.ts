@@ -1379,6 +1379,22 @@ export class SessionManager {
 		if (this.persist && this.sessionFile) this.flushed = true;
 	}
 
+	/** Apply a synchronous edit batch on isolated entry records, then publish its complete tree atomically. */
+	editMessages(edit: (draft: SessionManager) => void): void {
+		const draft = new SessionManager(this.cwd, this.sessionDir, undefined, false);
+		draft.fileEntries = structuredClone(this.fileEntries);
+		draft._buildIndex();
+		draft.leafId = this.leafId;
+		draft.summaryBlockMaxTokens = this.summaryBlockMaxTokens;
+		edit(draft);
+		const entries = draft.fileEntries.map((entry) => {
+			if (entry.type === "session" || entry.type === "leaf") return entry;
+			const original = this.byId.get(entry.id);
+			return original && isDeepStrictEqual(original, entry) ? original : entry;
+		});
+		this._commitEntries(entries, draft.leafId);
+	}
+
 	/** Clone branch-local references without modifying historical entries or their held references. */
 	private _cloneTailEntry(
 		entry: SessionEntry,

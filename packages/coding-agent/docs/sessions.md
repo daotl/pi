@@ -45,6 +45,8 @@ In `/tree`, select a user message to put its text back in the editor. Edit and s
 
 When you leave a branch, Pi can summarize it and attach that summary to the branch you enter. This preserves relevant work from the abandoned path without including every message from it.
 
+A submitted batch of `pi_edit`/`pi_swipe` blocks is one durable history change: replacements, additions, new versions and in-place swipe edits either all publish or none do. A stale swipe or storage failure keeps the previous branch, transcript and file unchanged. Id0 keeps its current new-version behavior (root messages use replacement); `pi_swipe` keeps existing version timestamps and positions. Editing does not dispatch a model request.
+
 For the persisted tree and entry types, see [Session Format](session-format.md).
 
 ## Manage conversation context

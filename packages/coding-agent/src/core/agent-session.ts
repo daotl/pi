@@ -2066,7 +2066,11 @@ export class AgentSession {
 	 * rest of that branch (tool results, later turns, any later conversation).
 	 */
 	getSwipeGroup(): SwipeGroup | undefined {
-		const entries = this.sessionManager.buildContextEntries();
+		return this._getSwipeGroup(this.sessionManager);
+	}
+
+	private _getSwipeGroup(manager: SessionManager): SwipeGroup | undefined {
+		const entries = manager.buildContextEntries();
 		// Find the swipe unit at the visible tail: skip trailing harness
 		// messages that follow another assistant message (abort notices), tool
 		// results (part of the turn), and state entries. The first assistant or
@@ -2081,7 +2085,7 @@ export class AgentSession {
 			if (message.role === "toolResult") continue;
 			if (message.role === "assistant") {
 				if (isHarnessMessage(message)) {
-					const parent = entry.parentId ? this.sessionManager.getEntry(entry.parentId) : undefined;
+					const parent = entry.parentId ? manager.getEntry(entry.parentId) : undefined;
 					if (parent?.type === "message" && parent.message.role === "assistant") continue;
 				}
 				unit = entry;
@@ -2102,7 +2106,7 @@ export class AgentSession {
 		// leftovers of in-place replacements and tail clones on abandoned
 		// branches, not real alternative versions.
 		const versions: SessionMessageEntry[] = [];
-		for (const entry of this.sessionManager.getEntries()) {
+		for (const entry of manager.getEntries()) {
 			if (entry.type !== "message") continue;
 			if (entry.parentId !== anchorEntryId) continue;
 			if (entry.deletedAt !== undefined || entry.supersededBy !== undefined) continue;
@@ -2121,11 +2125,20 @@ export class AgentSession {
 	 * branch resumes with everything that followed the version.
 	 */
 	goToSwipeVersion(group: SwipeGroup, index: number): boolean {
+		const changed = this._selectSwipeVersion(this.sessionManager, group, index);
+		if (changed) {
+			this._refreshFinalizedContext();
+			this._restoreToolsFromTranscript();
+		}
+		return changed;
+	}
+
+	private _selectSwipeVersion(manager: SessionManager, group: SwipeGroup, index: number): boolean {
 		if (index < 0 || index >= group.versions.length || index === group.currentIndex) return false;
 		const versionRoot = group.versions[index];
 
 		const childrenByParent = new Map<string, SessionEntry[]>();
-		for (const entry of this.sessionManager.getEntries()) {
+		for (const entry of manager.getEntries()) {
 			if (entry.parentId === null) continue;
 			const siblings = childrenByParent.get(entry.parentId);
 			if (siblings) {
@@ -2148,9 +2161,7 @@ export class AgentSession {
 			stack.push(...children);
 		}
 
-		this.sessionManager.branch(leaf.id);
-		this._refreshFinalizedContext();
-		this._restoreToolsFromTranscript();
+		manager.branch(leaf.id);
 		return true;
 	}
 
@@ -2541,27 +2552,25 @@ export class AgentSession {
 		// Version creations go first: they only append a child of the anchor,
 		// so snapshot entry ids of replacement targets stay valid.
 		let versioned = 0;
-		for (const { block, target } of versionTargets) {
-			this._appendEditAsNewSwipeVersion(block, target);
-			versioned++;
-		}
-
-		if (replacements.length > 0) {
-			this.sessionManager.replaceMessages(replacements);
-		}
-
-		for (const message of newMessages) {
-			this.sessionManager.appendMessage(message);
-		}
-
 		let swiped = 0;
-		for (const block of swipes) {
-			this._applySwipeEdit(block);
-			swiped++;
-		}
+		let navigatedSwipe = false;
+		this.sessionManager.editMessages((draft) => {
+			for (const { block, target } of versionTargets) {
+				this._appendEditAsNewSwipeVersion(draft, block, target);
+				versioned++;
+			}
+			if (replacements.length > 0) draft.replaceMessages(replacements);
+			for (const message of newMessages) draft.appendMessage(message);
+			for (const block of swipes) {
+				const navigated = this._applySwipeEdit(draft, block);
+				navigatedSwipe ||= navigated;
+				swiped++;
+			}
+		});
 
 		const sessionContext = this.sessionManager.buildSessionContext();
 		this.agent.state.messages = sessionContext.messages;
+		if (navigatedSwipe) this._restoreToolsFromTranscript(false);
 
 		return { edited: replacements.length, added: newMessages.length, versioned, swiped };
 	}
@@ -2572,8 +2581,8 @@ export class AgentSession {
 	 * or more messages follow it) or interrupted (nothing follows - it can be
 	 * continued via /continue prefill).
 	 */
-	private _messagesAfterEntry(entryId: string): AgentMessage[] {
-		const projection = this.sessionManager.buildSessionProjection();
+	private _messagesAfterEntry(entryId: string, manager = this.sessionManager): AgentMessage[] {
+		const projection = manager.buildSessionProjection();
 		let flatIndex = 0;
 		for (const projectedEntry of projection.entries) {
 			for (let i = 0; i < projectedEntry.messages.length; i++) {
@@ -2595,10 +2604,11 @@ export class AgentSession {
 	 * a group at), the edit replaces it in place instead.
 	 */
 	private _appendEditAsNewSwipeVersion(
+		manager: SessionManager,
 		block: ParsedEditBlock,
 		target: { entryId: string; message: AgentMessage },
 	): void {
-		const targetEntry = this.sessionManager.getEntry(target.entryId);
+		const targetEntry = manager.getEntry(target.entryId);
 		const baseAssistant = target.message.role === "assistant" ? (target.message as AssistantMessage) : undefined;
 		const message = editBlockToMessage(block, baseAssistant);
 		if (message.role === "assistant") {
@@ -2606,11 +2616,11 @@ export class AgentSession {
 		}
 		if (!targetEntry || targetEntry.parentId === null) {
 			// No anchor for a swipe group: replace in place.
-			this.sessionManager.replaceMessages([{ entryId: target.entryId, message }]);
+			manager.replaceMessages([{ entryId: target.entryId, message }]);
 			return;
 		}
-		this.sessionManager.branch(targetEntry.parentId);
-		this.sessionManager.appendMessage(message);
+		manager.branch(targetEntry.parentId);
+		manager.appendMessage(message);
 	}
 
 	/**
@@ -2619,22 +2629,24 @@ export class AgentSession {
 	 * current swipe group (any version, not only the current one). When the
 	 * target is not the current version, the session first navigates to it.
 	 */
-	private _applySwipeEdit(block: ParsedSwipeBlock): void {
-		const group = this.getSwipeGroup();
+	private _applySwipeEdit(manager: SessionManager, block: ParsedSwipeBlock): boolean {
+		const group = this._getSwipeGroup(manager);
 		const index = group?.versions.findIndex((entry) => entry.timestamp === block.timestamp) ?? -1;
 		if (!group || index < 0) {
 			throw new Error(`No swipe version with timestamp ${block.timestamp} (stale swipe edit)`);
 		}
-		if (index !== group.currentIndex) {
-			this.goToSwipeVersion(group, index);
-		}
+		const navigated = index !== group.currentIndex && this._selectSwipeVersion(manager, group, index);
 		const versionEntry = group.versions[index];
 		const baseAssistant = block.role === "assistant" ? (versionEntry.message as AssistantMessage) : undefined;
 		const message = editBlockToMessage(block, baseAssistant);
 		if (message.role === "assistant") {
-			message.stopReason = this._editedAssistantStopReason(block, this._messagesAfterEntry(versionEntry.id));
+			message.stopReason = this._editedAssistantStopReason(
+				block,
+				this._messagesAfterEntry(versionEntry.id, manager),
+			);
 		}
-		this.sessionManager.replaceMessages([{ entryId: versionEntry.id, message }]);
+		manager.replaceMessages([{ entryId: versionEntry.id, message }]);
+		return navigated;
 	}
 
 	/**
@@ -2865,10 +2877,15 @@ export class AgentSession {
 	 * Tools reachable only from other tools are never declared, but they do not depend on the active
 	 * set, so the transcript's declarations are the whole loadout.
 	 */
-	private _restoreToolsFromTranscript(): void {
+	private _restoreToolsFromTranscript(persist = true): void {
 		const current = getCurrentSystemMessage(this.sessionManager.buildSessionContext().messages);
 		if (!current) return;
-		this.setActiveToolsByName((current.toolsAdded ?? []).map((tool) => tool.name));
+		const names = (current.toolsAdded ?? []).map((tool) => tool.name);
+		if (persist) this.setActiveToolsByName(names);
+		else {
+			const tools = this._applyToolLoadout(names);
+			this._baseSystemPrompt = this._rebuildSystemPrompt(tools.map((tool) => tool.name));
+		}
 	}
 
 	/**
