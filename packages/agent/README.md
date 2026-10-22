@@ -145,6 +145,8 @@ agent.prepareRequest = async ({ context }) => ({
 
 `prepareRequest` does not poll queues. Steering queued while it runs waits for the next normal steering poll.
 
+`request.returnPrefill` identifies an actual assistant-prefill request independently of message object identity. The loop passes `true` only for the first resumed response and `false` for later tool-result or ordinary requests. A canonical projection can copy an assistant without making that copy a prefill.
+
 `finishTurn` runs after the assistant and all tool results are finalized, but before `turn_end`. It runs for normal, error, and aborted responses:
 
 ```typescript

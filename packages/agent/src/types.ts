@@ -176,6 +176,8 @@ export interface PrepareRequestContext {
 	context: AgentContext;
 	model: Model<any>;
 	thinkingLevel: ThinkingLevel;
+	/** Whether this request resumes a prefill, independent of projected message object identity. */
+	returnPrefill?: boolean;
 }
 
 /** Replacement runtime state for the provider request being prepared. */

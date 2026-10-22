@@ -902,64 +902,16 @@ export class AgentSession {
 		return true;
 	}
 
-	/**
-	 * Projected messages, with the prefill appended back when a prefill continuation
-	 * is in flight. The prefill is removed from the transcript on capture, so a
-	 * projection rebuild would drop it from the request; the continuation needs it
-	 * as the trailing assistant message (sent with return_prefill).
-	 */
-	private _projectedMessages(originalMessages?: AgentMessage[], projection?: SessionProjection): AgentMessage[] {
-		this._syncSummaryBlockMaxTokens();
-		const messages = projection?.messages ?? this.sessionManager.buildSessionProjection().messages;
-		// Preserve a trailing assistant prefill that only lives in the request
-		// context (pushed by runContinuation) and not in the projection (it was
-		// removed from the transcript on capture or deleted by the caller). A
-		// prefill's content is absent from state.messages (deleted on capture); a
-		// discarded message is still a real transcript message and must not leak
-		// back as a prefill.
-		const lastOriginal = originalMessages?.[originalMessages.length - 1];
-		// Once the echo is confirmed, the continued message fully represents the
-		// prefill and is persisted in the transcript. Appending the pending prefill
-		// again would re-send the old partial on every later turn of the same run
-		// (the projection does not contain it, it was removed on capture).
-		const prefill =
-			(this._pendingPrefill !== undefined && !this._prefillEchoConfirmed ? this._pendingPrefill : undefined) ??
-			(lastOriginal?.role === "assistant" &&
-			messages[messages.length - 1] !== lastOriginal &&
-			!this._isRealTranscriptMessage(lastOriginal)
-				? lastOriginal
-				: undefined);
-		if (prefill && messages[messages.length - 1] !== prefill) {
-			return [...messages, prefill];
-		}
-		return messages;
-	}
-
-	private _isRealTranscriptMessage(message: AgentMessage): boolean {
-		// Check the raw session branch (not state.messages, which is the projection
-		// after a compaction). A message still in the branch is a real transcript
-		// message; a deleted prefill is not. Only assistant messages carry prefill content.
-		if (message.role !== "assistant") return false;
-		return this.sessionManager
-			.getBranch()
-			.some(
-				(entry) =>
-					entry.type === "message" &&
-					entry.message.role === "assistant" &&
-					contentText(entry.message.content) === contentText(message.content),
-			);
-	}
-
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
 		this._syncSummaryBlockMaxTokens();
 		const projection = this.sessionManager.buildSessionProjection();
 		// A virtual selection is checked in prepareRequest, against the model the request is routed to.
 		const model = this.model;
 		if (!model || isVirtualModel(model) || !this._exceedsCompactionThreshold(model, projection)) {
-			return { ...context, messages: this._projectedMessages(context.messages, projection) };
+			return { ...context, messages: projection.messages };
 		}
 		await this._runAutoCompaction("threshold", false);
-		return { ...context, messages: this._projectedMessages(context.messages, projection) };
+		return { ...context, messages: this.sessionManager.buildSessionProjection().messages };
 	}
 
 	private _installAgentRequestProjection(): void {
@@ -967,12 +919,16 @@ export class AgentSession {
 		this.agent.prepareRequest = async (request, signal) => {
 			const failed = this._failedResponse;
 			this._failedResponse = undefined;
+			const trailing = request.context.messages.at(-1);
+			const prefill = request.returnPrefill
+				? (this._pendingPrefill ?? (trailing?.role === "assistant" ? trailing : undefined))
+				: undefined;
 			const prepare = async () => {
 				this._syncSummaryBlockMaxTokens();
 				const projection = this.sessionManager.buildSessionProjection();
 				const canonicalContext = {
 					...request.context,
-					messages: this._projectedMessages(request.context.messages, projection),
+					messages: prefill ? [...projection.messages, prefill] : projection.messages,
 					// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
 					tools: this.agent.state.tools.slice(),
 				};

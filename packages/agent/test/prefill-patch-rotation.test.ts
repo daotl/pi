@@ -119,6 +119,7 @@ it.each(matrix)("replaces one prefix across $suffix/$delivery ($consumer)", asyn
 	};
 	const final: AssistantMessage = { ...old, content: [{ type: "text", text: "done" }] };
 	let preparation = 0;
+	const preparedPrefills: Array<boolean | undefined> = [];
 	const config: AgentLoopConfig = {
 		model,
 		returnPrefill: true,
@@ -131,13 +132,13 @@ it.each(matrix)("replaces one prefix across $suffix/$delivery ($consumer)", asyn
 					message.role === "toolResult",
 			),
 		getSteeringMessages: async () => pending.splice(0),
-		prepareRequest:
-			suffix === "prepare-patches"
-				? (request) =>
-						++preparation === 1
-							? { context: { ...request.context, messages: [...history, prefix, ...patches] } }
-							: undefined
-				: undefined,
+		prepareRequest: (request) => {
+			preparedPrefills.push(request.returnPrefill);
+			if (suffix === "prepare-patches" && ++preparation === 1) {
+				return { context: { ...request.context, messages: [...history, prefix, ...patches] } };
+			}
+			return undefined;
+		},
 	};
 	const streamFn = (_model: Model<string>, request: TranscriptContext, options?: { returnPrefill?: boolean }) => {
 		requests.push({ ...request, messages: request.messages.slice() });
@@ -159,6 +160,7 @@ it.each(matrix)("replaces one prefix across $suffix/$delivery ($consumer)", asyn
 			: await runAgentLoopContinue(context, config, () => {}, undefined, streamFn);
 	expect(executed).toEqual(["once"]);
 	expect(flags).toEqual([true, false]);
+	expect(preparedPrefills).toEqual([true, false]);
 	expect(requests[0].messages).toEqual([...expected, prefix]);
 	const wire = requests.map((request, index) => convertMessages(model, request, compat, { prefill: flags[index] }));
 	expect(

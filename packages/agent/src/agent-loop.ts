@@ -368,6 +368,7 @@ async function runLoop(
 					context: currentContext,
 					model: config.model,
 					thinkingLevel: config.reasoning ?? "off",
+					returnPrefill: config.returnPrefill === true,
 				},
 				signal,
 			);

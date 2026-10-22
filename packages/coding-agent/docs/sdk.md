@@ -69,6 +69,8 @@ Preflight hooks, authentication, compaction and image normalization can yield to
 
 A steering message enters after the current assistant turn and its tool calls. A follow-up enters after the current run finishes its pending work. `steer()` and `followUp()` expose those behaviors directly and return `"queued"` if the input was queued (including after an extension transformed it), or `"handled"` if an extension consumed it.
 
+Canonical context edits remain authoritative on the next request. Ordinary projected assistant copies are not appended again as implicit prefills; an explicit direct-Agent prefill is retained even if earlier history contains the same text. Later tool-result requests use the finalized projection without reattaching the original partial.
+
 `abort()` stops the active operation and waits for the session to become idle. `waitForIdle()` waits without aborting it.
 
 `incomingMessagePrefix` is read from the supplied `SettingsManager` on each SDK context conversion. Historical and new string/array user text receive the current prefix without changing stored history, text metadata or images. The SDK uses the shared `prefixUserMessages` helper in its converter so direct summaries and token counts follow the same setting. Do not also set the Agent prefix to the same value; that would apply it twice. Cache warming replays the already converted original request, not a newly prefixed one.
