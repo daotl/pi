@@ -57,6 +57,8 @@ Run `/compact` to compact manually. You can add instructions when the summary sh
 
 Compaction can fail if the provider is unavailable or cannot accept the summarization request. Correct the provider problem and run `/compact` again. Disabling automatic compaction does not disable the manual command.
 
+Accepted steering and follow-up input does not grant another retry. When automatic retry is disabled or exhausted, queued input is sent as an ordinary request rather than recapturing the interrupted assistant prefix. An already approved prefix retry keeps its first request ahead of queued steering; that input is delivered afterward.
+
 See [Compaction Reference](compaction.md) for thresholds, retained boundaries, branch-summary behavior, and extension hooks.
 
 ## Control session storage

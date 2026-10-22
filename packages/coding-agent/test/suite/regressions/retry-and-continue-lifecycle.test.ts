@@ -491,28 +491,6 @@ describe("retry prefill continuation", () => {
 		const continuedText = " continued after server recovery";
 		const seenPrefills: string[] = [];
 
-		harness.setResponses([
-			// First call: partial response with terminated error
-			fauxAssistantMessage(partialText, {
-				stopReason: "error",
-				errorMessage: "terminated",
-			}),
-			// Second call (retry): 503 still loading
-			fauxAssistantMessage("", {
-				stopReason: "error",
-				errorMessage: '503: {"message":"Loading model","type":"unavailable_error","code":503}',
-			}),
-			// Third call (retry): succeeds with prefill continuation
-			(context) => {
-				const last = context.messages[context.messages.length - 1];
-				const lastText = getMessageText(last) as string;
-				seenPrefills.push(lastText);
-				return fauxAssistantMessage(`${lastText}${continuedText}`, {
-					stopReason: "stop",
-				});
-			},
-		]);
-
 		// Queue a steering message after the first error (simulates user typing
 		// during streaming, before the server terminates)
 		// In the real flow this happens via session.prompt() with streamingBehavior
@@ -553,37 +531,29 @@ describe("retry prefill continuation", () => {
 					stopReason: "stop",
 				});
 			},
+			fauxAssistantMessage("steering delivered"),
 		]);
 
 		await harness.session.prompt("test");
 
-		// Three calls: terminated, 503, success (prefill continuation)
-		expect(harness.faux.state.callCount).toBe(3);
+		// The approved prefix retry completes before the accepted steering request.
+		expect(harness.faux.state.callCount).toBe(4);
 		// The prefill must be the original partial text, NOT the steering message.
 		expect(seenPrefills).toEqual([partialText]);
 
-		// Final transcript: user prompt → successful assistant response
+		// Both the completed prefix and subsequent steering answer remain visible.
 		const messages = harness.session.messages;
 		const userMessages = messages.filter((m) => m.role === "user");
 		const assistantMessages = messages.filter((m) => m.role === "assistant");
-		expect(userMessages.length).toBe(1);
-		expect(assistantMessages.length).toBe(1);
-		expect(getMessageText(assistantMessages[0]) as string).toBe(`${partialText}${continuedText}`);
-		// Steering message must NOT have been sent to the LLM.
-		expect(userMessages[0]).toBeDefined();
-		expect(getMessageText(userMessages[0]) as string).toBe("test");
+		expect(userMessages.map(getMessageText)).toEqual(["test", "steering message"]);
+		expect(assistantMessages.map(getMessageText)).toEqual([`${partialText}${continuedText}`, "steering delivered"]);
 
-		// Verify session log integrity: /delete should remove exactly one message
-		// (the assistant response), not extra orphaned entries.
-		const entriesBeforeDelete = harness.sessionManager
+		const steeringReply = harness.sessionManager
 			.buildContextEntries()
-			.filter((e) => e.type === "message" && e.message.role !== "system").length;
-		expect(entriesBeforeDelete).toBe(2); // 1 user + 1 assistant
-		const removed = harness.session.deleteLastMessages(1);
-		expect(removed).toBe(1);
-		const entriesAfterDelete = harness.sessionManager
-			.buildContextEntries()
-			.filter((e) => e.type === "message" && e.message.role !== "system").length;
-		expect(entriesAfterDelete).toBe(1); // only user prompt remains
+			.findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
+		if (!steeringReply) throw new Error("Missing steering response");
+		expect(harness.session.deleteLastMessages(1)).toBe(1);
+		expect(harness.session.getLastAssistantText()).toBe(`${partialText}${continuedText}`);
+		expect(harness.sessionManager.getEntry(steeringReply.id)).toBeUndefined();
 	});
 });

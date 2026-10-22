@@ -3084,6 +3084,10 @@ export class AgentSession {
 	 * original partial is restored.
 	 */
 	private async _continueOnce(prefill?: AgentMessage): Promise<void> {
+		if (!prefill && !this._pendingPrefill && !this._failedResponse && this.agent.hasQueuedMessages()) {
+			await this.agent.continue();
+			return;
+		}
 		// Strip trailing harness messages so they do not block continuation or
 		// get duplicated in the LLM context.
 		const stripped = stripTrailingHarnessMessages(this.agent.state.messages);

@@ -675,7 +675,9 @@ export class Agent {
 	private async runContinuation(prefill?: AgentMessage): Promise<void> {
 		await this.runWithLifecycle(async (signal) => {
 			const context = this.createContextSnapshot();
-			const config = prefill ? { ...this.createLoopConfig(), returnPrefill: true } : this.createLoopConfig();
+			const config = prefill
+				? { ...this.createLoopConfig({ skipInitialSteeringPoll: true }), returnPrefill: true }
+				: this.createLoopConfig();
 			if (prefill) {
 				context.messages.push(prefill);
 			}
