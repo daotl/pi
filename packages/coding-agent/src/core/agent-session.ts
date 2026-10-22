@@ -946,7 +946,22 @@ export class AgentSession {
 			let { previous, context, projection } = await prepare();
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
-			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
+			const validatePrefillRoute = (physical: Model<string>): void => {
+				if (!prefill || prefill.role !== "assistant") return;
+				if (
+					physical.api !== "openai-completions" ||
+					physical.provider !== prefill.provider ||
+					physical.id !== prefill.model
+				) {
+					throw new Error(
+						"Prefill continuation requires the physical provider and model that produced the prefix",
+					);
+				}
+			};
+			if (!isVirtualModel(model)) {
+				validatePrefillRoute(model);
+				return { ...previous, context, model, thinkingLevel };
+			}
 
 			// The selection stays in agent state; only this request uses the routed model. A routing
 			// failure rejects, which ends the run with an error response. Only messages the user wrote
@@ -961,6 +976,7 @@ export class AgentSession {
 				failed,
 				state,
 			});
+			validatePrefillRoute(route.model);
 			if (route.state !== undefined && route.state !== state) {
 				const data: VirtualModelStateData = { provider: model.provider, modelId: model.id, state: route.state };
 				const entry = this.sessionManager.getEntry(
@@ -5458,7 +5474,9 @@ export class AgentSession {
 		if (isHarnessMessage(message)) {
 			return false;
 		}
-		if (this.agent.state.model.api !== "openai-completions") {
+		if (
+			(isVirtualModel(this.agent.state.model) ? message.api : this.agent.state.model.api) !== "openai-completions"
+		) {
 			return false;
 		}
 		// A message that completed on its own (stopReason "stop") needs no prefill

@@ -83,6 +83,8 @@ Registration follows the same queuing and reload rules as `pi.registerProvider()
 
 Returning `previous` for `continuation` and `failed` for `retry` keeps prompt caches and thinking signatures valid. Switching models between turns is allowed but loses the prompt cache. A retry can also switch to another model, for example when `failed.message.errorMessage` reports that a provider is overloaded or the context overflowed.
 
+Prefill continuation must stay on the physical `openai-completions` provider and model that produced the prefix. A virtual selection keeps its identity, but continuation checks the routed physical target before publishing router state or dispatching a provider request. An incompatible route fails and Session-owned continuation restores the original prefix. Direct-Agent prefixes projected by a Session use the same origin check even with a physical selection.
+
 If `route()` throws, or returns a virtual model or a model without credentials, the request ends with an error response.
 
 ## Keep routing state
