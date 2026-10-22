@@ -18,6 +18,7 @@ import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
 import { createInMemoryModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
+import { enableBuiltinProviders } from "./test-network-env.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
 
 const rpcIo = vi.hoisted(() => ({
@@ -189,9 +190,7 @@ async function startRpcMode(options: Parameters<typeof createRuntimeHost>[0]): P
 }
 
 describe("RPC prompt response semantics", () => {
-	// Successful prompt preflight requires a registered provider; local-only
-	// mode (PI_DISABLE_CLOUD_PROVIDERS=1) hides all built-in providers.
-	const cloudDisabled = process.env.PI_DISABLE_CLOUD_PROVIDERS === "1";
+	// Successful preflight uses bundled metadata; all responses use the scripted Agent stream.
 	afterEach(() => {
 		rpcIo.outputLines = [];
 		rpcIo.lineHandler = undefined;
@@ -237,7 +236,8 @@ describe("RPC prompt response semantics", () => {
 	});
 
 	// #9098: a successful prompt may start an agent run or be consumed by an extension.
-	it.skipIf(cloudDisabled)("emits one started response when prompt preflight succeeds", async () => {
+	it("emits one started response when prompt preflight succeeds", async () => {
+		enableBuiltinProviders();
 		const { lineHandler, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 0 });
 
 		try {
@@ -291,7 +291,8 @@ describe("RPC prompt response semantics", () => {
 		}
 	});
 
-	it.skipIf(cloudDisabled)("emits one success response when prompt is queued during streaming", async () => {
+	it("emits one success response when prompt is queued during streaming", async () => {
+		enableBuiltinProviders();
 		const { lineHandler, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 100 });
 
 		try {
@@ -332,9 +333,7 @@ describe("RPC prompt response semantics", () => {
 	it.each(["steer", "follow_up"] as const)(
 		"reports %s as handled even when an extension queues another message",
 		async (type) => {
-			// Successful prompt preflight needs a registered cloud provider; register them for the duration.
-			const previousCloudDisabled = process.env.PI_DISABLE_CLOUD_PROVIDERS;
-			process.env.PI_DISABLE_CLOUD_PROVIDERS = "0";
+			enableBuiltinProviders();
 			const { lineHandler, cleanup } = await startRpcMode({
 				withAuth: true,
 				responseDelayMs: 500,
@@ -375,8 +374,6 @@ describe("RPC prompt response semantics", () => {
 					).toHaveLength(1);
 				});
 			} finally {
-				if (previousCloudDisabled === undefined) delete process.env.PI_DISABLE_CLOUD_PROVIDERS;
-				else process.env.PI_DISABLE_CLOUD_PROVIDERS = previousCloudDisabled;
 				await cleanup();
 			}
 		},
@@ -417,10 +414,7 @@ describe("RPC prompt response semantics", () => {
 	});
 
 	it("returns and clears queued steering and follow-up messages", async () => {
-		// Uses a real builtin anthropic provider with a synthetic API key and no
-		// network, so register cloud providers for the duration.
-		const previousCloudDisabled = process.env.PI_DISABLE_CLOUD_PROVIDERS;
-		process.env.PI_DISABLE_CLOUD_PROVIDERS = "0";
+		enableBuiltinProviders();
 		const { lineHandler, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 500 });
 
 		try {
@@ -472,8 +466,6 @@ describe("RPC prompt response semantics", () => {
 			await sleep(600);
 			expect(parseOutputLines(rpcIo.outputLines).filter((record) => record.type === "agent_start")).toHaveLength(1);
 		} finally {
-			if (previousCloudDisabled === undefined) delete process.env.PI_DISABLE_CLOUD_PROVIDERS;
-			else process.env.PI_DISABLE_CLOUD_PROVIDERS = previousCloudDisabled;
 			await cleanup();
 		}
 	});
