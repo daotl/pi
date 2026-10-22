@@ -200,6 +200,8 @@ await agent.continue(); // Uses the queued message only because the tail is assi
 
 Explicit `continue(prefill)` requires an `openai-completions` request API. When `prepareRequest` routes a virtual selection, the physical API is checked after routing and before provider dispatch; a compatible route proceeds without changing the selected model. An incompatible routed prefill finishes through the normal error lifecycle without a provider request. Ordinary non-prefill requests are not restricted by this check.
 
+The low-level `agentLoopContinue` and `runAgentLoopContinue` APIs accept ordered system/tool patches after an assistant prefill. With `returnPrefill`, those patches and already accepted pending input precede the effective prefill before dispatch; streamed and terminal-only responses replace that one assistant slot. Later tool-result requests contain the echoed call once, not a duplicate original with a synthesized missing result. These low-level contexts keep their existing mutable-history contract.
+
 ### Event Types
 
 | Event | Description |

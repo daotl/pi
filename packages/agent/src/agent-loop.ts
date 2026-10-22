@@ -348,11 +348,17 @@ async function runLoop(
 				await emit({ type: "turn_start" });
 			}
 
+			if (config.returnPrefill) moveTrailingSystemPatchesBeforePrefill(currentContext.messages);
+
 			// Process prepared and queued messages before the next assistant response.
 			for (const message of declareToolChanges(currentContext, [...preparedMessages, ...pendingMessages])) {
 				await emit({ type: "message_start", message });
 				await emit({ type: "message_end", message });
-				currentContext.messages.push(message);
+				if (config.returnPrefill && currentContext.messages.at(-1)?.role === "assistant") {
+					currentContext.messages.splice(currentContext.messages.length - 1, 0, message);
+				} else {
+					currentContext.messages.push(message);
+				}
 				newMessages.push(message);
 			}
 			pendingMessages = [];
@@ -383,6 +389,9 @@ async function runLoop(
 			if (config.returnPrefill && config.model.api !== "openai-completions") {
 				throw new Error("Continuation is only supported for openai-completions providers (e.g., llama-server)");
 			}
+
+			// Preparation may replace the context or append another ordered policy suffix.
+			if (config.returnPrefill) moveTrailingSystemPatchesBeforePrefill(currentContext.messages);
 
 			// Stream assistant response
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
@@ -531,6 +540,16 @@ function withToolChanges(message: SystemMessage, { toolsAdded, toolsRemoved }: T
 	};
 }
 
+/** Move only ordered trailing system patches before the effective prefill, not older history. */
+function moveTrailingSystemPatchesBeforePrefill(messages: AgentMessage[]): void {
+	let index = messages.length - 1;
+	while (index >= 0 && messages[index].role === "system") index--;
+	if (index < 0 || messages[index].role !== "assistant" || index === messages.length - 1) return;
+	const prefill = messages[index];
+	messages.copyWithin(index, index + 1);
+	messages[messages.length - 1] = prefill;
+}
+
 /**
  * Stream an assistant response from the LLM.
  * This is where AgentMessage[] gets transformed to Message[] for the LLM.
@@ -571,8 +590,8 @@ async function streamAssistantResponse(
 	// being resumed. Replace it with the streamed partial instead of appending,
 	// so the context does not retain a duplicate of the prefill alongside the
 	// response (which would send the prefill's tool calls twice on a subsequent
-	// tool-result turn). convertToLlm above already received the prefill as the
-	// trailing assistant message, so it is safe to replace it here.
+	// tool-result turn). Ordered trailing patches have already moved before the
+	// prefill, so every replacement path targets the same final assistant slot.
 	const replaceLast =
 		config.returnPrefill === true &&
 		context.messages.length > 0 &&
@@ -614,7 +633,7 @@ async function streamAssistantResponse(
 			case "done":
 			case "error": {
 				const finalMessage = await result();
-				if (addedPartial) {
+				if (addedPartial || replaceLast) {
 					context.messages[context.messages.length - 1] = finalMessage;
 				} else {
 					context.messages.push(finalMessage);
@@ -629,10 +648,12 @@ async function streamAssistantResponse(
 	}
 
 	const finalMessage = await result();
-	if (addedPartial) {
+	if (addedPartial || replaceLast) {
 		context.messages[context.messages.length - 1] = finalMessage;
 	} else {
 		context.messages.push(finalMessage);
+	}
+	if (!addedPartial) {
 		await emit({ type: "message_start", message: { ...finalMessage } });
 	}
 	await emit({ type: "message_end", message: finalMessage });
