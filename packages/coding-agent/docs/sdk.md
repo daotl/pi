@@ -31,6 +31,8 @@ Read current state through `session.messages`, `session.model`, `session.thinkin
 
 `session.systemPrompt` is read-only and returns the current effective system prompt, including changes that have not yet been sent to the model. Tool changes are declared to the model before the next request.
 
+Explicit `setCustomSystemPrompt()` and granular `reloadSystemPromptFromFiles()`/`reloadSkillsFromFiles()`/`reloadAllFromFiles()` updates reject while an agent run, compaction or tree summary owns the session. If saving the updated snapshot fails, the previous effective prompt construction and skill metadata remain active for subsequent requests. Loader caches may already reflect changed files; another explicit update retries publication from those current resources.
+
 <a id="sessionmanager-api"></a>
 
 ### Session storage

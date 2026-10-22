@@ -3658,13 +3658,21 @@ export class InteractiveMode {
 			if (text === "/system-prompt" || text.startsWith("/system-prompt ")) {
 				const arg = text.startsWith("/system-prompt ") ? text.slice(14).trim() : "";
 				this.editor.setText("");
-				await this.handleSystemPromptCommand(arg);
+				try {
+					this.handleSystemPromptCommand(arg);
+				} catch (error) {
+					this.showError(`System prompt update failed: ${error instanceof Error ? error.message : String(error)}`);
+				}
 				return;
 			}
 			if (text === "/update" || text.startsWith("/update ")) {
 				const arg = text.startsWith("/update ") ? text.slice(7).trim() : "";
 				this.editor.setText("");
-				this.handleUpdateCommand(arg);
+				try {
+					this.handleUpdateCommand(arg);
+				} catch (error) {
+					this.showError(`Update failed: ${error instanceof Error ? error.message : String(error)}`);
+				}
 				return;
 			}
 			if (text === "/debug") {

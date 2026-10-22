@@ -2976,16 +2976,43 @@ export class AgentSession {
 	 * base system prompt once. Use to update a resumed session with the latest
 	 * APPEND_SYSTEM.md / SYSTEM.md / skill contents.
 	 */
-	private reloadFromFiles(options: { systemPrompt?: boolean; skills?: boolean }): void {
-		if (options.systemPrompt) {
-			this._resourceLoader.reloadSystemPrompt();
-			this._customSystemPromptOverride = undefined;
+	private reloadFromFiles(options: { systemPrompt?: boolean; skills?: boolean; customPrompt?: string }): void {
+		if (this.isStreaming || this.agent.signal) {
+			throw new Error("Cannot update the system prompt while the agent is running.");
 		}
-		if (options.skills) {
-			this._resourceLoader.reloadSkills();
-			this._effectiveSkills = undefined;
+		if (this.isCompacting) {
+			throw new Error("Cannot update the system prompt while compaction is in progress.");
 		}
-		this._commitBaseSystemPrompt(this._rebuildSystemPrompt(this.getActiveToolNames()), true);
+		const previous = {
+			prompt: this._baseSystemPrompt,
+			options: normalizeBuildSystemPromptOptions(this._baseSystemPromptOptions),
+			customPrompt: this._customSystemPromptOverride,
+			skills: this._effectiveSkills?.map((skill) => ({ ...skill, sourceInfo: { ...skill.sourceInfo } })),
+			restoreSystemPrompt: this._restoreSystemPrompt,
+			lastPersistedSystemPrompt: this._lastPersistedSystemPrompt,
+		};
+		try {
+			if (options.systemPrompt) {
+				this._resourceLoader.reloadSystemPrompt();
+				this._customSystemPromptOverride = undefined;
+			}
+			if (options.skills) {
+				this._resourceLoader.reloadSkills();
+				this._effectiveSkills = undefined;
+			}
+			if (options.customPrompt !== undefined) {
+				this._customSystemPromptOverride = options.customPrompt.length > 0 ? options.customPrompt : undefined;
+			}
+			this._commitBaseSystemPrompt(this._rebuildSystemPrompt(this.getActiveToolNames()), true);
+		} catch (error) {
+			this._baseSystemPrompt = previous.prompt;
+			this._baseSystemPromptOptions = previous.options;
+			this._customSystemPromptOverride = previous.customPrompt;
+			this._effectiveSkills = previous.skills;
+			this._restoreSystemPrompt = previous.restoreSystemPrompt;
+			this._lastPersistedSystemPrompt = previous.lastPersistedSystemPrompt;
+			throw error;
+		}
 	}
 
 	/**
@@ -3015,8 +3042,7 @@ export class AgentSession {
 	 * prompt) and persist it. Pass empty text to revert to the file-based prompt.
 	 */
 	setCustomSystemPrompt(text: string): void {
-		this._customSystemPromptOverride = text.length > 0 ? text : undefined;
-		this._commitBaseSystemPrompt(this._rebuildSystemPrompt(this.getActiveToolNames()), true);
+		this.reloadFromFiles({ customPrompt: text });
 	}
 
 	/** Whether a custom base system prompt is currently in effect. */
