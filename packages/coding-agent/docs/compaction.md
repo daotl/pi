@@ -22,6 +22,8 @@ Pi has two summarization mechanisms:
 
 Both use closely related structured formats and track file operations cumulatively. Summarization requests disable prompt-cache writes because these one-off prompts are unlikely to be reused.
 
+Each retry starts from a fresh copy of the fixed selected source history and reapplies the current context transform, converter and incoming-message prefix. Generated summary instructions are appended afterward and are not prefixed. The payload callback is read again after asynchronous policy work; a retry does not reuse a prior attempt's transformed messages. If policy removes an existing system baseline or tool declarations, summarization does not restore that private state afterward.
+
 ## Compaction
 
 ### When It Triggers

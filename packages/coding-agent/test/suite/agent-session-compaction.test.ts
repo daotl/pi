@@ -9,6 +9,7 @@ import {
 	type Model,
 	type SimpleStreamOptions,
 	type TranscriptContext,
+	toToolDeclaration,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -358,7 +359,9 @@ describe("AgentSession compaction characterization", () => {
 		// summarization only appends its instruction at the end).
 		expect(transformContext).toHaveBeenCalled();
 		expect(getCurrentSystemPrompt(requestContext?.messages ?? [])).toBe(harness.session.agent.state.systemPrompt);
-		expect(getCurrentTools(requestContext?.messages ?? [])).toEqual(harness.session.agent.state.tools);
+		expect(getCurrentTools(requestContext?.messages ?? [])).toEqual(
+			harness.session.agent.state.tools.map(toToolDeclaration),
+		);
 		// The replaced tail (the user message) stays in the request prefix byte-identical to the chat.
 		expect(JSON.stringify(requestContext?.messages)).toContain("message to compact");
 		// The one-off summary still avoids cache writes and uses fresh routing.
@@ -380,7 +383,9 @@ describe("AgentSession compaction characterization", () => {
 		expect(captured?.messages.filter((message) => message.role === "system")).toEqual([
 			expect.objectContaining({ role: "system", content: "CHECKPOINT-ONCE" }),
 		]);
-		expect(getCurrentTools(captured?.messages ?? [])).toEqual(harness.session.agent.state.tools);
+		expect(getCurrentTools(captured?.messages ?? [])).toEqual(
+			harness.session.agent.state.tools.map(toToolDeclaration),
+		);
 	});
 
 	it("persists usage from pi-generated manual compaction", async () => {

@@ -12,6 +12,7 @@ import {
 	type RetryCallbacks,
 	type RetryPolicy,
 	retryAssistantCall,
+	toToolDeclaration,
 	uuidv7,
 } from "@earendil-works/pi-ai";
 import type {
@@ -597,26 +598,17 @@ async function buildAgentSummarizationContext(
 	signal: AbortSignal | undefined,
 	fallbackSystemPrompt: string | undefined,
 ): Promise<Message[]> {
-	const source = structuredClone(messages);
+	const baseline = agent && messages[0]?.role !== "system" ? getCurrentSystemMessage(agent.state.messages) : undefined;
+	const source = structuredClone(baseline ? [baseline, ...messages] : messages);
 	if (source[0]?.role !== "system") {
-		const saved = agent ? getCurrentSystemMessage(agent.state.messages) : undefined;
-		source.unshift(
-			saved
-				? structuredClone(saved)
-				: {
-						role: "system",
-						content: fallbackSystemPrompt ?? agent?.state.systemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT,
-						timestamp: 0,
-					},
-		);
+		source.unshift({ role: "system", content: fallbackSystemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT, timestamp: 0 });
+	}
+	if (agent && source[0]?.role === "system" && source[0].toolsAdded === undefined) {
+		source[0] = { ...source[0], toolsAdded: agent.state.tools.map(toToolDeclaration) };
 	}
 	const transformed = agent?.transformContext ? await agent.transformContext(source, signal) : source;
-	const converted = agent ? await agent.convertForRequest(transformed) : convertToLlm(transformed);
-	const baseline = converted[0];
-	if (agent && baseline?.role === "system" && baseline.toolsAdded === undefined) {
-		return [{ ...baseline, toolsAdded: agent.state.tools.slice() }, ...converted.slice(1)];
-	}
-	return converted;
+	// Policy sees the complete default checkpoint and may remove any part; do not restore it afterward.
+	return agent ? await agent.convertForRequest(transformed) : convertToLlm(transformed);
 }
 
 function createSummarizationOptions(
@@ -653,7 +645,7 @@ function createSummarizationOptions(
  */
 export async function completeSummarization(
 	model: Model<any>,
-	context: TranscriptContext,
+	context: TranscriptContext | ((options: SimpleStreamOptions) => TranscriptContext | Promise<TranscriptContext>),
 	options: SimpleStreamOptions,
 	streamFn?: StreamFn,
 	retry?: RetryPolicy,
@@ -666,10 +658,13 @@ export async function completeSummarization(
 		cacheRetention: "none",
 		sessionId: options.sessionId ?? uuidv7(),
 	};
-	const produce = async (): Promise<AssistantMessage> =>
-		streamFn
-			? (await streamFn(model, context, requestOptions)).result()
-			: completeSimple(model, context, requestOptions);
+	const produce = async (): Promise<AssistantMessage> => {
+		const attemptOptions = { ...requestOptions };
+		const attemptContext = typeof context === "function" ? await context(attemptOptions) : structuredClone(context);
+		return streamFn
+			? (await streamFn(model, attemptContext, attemptOptions)).result()
+			: completeSimple(model, attemptContext, attemptOptions);
+	};
 	return retryAssistantCall(produce, retry, requestOptions.signal, callbacks);
 }
 
@@ -760,18 +755,21 @@ export async function generateSummaryWithUsage(
 	// convertToLlm exactly as a normal request would. The summarization
 	// instruction is appended as a final user message so nothing is inserted
 	// before the existing prefix.
-	const llmMessages = await buildAgentSummarizationContext(agent, currentMessages, signal, systemPrompt);
+	const sourceMessages = structuredClone(currentMessages);
 
 	const instructionText = `Do not continue the conversation above. Output only the structured summary requested below.\n\n${basePrompt}`;
 
-	const summarizationMessages: Message[] = [
-		...llmMessages,
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: instructionText }],
+	const buildContext = async (attemptOptions: SimpleStreamOptions): Promise<TranscriptContext> => {
+		const llmMessages = await buildAgentSummarizationContext(agent, sourceMessages, signal, systemPrompt);
+		const instruction: Message = {
+			role: "user",
+			content: [{ type: "text", text: instructionText }],
 			timestamp: Date.now(),
-		},
-	];
+		};
+		// Context/converter work can replace the policy while awaiting; read it immediately before dispatch.
+		if (agent) attemptOptions.onPayload = agent.onPayload;
+		return { messages: [...llmMessages, instruction] } as TranscriptContext;
+	};
 
 	const completionOptions = createSummarizationOptions(
 		model,
@@ -785,14 +783,7 @@ export async function generateSummaryWithUsage(
 		agent,
 	);
 
-	const response = await completeSummarization(
-		model,
-		{ messages: summarizationMessages } as TranscriptContext,
-		completionOptions,
-		streamFn,
-		retry,
-		callbacks,
-	);
+	const response = await completeSummarization(model, buildContext, completionOptions, streamFn, retry, callbacks);
 
 	const failure = getSummarizationFailure(response, "Summarization");
 	if (failure) {

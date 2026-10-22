@@ -358,12 +358,6 @@ export async function generateBranchSummary(
 	else if (source[0]?.role !== "system" || (!agent && systemPrompt !== undefined)) {
 		source.unshift({ role: "system", content: systemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT, timestamp: 0 });
 	}
-	if (agent && source[0]?.role === "system" && source[0].toolsAdded === undefined) {
-		source[0] = { ...source[0], toolsAdded: agent.state.tools.map(toToolDeclaration) };
-	}
-	const llmMessages = agent
-		? await agent.convertForRequest(agent.transformContext ? await agent.transformContext(source, signal) : source)
-		: convertToLlm(source);
 
 	// Build prompt
 	let instructions: string;
@@ -376,14 +370,22 @@ export async function generateBranchSummary(
 	}
 	const instructionText = `Do not continue the conversation above. Output only the structured summary requested below.\n\n${instructions}`;
 
-	const summarizationMessages: Message[] = [
-		...llmMessages,
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: instructionText }],
+	const buildContext = async (attemptOptions: SimpleStreamOptions) => {
+		const input = structuredClone(source);
+		if (agent && input[0]?.role === "system" && input[0].toolsAdded === undefined) {
+			input[0] = { ...input[0], toolsAdded: agent.state.tools.map(toToolDeclaration) };
+		}
+		const llmMessages = agent
+			? await agent.convertForRequest(agent.transformContext ? await agent.transformContext(input, signal) : input)
+			: convertToLlm(input);
+		const instruction: Message = {
+			role: "user",
+			content: [{ type: "text", text: instructionText }],
 			timestamp: Date.now(),
-		},
-	];
+		};
+		if (agent) attemptOptions.onPayload = agent.onPayload;
+		return normalizeContext({ messages: [...llmMessages, instruction] });
+	};
 
 	const maxTokens = Math.min(4096, model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY);
 
@@ -391,7 +393,6 @@ export async function generateBranchSummary(
 	// request behavior (timeouts, retries, attribution headers) stays consistent
 	// without running through agent state/events. Retried via completeSummarization
 	// so transient stream drops reuse the configured retry policy.
-	const context = { messages: summarizationMessages };
 	const requestOptions: SimpleStreamOptions = { apiKey, headers, env, signal, maxTokens };
 	if (agent) {
 		requestOptions.sessionId = agent.sessionId;
@@ -401,14 +402,7 @@ export async function generateBranchSummary(
 		requestOptions.onPayload = agent.onPayload;
 		requestOptions.onResponse = agent.onResponse;
 	}
-	const response = await completeSummarization(
-		model,
-		normalizeContext(context),
-		requestOptions,
-		streamFn,
-		retry,
-		callbacks,
-	);
+	const response = await completeSummarization(model, buildContext, requestOptions, streamFn, retry, callbacks);
 
 	// Check if aborted or errored
 	if (response.stopReason === "aborted") {
