@@ -3081,13 +3081,16 @@ export class AgentSession {
 				this._pendingPrefill = undefined;
 				this._prefillRestorePoint = undefined;
 				this._prefillTrailingEntries = [];
-				// A non-continuable assistant message (e.g., a partial error on a
-				// chat provider) would make Agent.continue() throw. Remove it from
-				// the transcript and continue from the last user/tool-result
-				// message instead.
-				const last = this.agent.state.messages[this.agent.state.messages.length - 1];
-				if (last?.role === "assistant" && !isHarnessMessage(last)) {
-					this.deleteLastMessages(1);
+				// Only interrupted responses on unsupported providers retry from their input.
+				// Completed answers remain authoritative and Agent.continue rejects them.
+				const last = this.agent.state.messages.findLast((message) => message.role !== "system");
+				if (
+					last?.role === "assistant" &&
+					(last.stopReason === "error" || last.stopReason === "aborted") &&
+					!this.agent.hasQueuedMessages() &&
+					!isHarnessMessage(last)
+				) {
+					this._omitRecoveryAttempt(last);
 				}
 			}
 		}

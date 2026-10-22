@@ -209,13 +209,12 @@ describe("AgentSession continue with prefill", () => {
 	);
 
 	it("keeps the streamed replacement when the abort arrives after the echo completed", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({ fauxApi: "openai-completions" });
 		harnesses.push(harness);
 
-		harness.setResponses([fauxAssistantMessage("Partial response")]);
+		harness.setResponses([fauxAssistantMessage("Partial response", { stopReason: "aborted" })]);
 		await harness.session.prompt("Hello");
 
-		setOpenaiCompletions(harness);
 		harness.session.agent.streamFunction = ((_model, _context, _options) => {
 			const stream = new EventStream<AssistantMessageEvent, AssistantMessage>(
 				(event) => event.type === "done" || event.type === "error",

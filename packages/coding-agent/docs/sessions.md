@@ -61,6 +61,8 @@ Accepted steering and follow-up input does not grant another retry. When automat
 
 Trailing system-policy patches do not hide an interrupted assistant from continuation. Successful continuation keeps those patches; if its echo is rejected, restoring the original partial also restores the ordered trailing patches. A system patch alone does not make a completed assistant answer runnable again.
 
+Continuing a completed assistant answer without supported prefill or new queued input rejects without deleting or regenerating that answer. Interrupted error/aborted responses on providers without prefill support can retry from their input; their original response stays in raw history and an append-only context omission removes it from the retry request.
+
 See [Compaction Reference](compaction.md) for thresholds, retained boundaries, branch-summary behavior, and extension hooks.
 
 ## Control session storage
