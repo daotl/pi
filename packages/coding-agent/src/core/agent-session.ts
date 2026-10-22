@@ -1179,8 +1179,8 @@ export class AgentSession {
 		const projection = this._createBoundaryPreviewManager(drafts).buildSessionProjection();
 		const pendingMessages = this._getPendingBoundaryMessages();
 		const llmMessages = convertToLlm(projection.messages);
-		const finalRole = llmMessages[llmMessages.length - 1]?.role;
-		const hasNonSystemContext = llmMessages.some((message) => message.role !== "system");
+		const finalRole = llmMessages.findLast((message) => message.role !== "system")?.role;
+		const hasNonSystemContext = finalRole !== undefined;
 		const contextCanContinue = hasNonSystemContext && finalRole !== "assistant";
 		const pendingCustomContext = this._pendingCustomMessages.length > 0;
 		return {
