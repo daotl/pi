@@ -1412,9 +1412,11 @@ export class ExtensionRunner {
 		prompt: string,
 		images: ImageContent[] | undefined,
 		systemPromptOptions: BuildSystemPromptOptions,
+		renderSystemPrompt: (options: NormalizedBuildSystemPromptOptions) => string = buildSystemPrompt,
 	): Promise<BeforeAgentStartCombinedResult> {
 		const currentOptions = normalizeBuildSystemPromptOptions(systemPromptOptions);
-		const renderCurrentSystemPrompt = (): string => buildSystemPrompt(currentOptions);
+		const renderCurrentSystemPrompt = (): string =>
+			currentOptions.forceSystemPrompt ?? renderSystemPrompt(currentOptions);
 		const ctx = Object.defineProperties(
 			{},
 			Object.getOwnPropertyDescriptors(this.createContext()),

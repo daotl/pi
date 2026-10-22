@@ -15,6 +15,7 @@
 
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
 	type AfterToolCallContext,
 	type AfterToolCallResult,
@@ -41,6 +42,7 @@ import {
 	countChatTokens,
 	countTokens,
 	getCurrentSystemMessage,
+	getSystemMessageText,
 	retryDelayMs,
 } from "@earendil-works/pi-ai";
 import type {
@@ -72,6 +74,7 @@ import {
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { processImage } from "../utils/image-process.ts";
+import { canonicalizePath, resolvePath } from "../utils/paths.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
@@ -159,7 +162,6 @@ import type { Skill } from "./skills.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { BUILTIN_PATH_PREFIX, createSyntheticSourceInfo, isSyntheticPath, type SourceInfo } from "./source-info.ts";
 import {
-	buildSystemPrompt,
 	buildSystemPromptSections,
 	diffSystemPromptSections,
 	type NormalizedBuildSystemPromptOptions,
@@ -587,7 +589,6 @@ export class AgentSession {
 	// Base system prompt (without extension appends) - used to apply fresh appends each turn
 	private _baseSystemPrompt = "";
 	private _baseSystemPromptOptions!: NormalizedBuildSystemPromptOptions;
-	private _systemPromptOverride?: string;
 	/** Custom base prompt text replacing the file-based SYSTEM.md prompt (via /system-prompt set). */
 	private _customSystemPromptOverride?: string;
 	/** Whether the saved system prompt should be restored on the next base-prompt commit. */
@@ -596,6 +597,11 @@ export class AgentSession {
 	private _lastPersistedSystemPrompt?: string;
 	/** Effective skill set used for the prompt and runtime, restored on resume. */
 	private _effectiveSkills?: Skill[];
+	private _restoredSystemPromptSections?: SystemPromptSections;
+	private _restoredPromptBaseline?: SystemPromptSections;
+	private _effectiveContextFiles?: NormalizedBuildSystemPromptOptions["contextFiles"];
+	private _untrustedSkillOrder?: string[];
+	private _deferUntrustedSnapshot = false;
 	/** Prompt options after before_agent_start mutations for the active run. */
 	private _runSystemPromptOptions?: NormalizedBuildSystemPromptOptions;
 
@@ -632,6 +638,7 @@ export class AgentSession {
 		this._installAgentNextTurnRefresh();
 		this._installAgentRequestProjection();
 		this._installAgentBoundaryHooks();
+		this._installUntrustedPromptProjection();
 		this._installHiddenDeclarationsProjection();
 		this._installAgentForcedPromptProjection();
 		this._installAgentQueuedCompactStop();
@@ -928,6 +935,10 @@ export class AgentSession {
 		const previousPrepareRequest = this.agent.prepareRequest;
 		this.agent.prepareRequest = async (request, signal) => {
 			this._flushPendingCompactionUsage();
+			if (this._deferUntrustedSnapshot) {
+				this._deferUntrustedSnapshot = false;
+				this._persistBaseSystemPrompt();
+			}
 			if (this._prefillRestoreFailed && this._pendingPrefill) {
 				this._restorePrefill(this._prefillRestorePoint ?? null, this._pendingPrefill);
 			}
@@ -1716,7 +1727,7 @@ export class AgentSession {
 
 	/** Current effective system prompt, including changes not yet sent to the model. */
 	get systemPrompt(): string {
-		if (this._runSystemPromptOptions) return buildSystemPrompt(this._runSystemPromptOptions);
+		if (this._runSystemPromptOptions) return this._renderEffectiveSystemPrompt(this._runSystemPromptOptions);
 		// On resume, `_baseSystemPrompt` holds the restored prompt verbatim (it may differ
 		// from a re-render of the on-disk options, e.g. APPEND_SYSTEM.md edits). Prefer it.
 		return this._baseSystemPrompt;
@@ -2774,12 +2785,19 @@ export class AgentSession {
 		}
 
 		const loaderSystemPrompt = this._resourceLoader.getSystemPrompt();
-		const customPrompt = this._customSystemPromptOverride ?? loaderSystemPrompt;
+		const customPrompt =
+			this._customSystemPromptOverride ??
+			(this._restoredSystemPromptSections?.preamble !== undefined
+				? this._baseSystemPromptOptions.customPrompt
+				: loaderSystemPrompt);
 		const loaderAppendSystemPrompt = this._resourceLoader.getAppendSystemPrompt();
-		const appendSystemPrompt =
-			loaderAppendSystemPrompt.length > 0 ? loaderAppendSystemPrompt.join("\n\n") : undefined;
+		const appendSystemPrompt = this._restoredSystemPromptSections
+			? (this._restoredSystemPromptSections.addendum?.slice("<addendum>\n".length, -"\n</addendum>".length) ?? "")
+			: loaderAppendSystemPrompt.length > 0
+				? loaderAppendSystemPrompt.join("\n\n")
+				: undefined;
 		const loadedSkills = this._resolveEffectiveSkills();
-		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
+		const loadedContextFiles = this._effectiveContextFiles ?? this._resourceLoader.getAgentsFiles().agentsFiles;
 
 		this._baseSystemPromptOptions = normalizeBuildSystemPromptOptions({
 			cwd: this._cwd,
@@ -2791,7 +2809,44 @@ export class AgentSession {
 			toolSnippets,
 			toolGuidelines: Object.fromEntries(this._toolPromptGuidelines),
 		});
-		return buildSystemPrompt(this._baseSystemPromptOptions);
+		return this._renderEffectiveSystemPrompt(this._baseSystemPromptOptions);
+	}
+
+	/** Keep saved static sections unless an option changes; runtime loadout and cwd remain current. */
+	private _buildEffectivePromptSections(options: NormalizedBuildSystemPromptOptions): SystemPromptSections {
+		const generated = buildSystemPromptSections(options);
+		if (!this._restoredSystemPromptSections || !this._restoredPromptBaseline) return generated;
+		const sections: SystemPromptSections = { preamble: generated.preamble, ...this._restoredSystemPromptSections };
+		for (const name of new Set([
+			...Object.keys(sections),
+			...Object.keys(generated),
+			...Object.keys(this._restoredPromptBaseline),
+		])) {
+			if (
+				!Object.hasOwn(options.sections, name) &&
+				name !== "tools" &&
+				name !== "rules" &&
+				name !== "skills" &&
+				name !== "cwd" &&
+				generated[name] === this._restoredPromptBaseline[name]
+			)
+				continue;
+			if (generated[name] === undefined) delete sections[name];
+			else sections[name] = generated[name];
+		}
+		return sections;
+	}
+
+	private _renderEffectiveSystemPrompt(options: NormalizedBuildSystemPromptOptions): string {
+		return (
+			options.forceSystemPrompt ??
+			getSystemMessageText({
+				role: "system",
+				content: "",
+				sections: this._buildEffectivePromptSections(options),
+				timestamp: 0,
+			})
+		);
 	}
 
 	/**
@@ -2806,7 +2861,7 @@ export class AgentSession {
 	 */
 	private _preparePromptAndToolLoadout(
 		options: NormalizedBuildSystemPromptOptions,
-		messages: AgentMessage[] = this.agent.state.messages,
+		messages: AgentMessage[] = this._buildLiveProjection().messages,
 	): SystemMessage | undefined {
 		options.selectedTools = this._applyToolLoadout(options.selectedTools).map((tool) => tool.name);
 		// The tool list must match the declarations the request carries, so hidden tools are not listed.
@@ -2815,9 +2870,31 @@ export class AgentSession {
 		);
 		const sections = diffSystemPromptSections(
 			getCurrentSystemMessage(messages)?.sections ?? {},
-			buildSystemPromptSections(options),
+			this._buildEffectivePromptSections(options),
 		);
 		return sections ? { role: "system", content: "", sections, timestamp: Date.now() } : undefined;
+	}
+
+	/** Historical system instructions cannot establish project trust; sanitize before extension transforms. */
+	private _installUntrustedPromptProjection(): void {
+		const previousTransformContext = this.agent.transformContext;
+		this.agent.transformContext = async (messages, signal) => {
+			let safeMessages = messages;
+			if (!this.settingsManager.isProjectTrusted()) {
+				const current = getCurrentSystemMessage(messages);
+				const head: SystemMessage = {
+					role: "system",
+					content: "",
+					sections: this._buildEffectivePromptSections(
+						this._runSystemPromptOptions ?? this._baseSystemPromptOptions,
+					),
+					...(current?.toolsAdded ? { toolsAdded: current.toolsAdded } : {}),
+					timestamp: current?.timestamp ?? Date.now(),
+				};
+				safeMessages = [head, ...messages.filter((message) => message.role !== "system")];
+			}
+			return previousTransformContext ? await previousTransformContext(safeMessages, signal) : safeMessages;
+		};
 	}
 
 	/**
@@ -2900,6 +2977,24 @@ export class AgentSession {
 		return this._effectiveSkills;
 	}
 
+	/** Saved paths order resources only; current non-project loader objects establish authority. */
+	private _resolveUntrustedSkills(): Skill[] {
+		const available = new Map(
+			this._resourceLoader
+				.getSkills()
+				.skills.filter((skill) => skill.sourceInfo.scope !== "project")
+				.map((skill) => [canonicalizePath(resolvePath(skill.filePath, this._cwd)), skill]),
+		);
+		const skills: Skill[] = [];
+		for (const path of this._untrustedSkillOrder ?? []) {
+			const skill = available.get(path);
+			if (!skill) continue;
+			skills.push(skill);
+			available.delete(path);
+		}
+		return [...skills, ...available.values()];
+	}
+
 	/**
 	 * Commit a newly-built base system prompt. On startup (restoreSystemPrompt
 	 * still enabled), the first commit restores the prompt saved in the session
@@ -2919,55 +3014,106 @@ export class AgentSession {
 				if (saved.customPrompt !== undefined) {
 					this._customSystemPromptOverride = saved.customPrompt;
 				}
-				this._baseSystemPromptOptions = {
+				const projectTrusted = this.settingsManager.isProjectTrusted();
+				this._untrustedSkillOrder = projectTrusted
+					? undefined
+					: (saved.skills ?? []).map((skill) => canonicalizePath(resolvePath(skill.filePath, this._cwd)));
+				this._deferUntrustedSnapshot =
+					!projectTrusted &&
+					(this._extensionRunner.hasHandlers("resources_discover") ||
+						this._extensionRunner.hasHandlers("session_start"));
+				this._effectiveSkills = (
+					projectTrusted
+						? (saved.skills ?? this._resourceLoader.getSkills().skills)
+						: this._resolveUntrustedSkills()
+				).map((skill) => ({ ...skill, sourceInfo: { ...skill.sourceInfo } }));
+				const legacyContext = saved.sections?.project_context;
+				this._effectiveContextFiles =
+					saved.contextFiles ??
+					(legacyContext
+						? [
+								{
+									path: "",
+									content:
+										legacyContext.startsWith("<project_context>\n") &&
+										legacyContext.endsWith("\n</project_context>")
+											? legacyContext.slice("<project_context>\n".length, -"\n</project_context>".length)
+											: legacyContext,
+									renderedProjectContext: true,
+								},
+							]
+						: []);
+				if (!projectTrusted && !saved.sections) this._effectiveContextFiles = undefined;
+				const sections: SystemPromptSections = saved.sections
+					? { ...saved.sections }
+					: { preamble: saved.systemPrompt };
+				this._baseSystemPromptOptions = normalizeBuildSystemPromptOptions({
 					...this._baseSystemPromptOptions,
-					customPrompt: saved.customPrompt,
-				};
+					customPrompt:
+						saved.customPrompt ??
+						(!projectTrusted
+							? this._resourceLoader.getSystemPrompt()
+							: saved.sections?.tools !== undefined && saved.sections.rules !== undefined
+								? undefined
+								: (saved.sections?.preamble ?? saved.systemPrompt)),
+					appendSystemPrompt: projectTrusted
+						? (sections.addendum?.slice("<addendum>\n".length, -"\n</addendum>".length) ?? "")
+						: this._resourceLoader.getAppendSystemPrompt().join("\n\n"),
+					skills: this._effectiveSkills,
+					contextFiles: this._effectiveContextFiles ?? this._resourceLoader.getAgentsFiles().agentsFiles,
+				});
+				this._restoredPromptBaseline = buildSystemPromptSections(this._baseSystemPromptOptions);
+				if (projectTrusted) this._restoredSystemPromptSections = sections;
+				else {
+					const safe: SystemPromptSections = {};
+					for (const name of Object.keys(sections)) {
+						const section = this._restoredPromptBaseline[name];
+						if (section !== undefined) safe[name] = section;
+					}
+					for (const [name, section] of Object.entries(this._restoredPromptBaseline))
+						if (!Object.hasOwn(safe, name)) safe[name] = section;
+					this._restoredSystemPromptSections = safe;
+				}
 				this._lastPersistedSystemPrompt = saved.systemPrompt;
-				this._baseSystemPrompt = saved.systemPrompt;
-				this._setAgentSystemPrompt(this._systemPromptOverride ?? this._baseSystemPrompt, saved.sections);
-				this._effectiveSkills = saved.skills !== undefined ? saved.skills : this._resourceLoader.getSkills().skills;
+				this._baseSystemPrompt = this._renderEffectiveSystemPrompt(this._baseSystemPromptOptions);
+				if (!projectTrusted) this._persistBaseSystemPrompt();
 				return;
 			}
 		}
 
 		this._effectiveSkills = this._resolveEffectiveSkills();
 		this._baseSystemPrompt = prompt;
-		// The transcript system message (with its sections) is owned and applied by the
-		// per-request prompt-and-tool loadout, so the normal commit path only persists the
-		// prompt and does not write a separate system message here. Only the restore path
-		// above writes the saved system message verbatim.
-		if (this.sessionManager.isPersisted() && (forcePersist || prompt !== this._lastPersistedSystemPrompt)) {
-			this.sessionManager.appendSystemPrompt(
-				prompt,
-				this._customSystemPromptOverride,
-				this._effectiveSkills,
-				buildSystemPromptSections(this._baseSystemPromptOptions),
-			);
-			this._lastPersistedSystemPrompt = prompt;
-		}
+		this._persistBaseSystemPrompt(forcePersist);
 	}
 
-	/**
-	 * Apply the effective system prompt to the agent. Agent.state exposes
-	 * systemPrompt as a getter derived from the leading system message in
-	 * state.messages (the transcript), so the prompt is applied by replacing
-	 * that message's content rather than assigning state.systemPrompt.
-	 * When `sections` is provided, the message carries the structured sections
-	 * (content stays empty), matching the sections-based system prompt flow.
-	 */
-	private _setAgentSystemPrompt(prompt: string, sections?: SystemPromptSections): void {
-		const messages = this.agent.state.messages.slice();
-		if (messages[0]?.role === "system") {
-			messages[0] = sections ? { ...messages[0], content: "", sections } : { ...messages[0], content: prompt };
-		} else {
-			messages.unshift(
-				sections
-					? { role: "system", content: "", sections, timestamp: 0 }
-					: { role: "system", content: prompt, timestamp: 0 },
-			);
+	private _persistBaseSystemPrompt(forcePersist = false): void {
+		if (this._deferUntrustedSnapshot || !this.sessionManager.isPersisted()) return;
+		if (
+			!forcePersist &&
+			this._untrustedSkillOrder === undefined &&
+			this._baseSystemPrompt === this._lastPersistedSystemPrompt
+		)
+			return;
+		const snapshot = {
+			systemPrompt: this._baseSystemPrompt,
+			customPrompt: this._customSystemPromptOverride,
+			skills: this._effectiveSkills,
+			sections: this._buildEffectivePromptSections(this._baseSystemPromptOptions),
+			contextFiles: this._baseSystemPromptOptions.contextFiles,
+		};
+		if (!forcePersist && this._untrustedSkillOrder !== undefined) {
+			const saved = this.sessionManager.getSavedSystemPrompt();
+			if (saved && isDeepStrictEqual(JSON.parse(JSON.stringify(saved)), JSON.parse(JSON.stringify(snapshot))))
+				return;
 		}
-		this.agent.state.messages = messages;
+		this.sessionManager.appendSystemPrompt(
+			snapshot.systemPrompt,
+			snapshot.customPrompt,
+			snapshot.skills,
+			snapshot.sections,
+			snapshot.contextFiles,
+		);
+		this._lastPersistedSystemPrompt = this._baseSystemPrompt;
 	}
 
 	/**
@@ -2990,18 +3136,35 @@ export class AgentSession {
 			skills: this._effectiveSkills?.map((skill) => ({ ...skill, sourceInfo: { ...skill.sourceInfo } })),
 			restoreSystemPrompt: this._restoreSystemPrompt,
 			lastPersistedSystemPrompt: this._lastPersistedSystemPrompt,
+			sections: this._restoredSystemPromptSections,
+			baseline: this._restoredPromptBaseline,
+			contextFiles: this._effectiveContextFiles,
+			untrustedSkillOrder: this._untrustedSkillOrder?.slice(),
+			deferUntrustedSnapshot: this._deferUntrustedSnapshot,
 		};
 		try {
 			if (options.systemPrompt) {
 				this._resourceLoader.reloadSystemPrompt();
 				this._customSystemPromptOverride = undefined;
+				this._restoredSystemPromptSections = undefined;
+				this._restoredPromptBaseline = undefined;
+				this._effectiveContextFiles = undefined;
 			}
 			if (options.skills) {
 				this._resourceLoader.reloadSkills();
-				this._effectiveSkills = undefined;
+				this._effectiveSkills =
+					this._untrustedSkillOrder !== undefined ? this._resolveUntrustedSkills() : undefined;
 			}
 			if (options.customPrompt !== undefined) {
 				this._customSystemPromptOverride = options.customPrompt.length > 0 ? options.customPrompt : undefined;
+				if (this._restoredSystemPromptSections) {
+					this._restoredSystemPromptSections = { ...this._restoredSystemPromptSections };
+					delete this._restoredSystemPromptSections.preamble;
+				}
+				if (this._restoredPromptBaseline) {
+					this._restoredPromptBaseline = { ...this._restoredPromptBaseline };
+					delete this._restoredPromptBaseline.preamble;
+				}
 			}
 			this._commitBaseSystemPrompt(this._rebuildSystemPrompt(this.getActiveToolNames()), true);
 		} catch (error) {
@@ -3011,6 +3174,11 @@ export class AgentSession {
 			this._effectiveSkills = previous.skills;
 			this._restoreSystemPrompt = previous.restoreSystemPrompt;
 			this._lastPersistedSystemPrompt = previous.lastPersistedSystemPrompt;
+			this._restoredSystemPromptSections = previous.sections;
+			this._restoredPromptBaseline = previous.baseline;
+			this._effectiveContextFiles = previous.contextFiles;
+			this._untrustedSkillOrder = previous.untrustedSkillOrder;
+			this._deferUntrustedSnapshot = previous.deferUntrustedSnapshot;
 			throw error;
 		}
 	}
@@ -3135,6 +3303,18 @@ export class AgentSession {
 		this._isAgentRunActive = true;
 		try {
 			this._flushPendingCompactionUsage();
+			const options = normalizeBuildSystemPromptOptions({
+				...this._baseSystemPromptOptions,
+				selectedTools: this.getActiveToolNames(),
+			});
+			const updateMessage = this._preparePromptAndToolLoadout(options);
+			// Save before capture so failed prefill restoration retains the accepted policy patch.
+			if (updateMessage) {
+				const entryId = this.sessionManager.appendMessage(updateMessage);
+				const entry = this.sessionManager.getEntry(entryId);
+				if (entry) this._emit({ type: "entry_appended", entry });
+			}
+			this._runSystemPromptOptions = options;
 			await this._continueOnce(prefill);
 			this._refreshFinalizedContext();
 			// Post-run handling restores an interrupted prefill even when the run was aborted.
@@ -3150,7 +3330,7 @@ export class AgentSession {
 		} finally {
 			try {
 				if (this._agentRunAbortRequested) this._finishCancelledRetry();
-				this._systemPromptOverride = undefined;
+				this._runSystemPromptOptions = undefined;
 				this._prefillEntryId = undefined;
 				if (!this._prefillRestoreFailed) {
 					this._pendingPrefill = undefined;
@@ -3529,6 +3709,7 @@ export class AgentSession {
 			expandedText,
 			currentImages,
 			this._baseSystemPromptOptions,
+			(options) => this._renderEffectiveSystemPrompt(options),
 		);
 		if (this.isStreaming || this.agent.signal || this.isCompacting) {
 			await dispatchToActiveRun();
@@ -5041,6 +5222,8 @@ export class AgentSession {
 		await this._extensionRunner.emit(this._sessionStartEvent);
 		this._extensionRunner.reportUnhandledMcpServers();
 		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+		this._deferUntrustedSnapshot = false;
+		this._persistBaseSystemPrompt();
 	}
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
@@ -5063,7 +5246,17 @@ export class AgentSession {
 			themePaths: this.buildExtensionResourcePaths(themePaths),
 		};
 
+		const loadedSkillPaths = new Set(this._resourceLoader.getSkills().skills.map((skill) => skill.filePath));
 		this._resourceLoader.extendResources(extensionPaths);
+		if (this._untrustedSkillOrder !== undefined) this._effectiveSkills = this._resolveUntrustedSkills();
+		else {
+			const effective = this._resolveEffectiveSkills();
+			const names = new Set(effective.map((skill) => skill.name));
+			const discovered = this._resourceLoader
+				.getSkills()
+				.skills.filter((skill) => !loadedSkillPaths.has(skill.filePath) && !names.has(skill.name));
+			if (discovered.length > 0) this._effectiveSkills = [...effective, ...discovered];
+		}
 		this._commitBaseSystemPrompt(this._rebuildSystemPrompt(this.getActiveToolNames()));
 	}
 
@@ -5432,6 +5625,8 @@ export class AgentSession {
 		this.syncQueueModesFromSettings();
 		resetApiProviders();
 		await this._resourceLoader.reload();
+		// Full reload refreshes context files, not saved skills, preamble or addendum.
+		this._effectiveContextFiles = undefined;
 		// Activate tools newly added to defaultTools. Removed ones stay active, and tools disabled
 		// during the session stay disabled unless the setting newly adds them.
 		const addedDefaultTools = this._usesDefaultTools
@@ -5942,8 +6137,8 @@ export class AgentSession {
 					streamFn: this.agent.streamFunction,
 					retry: this.settingsManager.getRetrySettings(),
 					callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
-					systemPrompt: this.agent.state.systemPrompt,
 					agent: this.agent,
+					contextProjection: this.sessionManager.buildSessionProjection(),
 				});
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };

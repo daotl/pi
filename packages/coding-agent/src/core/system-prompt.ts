@@ -25,8 +25,8 @@ export interface BuildSystemPromptOptions {
 	sections?: Record<string, string>;
 	/** Working directory. */
 	cwd: string;
-	/** Pre-loaded context files. */
-	contextFiles?: Array<{ path: string; content: string }>;
+	/** Pre-loaded files, or an opaque saved project-context body when raw files are unavailable. */
+	contextFiles?: Array<{ path: string; content: string; renderedProjectContext?: boolean }>;
 	/** Pre-loaded skills. */
 	skills?: Skill[];
 }
@@ -38,7 +38,7 @@ export type NormalizedBuildSystemPromptOptions = BuildSystemPromptOptions & {
 	promptGuidelines: string[];
 	appendSystemPrompt: string;
 	sections: Record<string, string>;
-	contextFiles: Array<{ path: string; content: string }>;
+	contextFiles: Array<{ path: string; content: string; renderedProjectContext?: boolean }>;
 	skills: Skill[];
 };
 
@@ -69,11 +69,15 @@ export function normalizeBuildSystemPromptOptions(input: BuildSystemPromptOption
 	};
 }
 
-function renderProjectContext(contextFiles: Array<{ path: string; content: string }>): string {
+function renderProjectContext(contextFiles: NormalizedBuildSystemPromptOptions["contextFiles"]): string {
 	return [
-		"Project-specific instructions and guidelines:",
-		...contextFiles.map(
-			({ path, content }) => `<project_instructions path="${path}">\n${content}\n</project_instructions>`,
+		...(contextFiles.some((file) => file.renderedProjectContext)
+			? []
+			: ["Project-specific instructions and guidelines:"]),
+		...contextFiles.map(({ path, content, renderedProjectContext }) =>
+			renderedProjectContext
+				? content
+				: `<project_instructions path="${path}">\n${content}\n</project_instructions>`,
 		),
 	].join("\n\n");
 }

@@ -205,6 +205,8 @@ export interface SystemPromptEntry extends SessionEntryBase {
 	 * file edits.
 	 */
 	skills?: Skill[];
+	/** Raw effective context files, or an opaque legacy project-context body. */
+	contextFiles?: Array<{ path: string; content: string; renderedProjectContext?: boolean }>;
 }
 
 /**
@@ -1702,6 +1704,7 @@ export class SessionManager {
 		customPrompt?: string,
 		skills?: Skill[],
 		sections?: SystemPromptSections,
+		contextFiles?: Array<{ path: string; content: string; renderedProjectContext?: boolean }>,
 	): string {
 		const entry: SystemPromptEntry = {
 			type: "system_prompt",
@@ -1714,6 +1717,7 @@ export class SessionManager {
 				skills: skills.map((skill) => ({ ...skill, sourceInfo: { ...skill.sourceInfo } })),
 			}),
 			...(sections !== undefined && { sections: { ...sections } }),
+			...(contextFiles !== undefined && { contextFiles: contextFiles.map((file) => ({ ...file })) }),
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1730,6 +1734,7 @@ export class SessionManager {
 				customPrompt?: string;
 				skills?: Skill[];
 				sections?: SystemPromptSections;
+				contextFiles?: Array<{ path: string; content: string; renderedProjectContext?: boolean }>;
 		  }
 		| undefined {
 		const path = this.getBranch();
@@ -1741,6 +1746,7 @@ export class SessionManager {
 					customPrompt: entry.customPrompt,
 					skills: entry.skills?.map((skill) => ({ ...skill, sourceInfo: { ...skill.sourceInfo } })),
 					sections: entry.sections ? { ...entry.sections } : undefined,
+					contextFiles: entry.contextFiles?.map((file) => ({ ...file })),
 				};
 			}
 		}

@@ -7,7 +7,7 @@
 
 import type { Agent, AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import type { RetryCallbacks, RetryPolicy } from "@earendil-works/pi-ai";
-import { contentText, normalizeContext } from "@earendil-works/pi-ai";
+import { contentText, getCurrentSystemMessage, normalizeContext, toToolDeclaration } from "@earendil-works/pi-ai";
 import type { Message, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
 import {
 	convertToLlm,
@@ -15,7 +15,7 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "../messages.ts";
-import type { ReadonlySessionManager, SessionEntry } from "../session-manager.ts";
+import type { ReadonlySessionManager, SessionEntry, SessionProjection } from "../session-manager.ts";
 import { completeSummarization, estimateTokens, getSummarizationFailure } from "./compaction.ts";
 import {
 	computeFileLists,
@@ -54,6 +54,8 @@ export interface BranchPreparation {
 	fileOps: FileOperations;
 	/** Total estimated tokens in messages */
 	totalTokens: number;
+	/** First retained source entry, for reconstructing preceding system state. */
+	firstEntryId?: string;
 }
 
 export interface CollectEntriesResult {
@@ -97,6 +99,8 @@ export interface GenerateBranchSummaryOptions {
 	 * sessionId, transport, etc.) should be mirrored for cache reuse.
 	 */
 	agent?: Agent;
+	/** Canonical old-branch projection used to recover policy preceding the retained range. */
+	contextProjection?: SessionProjection;
 }
 
 // ============================================================================
@@ -206,6 +210,7 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 	const messages: AgentMessage[] = [];
 	const fileOps = createFileOps();
 	let totalTokens = 0;
+	let firstEntryId: string | undefined;
 
 	// First pass: collect file ops from ALL entries (even if they don't fit in token budget)
 	// This ensures we capture cumulative file tracking from nested branch summaries
@@ -243,6 +248,7 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 				if (totalTokens < tokenBudget * 0.9) {
 					messages.unshift(message);
 					totalTokens += tokens;
+					firstEntryId = entry.id;
 				}
 			}
 			// Stop - we've hit the budget
@@ -251,9 +257,10 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 
 		messages.unshift(message);
 		totalTokens += tokens;
+		firstEntryId = entry.id;
 	}
 
-	return { messages, fileOps, totalTokens };
+	return { messages, fileOps, totalTokens, firstEntryId };
 }
 
 // ============================================================================
@@ -318,13 +325,14 @@ export async function generateBranchSummary(
 		callbacks,
 		systemPrompt,
 		agent,
+		contextProjection,
 	} = options;
 
 	// Token budget = context window minus reserved space for prompt + response
 	const contextWindow = model.contextWindow || 262144;
 	const tokenBudget = contextWindow - reserveTokens;
 
-	const { messages, fileOps } = prepareBranchEntries(entries, tokenBudget);
+	const { messages, fileOps, firstEntryId } = prepareBranchEntries(entries, tokenBudget);
 
 	if (messages.length === 0) {
 		return { summary: "No content to summarize" };
@@ -333,13 +341,29 @@ export async function generateBranchSummary(
 	// Reuse the same context pipeline as a normal turn so provider prompt caches
 	// stay valid. The summarization instruction is appended as a final user
 	// message so nothing is inserted before the existing prefix.
-	const effectiveSystemPrompt = agent ? agent.state.systemPrompt : (systemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT);
+	const source = structuredClone(messages);
+	const projectedStart = contextProjection?.entries.findIndex((entry) => entry.sourceEntry.id === firstEntryId) ?? -1;
+	if (contextProjection && projectedStart < 0) {
+		return { error: "Branch summarization context projection does not contain the retained entry" };
+	}
+	const start = agent?.state.messages.indexOf(messages[0]) ?? -1;
+	const baseline = contextProjection
+		? getCurrentSystemMessage(contextProjection.entries.slice(0, projectedStart).flatMap((entry) => entry.messages))
+		: agent && start > 0
+			? getCurrentSystemMessage(agent.state.messages.slice(0, start))
+			: agent && start < 0
+				? getCurrentSystemMessage(agent.state.messages)
+				: undefined;
+	if (baseline) source.unshift(structuredClone(baseline));
+	else if (source[0]?.role !== "system" || (!agent && systemPrompt !== undefined)) {
+		source.unshift({ role: "system", content: systemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT, timestamp: 0 });
+	}
+	if (agent && source[0]?.role === "system" && source[0].toolsAdded === undefined) {
+		source[0] = { ...source[0], toolsAdded: agent.state.tools.map(toToolDeclaration) };
+	}
 	const llmMessages = agent
-		? await agent.convertForRequest(
-				agent.transformContext ? await agent.transformContext(messages, signal) : messages,
-			)
-		: convertToLlm(messages);
-	const tools = agent ? agent.state.tools.slice() : undefined;
+		? await agent.convertForRequest(agent.transformContext ? await agent.transformContext(source, signal) : source)
+		: convertToLlm(source);
 
 	// Build prompt
 	let instructions: string;
@@ -367,7 +391,7 @@ export async function generateBranchSummary(
 	// request behavior (timeouts, retries, attribution headers) stays consistent
 	// without running through agent state/events. Retried via completeSummarization
 	// so transient stream drops reuse the configured retry policy.
-	const context = { systemPrompt: effectiveSystemPrompt, messages: summarizationMessages, tools };
+	const context = { messages: summarizationMessages };
 	const requestOptions: SimpleStreamOptions = { apiKey, headers, env, signal, maxTokens };
 	if (agent) {
 		requestOptions.sessionId = agent.sessionId;

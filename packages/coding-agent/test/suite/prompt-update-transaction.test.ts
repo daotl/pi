@@ -19,9 +19,13 @@ beforeEach(async () => {
 });
 afterEach(() => vi.useRealTimers());
 
-it.each(["set", "clear", "system", "skills", "all"] as const)(
-	"retains committed prompt construction after failed %s snapshot and a real next request",
-	async (operation) => {
+it.each(
+	(["set", "clear", "system", "skills", "all"] as const).flatMap((operation) =>
+		([false, true] as const).map((restored) => ({ operation, restored })),
+	),
+)(
+	"retains committed prompt construction after failed $operation snapshot with restored=$restored and a real next request",
+	async ({ operation, restored }) => {
 		const root = fs.mkdtempSync(join(tmpdir(), "pi-prompt-transaction-"));
 		const cwd = join(root, "project");
 		const agentDir = join(root, "agent");
@@ -44,8 +48,8 @@ it.each(["set", "clear", "system", "skills", "all"] as const)(
 			noContextFiles: true,
 		});
 		await loader.reload();
-		const manager = SessionManager.create(cwd, join(root, "sessions"));
-		const harness = await createHarness({
+		let manager = SessionManager.create(cwd, join(root, "sessions"));
+		let harness = await createHarness({
 			cwd,
 			sessionManager: manager,
 			resourceLoader: loader,
@@ -55,6 +59,20 @@ it.each(["set", "clear", "system", "skills", "all"] as const)(
 			if (operation === "clear") harness.session.setCustomSystemPrompt("ORIGINAL CUSTOM");
 			harness.setResponses([fauxAssistantMessage("seed")]);
 			await harness.session.prompt("seed question");
+			if (restored) {
+				const file = manager.getSessionFile()!;
+				harness.cleanup();
+				fs.writeFileSync(system, "DIFFERENT CURRENT FILE PREAMBLE");
+				await loader.reload();
+				manager = SessionManager.open(file);
+				harness = await createHarness({
+					cwd,
+					sessionManager: manager,
+					resourceLoader: loader,
+					initialActiveToolNames: ["read", "bash", "edit", "write"],
+					settings: { retry: { enabled: false }, compaction: { enabled: false } },
+				});
+			}
 			const before = harness.session.systemPrompt;
 			const snapshot = manager.getSavedSystemPrompt();
 			const entries = structuredClone(manager.getEntries());

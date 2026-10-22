@@ -1,18 +1,21 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
+import { createAssistantMessageEventStream, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { getModel, streamSimple } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, test } from "vitest";
 import { AgentSession } from "../../src/core/agent-session.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
 import { createExtensionRuntime } from "../../src/core/extensions/loader.ts";
-import type { ResourceLoader } from "../../src/core/resource-loader.ts";
+import { DefaultResourceLoader, type ResourceLoader } from "../../src/core/resource-loader.ts";
+import { createAgentSession } from "../../src/core/sdk.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
 import type { Skill } from "../../src/core/skills.ts";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.ts";
 import { createInMemoryModelRegistry, getModelRuntime } from "../model-runtime-test-utils.ts";
+import { createHarness, getMessageText } from "./harness.ts";
 
 // The effective skill set must be persisted with the session and restored on
 // resume so the runtime skill list stays consistent with the restored system
@@ -232,3 +235,233 @@ describe("skill persistence and restore", () => {
 		session.dispose();
 	});
 });
+
+function writeSkill(directory: string, name: string, description: string, body: string, disabled = false): string {
+	mkdirSync(directory, { recursive: true });
+	const file = join(directory, "SKILL.md");
+	writeFileSync(
+		file,
+		`---\nname: ${name}\ndescription: ${description}\ndisable-model-invocation: ${disabled}\n---\n${body}\n`,
+	);
+	return file;
+}
+
+test("untrusted SDK resume uses canonical saved ordering but current skill authority and bodies", async () => {
+	const root = createTempDir();
+	const cwd = join(root, "project");
+	const agentDir = join(root, "agent");
+	mkdirSync(cwd);
+	mkdirSync(agentDir);
+	const alphaDir = join(agentDir, "skills", "alpha");
+	const alpha = writeSkill(alphaDir, "alpha", "CURRENT ALPHA DESCRIPTION", "old alpha body");
+	const beta = writeSkill(join(agentDir, "skills", "beta"), "beta", "CURRENT HIDDEN DESCRIPTION", "beta body", true);
+	const gamma = writeSkill(join(agentDir, "skills", "gamma"), "gamma", "CURRENT GAMMA DESCRIPTION", "gamma body");
+	const project = writeSkill(
+		join(cwd, ".pi", "skills", "project-only"),
+		"project-only",
+		"PROJECT DESCRIPTION",
+		"project body",
+	);
+	const stale = writeSkill(join(root, "unavailable"), "stale", "STALE DESCRIPTION", "stale body");
+	const aliasDir = join(root, "alpha-alias");
+	symlinkSync(alphaDir, aliasDir, "dir");
+	const savedSkill = (name: string, filePath: string): Skill => ({
+		...makeSkill(name, "FORGED SAVED DESCRIPTION"),
+		filePath,
+		baseDir: join(root, "forged-references"),
+		disableModelInvocation: name !== "old-beta",
+		sourceInfo: createSyntheticSourceInfo(filePath, { source: "forged", scope: "user", origin: "package" }),
+	});
+	const manager = SessionManager.create(cwd, join(root, "sessions"));
+	manager.appendSystemPrompt("FORGED SAVED PROMPT", undefined, [
+		savedSkill("old-beta", beta),
+		savedSkill("forged-alpha", join(aliasDir, "SKILL.md")),
+		savedSkill("duplicate-alpha", "../agent/skills/alpha/../alpha/SKILL.md"),
+		savedSkill("stale", stale),
+		savedSkill("forged-project", project),
+	]);
+	manager.appendMessage({ role: "user", content: "historical question", timestamp: 1 });
+	const file = manager.getSessionFile()!;
+	const owner = await createHarness({ settings: { retry: { enabled: false }, compaction: { enabled: false } } });
+	let active: AgentSession | undefined;
+	const reopen = async () => {
+		const settings = SettingsManager.inMemory(
+			{ retry: { enabled: false }, compaction: { enabled: false } },
+			{ projectTrusted: false },
+		);
+		const loader = new DefaultResourceLoader({
+			cwd,
+			agentDir,
+			settingsManager: settings,
+			systemPrompt: "CURRENT USER POLICY",
+			noExtensions: true,
+			noSkills: true,
+			noThemes: true,
+			noPromptTemplates: true,
+			noContextFiles: true,
+			additionalSkillPaths: [alpha, beta, gamma, project],
+		});
+		await loader.reload();
+		const reopened = SessionManager.open(file, undefined, cwd);
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			sessionManager: reopened,
+			settingsManager: settings,
+			resourceLoader: loader,
+			modelRuntime: owner.session.modelRuntime,
+			model: owner.getModel(),
+			tools: ["read"],
+		});
+		active = session;
+		return { session, manager: reopened, loader };
+	};
+	try {
+		const first = await reopen();
+		const current = first.loader.getSkills().skills;
+		const expected = [beta, alpha, gamma].map((path) => current.find((skill) => skill.filePath === path)!);
+		expect(effectiveSkills(first.session)).toEqual(expected);
+		expect(first.session.systemPrompt).toContain("CURRENT ALPHA DESCRIPTION");
+		expect(first.session.systemPrompt).toContain("CURRENT GAMMA DESCRIPTION");
+		for (const rejected of ["FORGED", "CURRENT HIDDEN DESCRIPTION", "PROJECT DESCRIPTION", "STALE DESCRIPTION"]) {
+			expect(first.session.systemPrompt).not.toContain(rejected);
+		}
+		expect(first.manager.getSavedSystemPrompt()?.skills).toEqual(expected);
+
+		writeSkill(alphaDir, "alpha", "CURRENT ALPHA DESCRIPTION", "CURRENT ALPHA BODY");
+		const requests: string[] = [];
+		first.session.agent.streamFunction = (_model, context) => {
+			requests.push(getMessageText(context.messages.filter((message) => message.role === "user").at(-1)));
+			const stream = createAssistantMessageEventStream();
+			stream.push({ type: "done", reason: "stop", message: fauxAssistantMessage("done") });
+			return stream;
+		};
+		await first.session.prompt("/skill:alpha task arguments");
+		await first.session.prompt("/skill:forged-alpha unchanged arguments");
+		expect(requests).toEqual([
+			`<skill name="alpha" location="${alpha}">\nReferences are relative to ${alphaDir}.\n\nCURRENT ALPHA BODY\n</skill>\n\ntask arguments`,
+			"/skill:forged-alpha unchanged arguments",
+		]);
+		const safeSnapshot = first.manager.getSavedSystemPrompt();
+		const safeEntries = first.manager.getEntries().filter((entry) => entry.type === "system_prompt");
+		await first.session.dispose();
+		active = undefined;
+
+		const second = await reopen();
+		expect(effectiveSkills(second.session)).toEqual(expected);
+		expect(second.manager.getSavedSystemPrompt()).toEqual(safeSnapshot);
+		expect(second.manager.getEntries().filter((entry) => entry.type === "system_prompt")).toEqual(safeEntries);
+		rmSync(alphaDir, { recursive: true });
+		second.session.reloadSkillsFromFiles();
+		const remaining = expected.filter((skill) => skill.filePath !== alpha);
+		expect(effectiveSkills(second.session)).toEqual(remaining);
+		expect(second.session.systemPrompt).not.toContain("CURRENT ALPHA DESCRIPTION");
+		expect(second.manager.getSavedSystemPrompt()?.skills).toEqual(remaining);
+		const removedSnapshot = second.manager.getSavedSystemPrompt();
+		const removedEntries = second.manager.getEntries().filter((entry) => entry.type === "system_prompt");
+		expect(removedEntries.slice(0, -1)).toEqual(safeEntries);
+		await second.session.dispose();
+		active = undefined;
+
+		const third = await reopen();
+		expect(effectiveSkills(third.session)).toEqual(remaining);
+		expect(third.manager.getSavedSystemPrompt()).toEqual(removedSnapshot);
+		expect(third.manager.getEntries().filter((entry) => entry.type === "system_prompt")).toEqual(removedEntries);
+	} finally {
+		await active?.dispose();
+		owner.cleanup();
+	}
+});
+
+test.each(["binding", "request"] as const)(
+	"untrusted SDK finalizes its safe skill snapshot through %s",
+	async (finalization) => {
+		const root = createTempDir();
+		const cwd = join(root, "project");
+		const agentDir = join(root, "agent");
+		mkdirSync(cwd);
+		mkdirSync(agentDir);
+		const discovered = writeSkill(
+			join(root, "discovered"),
+			"discovered",
+			"CURRENT DISCOVERED DESCRIPTION",
+			"discovered body",
+		);
+		const manager = SessionManager.create(cwd, join(root, "sessions"));
+		const saved = { ...makeSkill("old-discovered", "OLD DISCOVERED DESCRIPTION"), filePath: discovered };
+		manager.appendSystemPrompt("OLD DISCOVERED POLICY", undefined, [saved]);
+		manager.appendMessage({ role: "user", content: "historical question", timestamp: 1 });
+		const file = manager.getSessionFile()!;
+		const owner = await createHarness({ settings: { retry: { enabled: false }, compaction: { enabled: false } } });
+		let active: AgentSession | undefined;
+		let previousEntries = manager.getEntries().filter((entry) => entry.type === "system_prompt");
+		let finalSnapshot = manager.getSavedSystemPrompt();
+		try {
+			for (const reopening of [0, 1]) {
+				const settings = SettingsManager.inMemory({}, { projectTrusted: false });
+				const loader = new DefaultResourceLoader({
+					cwd,
+					agentDir,
+					settingsManager: settings,
+					systemPrompt: "CURRENT USER POLICY",
+					noExtensions: true,
+					noSkills: true,
+					noThemes: true,
+					noPromptTemplates: true,
+					noContextFiles: true,
+					extensionFactories: [
+						(pi) => {
+							pi.on("resources_discover", () => ({ skillPaths: [discovered] }));
+						},
+					],
+				});
+				await loader.reload();
+				const reopened = SessionManager.open(file, undefined, cwd);
+				const { session } = await createAgentSession({
+					cwd,
+					agentDir,
+					sessionManager: reopened,
+					settingsManager: settings,
+					resourceLoader: loader,
+					modelRuntime: owner.session.modelRuntime,
+					model: owner.getModel(),
+					tools: ["read"],
+				});
+				active = session;
+				expect(reopened.getEntries().filter((entry) => entry.type === "system_prompt")).toEqual(previousEntries);
+				if (finalization === "binding") await session.bindExtensions({});
+				else {
+					session.agent.streamFunction = () => {
+						const stream = createAssistantMessageEventStream();
+						stream.push({ type: "done", reason: "stop", message: fauxAssistantMessage("accepted safe request") });
+						return stream;
+					};
+					await session.prompt("accepted request without binding discovery");
+				}
+				const expected = finalization === "binding" ? loader.getSkills().skills : [];
+				expect(effectiveSkills(session)).toEqual(expected);
+				expect(effectiveSkills(session).map((skill) => skill.name)).toEqual(
+					finalization === "binding" ? ["discovered"] : [],
+				);
+				if (finalization === "binding") expect(session.systemPrompt).toContain("CURRENT DISCOVERED DESCRIPTION");
+				else expect(session.systemPrompt).not.toContain("CURRENT DISCOVERED DESCRIPTION");
+				expect(session.systemPrompt).not.toContain("OLD DISCOVERED");
+				expect(reopened.getSavedSystemPrompt()?.skills).toEqual(expected);
+				const entries = reopened.getEntries().filter((entry) => entry.type === "system_prompt");
+				if (reopening === 0) {
+					expect(entries.slice(0, -1)).toEqual(previousEntries);
+					finalSnapshot = reopened.getSavedSystemPrompt();
+				} else {
+					expect(entries).toEqual(previousEntries);
+					expect(reopened.getSavedSystemPrompt()).toEqual(finalSnapshot);
+				}
+				previousEntries = entries;
+				await session.dispose();
+				active = undefined;
+			}
+		} finally {
+			await active?.dispose();
+			owner.cleanup();
+		}
+	},
+);

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import type { Skill } from "../src/core/skills.ts";
 import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
-import { buildSystemPrompt } from "../src/core/system-prompt.ts";
+import { buildSystemPrompt, buildSystemPromptSections } from "../src/core/system-prompt.ts";
 
 const testSkill: Skill = {
 	name: "test-skill",
@@ -72,6 +72,46 @@ describe("buildSystemPrompt", () => {
 			);
 			expect(prompt).toContain("<cwd>\n/tmp\n</cwd>");
 		});
+	});
+
+	describe("project context representation", () => {
+		const body =
+			'Project-specific instructions and guidelines:\n\n<project_instructions path="/project/AGENTS.md">\nUse the project conventions.\n</project_instructions>';
+
+		test.each([
+			{
+				name: "raw context files",
+				contextFiles: [{ path: "/project/AGENTS.md", content: "Use the project conventions." }],
+			},
+			{
+				name: "an opaque legacy context body",
+				contextFiles: [{ path: "/legacy-context", content: body, renderedProjectContext: true }],
+			},
+		])("renders $name with exactly one prefix and instruction wrapper", ({ contextFiles }) => {
+			const sections = buildSystemPromptSections({ cwd: "/project", contextFiles });
+
+			expect(sections.project_context).toBe(`<project_context>\n${body}\n</project_context>`);
+		});
+	});
+
+	test("an explicit empty section removes its override without restoring generated context or removing other sections", () => {
+		const options = {
+			cwd: "/project",
+			appendSystemPrompt: "Current appended instructions.",
+			contextFiles: [{ path: "/project/AGENTS.md", content: "Current project instructions." }],
+			sections: {
+				addendum: "Saved addendum override.",
+				project_context: "Saved context override.",
+				policy: "Retained policy.",
+			},
+		};
+		const baseline = buildSystemPromptSections(options);
+		expect(baseline.project_context).toBe("<project_context>\nSaved context override.\n</project_context>");
+		const retained = { ...baseline };
+		delete retained.project_context;
+		expect(buildSystemPromptSections({ ...options, sections: { ...options.sections, project_context: "" } })).toEqual(
+			retained,
+		);
 	});
 
 	describe("default tools", () => {

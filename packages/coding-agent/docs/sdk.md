@@ -33,6 +33,10 @@ Read current state through `session.messages`, `session.model`, `session.thinkin
 
 Explicit `setCustomSystemPrompt()` and granular `reloadSystemPromptFromFiles()`/`reloadSkillsFromFiles()`/`reloadAllFromFiles()` updates reject while an agent run, compaction or tree summary owns the session. If saving the updated snapshot fails, the previous effective prompt construction and skill metadata remain active for subsequent requests. Loader caches may already reflect changed files; another explicit update retries publication from those current resources.
 
+On trusted resume, saved static prompt sections remain effective across getters, `before_agent_start` handlers and provider requests; the current working directory and executable tool/skill-reader guidance follow the runtime. New snapshots retain copied raw context files. Older rendered project-context bodies remain opaque rather than being parsed into invented file paths. Per-run option edits and explicit empty sections override the saved rendering without rewriting the base snapshot.
+
+On untrusted resume, saved skill paths provide ordering hints only: current non-project loader resources determine skill identity and metadata. Historical system instruction sections are replaced before request-context hooks and direct summaries; allowed current hooks can still augment the sanitized policy. An explicit user `customPrompt` override remains effective. AGENTS context loads regardless of project trust: structured saved context remains effective until a full resource reload, while an opaque legacy prompt without sections uses current loader context. A full reload refreshes context files while retaining saved preamble, addendum and skill metadata until their explicit granular update.
+
 <a id="sessionmanager-api"></a>
 
 ### Session storage
