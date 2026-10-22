@@ -157,6 +157,8 @@ agent.finishTurn = async ({ message }) => {
 
 Returning `undefined` preserves normal scheduling. `{ action: "end" }` stops immediately after `turn_end`, before polling steering or follow-up queues or preparing another request. On a normal response, `{ action: "continue" }` ensures one next provider request. If tool results, steering, or a follow-up already cause that request, they satisfy the decision and no additional request is made; otherwise the loop makes one context-only request. Error and aborted responses remain hard exits, so their decisions are ignored. `finishTurn` runs again after the next request, so returning `{ action: "continue" }` unconditionally creates an endless loop.
 
+`turn.canContinue` reports the finalized natural tool-batch continuation, excluding queue contents and the explicit `finishTurn` decision. It is false for errors, aborts, tool-less responses and all-terminating batches. Use it rather than the presence of tool results when deciding whether interrupted work should resume.
+
 To migrate from the removed `shouldStopAfterTurn`, return `{ action: "end" }`. Guard error and aborted responses to preserve the old hook's normal-response-only invocation, especially when the predicate has side effects or assumes a successful response:
 
 ```typescript

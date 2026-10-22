@@ -1118,21 +1118,16 @@ export class AgentSession {
 	 */
 	private _installAgentQueuedCompactStop(): void {
 		const previousFinishTurn = this.agent.finishTurn;
-		// Must be async: the wrapped finishTurn (boundary hooks) returns a Promise,
-		// and a sync wrapper would treat that Promise as a defined decision and
-		// never reach the queued-compact stop below.
 		this.agent.finishTurn = async (turn, signal) => {
-			const previousResult = await previousFinishTurn?.(turn, signal);
-			if (previousResult !== undefined) return previousResult;
-			if (this._queuedCompact) {
-				// Resume after compacting when tool results are pending a response;
-				// a turn without tool results ended the run, so no continuation
-				// follows. Turns that errored or were aborted exit the loop before
-				// this callback and compact without resuming.
-				this._queuedCompactResume = turn.toolResults.length > 0;
-				return { action: "end" };
-			}
-			return undefined;
+			const decision = await previousFinishTurn?.(turn, signal);
+			if (!this._queuedCompact) return decision ?? undefined;
+			this._queuedCompactResume =
+				turn.message.stopReason !== "error" &&
+				turn.message.stopReason !== "aborted" &&
+				decision?.action !== "end" &&
+				(turn.canContinue ||
+					(decision?.action === "continue" && this._buildBoundaryContext([], "turn_end").canContinue));
+			return { action: "end" };
 		};
 	}
 

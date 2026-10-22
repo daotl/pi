@@ -381,6 +381,7 @@ async function runLoop(
 				lastCompletedTurn = {
 					message,
 					toolResults: [],
+					canContinue: false,
 					context: currentContext,
 					newMessages,
 				};
@@ -415,6 +416,7 @@ async function runLoop(
 			lastCompletedTurn = {
 				message,
 				toolResults,
+				canContinue: hasMoreToolCalls,
 				context: currentContext,
 				newMessages,
 			};

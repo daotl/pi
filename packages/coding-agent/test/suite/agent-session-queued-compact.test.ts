@@ -82,6 +82,156 @@ describe("AgentSession queued /compact", () => {
 		}
 	});
 
+	it.each([true, false])(
+		"honors natural tool-batch continuation through compact (terminate=%s)",
+		async (terminate) => {
+			const { tool: waitTool, release, waitForToolStart } = createWaitTool();
+			const tool: AgentTool = {
+				...waitTool,
+				execute: async (...args) => ({ ...(await waitTool.execute(...args)), terminate }),
+			};
+			const harness = await createHarness({
+				tools: [tool],
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 }, retry: { enabled: false } },
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage(SUMMARY_TEXT),
+				fauxAssistantMessage("continued runnable work"),
+			]);
+			const started = waitForToolStart(harness);
+			const prompt = harness.session.prompt("start");
+			try {
+				await started;
+				harness.session.queueCompact();
+				release();
+				await prompt;
+				expect(harness.eventsOfType("compaction_end")[0]?.result?.summary).toBe(SUMMARY_TEXT);
+				expect(getAssistantTexts(harness).includes("continued runnable work")).toBe(!terminate);
+				expect(harness.getPendingResponseCount()).toBe(terminate ? 1 : 0);
+				expect(harness.session.isIdle).toBe(true);
+			} finally {
+				release();
+				await harness.session.abort();
+				await prompt.catch(() => {});
+			}
+		},
+	);
+
+	it("keeps an explicit end after queued compaction", async () => {
+		const { tool, release, waitForToolStart } = createWaitTool();
+		const harness = await createHarness({
+			tools: [tool],
+			finishTurn: () => ({ action: "end" }),
+			settings: { compaction: { enabled: false, keepRecentTokens: 1 }, retry: { enabled: false } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage(SUMMARY_TEXT),
+			fauxAssistantMessage("must not resume"),
+		]);
+		const started = waitForToolStart(harness);
+		const prompt = harness.session.prompt("start");
+		try {
+			await started;
+			harness.session.queueCompact();
+			release();
+			await prompt;
+			expect(harness.eventsOfType("compaction_end")[0]?.result?.summary).toBe(SUMMARY_TEXT);
+			expect(getAssistantTexts(harness)).not.toContain("must not resume");
+			expect(harness.getPendingResponseCount()).toBe(1);
+			expect(harness.session.isIdle).toBe(true);
+		} finally {
+			release();
+			await harness.session.abort();
+			await prompt.catch(() => {});
+		}
+	});
+
+	it.each(["control", "success", "failure", "cancel"] as const)(
+		"honors committed boundary input through queued compact (%s)",
+		async (outcome) => {
+			let handled = false;
+			const requests: string[] = [];
+			const harness = await createHarness({
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 }, retry: { enabled: false } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("turn_end", () => {
+							if (handled) return;
+							handled = true;
+							return {
+								entries: [
+									{
+										type: "custom_message",
+										customType: "next-work",
+										content: "exact next instruction",
+										display: false,
+									},
+								],
+								continue: true,
+							};
+						});
+						pi.on("session_before_compact", (event) => {
+							if (outcome === "cancel") return { cancel: true };
+							if (outcome === "failure") return;
+							return {
+								compaction: {
+									summary: SUMMARY_TEXT,
+									firstKeptEntryId: event.preparation.firstKeptEntryId,
+									tokensBefore: event.preparation.tokensBefore,
+								},
+							};
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.session.subscribe((event) => {
+				if (event.type === "message_start" && event.message.role === "user" && outcome !== "control")
+					harness.session.queueCompact();
+			});
+			harness.setResponses([
+				fauxAssistantMessage("first completed answer"),
+				...(outcome === "failure"
+					? [fauxAssistantMessage("", { stopReason: "error", errorMessage: "summary rejected" })]
+					: []),
+				(context) => {
+					requests.push(JSON.stringify(context.messages));
+					return fauxAssistantMessage("answered next instruction");
+				},
+			]);
+			await harness.session.prompt("start");
+			if (outcome === "cancel") {
+				expect(requests).toEqual([]);
+				expect(harness.eventsOfType("compaction_end")[0]?.aborted).toBe(true);
+			} else {
+				expect(requests).toHaveLength(1);
+				expect(requests[0]).toContain("exact next instruction");
+				expect(getAssistantTexts(harness)).toContain("answered next instruction");
+				if (outcome !== "control") {
+					const end = harness.eventsOfType("compaction_end")[0];
+					if (outcome === "failure") expect(end?.errorMessage).toBeDefined();
+					else expect(end?.result?.summary).toBe(SUMMARY_TEXT);
+					const providerAnswer = harness.events.findIndex(
+						(event) =>
+							event.type === "message_end" &&
+							event.message.role === "assistant" &&
+							event.message.content.some(
+								(part) => part.type === "text" && part.text === "answered next instruction",
+							),
+					);
+					expect(harness.events.findIndex((event) => event.type === "compaction_end")).toBeLessThan(
+						providerAnswer,
+					);
+				}
+			}
+			expect(harness.session.isIdle).toBe(true);
+		},
+	);
+
 	it.each((["prompt", "continue"] as const).flatMap((mode) => [false, true].map((cancel) => ({ mode, cancel }))))(
 		"runs a compact accepted at the final $mode settle boundary (cancel $cancel)",
 		async ({ mode, cancel }) => {
@@ -395,66 +545,75 @@ describe("AgentSession queued /compact", () => {
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
-	it("does not auto-continue when the queued /compact lands on a turn that ended the run", async () => {
-		const harness = await createHarness({
-			settings: { compaction: { keepRecentTokens: 1 } },
-		});
-		harnesses.push(harness);
+	it.each([false, true])(
+		"does not restart an ended tool-less answer through compact (continue=%s)",
+		async (continueDecision) => {
+			const harness = await createHarness({
+				settings: { compaction: { keepRecentTokens: 1 } },
+				finishTurn: continueDecision
+					? (turn) =>
+							turn.message.content.some((part) => part.type === "text" && part.text === "done")
+								? { action: "continue" }
+								: undefined
+					: undefined,
+			});
+			harnesses.push(harness);
 
-		// Hold the first (tool-less) response open so /compact can be queued
-		// while it streams; the summarization request is served immediately.
-		let releaseResponse: (() => void) | undefined;
-		const responseRelease = new Promise<void>((resolve) => {
-			releaseResponse = resolve;
-		});
-		let markFirstRequest = () => {};
-		const firstRequest = new Promise<void>((resolve) => {
-			markFirstRequest = resolve;
-		});
-		let requestCount = 0;
-		harness.session.agent.streamFunction = (model, _context, _options) => {
-			requestCount++;
-			if (requestCount === 1) {
-				markFirstRequest();
-			}
-			const stream = createAssistantMessageEventStream();
-			void (async () => {
+			// Hold the first (tool-less) response open so /compact can be queued
+			// while it streams; the summarization request is served immediately.
+			let releaseResponse: (() => void) | undefined;
+			const responseRelease = new Promise<void>((resolve) => {
+				releaseResponse = resolve;
+			});
+			let markFirstRequest = () => {};
+			const firstRequest = new Promise<void>((resolve) => {
+				markFirstRequest = resolve;
+			});
+			let requestCount = 0;
+			harness.session.agent.streamFunction = (model, _context, _options) => {
+				requestCount++;
 				if (requestCount === 1) {
-					await responseRelease;
+					markFirstRequest();
 				}
-				const text = requestCount === 1 ? "done" : SUMMARY_TEXT;
-				const message: AssistantMessage = {
-					...fauxAssistantMessage(text),
-					api: model.api,
-					provider: model.provider,
-					model: model.id,
-					usage: usage(10),
-				};
-				stream.push({ type: "done", reason: "stop", message });
-			})();
-			return stream;
-		};
+				const stream = createAssistantMessageEventStream();
+				void (async () => {
+					if (requestCount === 1) {
+						await responseRelease;
+					}
+					const text = requestCount === 1 ? "done" : SUMMARY_TEXT;
+					const message: AssistantMessage = {
+						...fauxAssistantMessage(text),
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: usage(10),
+					};
+					stream.push({ type: "done", reason: "stop", message });
+				})();
+				return stream;
+			};
 
-		const promptPromise = harness.session.prompt("start");
-		await firstRequest;
+			const promptPromise = harness.session.prompt("start");
+			await firstRequest;
 
-		// The provider request is in flight: /compact is queued, not run.
-		expect(harness.session.isStreaming).toBe(true);
-		harness.session.queueCompact();
+			// The provider request is in flight: /compact is queued, not run.
+			expect(harness.session.isStreaming).toBe(true);
+			harness.session.queueCompact();
 
-		releaseResponse!();
-		await promptPromise;
+			releaseResponse!();
+			await promptPromise;
 
-		// Compaction ran, but the run had ended naturally: no continuation.
-		const compactionStarts = harness.eventsOfType("compaction_start");
-		expect(compactionStarts).toHaveLength(1);
-		expect(compactionStarts[0].reason).toBe("manual");
-		expect(harness.eventsOfType("compaction_end")).toHaveLength(1);
-		expect(getAssistantTexts(harness)).toEqual(["done"]);
-		expect(requestCount).toBe(2);
-		expect(harness.events.some((event) => event.type === "agent_settled")).toBe(true);
-		expect(harness.sessionManager.getBranch().some((entry) => entry.type === "compaction")).toBe(true);
-	});
+			// Compaction ran, but the run had ended naturally: no continuation.
+			const compactionStarts = harness.eventsOfType("compaction_start");
+			expect(compactionStarts).toHaveLength(1);
+			expect(compactionStarts[0].reason).toBe("manual");
+			expect(harness.eventsOfType("compaction_end")).toHaveLength(1);
+			expect(getAssistantTexts(harness)).toEqual(["done"]);
+			expect(requestCount).toBe(2);
+			expect(harness.events.some((event) => event.type === "agent_settled")).toBe(true);
+			expect(harness.sessionManager.getBranch().some((entry) => entry.type === "compaction")).toBe(true);
+		},
+	);
 
 	it("cancelQueuedCompact clears the queued compaction without interrupting the stream", async () => {
 		const { tool: waitTool, release, waitForToolStart } = createWaitTool();

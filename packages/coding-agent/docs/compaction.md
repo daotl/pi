@@ -109,6 +109,8 @@ Cancelling a queued compaction during asynchronous summary authentication or str
 
 A manual compact queued during a retryable response runs at the completed boundary before automatic retry events or backoff. Successful or failed compaction does not create an extra retry grant: disabled and exhausted policies remain exhausted. Cancelling the compaction suppresses the interrupted run's retry.
 
+A queued compact takes precedence over a boundary continuation decision. After compaction, only a naturally runnable tool batch or an explicit continuation with committed runnable boundary input resumes. Tool results alone do not restart an all-terminating batch; an explicit end or completed tool-less answer without runnable boundary input stays ended. Cancellation suppresses this interrupted continuation; an ordinary compaction failure can still resume runnable work.
+
 If compaction is cancelled while finding its cut point, preparation stops before `session_before_compact` handlers run. A started automatic compaction emits its aborted completion event whether preparation produced a usable candidate or not.
 
 A compact accepted after the final turn boundary, including from `agent_before_settle`, runs before `agent_settled` for both prompts and standalone continuations. It does not start another model request solely because it was queued late.

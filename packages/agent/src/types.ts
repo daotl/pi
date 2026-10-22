@@ -137,6 +137,8 @@ export interface AgentTurnContext {
 	message: AssistantMessage;
 	/** Tool result messages emitted for the completed turn. */
 	toolResults: ToolResultMessage[];
+	/** Whether the finalized tool batch naturally needs a response, excluding queues and finishTurn decisions. */
+	canContinue: boolean;
 	/** Current agent context after the turn's assistant message and tool results have been appended. */
 	context: AgentContext;
 	/** Messages that this loop invocation will return if it exits at this point. Prompt runs include the initial prompt messages; continuation runs do not include pre-existing context messages. */

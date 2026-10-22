@@ -6,7 +6,7 @@ import { createInMemoryModelRegistry, createModelRegistry, getModelRuntime } fro
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool, FinishTurn } from "@earendil-works/pi-agent-core";
 import { Agent } from "@earendil-works/pi-agent-core";
 import type {
 	FauxModelDefinition,
@@ -116,6 +116,7 @@ export interface HarnessOptions {
 	/** Override the faux provider API (e.g. "openai-completions" for prefill tests). */
 	fauxApi?: string;
 	settings?: Partial<Settings>;
+	finishTurn?: FinishTurn;
 	tools?: AgentTool[];
 	initialActiveToolNames?: string[];
 	allowedToolNames?: string[];
@@ -212,6 +213,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const agent = new Agent({
 		getApiKey: () => (withConfiguredAuth ? "faux-key" : undefined),
 		streamFn: streamSimple,
+		finishTurn: options.finishTurn,
 		initialState: {
 			model,
 			systemPrompt: "",
