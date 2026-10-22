@@ -1896,6 +1896,7 @@ export class AgentSession {
 		if (removed > 0) {
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
+			this._restoreBaseSystemPromptFromBranch();
 		}
 		return removed;
 	}
@@ -1946,18 +1947,34 @@ export class AgentSession {
 		return units.slice(Math.max(0, units.length - count)).reverse();
 	}
 
-	/**
-	 * All non-superseded assistant message entries that share the given
-	 * entry's parent: the swipe versions of one response (the entry itself
-	 * plus its sibling versions), or just the entry when there is no group.
-	 */
+	/** Policy-only ancestors do not split assistant versions; user-version anchors remain physical. */
+	private _swipeAnchor(manager: SessionManager, entry: SessionEntry): string | null {
+		let parentId = entry.parentId;
+		if (entry.type !== "message" || entry.message.role !== "assistant") return parentId;
+		while (parentId) {
+			const parent = manager.getEntry(parentId);
+			if (
+				!parent ||
+				(parent.type !== "system_prompt" && (parent.type !== "message" || parent.message.role !== "system"))
+			)
+				break;
+			parentId = parent.parentId;
+		}
+		return parentId;
+	}
+
+	/** All non-superseded assistant versions sharing the same logical anchor. */
 	private _swipeSiblingsOf(entry: SessionEntry): SessionMessageEntry[] {
 		if (entry.type !== "message" || entry.message.role !== "assistant" || entry.parentId === null) {
 			return entry.type === "message" ? [entry as SessionMessageEntry] : [];
 		}
 		const siblings: SessionMessageEntry[] = [];
 		for (const candidate of this.sessionManager.getEntries()) {
-			if (candidate.type !== "message" || candidate.parentId !== entry.parentId) continue;
+			if (
+				candidate.type !== "message" ||
+				this._swipeAnchor(this.sessionManager, candidate) !== this._swipeAnchor(this.sessionManager, entry)
+			)
+				continue;
 			if (candidate.message.role !== "assistant") continue;
 			if (candidate.supersededBy !== undefined) continue;
 			siblings.push(candidate);
@@ -2093,6 +2110,7 @@ export class AgentSession {
 			const entry = entries[i];
 			if (entry.type !== "message") continue;
 			const message = entry.message;
+			if (message.role === "system") continue;
 			if (message.role === "toolResult") continue;
 			if (message.role === "assistant") {
 				if (isHarnessMessage(message)) {
@@ -2107,8 +2125,9 @@ export class AgentSession {
 			}
 			break;
 		}
-		if (!unit || unit.parentId === null) return undefined;
-		const anchorEntryId = unit.parentId;
+		if (!unit) return undefined;
+		const anchorEntryId = this._swipeAnchor(manager, unit);
+		if (anchorEntryId === null) return undefined;
 		const role = unit.message.role === "user" ? "user" : "assistant";
 
 		// Every non-deleted, non-superseded child of the anchor with the
@@ -2119,7 +2138,7 @@ export class AgentSession {
 		const versions: SessionMessageEntry[] = [];
 		for (const entry of manager.getEntries()) {
 			if (entry.type !== "message") continue;
-			if (entry.parentId !== anchorEntryId) continue;
+			if (this._swipeAnchor(manager, entry) !== anchorEntryId) continue;
 			if (entry.deletedAt !== undefined || entry.supersededBy !== undefined) continue;
 			if (entry.message.role !== role) continue;
 			versions.push(entry);
@@ -2139,7 +2158,7 @@ export class AgentSession {
 		const changed = this._selectSwipeVersion(this.sessionManager, group, index);
 		if (changed) {
 			this._refreshFinalizedContext();
-			this._restoreToolsFromTranscript();
+			this._restoreBaseSystemPromptFromBranch();
 		}
 		return changed;
 	}
@@ -2190,7 +2209,7 @@ export class AgentSession {
 		}
 		this.sessionManager.branch(group.anchorEntryId);
 		this._refreshFinalizedContext();
-		this._restoreToolsFromTranscript();
+		this._restoreBaseSystemPromptFromBranch(false);
 	}
 
 	/**
@@ -2300,7 +2319,8 @@ export class AgentSession {
 	private _visibleVersionsOf(group: SwipeGroup): SessionMessageEntry[] {
 		const remaining: SessionMessageEntry[] = [];
 		for (const entry of this.sessionManager.getEntries()) {
-			if (entry.type !== "message" || entry.parentId !== group.anchorEntryId) continue;
+			if (entry.type !== "message" || this._swipeAnchor(this.sessionManager, entry) !== group.anchorEntryId)
+				continue;
 			if (entry.message.role !== group.role) continue;
 			if (entry.deletedAt !== undefined || entry.supersededBy !== undefined) continue;
 			remaining.push(entry);
@@ -2323,9 +2343,16 @@ export class AgentSession {
 		const deleted: SessionMessageEntry[] = [];
 		for (const entry of this.sessionManager.getEntries()) {
 			if (entry.type !== "message" || entry.deletedAt === undefined || entry.supersededBy !== undefined) continue;
-			if (entry.parentId === group.anchorEntryId && entry.message.role === group.role) {
+			if (
+				this._swipeAnchor(this.sessionManager, entry) === group.anchorEntryId &&
+				entry.message.role === group.role
+			) {
 				deleted.push(entry);
-			} else if (group.role === "user" && entry.parentId === unit.id && entry.message.role === "assistant") {
+			} else if (
+				group.role === "user" &&
+				this._swipeAnchor(this.sessionManager, entry) === unit.id &&
+				entry.message.role === "assistant"
+			) {
 				// All response versions deleted: the tail user message keeps its
 				// deleted assistant children restorable.
 				deleted.push(entry);
@@ -2353,12 +2380,13 @@ export class AgentSession {
 			// When the leaf sits outside every visible version subtree of the
 			// restored set (for example all versions were deleted), navigate to
 			// the latest restored version so it does not stay orphaned.
-			const anchorEntryId = selected[0].parentId;
+			const anchorEntryId = this._swipeAnchor(this.sessionManager, selected[0]);
 			const role = selected[0].message.role;
 			if (anchorEntryId && (role === "assistant" || role === "user")) {
 				const versions: SessionMessageEntry[] = [];
 				for (const entry of this.sessionManager.getEntries()) {
-					if (entry.type !== "message" || entry.parentId !== anchorEntryId) continue;
+					if (entry.type !== "message" || this._swipeAnchor(this.sessionManager, entry) !== anchorEntryId)
+						continue;
 					if (entry.message.role !== role) continue;
 					if (entry.deletedAt !== undefined || entry.supersededBy !== undefined) continue;
 					versions.push(entry);
@@ -2366,7 +2394,8 @@ export class AgentSession {
 				versions.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
 				const leafInside = this._leafWithinIds(new Set(versions.map((entry) => entry.id)));
 				const candidates = selected.filter(
-					(entry) => entry.parentId === anchorEntryId && entry.message.role === role,
+					(entry) =>
+						this._swipeAnchor(this.sessionManager, entry) === anchorEntryId && entry.message.role === role,
 				);
 				if (!leafInside && versions.length > 0 && candidates.length > 0) {
 					const latest = candidates.reduce((a, b) => (a.timestamp >= b.timestamp ? a : b));
@@ -2581,7 +2610,7 @@ export class AgentSession {
 
 		const sessionContext = this.sessionManager.buildSessionContext();
 		this.agent.state.messages = sessionContext.messages;
-		if (navigatedSwipe) this._restoreToolsFromTranscript(false);
+		if (navigatedSwipe || versioned > 0) this._restoreBaseSystemPromptFromBranch(false);
 
 		return { edited: replacements.length, added: newMessages.length, versioned, swiped };
 	}
@@ -3018,7 +3047,7 @@ export class AgentSession {
 				this._untrustedSkillOrder = projectTrusted
 					? undefined
 					: (saved.skills ?? []).map((skill) => canonicalizePath(resolvePath(skill.filePath, this._cwd)));
-				this._deferUntrustedSnapshot =
+				this._deferUntrustedSnapshot ||=
 					!projectTrusted &&
 					(this._extensionRunner.hasHandlers("resources_discover") ||
 						this._extensionRunner.hasHandlers("session_start"));
@@ -3087,7 +3116,9 @@ export class AgentSession {
 	}
 
 	private _persistBaseSystemPrompt(forcePersist = false): void {
-		if (this._deferUntrustedSnapshot || !this.sessionManager.isPersisted()) return;
+		if (this._deferUntrustedSnapshot) return;
+		// In-memory sessions acquire snapshots through explicit updates, not an invisible startup anchor.
+		if (!this.sessionManager.isPersisted() && !forcePersist && !this.sessionManager.getSavedSystemPrompt()) return;
 		if (
 			!forcePersist &&
 			this._untrustedSkillOrder === undefined &&
@@ -3114,6 +3145,26 @@ export class AgentSession {
 			snapshot.contextFiles,
 		);
 		this._lastPersistedSystemPrompt = this._baseSystemPrompt;
+	}
+
+	/** Reconcile the effective resource state with the selected durable path, not the abandoned leaf. */
+	private _restoreBaseSystemPromptFromBranch(persist = true): void {
+		this._customSystemPromptOverride = undefined;
+		this._restoredSystemPromptSections = undefined;
+		this._restoredPromptBaseline = undefined;
+		this._effectiveSkills = undefined;
+		this._effectiveContextFiles = undefined;
+		this._untrustedSkillOrder = undefined;
+		this._deferUntrustedSnapshot = !persist;
+		this._lastPersistedSystemPrompt = undefined;
+		this._restoreSystemPrompt = true;
+		this._runSystemPromptOptions = undefined;
+		// Tool restoration is runtime-only: do not publish an intermediate abandoned-policy snapshot.
+		this._restoreToolsFromTranscript(false);
+		this._commitBaseSystemPrompt(this._rebuildSystemPrompt(this.getActiveToolNames()));
+		// Navigation uses the already-discovered resources and is not another startup lifecycle.
+		this._deferUntrustedSnapshot = false;
+		if (persist) this._persistBaseSystemPrompt();
 	}
 
 	/**
@@ -6208,7 +6259,7 @@ export class AgentSession {
 
 			// Update finalized context from the canonical session projection.
 			this._refreshFinalizedContext();
-			this._restoreToolsFromTranscript();
+			this._restoreBaseSystemPromptFromBranch();
 			// Accepted navigation supersedes recoverable work on the abandoned branch.
 			this._prefillRestoreFailed = false;
 			this._pendingPrefill = undefined;

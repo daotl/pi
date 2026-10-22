@@ -37,6 +37,8 @@ On trusted resume, saved static prompt sections remain effective across getters,
 
 On untrusted resume, saved skill paths provide ordering hints only: current non-project loader resources determine skill identity and metadata. Historical system instruction sections are replaced before request-context hooks and direct summaries; allowed current hooks can still augment the sanitized policy. An explicit user `customPrompt` override remains effective. AGENTS context loads regardless of project trust: structured saved context remains effective until a full resource reload, while an opaque legacy prompt without sections uses current loader context. A full reload refreshes context files while retaining saved preamble, addendum and skill metadata until their explicit granular update.
 
+Tree and swipe navigation restore prompt construction, skill metadata, context files and executable tool loadout from the selected path. Regeneration and mixed message edits reconcile that state without an intermediate snapshot append; policy-only system entries do not split assistant swipe versions. Physical tail removal also restores the remaining path's policy. In-memory explicit updates retain snapshots for later branch restoration without adding an invisible startup anchor to an otherwise empty session.
+
 <a id="sessionmanager-api"></a>
 
 ### Session storage

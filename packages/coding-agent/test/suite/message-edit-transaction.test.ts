@@ -184,8 +184,7 @@ it("restores the committed non-current swipe branch's tools, not the abandoned r
 		harness.session.setActiveToolsByName(["bash"]);
 		await harness.session.prompt("follow-up");
 		vi.setSystemTime(new Date("2026-10-22T13:00:02Z"));
-		// Persisted prepareSwipeRegeneration may append a prompt snapshot at the anchor;
-		// construct the retained sibling directly so this fixture targets the same swipe group.
+		// Construct the retained sibling directly so the edit selects the original version's subtree.
 		manager.branch(originalGroup.anchorEntryId);
 		manager.appendMessage(fauxAssistantMessage("read alternative"));
 		harness.session.refreshContext();
