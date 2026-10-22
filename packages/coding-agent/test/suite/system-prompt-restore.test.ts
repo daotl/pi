@@ -176,6 +176,7 @@ test.each([
 	"unchanged",
 	"context-edit",
 	"forced",
+	"failed-update",
 	"remove-addendum",
 	"clear-preamble",
 	"full-reload",
@@ -237,6 +238,11 @@ test.each([
 			harness.setResponses([fauxAssistantMessage("seed answer")]);
 			await harness.session.prompt("seed question");
 			const saved = harness.session.systemPrompt;
+			expect(harness.session.getEffectiveContextSources()).toEqual([
+				{ path: systemPath },
+				{ path: appendPath },
+				{ path: contextPath },
+			]);
 			const file = manager.getSessionFile()!;
 			if (mode === "legacy-context" || mode === "legacy-context-edit") {
 				const snapshot = manager.getSavedSystemPrompt()!;
@@ -262,11 +268,42 @@ test.each([
 				initialActiveToolNames: ["read"],
 				settings: { retry: { enabled: false }, compaction: { enabled: false } },
 			});
+			const expectedSources = [
+				{ label: expect.stringMatching(/saved system prompt.*source unavailable/i) },
+				{ label: expect.stringMatching(/saved.*addendum.*source unavailable/i) },
+				mode === "legacy-context" || mode === "legacy-context-edit"
+					? { label: expect.stringMatching(/saved.*context.*source unavailable/i) }
+					: { path: contextPath },
+			];
+			expect(harness.session.getEffectiveContextSources()).toEqual(expectedSources);
+			const consumerSources = harness.session.getEffectiveContextSources();
+			for (const source of consumerSources) {
+				if ("path" in source) source.path = "/consumer/replaced-context.md";
+				else source.label = "consumer replaced label";
+			}
+			consumerSources.pop();
+			expect(harness.session.getEffectiveContextSources()).toEqual(expectedSources);
+			if (mode === "failed-update") {
+				Object.assign(loader, {
+					reloadSkills: () => {
+						throw new Error("skill update failed after prompt reload");
+					},
+				});
+				expect(() => harness!.session.reloadAllFromFiles()).toThrow("skill update failed after prompt reload");
+				expect(harness.session.getEffectiveContextSources()).toEqual(expectedSources);
+			}
 			if (mode === "clear-preamble") {
 				harness.session.setCustomSystemPrompt("TEMPORARY CUSTOM PREAMBLE");
 				harness.session.setCustomSystemPrompt("");
 			}
 			if (mode === "full-reload") await harness.session.reload();
+			if (mode === "clear-preamble") {
+				expect(harness.session.getEffectiveContextSources()).toEqual([
+					{ path: systemPath },
+					expectedSources[1],
+					{ path: contextPath },
+				]);
+			}
 			const effective =
 				mode === "clear-preamble"
 					? saved.replace("SAVED PREAMBLE", "CHANGED DISK PREAMBLE")

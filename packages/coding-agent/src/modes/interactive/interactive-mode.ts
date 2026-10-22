@@ -799,6 +799,7 @@ export class InteractiveMode {
 	private keybindings: KeybindingsManager;
 	private version: string;
 	private isInitialized = false;
+	private resourceDiscoveryIdentity?: string;
 	private onInputCallback?: (text: string) => void;
 	private pendingUserInputs: string[] = [];
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
@@ -1148,7 +1149,7 @@ export class InteractiveMode {
 		this.skillCommands.clear();
 		const skillCommandList: SlashCommand[] = [];
 		if (this.settingsManager.getEnableSkillCommands()) {
-			for (const skill of this.session.resourceLoader.getSkills().skills) {
+			for (const skill of this.session.getEffectiveSkills()) {
 				const commandName = `skill:${skill.name}`;
 				this.skillCommands.set(commandName, skill.filePath);
 				skillCommandList.push({
@@ -2105,12 +2106,23 @@ export class InteractiveMode {
 		return lines.join("\n");
 	}
 
+	private getResourceDiscoveryIdentity(): string {
+		return JSON.stringify([this.session.getEffectiveSkills(), this.session.getEffectiveContextSources()]);
+	}
+
+	private refreshEffectiveResources(): void {
+		if (this.resourceDiscoveryIdentity === this.getResourceDiscoveryIdentity()) return;
+		this.setupAutocompleteProvider();
+		this.showLoadedResources({ showDiagnosticsWhenQuiet: true });
+	}
+
 	private showLoadedResources(options?: {
 		extensions?: Array<{ path: string; sourceInfo?: SourceInfo }>;
 		force?: boolean;
 		showDiagnosticsWhenQuiet?: boolean;
 	}): void {
 		// Resource rendering is idempotent; chat clears no longer clear this separate container.
+		this.resourceDiscoveryIdentity = this.getResourceDiscoveryIdentity();
 		this.loadedResourcesContainer.clear();
 
 		const showListing = options?.force || this.options.verbose || !this.settingsManager.getQuietStartup();
@@ -2146,6 +2158,7 @@ export class InteractiveMode {
 		};
 
 		const skillsResult = this.session.resourceLoader.getSkills();
+		const effectiveSkills = this.session.getEffectiveSkills();
 		const promptsResult = this.session.resourceLoader.getPrompts();
 		const themesResult = this.session.resourceLoader.getThemes();
 		const extensions =
@@ -2163,7 +2176,7 @@ export class InteractiveMode {
 				sourceInfos.set(extension.path, extension.sourceInfo);
 			}
 		}
-		for (const skill of skillsResult.skills) {
+		for (const skill of effectiveSkills) {
 			if (skill.sourceInfo) {
 				sourceInfos.set(skill.filePath, skill.sourceInfo);
 			}
@@ -2180,25 +2193,24 @@ export class InteractiveMode {
 		}
 
 		if (showListing) {
-			const systemPromptSource = this.session.resourceLoader.getSystemPromptSource();
-			const contextFiles = [
-				...(systemPromptSource ? [systemPromptSource] : []),
-				...this.session.resourceLoader.getAppendSystemPromptSources(),
-				...this.session.resourceLoader.getAgentsFiles().agentsFiles,
-			];
+			const contextFiles = this.session.getEffectiveContextSources();
 			if (contextFiles.length > 0) {
 				this.loadedResourcesContainer.addChild(new Spacer(1));
 				const contextList = () =>
-					contextFiles.map((f) => theme.fg("dim", `  ${this.formatDisplayPath(f.path)}`)).join("\n");
+					contextFiles
+						.map((source) =>
+							theme.fg("dim", `  ${"path" in source ? this.formatDisplayPath(source.path) : source.label}`),
+						)
+						.join("\n");
 				const contextCompactList = () =>
 					formatCompactList(
-						contextFiles.map((contextFile) => this.formatContextPath(contextFile.path)),
+						contextFiles.map((source) => ("path" in source ? this.formatContextPath(source.path) : source.label)),
 						{ sort: false },
 					);
 				addLoadedSection("Context", contextCompactList, contextList);
 			}
 
-			const skills = skillsResult.skills;
+			const skills = effectiveSkills;
 			if (skills.length > 0) {
 				const groups = this.buildScopeGroups(
 					skills.map((skill) => ({ path: skill.filePath, sourceInfo: skill.sourceInfo })),
@@ -3911,6 +3923,7 @@ export class InteractiveMode {
 				// prefill capture/restore during retry). Re-render from the session
 				// log so the UI reflects deletions and restorations.
 				this.rebuildChatFromMessages();
+				this.refreshEffectiveResources();
 				this.ui.requestRender();
 				break;
 
@@ -4642,6 +4655,7 @@ export class InteractiveMode {
 	}
 
 	renderInitialMessages(): void {
+		this.refreshEffectiveResources();
 		const entries = this.sessionManager.buildContextEntries();
 		this.renderSessionEntries(entries, {
 			updateFooter: true,
@@ -8342,16 +8356,22 @@ export class InteractiveMode {
 		const target = arg === "" ? "all" : arg;
 		if (target === "all") {
 			this.session.reloadAllFromFiles();
+			this.setupAutocompleteProvider();
+			this.showLoadedResources({ showDiagnosticsWhenQuiet: true });
 			this.showStatus("Updated system prompt and skills from current files; saved to the session");
 			return;
 		}
 		if (target === "system-prompt" || target === "system_prompt") {
 			this.session.reloadSystemPromptFromFiles();
+			this.setupAutocompleteProvider();
+			this.showLoadedResources({ showDiagnosticsWhenQuiet: true });
 			this.showStatus("Updated system prompt from current files; saved to the session");
 			return;
 		}
 		if (target === "skills") {
 			this.session.reloadSkillsFromFiles();
+			this.setupAutocompleteProvider();
+			this.showLoadedResources({ showDiagnosticsWhenQuiet: true });
 			this.showStatus("Updated skills from current files; saved to the session");
 			return;
 		}
@@ -8362,6 +8382,7 @@ export class InteractiveMode {
 		if (arg === "clear") {
 			this.session.setCustomSystemPrompt("");
 			this.showStatus("Custom system prompt cleared; using the file-based prompt");
+			this.showLoadedResources({ showDiagnosticsWhenQuiet: true });
 			return;
 		}
 		if (arg.startsWith("set ")) {
@@ -8373,23 +8394,18 @@ export class InteractiveMode {
 				this.session.setCustomSystemPrompt(text);
 				this.showStatus("Custom system prompt set and saved to the session");
 			}
+			this.showLoadedResources({ showDiagnosticsWhenQuiet: true });
 			return;
 		}
 
 		const prompt = this.session.systemPrompt;
-		const sourcePath = this.session.resourceLoader.getSystemPromptSource()?.path;
-		const appendPaths = this.session.resourceLoader
-			.getAppendSystemPromptSources()
-			.map((p) => `  - ${p.path}`)
+		const sourceList = this.session
+			.getEffectiveContextSources()
+			.map((source) => `  - ${"path" in source ? source.path : source.label}`)
 			.join("\n");
 		let info = `${theme.bold(theme.fg("accent", "System Prompt"))}\n\n`;
 		info += `${theme.fg("dim", "Custom:")} ${this.session.hasCustomSystemPrompt ? "yes" : "no"}\n`;
-		if (sourcePath) {
-			info += `${theme.fg("dim", "Source:")} ${sourcePath}\n`;
-		}
-		if (appendPaths) {
-			info += `${theme.fg("dim", "Append:")}\n${appendPaths}\n`;
-		}
+		if (sourceList) info += `${theme.fg("dim", "Sources:")}\n${sourceList}\n`;
 		info += `${theme.fg("dim", "Length:")} ${prompt.length} characters\n`;
 		info += `\n${theme.fg("dim", "Usage:")} /system-prompt [set <text>|clear] | /update [all|system-prompt|skills]\n`;
 

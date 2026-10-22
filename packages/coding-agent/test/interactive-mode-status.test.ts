@@ -541,6 +541,12 @@ describe("InteractiveMode.showLoadedResources", () => {
 				getCwd: () => options.cwd ?? "/tmp/project",
 			},
 			session: {
+				getEffectiveSkills: () => options.skills ?? [],
+				getEffectiveContextSources: () => [
+					...(options.systemPromptSource ? [options.systemPromptSource] : []),
+					...(options.appendSystemPromptSources ?? []),
+					...(options.contextFiles ?? []),
+				],
 				promptTemplates: [],
 				extensionRunner: {
 					getCommandDiagnostics: () => [],
@@ -588,6 +594,7 @@ describe("InteractiveMode.showLoadedResources", () => {
 				(InteractiveMode as any).prototype.getCompactExtensionLabels.call(fakeThis, extensions),
 			formatDiagnostics: () => "diagnostics",
 			getBuiltInCommandConflictDiagnostics: () => [],
+			getResourceDiscoveryIdentity: () => "fixture-resources",
 		};
 
 		if (options.useRealScopeGroups) {

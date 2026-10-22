@@ -14,8 +14,11 @@ type LoadedResourcesContext = {
 	options: { verbose?: boolean };
 	settingsManager: { getQuietStartup: () => boolean };
 	sessionManager: { getCwd: () => string };
+	getResourceDiscoveryIdentity: () => string;
 	session: {
 		promptTemplates: [];
+		getEffectiveSkills: () => [];
+		getEffectiveContextSources: () => Array<{ path: string }>;
 		resourceLoader: {
 			getAgentsFiles: () => LoadedResourcesResult<{ agentsFiles: Array<{ path: string }> }>;
 			getSystemPromptSource: () => { path: string } | undefined;
@@ -198,8 +201,11 @@ function createLoadedResourcesContext(): LoadedResourcesContext {
 		options: { verbose: true },
 		settingsManager: { getQuietStartup: () => false },
 		sessionManager: { getCwd: () => "/repo" },
+		getResourceDiscoveryIdentity: () => "session-start-resources",
 		session: {
 			promptTemplates: [],
+			getEffectiveSkills: () => [],
+			getEffectiveContextSources: () => [{ path: "/repo/AGENTS.md" }],
 			resourceLoader: {
 				getAgentsFiles: () => ({ agentsFiles: [{ path: "/repo/AGENTS.md" }], diagnostics: [] }),
 				getSystemPromptSource: () => undefined,

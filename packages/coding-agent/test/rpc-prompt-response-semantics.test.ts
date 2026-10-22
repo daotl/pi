@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
@@ -14,6 +14,7 @@ import { AgentSession } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { LoadExtensionsResult } from "../src/core/extensions/index.ts";
+import { DefaultResourceLoader, type ResourceLoader } from "../src/core/resource-loader.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
@@ -102,11 +103,14 @@ async function createRuntimeHost(options: {
 	responseDelayMs: number;
 	model?: Model<any>;
 	extensionsResult?: LoadExtensionsResult;
+	cwd?: string;
+	resourceLoader?: ResourceLoader;
+	sessionManager?: SessionManager;
 }): Promise<{
 	runtimeHost: AgentSessionRuntime;
 	cleanup: () => Promise<void>;
 }> {
-	const tempDir = join(tmpdir(), `pi-rpc-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+	const tempDir = options.cwd ?? join(tmpdir(), `pi-rpc-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 	mkdirSync(tempDir, { recursive: true });
 
 	const model = options.model ?? getModel("anthropic", "claude-sonnet-4-5");
@@ -133,7 +137,7 @@ async function createRuntimeHost(options: {
 		},
 	});
 
-	const sessionManager = SessionManager.inMemory();
+	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
 	const settingsManager = SettingsManager.create(tempDir, tempDir);
 	const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 	const modelRegistry = await createInMemoryModelRegistry(authStorage);
@@ -147,7 +151,8 @@ async function createRuntimeHost(options: {
 		settingsManager,
 		cwd: tempDir,
 		modelRuntime: getModelRuntime(modelRegistry),
-		resourceLoader: createTestResourceLoader({ extensionsResult: options.extensionsResult }),
+		resourceLoader:
+			options.resourceLoader ?? createTestResourceLoader({ extensionsResult: options.extensionsResult }),
 	});
 
 	const runtimeHost = {
@@ -168,7 +173,7 @@ async function createRuntimeHost(options: {
 				// ignore test cleanup failures
 			}
 			session.dispose();
-			if (existsSync(tempDir)) {
+			if (!options.cwd && existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true });
 			}
 		},
@@ -177,16 +182,38 @@ async function createRuntimeHost(options: {
 
 async function startRpcMode(options: Parameters<typeof createRuntimeHost>[0]): Promise<{
 	lineHandler: (line: string) => void;
+	runtimeHost: AgentSessionRuntime;
 	cleanup: () => Promise<void>;
 }> {
 	rpcIo.outputLines = [];
 	rpcIo.lineHandler = undefined;
 
 	const { runtimeHost, cleanup } = await createRuntimeHost(options);
+	const signals = ["SIGTERM", "SIGHUP"] as const;
+	const signalListeners = signals.map((signal) => ({ signal, listeners: new Set(process.listeners(signal)) }));
+	const inputEndListeners = new Set(process.stdin.listeners("end"));
 	void runRpcMode(runtimeHost);
 	await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
+	const ownedSignalListeners = signalListeners.flatMap(({ signal, listeners }) =>
+		process
+			.listeners(signal)
+			.filter((listener) => !listeners.has(listener))
+			.map((listener) => ({ signal, listener })),
+	);
+	const ownedInputEndListeners = process.stdin.listeners("end").filter((listener) => !inputEndListeners.has(listener));
 
-	return { lineHandler: rpcIo.lineHandler!, cleanup };
+	return {
+		lineHandler: rpcIo.lineHandler!,
+		runtimeHost,
+		cleanup: async () => {
+			try {
+				await cleanup();
+			} finally {
+				for (const { signal, listener } of ownedSignalListeners) process.off(signal, listener);
+				for (const listener of ownedInputEndListeners) process.stdin.off("end", listener as () => void);
+			}
+		},
+	};
 }
 
 describe("RPC prompt response semantics", () => {
@@ -194,6 +221,89 @@ describe("RPC prompt response semantics", () => {
 	afterEach(() => {
 		rpcIo.outputLines = [];
 		rpcIo.lineHandler = undefined;
+	});
+
+	it("lists restored skill metadata until skills are explicitly refreshed from disk", async () => {
+		const cwd = join(tmpdir(), `pi-rpc-skills-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const skillRoot = join(cwd, "skills");
+		const savedDirectory = join(skillRoot, "saved");
+		const currentDirectory = join(skillRoot, "current");
+		mkdirSync(savedDirectory, { recursive: true });
+		writeFileSync(
+			join(savedDirectory, "SKILL.md"),
+			"---\nname: lookup\ndescription: Saved lookup instructions\n---\nSaved lookup body.\n",
+		);
+		const loader = new DefaultResourceLoader({
+			cwd,
+			agentDir: join(cwd, "agent"),
+			settingsManager: SettingsManager.inMemory(),
+			noExtensions: true,
+			noSkills: true,
+			noPromptTemplates: true,
+			noThemes: true,
+			noContextFiles: true,
+			additionalSkillPaths: [skillRoot],
+		});
+		let cleanup = async () => {};
+		try {
+			await loader.reload();
+			const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+			const first = await createRuntimeHost({
+				withAuth: false,
+				responseDelayMs: 0,
+				cwd,
+				resourceLoader: loader,
+				sessionManager: manager,
+			});
+			cleanup = first.cleanup;
+			const savedSkill = manager.getSavedSystemPrompt()!.skills![0];
+			manager.appendMessage({ role: "user", content: "Remember this resource inventory.", timestamp: 1 });
+			await first.cleanup();
+			cleanup = async () => {};
+			rmSync(savedDirectory, { recursive: true });
+			mkdirSync(currentDirectory, { recursive: true });
+			writeFileSync(
+				join(currentDirectory, "SKILL.md"),
+				"---\nname: lookup\ndescription: Current lookup instructions\n---\nCurrent lookup body.\n",
+			);
+			loader.reloadSkills();
+			const currentSkill = loader.getSkills().skills[0];
+			const started = await startRpcMode({
+				withAuth: false,
+				responseDelayMs: 0,
+				cwd,
+				resourceLoader: loader,
+				sessionManager: SessionManager.open(manager.getSessionFile()!, join(cwd, "sessions"), cwd),
+			});
+			cleanup = started.cleanup;
+			const expectCommands = async (id: string, description: string, sourceInfo: unknown) => {
+				started.lineHandler(JSON.stringify({ id, type: "get_commands" }));
+				await vi.waitFor(() => {
+					expect(parseOutputLines(rpcIo.outputLines).filter((line) => line.id === id)).toEqual([
+						{
+							id,
+							type: "response",
+							command: "get_commands",
+							success: true,
+							data: { commands: [{ name: "skill:lookup", description, source: "skill", sourceInfo }] },
+						},
+					]);
+				});
+			};
+			expect(currentSkill.description).toBe("Current lookup instructions");
+			expect(currentSkill.sourceInfo.path).not.toBe(savedSkill.sourceInfo.path);
+			await expectCommands("restored", "Saved lookup instructions", savedSkill.sourceInfo);
+			await started.runtimeHost.session.reload();
+			await expectCommands("reloaded", "Saved lookup instructions", savedSkill.sourceInfo);
+			started.runtimeHost.session.reloadSkillsFromFiles();
+			await expectCommands("refreshed", "Current lookup instructions", currentSkill.sourceInfo);
+		} finally {
+			try {
+				await cleanup();
+			} finally {
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		}
 	});
 
 	it("emits one failure response when prompt preflight rejects", async () => {

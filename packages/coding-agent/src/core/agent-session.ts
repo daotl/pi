@@ -602,6 +602,7 @@ export class AgentSession {
 	private _effectiveContextFiles?: NormalizedBuildSystemPromptOptions["contextFiles"];
 	private _untrustedSkillOrder?: string[];
 	private _deferUntrustedSnapshot = false;
+	private _promptFileSources: { systemPrompt?: string; addendum: string[] } = { addendum: [] };
 	/** Prompt options after before_agent_start mutations for the active run. */
 	private _runSystemPromptOptions?: NormalizedBuildSystemPromptOptions;
 
@@ -2827,6 +2828,17 @@ export class AgentSession {
 				: undefined;
 		const loadedSkills = this._resolveEffectiveSkills();
 		const loadedContextFiles = this._effectiveContextFiles ?? this._resourceLoader.getAgentsFiles().agentsFiles;
+		this._promptFileSources = {
+			systemPrompt:
+				this._restoredSystemPromptSections?.preamble !== undefined
+					? this._promptFileSources.systemPrompt
+					: this._customSystemPromptOverride === undefined && customPrompt === loaderSystemPrompt
+						? this._resourceLoader.getSystemPromptSource()?.path
+						: undefined,
+			addendum: this._restoredSystemPromptSections
+				? this._promptFileSources.addendum
+				: this._resourceLoader.getAppendSystemPromptSources().map((source) => source.path),
+		};
 
 		this._baseSystemPromptOptions = normalizeBuildSystemPromptOptions({
 			cwd: this._cwd,
@@ -3024,6 +3036,32 @@ export class AgentSession {
 		return [...skills, ...available.values()];
 	}
 
+	/** Copied effective skill metadata shared by prompt rendering and command dispatch. */
+	getEffectiveSkills(): Skill[] {
+		return this._resolveEffectiveSkills().map((skill) => ({ ...skill, sourceInfo: { ...skill.sourceInfo } }));
+	}
+
+	/** Effective base-prompt sources; saved opaque sections never borrow current file paths. */
+	getEffectiveContextSources(): Array<{ path: string } | { label: string }> {
+		const sources: Array<{ path: string } | { label: string }> = [];
+		const sections = this._buildEffectivePromptSections(this._baseSystemPromptOptions);
+		const restored = this.settingsManager.isProjectTrusted() && this._restoredSystemPromptSections !== undefined;
+		if (this._customSystemPromptOverride !== undefined) sources.push({ label: "Custom system prompt" });
+		else if (restored && this._restoredSystemPromptSections?.preamble !== undefined)
+			sources.push({ label: "Saved system prompt (source unavailable)" });
+		else if (this._promptFileSources.systemPrompt && this._baseSystemPromptOptions.customPrompt)
+			sources.push({ path: this._promptFileSources.systemPrompt });
+		if (sections.addendum) {
+			if (restored) sources.push({ label: "Saved system prompt addendum (source unavailable)" });
+			else for (const path of this._promptFileSources.addendum) sources.push({ path });
+		}
+		for (const file of this._baseSystemPromptOptions.contextFiles)
+			sources.push(
+				file.renderedProjectContext ? { label: "Saved project context (source unavailable)" } : { path: file.path },
+			);
+		return sources;
+	}
+
 	/**
 	 * Commit a newly-built base system prompt. On startup (restoreSystemPrompt
 	 * still enabled), the first commit restores the prompt saved in the session
@@ -3192,6 +3230,7 @@ export class AgentSession {
 			contextFiles: this._effectiveContextFiles,
 			untrustedSkillOrder: this._untrustedSkillOrder?.slice(),
 			deferUntrustedSnapshot: this._deferUntrustedSnapshot,
+			fileSources: this._promptFileSources,
 		};
 		try {
 			if (options.systemPrompt) {
@@ -3230,6 +3269,7 @@ export class AgentSession {
 			this._effectiveContextFiles = previous.contextFiles;
 			this._untrustedSkillOrder = previous.untrustedSkillOrder;
 			this._deferUntrustedSnapshot = previous.deferUntrustedSnapshot;
+			this._promptFileSources = previous.fileSources;
 			throw error;
 		}
 	}

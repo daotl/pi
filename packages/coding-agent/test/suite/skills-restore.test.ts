@@ -97,10 +97,6 @@ async function createSession(
 	return session;
 }
 
-function effectiveSkills(session: AgentSession): Skill[] {
-	return (session as unknown as { _effectiveSkills: Skill[] })._effectiveSkills;
-}
-
 afterEach(() => {
 	for (const dir of tempDirs.splice(0)) {
 		if (existsSync(dir)) {
@@ -122,7 +118,7 @@ describe("skill persistence and restore", () => {
 		);
 		expect(first.systemPrompt).toContain("alpha");
 		expect(sessionManager.getSavedSystemPrompt()?.skills?.map((s) => s.name)).toEqual(["alpha"]);
-		expect(effectiveSkills(first).map((s) => s.name)).toEqual(["alpha"]);
+		expect(first.getEffectiveSkills().map((s) => s.name)).toEqual(["alpha"]);
 		first.dispose();
 
 		// Resume with disk now reporting skill "beta". The saved skill set must win.
@@ -133,7 +129,7 @@ describe("skill persistence and restore", () => {
 		);
 		expect(resumed.systemPrompt).toContain("alpha");
 		expect(resumed.systemPrompt).not.toContain("beta");
-		expect(effectiveSkills(resumed).map((s) => s.name)).toEqual(["alpha"]);
+		expect(resumed.getEffectiveSkills().map((s) => s.name)).toEqual(["alpha"]);
 		expect(sessionManager.getSavedSystemPrompt()?.skills?.map((s) => s.name)).toEqual(["alpha"]);
 		resumed.dispose();
 	});
@@ -181,7 +177,7 @@ describe("skill persistence and restore", () => {
 			false,
 		);
 		expect(forced.systemPrompt).toContain("beta");
-		expect(effectiveSkills(forced).map((s) => s.name)).toEqual(["beta"]);
+		expect(forced.getEffectiveSkills().map((s) => s.name)).toEqual(["beta"]);
 		expect(sessionManager.getSavedSystemPrompt()?.skills?.map((s) => s.name)).toEqual(["beta"]);
 		forced.dispose();
 	});
@@ -200,7 +196,7 @@ describe("skill persistence and restore", () => {
 
 		expect(session.systemPrompt).toContain("beta");
 		expect(session.systemPrompt).not.toContain("alpha");
-		expect(effectiveSkills(session).map((s) => s.name)).toEqual(["beta"]);
+		expect(session.getEffectiveSkills().map((s) => s.name)).toEqual(["beta"]);
 		expect(sessionManager.getSavedSystemPrompt()?.skills?.map((s) => s.name)).toEqual(["beta"]);
 		session.dispose();
 	});
@@ -229,7 +225,7 @@ describe("skill persistence and restore", () => {
 
 		expect(session.systemPrompt).toContain("append-v2");
 		expect(session.systemPrompt).toContain("beta");
-		expect(effectiveSkills(session).map((s) => s.name)).toEqual(["beta"]);
+		expect(session.getEffectiveSkills().map((s) => s.name)).toEqual(["beta"]);
 		expect(sessionManager.getSavedSystemPrompt()?.systemPrompt).toContain("append-v2");
 		expect(sessionManager.getSavedSystemPrompt()?.skills?.map((s) => s.name)).toEqual(["beta"]);
 		session.dispose();
@@ -319,8 +315,22 @@ test("untrusted SDK resume uses canonical saved ordering but current skill autho
 	try {
 		const first = await reopen();
 		const current = first.loader.getSkills().skills;
-		const expected = [beta, alpha, gamma].map((path) => current.find((skill) => skill.filePath === path)!);
-		expect(effectiveSkills(first.session)).toEqual(expected);
+		const expected = [beta, alpha, gamma].map((path) => {
+			const skill = current.find((skill) => skill.filePath === path)!;
+			return { ...skill, sourceInfo: { ...skill.sourceInfo } };
+		});
+		expect(first.session.getEffectiveSkills()).toEqual(expected);
+		const consumerSkills = first.session.getEffectiveSkills();
+		consumerSkills[0].disableModelInvocation = false;
+		consumerSkills[1].name = "consumer-renamed-alpha";
+		consumerSkills[1].description = "CONSUMER DESCRIPTION";
+		consumerSkills[1].filePath = stale;
+		consumerSkills[1].baseDir = join(root, "consumer-references");
+		consumerSkills[1].sourceInfo.path = stale;
+		consumerSkills[1].sourceInfo.scope = "project";
+		consumerSkills[1].sourceInfo.source = "consumer";
+		consumerSkills.pop();
+		expect(first.session.getEffectiveSkills()).toEqual(expected);
 		expect(first.session.systemPrompt).toContain("CURRENT ALPHA DESCRIPTION");
 		expect(first.session.systemPrompt).toContain("CURRENT GAMMA DESCRIPTION");
 		for (const rejected of ["FORGED", "CURRENT HIDDEN DESCRIPTION", "PROJECT DESCRIPTION", "STALE DESCRIPTION"]) {
@@ -348,13 +358,13 @@ test("untrusted SDK resume uses canonical saved ordering but current skill autho
 		active = undefined;
 
 		const second = await reopen();
-		expect(effectiveSkills(second.session)).toEqual(expected);
+		expect(second.session.getEffectiveSkills()).toEqual(expected);
 		expect(second.manager.getSavedSystemPrompt()).toEqual(safeSnapshot);
 		expect(second.manager.getEntries().filter((entry) => entry.type === "system_prompt")).toEqual(safeEntries);
 		rmSync(alphaDir, { recursive: true });
 		second.session.reloadSkillsFromFiles();
 		const remaining = expected.filter((skill) => skill.filePath !== alpha);
-		expect(effectiveSkills(second.session)).toEqual(remaining);
+		expect(second.session.getEffectiveSkills()).toEqual(remaining);
 		expect(second.session.systemPrompt).not.toContain("CURRENT ALPHA DESCRIPTION");
 		expect(second.manager.getSavedSystemPrompt()?.skills).toEqual(remaining);
 		const removedSnapshot = second.manager.getSavedSystemPrompt();
@@ -364,7 +374,7 @@ test("untrusted SDK resume uses canonical saved ordering but current skill autho
 		active = undefined;
 
 		const third = await reopen();
-		expect(effectiveSkills(third.session)).toEqual(remaining);
+		expect(third.session.getEffectiveSkills()).toEqual(remaining);
 		expect(third.manager.getSavedSystemPrompt()).toEqual(removedSnapshot);
 		expect(third.manager.getEntries().filter((entry) => entry.type === "system_prompt")).toEqual(removedEntries);
 	} finally {
@@ -439,8 +449,8 @@ test.each(["binding", "request"] as const)(
 					await session.prompt("accepted request without binding discovery");
 				}
 				const expected = finalization === "binding" ? loader.getSkills().skills : [];
-				expect(effectiveSkills(session)).toEqual(expected);
-				expect(effectiveSkills(session).map((skill) => skill.name)).toEqual(
+				expect(session.getEffectiveSkills()).toEqual(expected);
+				expect(session.getEffectiveSkills().map((skill) => skill.name)).toEqual(
 					finalization === "binding" ? ["discovered"] : [],
 				);
 				if (finalization === "binding") expect(session.systemPrompt).toContain("CURRENT DISCOVERED DESCRIPTION");

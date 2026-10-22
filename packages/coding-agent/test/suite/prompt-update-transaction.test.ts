@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAssistantMessageEventStream, fauxAssistantMessage, getCurrentSystemPrompt } from "@earendil-works/pi-ai";
+import { Container } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { DefaultResourceLoader } from "../../src/core/resource-loader.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
@@ -251,8 +252,17 @@ it.each(["/update", "/update system-prompt", "/update skills", "/system-prompt s
 		const statuses: string[] = [];
 		const context = Object.assign(Object.create(InteractiveMode.prototype), {
 			runtimeHost: { session: harness.session },
-			defaultEditor: {} as { onSubmit?: (text: string) => Promise<void> },
+			defaultEditor: { setAutocompleteProvider: () => {} } as {
+				onSubmit?: (text: string) => Promise<void>;
+				setAutocompleteProvider: () => void;
+			},
 			editor: { setText: (_text: string) => {} },
+			skillCommands: new Map<string, string>(),
+			autocompleteProviderWrappers: [],
+			fdPath: null,
+			loadedResourcesContainer: new Container(),
+			options: { verbose: false },
+			getBuiltInCommandConflictDiagnostics: () => [],
 			showError: (message: string) => errors.push(message),
 			showStatus: (message: string) => statuses.push(message),
 		}) as { setupEditorSubmitHandler(): void; defaultEditor: { onSubmit?: (text: string) => Promise<void> } };

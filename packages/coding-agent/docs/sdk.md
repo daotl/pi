@@ -39,6 +39,8 @@ On untrusted resume, saved skill paths provide ordering hints only: current non-
 
 Tree and swipe navigation restore prompt construction, skill metadata, context files and executable tool loadout from the selected path. Regeneration and mixed message edits reconcile that state without an intermediate snapshot append; policy-only system entries do not split assistant swipe versions. Physical tail removal also restores the remaining path's policy. In-memory explicit updates retain snapshots for later branch restoration without adding an invisible startup anchor to an otherwise empty session.
 
+Use `session.getEffectiveSkills()` for the skill inventory used by prompt rendering and `/skill:name` dispatch, rather than newly discovered loader metadata. Returned skill records and source metadata are copies. `session.getEffectiveContextSources()` returns copied `{ path }` or `{ label }` records; restored opaque sections use an unavailable-source label instead of claiming a changed file supplied their current contents. Interactive resource listings, completions and RPC `get_commands` follow the effective inventory; explicit resource updates and selected-path changes refresh the interactive views.
+
 <a id="sessionmanager-api"></a>
 
 ### Session storage
