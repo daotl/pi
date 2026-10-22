@@ -50,11 +50,17 @@ export function applyFrame(o: { message?: AssistantMessage }, frame: AssistantMe
 		case "toolcall_start":
 			c[frame.contentIndex] = { ...frame.toolCall };
 			return;
-		case "toolcall_checkpoint":
-			(c[frame.contentIndex] as ToolCall).arguments = safeParse(frame.json);
+		case "toolcall_checkpoint": {
+			const b = c[frame.contentIndex] as ToolCall;
+			b.arguments = safeParse(frame.json);
+			if (frame.rawDelta !== undefined) b.raw = (b.raw ?? "") + frame.rawDelta;
 			return;
-		case "toolcall_delta":
-			return; // arguments materialise at checkpoint/end; deltas only feed the encoder's own json buffer
+		}
+		case "toolcall_delta": {
+			const b = c[frame.contentIndex] as ToolCall;
+			if (frame.rawDelta !== undefined) b.raw = (b.raw ?? "") + frame.rawDelta;
+			return; // Arguments materialise at checkpoint/end, independently of raw tokens.
+		}
 		case "toolcall_end": {
 			const b = c[frame.contentIndex] as ToolCall;
 			b.id = frame.id;
@@ -62,6 +68,8 @@ export function applyFrame(o: { message?: AssistantMessage }, frame: AssistantMe
 			b.arguments = frame.arguments;
 			if (frame.thoughtSignature !== undefined) b.thoughtSignature = frame.thoughtSignature;
 			if (frame.namespace !== undefined) b.namespace = frame.namespace;
+			delete b.raw;
+			if (frame.raw !== undefined) b.raw = frame.raw;
 			return;
 		}
 	}

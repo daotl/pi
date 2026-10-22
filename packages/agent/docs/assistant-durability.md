@@ -80,6 +80,8 @@ Do not define a second harness frame codec or reducer. Persistence stores the ex
 
 Provider event blocks may interleave. Encoding and reduction rely on `contentIndex`, never block contiguity. Text and ordinary thinking blocks must be empty when `*_start` is published and then append only through matching deltas until end; redacted thinking may be complete at start and emit no deltas. Streaming tool calls start with empty arguments and emit their complete raw JSON through deltas; a provider that starts with complete arguments must emit a cumulative delta prefix that parses to that snapshot at an event boundary before later argument deltas.
 
+Tool-call frames also preserve optional provider raw tokens separately from JSON arguments. Start snapshots carry `ToolCall.raw`; checkpoint/delta frames carry only uncovered `rawDelta`; tool end frames provide authoritative `raw` (including its absence). Raw coverage is tracked independently of JSON snapshot catch-up, so a raw-only increment survives even while its JSON delta is covered or still catching up. This retains interrupted tool-call prefixes without retransmitting a growing raw snapshot per token. Both the replay reducer and tracked harness consumer apply these fields; terminal frames still do not prove completion.
+
 ## Fresh stream scheduling
 
 The simplest scheduling is deliberate: one list-append transaction per converted frame, enqueued without awaiting storage in the provider loop.

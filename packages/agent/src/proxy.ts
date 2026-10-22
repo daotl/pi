@@ -42,7 +42,7 @@ export type ProxyAssistantMessageEvent =
 	| { type: "thinking_delta"; contentIndex: number; delta: string }
 	| { type: "thinking_end"; contentIndex: number; contentSignature?: string }
 	| { type: "toolcall_start"; contentIndex: number; id: string; toolName: string }
-	| { type: "toolcall_delta"; contentIndex: number; delta: string }
+	| { type: "toolcall_delta"; contentIndex: number; delta: string; rawDelta?: string }
 	| { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall }
 	| {
 			type: "done";
@@ -71,6 +71,7 @@ type ProxySerializableStreamOptions = Pick<
 	| "transport"
 	| "thinkingBudgets"
 	| "maxRetryDelayMs"
+	| "returnPrefill"
 >;
 
 export interface ProxyStreamOptions extends ProxySerializableStreamOptions {
@@ -114,6 +115,7 @@ function buildProxyRequestOptions(options: ProxyStreamOptions): ProxySerializabl
 		transport: options.transport,
 		thinkingBudgets: options.thinkingBudgets,
 		maxRetryDelayMs: options.maxRetryDelayMs,
+		returnPrefill: options.returnPrefill,
 	};
 }
 
@@ -352,13 +354,16 @@ function processProxyEvent(
 		case "toolcall_delta": {
 			const content = partial.content[proxyEvent.contentIndex];
 			if (content?.type === "toolCall") {
-				(content as any).partialJson += proxyEvent.delta;
-				content.arguments = parseStreamingJson((content as any).partialJson) || {};
+				const scratch = content as ToolCall & { partialJson: string };
+				scratch.partialJson += proxyEvent.delta;
+				content.arguments = parseStreamingJson(scratch.partialJson) || {};
+				if (proxyEvent.rawDelta !== undefined) content.raw = (content.raw ?? "") + proxyEvent.rawDelta;
 				partial.content[proxyEvent.contentIndex] = { ...content }; // Trigger reactivity
 				return {
 					type: "toolcall_delta",
 					contentIndex: proxyEvent.contentIndex,
 					delta: proxyEvent.delta,
+					...(proxyEvent.rawDelta === undefined ? {} : { rawDelta: proxyEvent.rawDelta }),
 					partial,
 				};
 			}
@@ -368,8 +373,9 @@ function processProxyEvent(
 		case "toolcall_end": {
 			const content = partial.content[proxyEvent.contentIndex];
 			if (content?.type === "toolCall") {
+				delete content.raw;
 				Object.assign(content, proxyEvent.toolCall);
-				delete (content as any).partialJson;
+				delete (content as ToolCall & { partialJson?: string }).partialJson;
 				return {
 					type: "toolcall_end",
 					contentIndex: proxyEvent.contentIndex,

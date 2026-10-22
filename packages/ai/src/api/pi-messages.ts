@@ -66,7 +66,7 @@ export type PiMessagesEvent =
 			redacted?: boolean;
 	  }
 	| { type: "toolcall_start"; contentIndex: number; id: string; toolName: string }
-	| { type: "toolcall_delta"; contentIndex: number; delta: string }
+	| { type: "toolcall_delta"; contentIndex: number; delta: string; rawDelta?: string }
 	| { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall }
 	| {
 			type: "done";
@@ -256,9 +256,14 @@ function createEventConverter(model: Model<"pi-messages">) {
 				toolJson.set(event.contentIndex, json);
 				(partial.content[event.contentIndex] as ToolCall).arguments =
 					parseStreamingJson<ToolCall["arguments"]>(json);
+				if (event.rawDelta !== undefined) {
+					const block = partial.content[event.contentIndex] as ToolCall;
+					block.raw = (block.raw ?? "") + event.rawDelta;
+				}
 				break;
 			}
 			case "toolcall_end":
+				delete (partial.content[event.contentIndex] as ToolCall).raw;
 				Object.assign(partial.content[event.contentIndex]!, event.toolCall);
 				toolJson.delete(event.contentIndex);
 				return {

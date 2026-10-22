@@ -20,8 +20,8 @@ export type AssistantMessageFrame =
 			redacted?: boolean;
 	  }
 	| { type: "toolcall_start"; contentIndex: number; toolCall: ToolCall }
-	| { type: "toolcall_checkpoint"; contentIndex: number; json: string }
-	| { type: "toolcall_delta"; contentIndex: number; delta: string }
+	| { type: "toolcall_checkpoint"; contentIndex: number; json: string; rawDelta?: string }
+	| { type: "toolcall_delta"; contentIndex: number; delta: string; rawDelta?: string }
 	| {
 			type: "toolcall_end";
 			contentIndex: number;
@@ -30,6 +30,7 @@ export type AssistantMessageFrame =
 			arguments: ToolCall["arguments"];
 			thoughtSignature?: string;
 			namespace?: string;
+			raw?: string;
 	  };
 
 type EncoderBlockState =
@@ -39,6 +40,8 @@ type EncoderBlockState =
 			caughtUp: boolean;
 			catchupJson: string;
 			snapshotArguments: string;
+			rawCoveredChars: number;
+			rawDeltaChars: number;
 	  };
 
 type ReducerBlockState =
@@ -71,6 +74,7 @@ function cloneToolCall(toolCall: ToolCall): ToolCall {
 		arguments: structuredClone(toolCall.arguments),
 		...(toolCall.thoughtSignature === undefined ? {} : { thoughtSignature: toolCall.thoughtSignature }),
 		...(toolCall.namespace === undefined ? {} : { namespace: toolCall.namespace }),
+		...(toolCall.raw === undefined ? {} : { raw: toolCall.raw }),
 	};
 }
 
@@ -232,33 +236,59 @@ export class AssistantMessageFrameEncoder {
 					caughtUp,
 					catchupJson: "",
 					snapshotArguments: caughtUp ? "" : snapshotArguments,
+					rawCoveredChars: content.raw?.length ?? 0,
+					rawDeltaChars: 0,
 				});
 				return { type: "toolcall_start", contentIndex: event.contentIndex, toolCall: cloneToolCall(content) };
 			}
 			case "toolcall_delta": {
 				const state = this.block(event.contentIndex, "toolCall");
 				if (state.kind !== "toolCall") throw new Error("Unreachable tool-call encoder state");
-				if (state.caughtUp) {
-					return event.delta.length === 0
-						? undefined
-						: { type: "toolcall_delta", contentIndex: event.contentIndex, delta: event.delta };
+				let rawDelta: string | undefined;
+				if (event.rawDelta !== undefined) {
+					const deltaStart = state.rawDeltaChars;
+					state.rawDeltaChars += event.rawDelta.length;
+					const covered = Math.max(0, state.rawCoveredChars - deltaStart);
+					if (covered < event.rawDelta.length) {
+						rawDelta = covered === 0 ? event.rawDelta : event.rawDelta.slice(covered);
+					}
 				}
-				state.catchupJson += event.delta;
-				const argumentsValue = parseStreamingJson<ToolCall["arguments"]>(state.catchupJson);
-				if (serializedArguments(argumentsValue) !== state.snapshotArguments) {
-					// Legacy grammar calls include the initial input in toolcall_start, but their
-					// JSON delta stream still begins at an empty input. Its parsed arguments can
-					// therefore extend, rather than exactly reproduce, the start snapshot.
-					const snapshotArguments = parseStreamingJson<ToolCall["arguments"]>(state.snapshotArguments);
-					if (!isJsonPrefix(snapshotArguments, argumentsValue)) return undefined;
+
+				let delta = event.delta;
+				let checkpoint: string | undefined;
+				if (!state.caughtUp) {
+					if (event.delta.length > 0) {
+						state.catchupJson += event.delta;
+						const argumentsValue = parseStreamingJson<ToolCall["arguments"]>(state.catchupJson);
+						// Legacy grammar calls may extend, rather than exactly reproduce, the
+						// initial argument snapshot when their JSON stream catches up.
+						if (
+							serializedArguments(argumentsValue) === state.snapshotArguments ||
+							isJsonPrefix(parseStreamingJson<ToolCall["arguments"]>(state.snapshotArguments), argumentsValue)
+						) {
+							state.caughtUp = true;
+							state.snapshotArguments = "";
+							checkpoint = state.catchupJson;
+							state.catchupJson = "";
+						}
+					}
+					delta = "";
 				}
-				state.caughtUp = true;
-				state.snapshotArguments = "";
-				const json = state.catchupJson;
-				state.catchupJson = "";
-				return json.length === 0
-					? undefined
-					: { type: "toolcall_checkpoint", contentIndex: event.contentIndex, json };
+				if (checkpoint !== undefined) {
+					return {
+						type: "toolcall_checkpoint",
+						contentIndex: event.contentIndex,
+						json: checkpoint,
+						...(rawDelta === undefined ? {} : { rawDelta }),
+					};
+				}
+				if (delta.length === 0 && rawDelta === undefined) return undefined;
+				return {
+					type: "toolcall_delta",
+					contentIndex: event.contentIndex,
+					delta,
+					...(rawDelta === undefined ? {} : { rawDelta }),
+				};
 			}
 			case "toolcall_end": {
 				const content = eventBlock(event);
@@ -279,6 +309,7 @@ export class AssistantMessageFrameEncoder {
 						? {}
 						: { thoughtSignature: event.toolCall.thoughtSignature }),
 					...(event.toolCall.namespace === undefined ? {} : { namespace: event.toolCall.namespace }),
+					...(event.toolCall.raw === undefined ? {} : { raw: event.toolCall.raw }),
 				};
 			}
 		}
@@ -452,6 +483,7 @@ export function reduceAssistantMessageFrames(frames: Iterable<AssistantMessageFr
 				}
 				state.json = frame.json;
 				block.arguments = parseStreamingJson<ToolCall["arguments"]>(frame.json);
+				if (frame.rawDelta !== undefined) block.raw = (block.raw ?? "") + frame.rawDelta;
 				break;
 			}
 			case "toolcall_delta": {
@@ -460,6 +492,7 @@ export function reduceAssistantMessageFrames(frames: Iterable<AssistantMessageFr
 					throw new Error("Unreachable tool-call frame state");
 				}
 				state.json += frame.delta;
+				if (frame.rawDelta !== undefined) block.raw = (block.raw ?? "") + frame.rawDelta;
 				break;
 			}
 			case "toolcall_end": {
@@ -470,8 +503,10 @@ export function reduceAssistantMessageFrames(frames: Iterable<AssistantMessageFr
 				block.arguments = structuredClone(frame.arguments);
 				delete block.thoughtSignature;
 				delete block.namespace;
+				delete block.raw;
 				if (frame.thoughtSignature !== undefined) block.thoughtSignature = frame.thoughtSignature;
 				if (frame.namespace !== undefined) block.namespace = frame.namespace;
+				if (frame.raw !== undefined) block.raw = frame.raw;
 				state.ended = true;
 				break;
 			}

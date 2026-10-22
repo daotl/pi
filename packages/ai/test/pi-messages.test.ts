@@ -269,6 +269,44 @@ describe("pi-messages", () => {
 		expect(message.stopReason).toBe("error");
 		expect(message.errorMessage).toContain("stream ended without a terminal event");
 	});
+
+	it("preserves raw-only tool increments before an interrupted native message stream ends", async () => {
+		const { baseUrl } = await startServer({
+			events: [
+				{ type: "start" },
+				{ type: "toolcall_start", contentIndex: 0, id: "call", toolName: "read" },
+				{ type: "toolcall_delta", contentIndex: 0, delta: '{"path":"/tmp', rawDelta: "<prefix>" },
+				{ type: "toolcall_delta", contentIndex: 0, delta: "", rawDelta: "<tail>" },
+				{ type: "error", reason: "error", usage, errorMessage: "interrupted" },
+			],
+		});
+		const response = await stream(createModel(baseUrl), normalizeContext(context), { apiKey: "offline" }).result();
+		expect(response.stopReason).toBe("error");
+		expect(response.content).toEqual([
+			{ type: "toolCall", id: "call", name: "read", arguments: { path: "/tmp" }, raw: "<prefix><tail>" },
+		]);
+	});
+
+	it.each([undefined, "", "<final>"])("uses authoritative native message tool end raw %j", async (raw) => {
+		const final = {
+			type: "toolCall" as const,
+			id: "call",
+			name: "read",
+			arguments: { path: "a" },
+			...(raw === undefined ? {} : { raw }),
+		};
+		const { baseUrl } = await startServer({
+			events: [
+				{ type: "start" },
+				{ type: "toolcall_start", contentIndex: 0, id: "call", toolName: "read" },
+				{ type: "toolcall_delta", contentIndex: 0, delta: '{"path":"a"}', rawDelta: "<stale>" },
+				{ type: "toolcall_end", contentIndex: 0, toolCall: final },
+				{ type: "done", reason: "toolUse", usage },
+			],
+		});
+		const response = await stream(createModel(baseUrl), normalizeContext(context), { apiKey: "offline" }).result();
+		expect(response.content).toEqual([final]);
+	});
 });
 
 describe("pi-messages api registration", () => {

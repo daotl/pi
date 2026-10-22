@@ -667,6 +667,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 								type: "toolcall_delta",
 								contentIndex: getContentIndex(block),
 								delta,
+								...(typeof rawDelta === "string" && rawDelta.length > 0 ? { rawDelta } : {}),
 								partial: output,
 							});
 						}

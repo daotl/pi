@@ -546,6 +546,8 @@ const agent = new Agent({
 });
 ```
 
+Proxy requests forward `returnPrefill` to the backend for explicit assistant continuation. Proxy senders should retain optional `toolcall_delta.rawDelta` independently of the JSON argument `delta`, including raw-only chunks. The client accumulates these per content index, so an EOF/error before `toolcall_end` still retains the raw prefix needed for tool-call prefill. Older senders that omit raw increments cannot reconstruct metadata they never transmit.
+
 ## Low-Level API
 
 For direct control without the Agent class:
