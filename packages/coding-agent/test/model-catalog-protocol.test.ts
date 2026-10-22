@@ -12,7 +12,7 @@ import {
 } from "../../../scripts/model-catalog-protocol.ts";
 import { VERSION } from "../src/config.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
-import { allowNetwork } from "./test-network-env.ts";
+import { allowNetwork, enableBuiltinProviders } from "./test-network-env.ts";
 
 // Runs the current client against the catalog selection pi.dev performs, using
 // the shared protocol in scripts/model-catalog-protocol.ts. Regression test for #9099.
@@ -93,24 +93,35 @@ function startCatalogServer(requests: string[]): Promise<Server> {
 	});
 }
 
-describe.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")(
-	"model catalog protocol with the current client",
-	() => {
-		const requests: string[] = [];
-		let server: Server;
-		let catalogBaseUrl: string;
+describe("model catalog protocol with the current client", () => {
+	const requests: string[] = [];
+	let server: Server;
+	let catalogBaseUrl: string;
 
-		beforeAll(async () => {
-			server = await startCatalogServer(requests);
-			catalogBaseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+	beforeAll(async () => {
+		server = await startCatalogServer(requests);
+		catalogBaseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+	});
+
+	afterAll(async () => {
+		await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+	});
+
+	it("negotiates the catalog for its version and reaches the OpenRouter API", async () => {
+		enableBuiltinProviders();
+		allowNetwork();
+		let providerUrl: URL | undefined;
+		const nativeFetch = globalThis.fetch;
+		vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+			const request = new Request(input, init);
+			if (new URL(request.url).origin === new URL(catalogBaseUrl).origin) return nativeFetch(request);
+			if (new URL(request.url).origin !== "https://openrouter.ai") {
+				throw new Error(`Unexpected fixture network target: ${request.url}`);
+			}
+			providerUrl = new URL(request.url);
+			throw new Error("Provider request captured");
 		});
-
-		afterAll(async () => {
-			await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-		});
-
-		it("negotiates the catalog for its version and reaches the OpenRouter API", async () => {
-			allowNetwork();
+		try {
 			const runtime = await ModelRuntime.create({
 				credentials: new InMemoryCredentialStore(),
 				modelsPath: null,
@@ -130,26 +141,16 @@ describe.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")(
 			expect(model).toMatchObject({ api: expectedModel.api, baseUrl: expectedModel.baseUrl });
 			if (!model) throw new Error(`Missing model: openrouter/${modelId}`);
 
-			let providerUrl: URL | undefined;
-			const nativeFetch = globalThis.fetch;
-			vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-				const request = new Request(input, init);
-				if (new URL(request.url).origin !== "https://openrouter.ai") return nativeFetch(request);
-				providerUrl = new URL(request.url);
-				throw new Error("Provider request captured");
-			});
-			try {
-				await runtime.completeSimple(
-					model,
-					{ messages: [{ role: "user", content: "Hello", timestamp: 0 }] },
-					{ apiKey: "test-key", maxRetries: 0 },
-				);
-			} finally {
-				vi.unstubAllGlobals();
-			}
+			await runtime.completeSimple(
+				model,
+				{ messages: [{ role: "user", content: "Hello", timestamp: 0 }] },
+				{ apiKey: "test-key", maxRetries: 0 },
+			);
 			expect(providerUrl?.pathname).toBe(
 				expectedModel.api === "anthropic-messages" ? "/api/v1/messages" : "/api/v1/chat/completions",
 			);
-		});
-	},
-);
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+});
