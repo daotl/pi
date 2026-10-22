@@ -16,7 +16,7 @@ import {
 	type TextContent,
 } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -67,6 +67,7 @@ function createAssistantMessage(text: string): AssistantMessage {
 describe("AgentSession concurrent prompt guard", () => {
 	let session: AgentSession;
 	let tempDir: string;
+	const pendingPrompts: Promise<void>[] = [];
 
 	beforeEach(async () => {
 		enableBuiltinProviders();
@@ -78,8 +79,10 @@ describe("AgentSession concurrent prompt guard", () => {
 		delete (globalThis as typeof globalThis & { testExtensionApi?: unknown }).testExtensionApi;
 		delete (globalThis as typeof globalThis & { testCommandRuns?: unknown }).testCommandRuns;
 		if (session) {
-			session.dispose();
+			await session.abort();
 		}
+		await Promise.allSettled(pendingPrompts.splice(0));
+		if (session) session.dispose();
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true });
 		}
@@ -87,7 +90,6 @@ describe("AgentSession concurrent prompt guard", () => {
 
 	async function createSession() {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
-		let abortSignal: AbortSignal | undefined;
 
 		// Use a stream function that responds to abort
 		const agent = new Agent({
@@ -98,7 +100,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				tools: [],
 			},
 			streamFn: (_model, _context, options) => {
-				abortSignal = options?.signal;
+				const abortSignal = options?.signal;
 				const stream = new MockAssistantStream();
 				queueMicrotask(() => {
 					stream.push({ type: "start", partial: createAssistantMessage("") });
@@ -134,14 +136,19 @@ describe("AgentSession concurrent prompt guard", () => {
 		return session;
 	}
 
+	async function waitForStreaming(): Promise<void> {
+		await vi.waitFor(() => expect(session.agent.state.streamingMessage?.role).toBe("assistant"), { timeout: 5000 });
+	}
+
 	it("should throw when prompt() called while streaming", async () => {
 		await createSession();
 
 		// Start first prompt (don't await, it will block until abort)
 		const firstPrompt = session.prompt("First message");
+		pendingPrompts.push(firstPrompt);
+		void firstPrompt.catch(() => {});
 
-		// Wait a tick for isStreaming to be set
-		await new Promise((resolve) => setTimeout(resolve, 10));
+		await waitForStreaming();
 
 		// Verify we're streaming
 		expect(session.isStreaming).toBe(true);
@@ -161,7 +168,9 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		// Start first prompt
 		const firstPrompt = session.prompt("First message");
-		await new Promise((resolve) => setTimeout(resolve, 10));
+		pendingPrompts.push(firstPrompt);
+		void firstPrompt.catch(() => {});
+		await waitForStreaming();
 
 		// steer should work while streaming
 		await expect(session.steer("Steering message")).resolves.toBe("queued");
@@ -177,7 +186,9 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		// Start first prompt
 		const firstPrompt = session.prompt("First message");
-		await new Promise((resolve) => setTimeout(resolve, 10));
+		pendingPrompts.push(firstPrompt);
+		void firstPrompt.catch(() => {});
+		await waitForStreaming();
 
 		// followUp should work while streaming
 		await expect(session.followUp("Follow-up message")).resolves.toBe("queued");
@@ -272,7 +283,9 @@ describe("AgentSession concurrent prompt guard", () => {
 		});
 
 		const firstPrompt = session.prompt("First message");
-		await new Promise((resolve) => setTimeout(resolve, 10));
+		pendingPrompts.push(firstPrompt);
+		void firstPrompt.catch(() => {});
+		await waitForStreaming();
 		expect(session.isStreaming).toBe(true);
 
 		const pi = (
