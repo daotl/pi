@@ -1,7 +1,8 @@
 import { InMemoryModelsStore } from "@earendil-works/pi-ai";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
+import { enableBuiltinProviders } from "./test-network-env.ts";
 
 const context = {
 	state: { text: "Looks good" },
@@ -14,7 +15,8 @@ const context = {
 	},
 };
 
-describe.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")("ModelRuntime classifiers", () => {
+describe("ModelRuntime classifiers", () => {
+	beforeEach(enableBuiltinProviders);
 	it("lists Jev separately and classifies with runtime-resolved auth", async () => {
 		const runtime = await ModelRuntime.create({
 			credentials: AuthStorage.inMemory(),

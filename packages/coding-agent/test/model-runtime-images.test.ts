@@ -13,9 +13,10 @@ import {
 	isModelType,
 	type Model,
 } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
+import { enableBuiltinProviders } from "./test-network-env.ts";
 
 function imageModel(provider: string, id: string): ImageModel<"test-images"> {
 	return {
@@ -68,7 +69,8 @@ function okImageResult(model: ImageModel<string>): AssistantImages {
 	};
 }
 
-describe.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")("ModelRuntime image generation", () => {
+describe("ModelRuntime image generation", () => {
+	beforeEach(enableBuiltinProviders);
 	const tempDirs: string[] = [];
 	afterEach(() => {
 		for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
