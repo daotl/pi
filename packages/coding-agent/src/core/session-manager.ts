@@ -1698,9 +1698,9 @@ export class SessionManager {
 	/**
 	 * Re-append previously removed trailing entries (e.g. a compaction entry that
 	 * followed a removed prefill message) after the current leaf, re-chaining
-	 * their parent ids. Message entries are skipped; the caller restores the
-	 * prefill message itself via appendMessage(). Returns the ids of the
-	 * appended entries.
+	 * their parent ids. System-message patches are retained; conversational messages
+	 * are skipped because the caller restores the prefill itself via appendMessage().
+	 * Returns the ids of the appended entries.
 	 *
 	 * @param entries Trailing entries to re-append.
 	 * @param firstKeptEntryIdFallback For compaction entries whose referenced
@@ -1713,6 +1713,20 @@ export class SessionManager {
 			let id: string | undefined;
 			const timestamp = new Date().toISOString();
 			switch (source.type) {
+				case "message": {
+					if (source.message.role !== "system") continue;
+					const entry: SessionMessageEntry = {
+						type: "message",
+						id: generateId(this.byId),
+						parentId: this.leafId,
+						timestamp,
+						message: source.message,
+						...(source.deletedAt !== undefined ? { deletedAt: source.deletedAt } : {}),
+					};
+					this._appendEntry(entry);
+					id = entry.id;
+					break;
+				}
 				case "compaction": {
 					const e = source as CompactionEntry;
 					// If the compaction's first kept entry is not on the active leaf
@@ -1784,8 +1798,7 @@ export class SessionManager {
 					break;
 				}
 				default:
-					// Message and custom_message entries are restored by the caller via
-					// appendMessage(); skip them here.
+					// Conversational and custom-message entries are restored by the caller.
 					continue;
 			}
 			if (id) appended.push(id);

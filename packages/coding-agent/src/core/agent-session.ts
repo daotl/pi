@@ -1423,10 +1423,16 @@ export class AgentSession {
 	}
 
 	private _findPersistedMessageEntryId(message: AgentMessage): string | undefined {
+		const branch = this.sessionManager.getBranch();
 		const mapped = this._entryIdsByMessage.get(message);
-		if (mapped) return mapped;
-		for (const entry of [...this.sessionManager.getBranch()].reverse()) {
-			if (entry.type === "message" && entry.message === message) return entry.id;
+		const mappedEntry = mapped ? branch.find((entry) => entry.id === mapped) : undefined;
+		if (mappedEntry?.type === "message" && mappedEntry.message === message) return mappedEntry.id;
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.type === "message" && entry.message === message) {
+				this._entryIdsByMessage.set(message, entry.id);
+				return entry.id;
+			}
 		}
 
 		const messageIndex = this.agent.state.messages.indexOf(message);
@@ -5525,7 +5531,7 @@ export class AgentSession {
 	 */
 	private _detectPrefillCandidate(): AgentMessage | undefined {
 		const stripped = stripTrailingHarnessMessages(this.agent.state.messages);
-		const last = stripped[stripped.length - 1];
+		const last = stripped.findLast((message) => message.role !== "system");
 		if (!last || !this._canPrefillContinue(last)) {
 			return undefined;
 		}
@@ -5541,24 +5547,9 @@ export class AgentSession {
 		this._pendingPrefill = message;
 		this._prefillEchoConfirmed = false;
 		const branch = this.sessionManager.getBranch();
-		// The captured message is the last non-harness message on the leaf path.
-		// After a compaction, a compaction entry is appended after the partial, so
-		// the message is not necessarily the last entry. Find it: the restore
-		// point is its parent, and any trailing entries (e.g. the compaction
-		// entry) are removed with it and restored alongside it. Use removeMessage
-		// so trailing entries survive the capture (a successful continuation
-		// keeps them on the leaf path).
-		let targetIdx = -1;
-		for (let i = branch.length - 1; i >= 0; i--) {
-			const entry = branch[i];
-			if (entry.type !== "message") continue;
-			// Soft-deleted entries are hidden from context and never a prefill source.
-			if (entry.deletedAt !== undefined) continue;
-			const msg = entry.message;
-			if (msg.role === "assistant" && (!msg.content || isHarnessMessage(msg))) continue;
-			targetIdx = i;
-			break;
-		}
+		// Resolve the captured contribution, not a trailing system patch or state-only entry.
+		const targetId = this._findPersistedMessageEntryId(message);
+		const targetIdx = targetId ? branch.findIndex((entry) => entry.id === targetId) : -1;
 		const target = targetIdx >= 0 ? branch[targetIdx] : undefined;
 		this._prefillRestorePoint = target?.parentId ? target.parentId : null;
 		this._prefillTrailingEntries = targetIdx >= 0 ? branch.slice(targetIdx + 1) : [];

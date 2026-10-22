@@ -182,7 +182,7 @@ selected input events
 
 ### continue() and queued input
 
-`continue()` retains its existing queue behavior. Empty and system-only transcripts reject without consuming queues. A non-assistant tail continues from existing context: steering is polled at startup, while follow-up input waits until the response naturally stops.
+`continue()` decides from the last non-system message. Trailing system patches do not turn a completed assistant into runnable context; empty and system-only transcripts reject without consuming queues. Empty harness notifications are dismissed across intervening system patches while those prompt/tool patches keep their order. A non-assistant tail continues from existing context: steering is polled at startup, while follow-up input waits until the response naturally stops.
 
 ```typescript
 agent.followUp({ role: "user", content: "After the retry", timestamp: Date.now() });

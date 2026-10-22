@@ -558,8 +558,8 @@ export class Agent {
 			return;
 		}
 
-		const lastMessage = this._state.messages[this._state.messages.length - 1];
-		if (!lastMessage || this._state.messages.every((message) => message.role === "system")) {
+		const lastMessage = this._state.messages.findLast((message) => message.role !== "system");
+		if (!lastMessage) {
 			throw new Error("No messages to continue from");
 		}
 

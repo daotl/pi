@@ -51,15 +51,24 @@ export function isHarnessMessage(message: AgentMessage): boolean {
 }
 
 /**
- * Remove trailing harness messages. Continuing dismisses these notifications;
- * they should not be re-sent to the model or block continuation.
+ * Remove trailing harness messages while retaining intervening system patches.
+ * Continuing dismisses notifications without losing prompt or tool changes.
  */
 export function stripTrailingHarnessMessages(messages: AgentMessage[]): AgentMessage[] {
-	let end = messages.length;
-	while (end > 0 && isHarnessMessage(messages[end - 1])) {
-		end--;
+	let end = messages.length - 1;
+	let hasHarness = false;
+	while (end >= 0) {
+		const message = messages[end];
+		if (message.role === "system") {
+			end--;
+		} else if (isHarnessMessage(message)) {
+			hasHarness = true;
+			end--;
+		} else {
+			break;
+		}
 	}
-	return end < messages.length ? messages.slice(0, end) : messages;
+	return hasHarness ? messages.filter((message, index) => index <= end || message.role === "system") : messages;
 }
 
 /**
@@ -104,7 +113,10 @@ export function agentLoopContinue(
 		throw new Error("Cannot continue: no messages in context");
 	}
 
-	assertContinuableLastMessage(effectiveMessages[effectiveMessages.length - 1], config);
+	assertContinuableLastMessage(
+		effectiveMessages.findLast((message) => message.role !== "system"),
+		config,
+	);
 
 	const effectiveContext =
 		effectiveMessages.length !== context.messages.length ? { ...context, messages: effectiveMessages } : context;
@@ -180,7 +192,10 @@ async function runAgentLoopContinueInternal(
 		throw new Error("Cannot continue: no messages in context");
 	}
 
-	assertContinuableLastMessage(effectiveMessages[effectiveMessages.length - 1], config);
+	assertContinuableLastMessage(
+		effectiveMessages.findLast((message) => message.role !== "system"),
+		config,
+	);
 
 	const newMessages: AgentMessage[] = [];
 	const currentContext: AgentContext =
@@ -204,7 +219,8 @@ async function runAgentLoopContinueInternal(
  * both complete and partial tool calls. Non-openai-completions providers are not
  * supported for prefill continuation.
  */
-function assertContinuableLastMessage(lastMessage: AgentMessage, config: AgentLoopConfig): void {
+function assertContinuableLastMessage(lastMessage: AgentMessage | undefined, config: AgentLoopConfig): void {
+	if (!lastMessage) throw new Error("Cannot continue: no messages in context");
 	if (lastMessage.role !== "assistant") {
 		return;
 	}

@@ -59,6 +59,8 @@ Compaction can fail if the provider is unavailable or cannot accept the summariz
 
 Accepted steering and follow-up input does not grant another retry. When automatic retry is disabled or exhausted, queued input is sent as an ordinary request rather than recapturing the interrupted assistant prefix. An already approved prefix retry keeps its first request ahead of queued steering; that input is delivered afterward.
 
+Trailing system-policy patches do not hide an interrupted assistant from continuation. Successful continuation keeps those patches; if its echo is rejected, restoring the original partial also restores the ordered trailing patches. A system patch alone does not make a completed assistant answer runnable again.
+
 See [Compaction Reference](compaction.md) for thresholds, retained boundaries, branch-summary behavior, and extension hooks.
 
 ## Control session storage
