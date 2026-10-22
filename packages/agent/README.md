@@ -131,6 +131,8 @@ Tools, blocked `beforeToolCall` results, and `afterToolCall` overrides can retur
 
 When you use the `Agent` class, assistant `message_end` processing is treated as a barrier before tool preflight begins. That means `beforeToolCall` sees agent state that already includes the assistant message that requested the tool call.
 
+Prefill continuations must reproduce the complete successful terminal echo before that message is published or any tool preflight runs, even if an earlier streamed partial matched. Raw-less tool calls must retain semantically equal JSON arguments (object key order is ignored; array order and nested values are not). Incomplete streamed arguments remain provisional. A mismatch aborts the active request and finishes through the normal error-event lifecycle; a rejected completed response keeps its usage and physical response metadata in a content-free failure message, while a streaming-only failure invents no completed charge. Restoring the original prefix remains the session owner's responsibility.
+
 ### Request preparation and turn finalization
 
 `prepareRequest` runs immediately before every conversational provider request, including the first. Use it to install canonical persisted context after pending input has been emitted:

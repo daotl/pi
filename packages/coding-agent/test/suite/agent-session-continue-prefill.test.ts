@@ -262,7 +262,10 @@ describe("AgentSession continue with prefill", () => {
 			return stream;
 		}) as StreamFn;
 
-		await expect(harness.session.continue()).rejects.toThrow(/echo mismatch/i);
+		await harness.session.continue();
+		expect(harness.eventsOfType("message_end")).toContainEqual(
+			expect.objectContaining({ message: expect.objectContaining({ role: "assistant", stopReason: "error" }) }),
+		);
 
 		// The original message is restored; the mismatched echo is not kept.
 		expect(getMessageText(harness.session.messages[2]!)).toBe("Partial response");

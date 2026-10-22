@@ -187,6 +187,19 @@ type ActiveRun = {
 	abortController: AbortController;
 };
 
+/**
+ * @internal Carries a completed response rejected before publication into a content-free failure receipt.
+ * Already-persisted responses must not be wrapped, because their usage is already recorded.
+ */
+export class TerminalResponseError extends Error {
+	readonly terminalMessage?: AssistantMessage;
+
+	constructor(message: string, terminalMessage?: AssistantMessage, options?: ErrorOptions) {
+		super(message, options);
+		this.terminalMessage = terminalMessage;
+	}
+}
+
 function extractThinkingText(message: Extract<AgentMessage, { role: "assistant" }>): string {
 	return message.content
 		.filter((block) => block.type === "thinking")
@@ -216,13 +229,29 @@ export function prefixUserMessages(messages: AgentMessage[], prefix: string | un
 	});
 }
 
+/** Compare JSON values independently of object property order. */
+function jsonValuesEqual(left: unknown, right: unknown): boolean {
+	if (left === right) return true;
+	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
+	if (Array.isArray(left)) {
+		if (!Array.isArray(right) || left.length !== right.length) return false;
+		return left.every((value, index) => jsonValuesEqual(value, right[index]));
+	}
+	if (Array.isArray(right)) return false;
+	const leftObject = left as Record<string, unknown>;
+	const rightObject = right as Record<string, unknown>;
+	const keys = Object.keys(leftObject);
+	if (keys.length !== Object.keys(rightObject).length) return false;
+	return keys.every((key) => Object.hasOwn(rightObject, key) && jsonValuesEqual(leftObject[key], rightObject[key]));
+}
+
 /**
  * Whether a streamed assistant message fully contains a prefill: its
  * reasoning and text start with the prefill's (at least as long), and its
  * first tool calls reproduce the prefill's (raw-token prefix when raw is
- * available, otherwise name). Used to decide whether a failed or aborted
- * continuation may keep the streamed replacement, or must restore the
- * original prefill message so no content is lost.
+ * available, otherwise name and semantically equal JSON arguments). Used to
+ * decide whether a failed or aborted continuation may keep the streamed
+ * replacement, or must restore the original prefill so no content is lost.
  */
 export function prefillEchoComplete(
 	partial: Extract<AgentMessage, { role: "assistant" }>,
@@ -251,6 +280,8 @@ export function prefillEchoComplete(
 					return false;
 				}
 				if (!partialTc.raw.startsWith(prefillTc.raw)) return false;
+			} else if (!jsonValuesEqual(prefillTc.arguments, partialTc.arguments)) {
+				return false;
 			}
 		}
 	}
@@ -513,24 +544,12 @@ export class Agent {
 				throw new Error("Continuation is only supported for openai-completions providers (e.g., llama-server)");
 			}
 
-			// Verify the prefill echo during streaming: the model must return at
-			// least the prefill reasoning_content, content, and tool calls before
-			// generating new tokens. The check runs once as soon as all prefilled
-			// fields are long enough, then normal generation continues.
+			// Streaming checks wait for sufficient length; the complete terminal echo
+			// is verified before publication and tool execution.
 			this._pendingPrefill = assistantPrefill;
 			this._prefillVerified = false;
 			try {
 				await this.runContinuation(assistantPrefill);
-				const lastMessage = this._state.messages[this._state.messages.length - 1] as AssistantMessage | undefined;
-				if (
-					this._pendingPrefill &&
-					!this._prefillVerified &&
-					lastMessage?.role === "assistant" &&
-					lastMessage.stopReason !== "error" &&
-					lastMessage.stopReason !== "aborted"
-				) {
-					throw new Error("Prefill echo mismatch: the model response did not contain the full prefill.");
-				}
 			} finally {
 				this._pendingPrefill = undefined;
 				this._prefillVerified = false;
@@ -569,11 +588,11 @@ export class Agent {
 	 * (thinking), content (text), and tool calls are at least as long as the
 	 * prefill, it performs a one-time comparison. Tool calls are verified by
 	 * raw-token prefix (covering both complete and partial calls) when raw is
-	 * available, otherwise by name. If everything matches, verification is
-	 * marked complete and generation continues normally. If anything does not
-	 * match, it throws so the caller can restore the original message.
+	 * available, otherwise by name. Successful terminal responses are checked
+	 * again for a complete echo before publication, even if a partial matched.
+	 * A mismatch aborts the request and fails the run.
 	 */
-	private checkPrefillEcho(partialMessage: AgentMessage): void {
+	private checkPrefillEcho(partialMessage: AgentMessage, terminalMessage?: AssistantMessage): void {
 		if (!this._pendingPrefill || this._prefillVerified) {
 			return;
 		}
@@ -598,19 +617,21 @@ export class Agent {
 		}
 
 		if (!partialThinking.startsWith(prefillThinking)) {
-			throw new Error("Prefill echo mismatch: reasoning_content does not match the prefill.");
+			throw new TerminalResponseError(
+				"Prefill echo mismatch: reasoning_content does not match the prefill.",
+				terminalMessage,
+			);
 		}
 		if (!partialText.startsWith(prefillText)) {
-			throw new Error("Prefill echo mismatch: content does not match the prefill.");
+			throw new TerminalResponseError("Prefill echo mismatch: content does not match the prefill.", terminalMessage);
 		}
 
 		// Verify tool calls: with return_prefill the provider echoes the prefilled
 		// tool calls before generating new ones, so the partial's first N tool
 		// calls must reproduce the prefill's N tool calls. Raw tokens are a prefix
 		// of the streamed call (equal for complete calls, a prefix for partial
-		// calls the model completes). When raw is unavailable (provider did not
-		// emit it), only the name is verified; argument equality is left to the
-		// post-run fallback check.
+		// calls the model completes). Rawless arguments remain provisional until
+		// terminal semantic validation in prefillEchoComplete.
 		const prefillToolCalls = prefill.content.filter((b): b is AgentToolCall => b.type === "toolCall");
 		if (prefillToolCalls.length > 0) {
 			const partialToolCalls = partial.content.filter((b): b is AgentToolCall => b.type === "toolCall");
@@ -621,14 +642,20 @@ export class Agent {
 				const prefillTc = prefillToolCalls[i];
 				const partialTc = partialToolCalls[i];
 				if (prefillTc.name !== partialTc.name) {
-					throw new Error(`Prefill echo mismatch: tool call ${i} name does not match the prefill.`);
+					throw new TerminalResponseError(
+						`Prefill echo mismatch: tool call ${i} name does not match the prefill.`,
+						terminalMessage,
+					);
 				}
 				if (typeof prefillTc.raw === "string" && prefillTc.raw.length > 0) {
 					if (typeof partialTc.raw !== "string" || partialTc.raw.length < prefillTc.raw.length) {
 						return;
 					}
 					if (!partialTc.raw.startsWith(prefillTc.raw)) {
-						throw new Error(`Prefill echo mismatch: tool call ${i} raw tokens do not match the prefill.`);
+						throw new TerminalResponseError(
+							`Prefill echo mismatch: tool call ${i} raw tokens do not match the prefill.`,
+							terminalMessage,
+						);
 					}
 				}
 			}
@@ -751,7 +778,9 @@ export class Agent {
 		try {
 			await executor(abortController.signal);
 		} catch (error) {
-			await this.handleRunFailure(error, abortController.signal.aborted);
+			const aborted = abortController.signal.aborted;
+			if (!aborted) abortController.abort();
+			await this.handleRunFailure(error, aborted);
 		} finally {
 			this.finishRun();
 		}
@@ -760,16 +789,19 @@ export class Agent {
 	private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {
 		const failureMessage = {
 			role: "assistant",
-			content: [{ type: "text", text: "" }],
 			api: this._state.model.api,
 			provider: this._state.model.provider,
 			model: this._state.model.id,
 			usage: EMPTY_USAGE,
+			timestamp: Date.now(),
+			...(error instanceof TerminalResponseError ? error.terminalMessage : undefined),
+			content: [{ type: "text", text: "" }],
 			stopReason: aborted ? "aborted" : "error",
 			errorMessage: error instanceof Error ? error.message : String(error),
-			timestamp: Date.now(),
 		} satisfies AgentMessage;
-		await this.processEvents({ type: "message_start", message: failureMessage });
+		if (this._state.streamingMessage?.role !== "assistant") {
+			await this.processEvents({ type: "message_start", message: failureMessage });
+		}
 		await this.processEvents({ type: "message_end", message: failureMessage });
 		await this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] });
 		await this.processEvents({ type: "agent_end", messages: [failureMessage] });
@@ -802,8 +834,22 @@ export class Agent {
 				break;
 
 			case "message_end":
+				this.checkPrefillEcho(event.message, event.message.role === "assistant" ? event.message : undefined);
+				if (
+					this._pendingPrefill?.role === "assistant" &&
+					event.message.role === "assistant" &&
+					event.message.stopReason !== "error" &&
+					event.message.stopReason !== "aborted"
+				) {
+					if (!prefillEchoComplete(event.message, this._pendingPrefill)) {
+						throw new TerminalResponseError(
+							"Prefill echo mismatch: the model response did not contain the full prefill.",
+							event.message,
+						);
+					}
+					this._pendingPrefill = undefined;
+				}
 				this._state.streamingMessage = undefined;
-				this.checkPrefillEcho(event.message);
 				this._state.messages.push(event.message);
 				break;
 
