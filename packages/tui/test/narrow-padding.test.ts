@@ -58,3 +58,30 @@ for (const { padded, width, x, expected } of [
 		assert.equal(editor.getText(), expected);
 	});
 }
+
+for (const { padded, x } of [
+	{ padded: false, x: 3 },
+	{ padded: true, x: 5 },
+]) {
+	it(`positions the editor cursor using its rendered margin (padding ${padded})`, () => {
+		setPadLinesToWidth(padded);
+		const editor = new Editor(new TuiMainScreen(new VirtualTerminal(20, 24)), defaultEditorTheme, { paddingX: 2 });
+		editor.setText("abcdef");
+		const height = editor.render(20).length;
+		editor.handleMouse({
+			type: "click",
+			button: "left",
+			x,
+			y: 1,
+			screenX: x,
+			screenY: 1,
+			width: 20,
+			height,
+			shift: false,
+			alt: false,
+			ctrl: false,
+		});
+		editor.handleInput("X");
+		assert.equal(editor.getText(), "abcXdef");
+	});
+}

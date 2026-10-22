@@ -644,14 +644,15 @@ export class Editor implements Component, Focusable {
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		const autocompleteStartRow = this.renderedVisibleLineCount + 2;
+		const paddingX = isPadLinesToWidth()
+			? Math.min(this.paddingX, Math.max(0, Math.floor((event.width - 1) / 2)))
+			: 0;
 		if (
 			this.autocompleteState &&
 			this.autocompleteList &&
 			event.y >= autocompleteStartRow &&
 			event.y < autocompleteStartRow + this.renderedAutocompleteHeight
 		) {
-			const maxPadding = Math.max(0, Math.floor((event.width - 1) / 2));
-			const paddingX = Math.min(this.paddingX, maxPadding);
 			const contentWidth = Math.max(1, event.width - paddingX * 2);
 			const result = this.autocompleteList.handleMouse?.({
 				...event,
@@ -677,8 +678,6 @@ export class Editor implements Component, Focusable {
 		const logicalLine = this.state.lines[visualLine.logicalLine] ?? "";
 		const chunkEnd = visualLine.startCol + visualLine.length;
 		const chunk = logicalLine.slice(visualLine.startCol, chunkEnd);
-		const maxPadding = Math.max(0, Math.floor((event.width - 1) / 2));
-		const paddingX = Math.min(this.paddingX, maxPadding);
 		const targetColumn = Math.max(0, event.x - paddingX);
 		let visibleColumn = 0;
 		let targetIndex = chunk.length;
