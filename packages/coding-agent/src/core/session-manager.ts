@@ -260,6 +260,14 @@ export type SessionEntry =
 /** Raw file entry (includes header) */
 export type FileEntry = SessionHeader | SessionEntry;
 
+/** Storage-only selection marker; never a transcript or tree entry. */
+interface LeafCheckpoint {
+	type: "leaf";
+	leafId: string | null;
+}
+
+type StoredFileEntry = FileEntry | LeafCheckpoint;
+
 /** Tree node for getTree() - defensive copy of session structure */
 export interface SessionTreeNode {
 	entry: SessionEntry;
@@ -348,7 +356,7 @@ function generateId(byId: { has(id: string): boolean }): string {
 }
 
 /** Migrate v1 → v2: add id/parentId tree structure. Mutates in place. */
-function migrateV1ToV2(entries: FileEntry[]): void {
+function migrateV1ToV2(entries: StoredFileEntry[]): void {
 	const ids = new Set<string>();
 	let prevId: string | null = null;
 
@@ -357,6 +365,7 @@ function migrateV1ToV2(entries: FileEntry[]): void {
 			entry.version = 2;
 			continue;
 		}
+		if (entry.type === "leaf") continue;
 
 		entry.id = generateId(ids);
 		entry.parentId = prevId;
@@ -367,7 +376,7 @@ function migrateV1ToV2(entries: FileEntry[]): void {
 			const comp = entry as CompactionEntry & { firstKeptEntryIndex?: number };
 			if (typeof comp.firstKeptEntryIndex === "number") {
 				const targetEntry = entries[comp.firstKeptEntryIndex];
-				if (targetEntry && targetEntry.type !== "session") {
+				if (targetEntry && targetEntry.type !== "session" && targetEntry.type !== "leaf") {
 					comp.firstKeptEntryId = targetEntry.id;
 				}
 				delete comp.firstKeptEntryIndex;
@@ -377,7 +386,7 @@ function migrateV1ToV2(entries: FileEntry[]): void {
 }
 
 /** Migrate v2 → v3: rename hookMessage role to custom. Mutates in place. */
-function migrateV2ToV3(entries: FileEntry[]): void {
+function migrateV2ToV3(entries: StoredFileEntry[]): void {
 	for (const entry of entries) {
 		if (entry.type === "session") {
 			entry.version = 3;
@@ -398,7 +407,7 @@ function migrateV2ToV3(entries: FileEntry[]): void {
  * Run all necessary migrations to bring entries to current version.
  * Mutates entries in place. Returns true if any migration was applied.
  */
-function migrateToCurrentVersion(entries: FileEntry[]): boolean {
+function migrateToCurrentVersion(entries: StoredFileEntry[]): boolean {
 	const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
 	const version = header?.version ?? 1;
 
@@ -424,6 +433,7 @@ export function parseSessionEntries(content: string): FileEntry[] {
 		if (!line.trim()) continue;
 		try {
 			const entry = JSON.parse(line) as FileEntry;
+			if ((entry as { type: string }).type === "leaf") continue;
 			entries.push(entry);
 		} catch {
 			// Skip malformed lines
@@ -768,22 +778,26 @@ class SessionHeaderScanLimitError extends Error {
 	}
 }
 
-function parseSessionEntryLine(line: string): FileEntry | null {
+function parseSessionEntryLine(line: string): StoredFileEntry | null {
 	if (!line.trim()) return null;
 	try {
-		return JSON.parse(line) as FileEntry;
+		return JSON.parse(line) as StoredFileEntry;
 	} catch {
 		// Skip malformed lines
 		return null;
 	}
 }
 
-/** Exported for testing */
+/** Load public session records without exposing storage-only selection markers. */
 export function loadEntriesFromFile(filePath: string): FileEntry[] {
+	return loadStoredEntriesFromFile(filePath).filter((entry): entry is FileEntry => entry.type !== "leaf");
+}
+
+function loadStoredEntriesFromFile(filePath: string): StoredFileEntry[] {
 	const resolvedFilePath = normalizePath(filePath);
 	if (!existsSync(resolvedFilePath)) return [];
 
-	const entries: FileEntry[] = [];
+	const entries: StoredFileEntry[] = [];
 	let pending = "";
 	const fd = openSync(resolvedFilePath, "r");
 	try {
@@ -1146,7 +1160,7 @@ export class SessionManager {
 	private cwd: string;
 	private persist: boolean;
 	private flushed: boolean = false;
-	private fileEntries: FileEntry[] = [];
+	private fileEntries: StoredFileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
@@ -1167,7 +1181,7 @@ export class SessionManager {
 		sessionFile: string | undefined,
 		persist: boolean,
 		newSessionOptions?: NewSessionOptions,
-		preloadedFileEntries?: FileEntry[],
+		preloadedFileEntries?: StoredFileEntry[],
 	) {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
@@ -1190,10 +1204,10 @@ export class SessionManager {
 		this._setSessionFile(sessionFile);
 	}
 
-	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
+	private _setSessionFile(sessionFile: string, preloadedFileEntries?: StoredFileEntry[]): void {
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
-			const entries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
+			const entries = preloadedFileEntries ?? loadStoredEntriesFromFile(this.sessionFile);
 
 			// If file was empty, initialize it with a valid session header. If it was
 			// non-empty but did not parse as a pi session, fail without modifying it.
@@ -1246,7 +1260,7 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
-	private _loadEntries(entries: FileEntry[], options?: NewSessionOptions): void {
+	private _loadEntries(entries: StoredFileEntry[], options?: NewSessionOptions): void {
 		const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
 
 		if (header) {
@@ -1271,6 +1285,12 @@ export class SessionManager {
 		this.leafId = null;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
+			if (entry.type === "leaf") {
+				if (entry.leafId === null || (typeof entry.leafId === "string" && this.byId.has(entry.leafId))) {
+					this.leafId = entry.leafId;
+				}
+				continue;
+			}
 			this.byId.set(entry.id, entry);
 			this.leafId = entry.id;
 			if (entry.type === "label") {
@@ -1285,7 +1305,7 @@ export class SessionManager {
 		}
 	}
 
-	private _rewriteFile(entries: FileEntry[] = this.fileEntries): void {
+	private _rewriteFile(entries: StoredFileEntry[] = this.fileEntries): void {
 		if (!this.persist || !this.sessionFile) return;
 		const destination = existsSync(this.sessionFile) ? realpathSync(this.sessionFile) : this.sessionFile;
 		const mode = existsSync(destination) ? statSync(destination).mode & 0o7777 : undefined;
@@ -1318,17 +1338,23 @@ export class SessionManager {
 		}
 	}
 
-	/** Publish prepared entries and indexes only after their atomic rewrite succeeds. */
-	private _commitEntries(entries: FileEntry[], leafId: string, supersededBy: ReadonlyMap<string, string>): void {
-		const staged = entries.map((entry) => {
-			const replacementId = entry.type !== "session" ? supersededBy.get(entry.id) : undefined;
-			return replacementId === undefined ? entry : { ...entry, supersededBy: replacementId };
-		});
+	/** Stage durable selection and indexes, then publish only after atomic rewrite succeeds. */
+	private _commitEntries(
+		entries: StoredFileEntry[],
+		leafId: string | null,
+		supersededBy: ReadonlyMap<string, string> = new Map(),
+	): void {
+		const staged: StoredFileEntry[] = entries
+			.filter((entry) => entry.type !== "leaf")
+			.map((entry) => {
+				const replacementId = entry.type !== "session" ? supersededBy.get(entry.id) : undefined;
+				return replacementId === undefined ? entry : { ...entry, supersededBy: replacementId };
+			});
 		const byId = new Map<string, SessionEntry>();
 		const labelsById = new Map<string, string>();
 		const labelTimestampsById = new Map<string, string>();
 		for (const entry of staged) {
-			if (entry.type !== "session") byId.set(entry.id, entry);
+			if (entry.type !== "session" && entry.type !== "leaf") byId.set(entry.id, entry);
 		}
 		for (const entry of staged) {
 			if (entry.type !== "label" || !byId.has(entry.targetId)) continue;
@@ -1339,6 +1365,10 @@ export class SessionManager {
 				labelsById.delete(entry.targetId);
 				labelTimestampsById.delete(entry.targetId);
 			}
+		}
+		const last = staged.at(-1);
+		if (leafId === null ? byId.size > 0 : !last || last.type === "leaf" || last.id !== leafId) {
+			staged.push({ type: "leaf", leafId });
 		}
 		this._rewriteFile(staged);
 		this.fileEntries = staged;
@@ -1408,11 +1438,11 @@ export class SessionManager {
 	 * closing pi without chatting leaves no file behind. Starting at the user message (not the
 	 * first assistant reply) keeps the prompt on disk if the first turn never completes (#10000).
 	 */
-	private _hasConversation(entries: FileEntry[] = this.fileEntries): boolean {
+	private _hasConversation(entries: StoredFileEntry[] = this.fileEntries): boolean {
 		return entries.some((e) => e.type === "message" && (e.message.role === "user" || e.message.role === "assistant"));
 	}
 
-	_persist(entry: SessionEntry, entries: FileEntry[] = this.fileEntries): void {
+	_persist(entry: SessionEntry, entries: StoredFileEntry[] = this.fileEntries): void {
 		if (!this.persist || !this.sessionFile) return;
 
 		if (!this.flushed) {
@@ -2060,7 +2090,7 @@ export class SessionManager {
 	 * via removeLastMessages(), which removes recent messages from the leaf path.
 	 */
 	getEntries(): SessionEntry[] {
-		return this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");
+		return this.fileEntries.filter((e): e is SessionEntry => e.type !== "session" && e.type !== "leaf");
 	}
 
 	/**
@@ -2104,6 +2134,7 @@ export class SessionManager {
 			for (const entry of this.fileEntries) {
 				if (
 					entry.type !== "session" &&
+					entry.type !== "leaf" &&
 					entry.parentId &&
 					removedIds.has(entry.parentId) &&
 					!removedIds.has(entry.id)
@@ -2114,37 +2145,9 @@ export class SessionManager {
 			}
 		}
 
-		const previousEntries = this.fileEntries;
-		const previousLeaf = this.leafId;
-		this.fileEntries = this.fileEntries.filter((e) => !removedIds.has(e.id));
-		for (const id of removedIds) {
-			this.byId.delete(id);
-		}
-		this.leafId = firstDeleteIdx > 0 ? path[firstDeleteIdx - 1].id : null;
-
-		// Rebuild label maps from remaining label entries (latest wins; skip orphaned targets).
-		this.labelsById.clear();
-		this.labelTimestampsById.clear();
-		for (const entry of this.fileEntries) {
-			if (entry.type === "label" && this.byId.has(entry.targetId)) {
-				if (entry.label) {
-					this.labelsById.set(entry.targetId, entry.label);
-					this.labelTimestampsById.set(entry.targetId, entry.timestamp);
-				} else {
-					this.labelsById.delete(entry.targetId);
-					this.labelTimestampsById.delete(entry.targetId);
-				}
-			}
-		}
-
-		try {
-			this._rewriteFile();
-		} catch (error) {
-			this.fileEntries = previousEntries;
-			this._buildIndex();
-			this.leafId = previousLeaf;
-			throw error;
-		}
+		const entries = this.fileEntries.filter((entry) => entry.type === "leaf" || !removedIds.has(entry.id));
+		const leafId = firstDeleteIdx > 0 ? path[firstDeleteIdx - 1].id : null;
+		this._commitEntries(entries, leafId);
 		return removeCount;
 	}
 
@@ -2338,6 +2341,7 @@ export class SessionManager {
 			for (const entry of this.fileEntries) {
 				if (
 					entry.type !== "session" &&
+					entry.type !== "leaf" &&
 					entry.parentId &&
 					removedIds.has(entry.parentId) &&
 					!removedIds.has(entry.id)
@@ -2348,44 +2352,16 @@ export class SessionManager {
 			}
 		}
 
-		const previousEntries = this.fileEntries;
-		const previousLeaf = this.leafId;
-		if (this.leafId && removedIds.has(this.leafId)) {
-			let ancestor = this.byId.get(this.leafId)?.parentId ?? null;
+		let leafId = this.leafId;
+		if (leafId && removedIds.has(leafId)) {
+			let ancestor = this.byId.get(leafId)?.parentId ?? null;
 			while (ancestor && removedIds.has(ancestor)) {
 				ancestor = this.byId.get(ancestor)?.parentId ?? null;
 			}
-			this.leafId = ancestor;
+			leafId = ancestor;
 		}
-
-		this.fileEntries = this.fileEntries.filter((entry) => !removedIds.has(entry.id));
-		for (const id of removedIds) {
-			this.byId.delete(id);
-		}
-
-		// Rebuild label maps from remaining label entries (latest wins; skip orphaned targets).
-		this.labelsById.clear();
-		this.labelTimestampsById.clear();
-		for (const entry of this.fileEntries) {
-			if (entry.type === "label" && this.byId.has(entry.targetId)) {
-				if (entry.label) {
-					this.labelsById.set(entry.targetId, entry.label);
-					this.labelTimestampsById.set(entry.targetId, entry.timestamp);
-				} else {
-					this.labelsById.delete(entry.targetId);
-					this.labelTimestampsById.delete(entry.targetId);
-				}
-			}
-		}
-
-		try {
-			this._rewriteFile();
-		} catch (error) {
-			this.fileEntries = previousEntries;
-			this._buildIndex();
-			this.leafId = previousLeaf;
-			throw error;
-		}
+		const entries = this.fileEntries.filter((entry) => entry.type === "leaf" || !removedIds.has(entry.id));
+		this._commitEntries(entries, leafId);
 		return removedIds.size;
 	}
 
@@ -2612,16 +2588,9 @@ export class SessionManager {
 			}
 		}
 
-		const previousEntries = this.persist && this.sessionFile ? this.fileEntries.slice() : undefined;
-		const previousValues = previousEntries?.map((entry) => ({ entry, value: { ...entry } }));
-		const previousLeaf = this.leafId;
-
-		const branchPoint = path[firstAffectedIdx].parentId;
-		if (branchPoint) {
-			this.branch(branchPoint);
-		} else {
-			this.resetLeaf();
-		}
+		const entries = this.fileEntries.slice();
+		let leafId = path[firstAffectedIdx].parentId;
+		const ids = new Set(this.byId.keys());
 
 		// For each removed entry, the first entry after it that is not also
 		// removed: dangling references to the removed entry move to its clone.
@@ -2639,23 +2608,25 @@ export class SessionManager {
 		// Clone the tail, skipping removed entries and filtering removed tool
 		// call blocks out of assistant messages that stay.
 		const idMap = new Map<string, string>();
+		const clones: SessionEntry[] = [];
 		let removedToolCallCount = 0;
 		for (let i = firstAffectedIdx; i < path.length; i++) {
 			const entry = path[i];
 			if (removedSet.has(entry.id)) continue;
-			const newId = generateId(this.byId);
+			const newId = generateId(ids);
 			idMap.set(entry.id, newId);
+			ids.add(newId);
 
 			const newEntry: SessionEntry = {
 				...entry,
 				id: newId,
-				parentId: this.leafId,
+				parentId: leafId,
 				usageSourceId: entry.usageSourceId ?? entry.id,
 			};
 			delete newEntry.supersededBy;
 			// The source entry stays on an abandoned branch: mark it superseded
 			// so it is not mistaken for a real alternative (swipe version).
-			entry.supersededBy = newId;
+			// Source supersession publishes only after the staged rewrite succeeds.
 			if (newEntry.type === "branch_summary") {
 				const oldFromId = (entry as BranchSummaryEntry).fromId;
 				(newEntry as BranchSummaryEntry).fromId = idMap.get(oldFromId) ?? oldFromId;
@@ -2680,14 +2651,13 @@ export class SessionManager {
 				}
 			}
 
-			this.fileEntries.push(newEntry);
-			this.byId.set(newId, newEntry);
-			this.leafId = newId;
+			clones.push(newEntry);
+			entries.push(newEntry);
+			leafId = newId;
 		}
 
 		// Only new clones belong to this removal; historical branches keep their references.
-		for (const id of idMap.values()) {
-			const entry = this.byId.get(id)!;
+		for (const entry of clones) {
 			if (entry.type === "compaction" && entry.firstKeptEntryId) {
 				if (idMap.has(entry.firstKeptEntryId)) {
 					entry.firstKeptEntryId = idMap.get(entry.firstKeptEntryId)!;
@@ -2709,37 +2679,7 @@ export class SessionManager {
 			}
 		}
 
-		// Rebuild label maps from remaining label entries (latest wins; skip orphaned targets).
-		this.labelsById.clear();
-		this.labelTimestampsById.clear();
-		for (const entry of this.fileEntries) {
-			if (entry.type === "label" && this.byId.has(entry.targetId)) {
-				if (entry.label) {
-					this.labelsById.set(entry.targetId, entry.label);
-					this.labelTimestampsById.set(entry.targetId, entry.timestamp);
-				} else {
-					this.labelsById.delete(entry.targetId);
-					this.labelTimestampsById.delete(entry.targetId);
-				}
-			}
-		}
-
-		try {
-			this._rewriteFile();
-		} catch (error) {
-			if (previousEntries && previousValues) {
-				for (const { entry, value } of previousValues) {
-					for (const key of Object.keys(entry)) {
-						if (!Object.hasOwn(value, key)) Reflect.deleteProperty(entry, key);
-					}
-					Object.assign(entry, value);
-				}
-				this.fileEntries = previousEntries;
-				this._buildIndex();
-				this.leafId = previousLeaf;
-			}
-			throw error;
-		}
+		this._commitEntries(entries, leafId, idMap);
 		return removedSet.size + removedToolCallCount;
 	}
 
@@ -2988,7 +2928,7 @@ export class SessionManager {
 	static open(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
 		const resolvedPath = resolvePath(path);
 		let header: SessionHeader | null = null;
-		let preloadedFileEntries: FileEntry[] | undefined;
+		let preloadedFileEntries: StoredFileEntry[] | undefined;
 		if (cwdOverride === undefined && existsSync(resolvedPath)) {
 			try {
 				header = readSessionHeader(resolvedPath);
@@ -2996,7 +2936,7 @@ export class SessionManager {
 				if (!(error instanceof SessionHeaderScanLimitError)) throw error;
 				// The bounded scan is only a discovery optimization. A full load remains
 				// authoritative for legacy files with very large headers or prefixes.
-				preloadedFileEntries = loadEntriesFromFile(resolvedPath);
+				preloadedFileEntries = loadStoredEntriesFromFile(resolvedPath);
 				const firstEntry = preloadedFileEntries[0];
 				header = firstEntry?.type === "session" ? firstEntry : null;
 			}
@@ -3042,7 +2982,7 @@ export class SessionManager {
 	): SessionManager {
 		const resolvedSourcePath = resolvePath(sourcePath);
 		const resolvedTargetCwd = resolvePath(targetCwd);
-		const sourceEntries = loadEntriesFromFile(resolvedSourcePath);
+		const sourceEntries = loadStoredEntriesFromFile(resolvedSourcePath);
 		if (sourceEntries.length === 0) {
 			throw new Error(`Cannot fork: source session file is empty or invalid: ${resolvedSourcePath}`);
 		}
