@@ -373,6 +373,8 @@ container.removeChild(component);
 
 Container that applies padding and background color to all children.
 
+When full-width line padding is enabled, horizontal margins are clamped to leave at least one content column. With padding disabled, Box uses no horizontal margin; mouse coordinates follow the same effective margin as rendering.
+
 ```typescript
 const box = new Box(
   1,                              // paddingX (default: 1)
@@ -401,6 +403,8 @@ text.setCustomBgFn((text) => chalk.bgBlue(text));
 ### TruncatedText
 
 Single-line text that truncates to fit viewport width. Useful for status lines and headers.
+
+Horizontal padding is clamped to the viewport so configured margins cannot push the truncated content beyond a narrow terminal's width.
 
 ```typescript
 const truncated = new TruncatedText(

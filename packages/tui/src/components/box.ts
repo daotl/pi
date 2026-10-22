@@ -91,9 +91,12 @@ export class Box implements Component {
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseDispatchResult | undefined {
-		const contentWidth = Math.max(1, event.width - this.paddingX * 2);
+		const paddingX = isPadLinesToWidth()
+			? Math.min(this.paddingX, Math.max(0, Math.floor((event.width - 1) / 2)))
+			: 0;
+		const contentWidth = Math.max(1, event.width - paddingX * 2);
 		const contentY = event.y - this.paddingY;
-		const contentX = event.x - this.paddingX;
+		const contentX = event.x - paddingX;
 		if (contentY < 0 || contentX < 0 || contentX >= contentWidth) return undefined;
 
 		const mouseChildren =
@@ -122,8 +125,9 @@ export class Box implements Component {
 		}
 
 		const padEnabled = isPadLinesToWidth();
-		const contentWidth = padEnabled ? Math.max(1, width - this.paddingX * 2) : width;
-		const leftPad = " ".repeat(this.paddingX);
+		const paddingX = padEnabled ? Math.min(this.paddingX, Math.max(0, Math.floor((width - 1) / 2))) : 0;
+		const contentWidth = Math.max(1, width - paddingX * 2);
+		const leftPad = " ".repeat(paddingX);
 
 		// Render all children. Keep the child lines unpadded: children usually return the same string
 		// objects every frame, so the cache check below is a cheap identity comparison per line.

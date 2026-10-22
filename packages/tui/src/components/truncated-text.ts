@@ -33,7 +33,8 @@ export class TruncatedText implements Component {
 		const padEnabled = isPadLinesToWidth();
 
 		// Calculate available width after horizontal padding
-		const availableWidth = padEnabled ? Math.max(1, width - this.paddingX * 2) : width;
+		const paddingX = padEnabled ? Math.min(this.paddingX, Math.max(0, Math.floor((width - 1) / 2))) : 0;
+		const availableWidth = Math.max(1, width - paddingX * 2);
 
 		// Take only the first line (stop at newline)
 		let singleLineText = this.text;
@@ -47,8 +48,8 @@ export class TruncatedText implements Component {
 
 		if (padEnabled) {
 			// Add horizontal padding and pad to exactly width characters
-			const leftPadding = " ".repeat(this.paddingX);
-			const rightPadding = " ".repeat(this.paddingX);
+			const leftPadding = " ".repeat(paddingX);
+			const rightPadding = leftPadding;
 			result.push(padLineToWidth(leftPadding + displayText + rightPadding, width));
 		} else {
 			// No padding: raw content, no margins, no trailing spaces
