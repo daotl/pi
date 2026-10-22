@@ -65,6 +65,8 @@ After a runtime replacement, subscriptions belong to the old `AgentSession` and 
 
 A prompt sent while the session is already streaming must specify whether it should steer the current run or follow it. Calling `prompt()` without that choice rejects rather than guessing.
 
+Preflight hooks, authentication, compaction and image normalization can yield to another run. On resuming, `prompt()` queues or rejects against current run ownership before publishing its prompt/tool loadout. A rejected prompt does not settle another run. An active run's automatic compaction keeps ordinary steering/follow-up behavior; independent manual compaction or branch summarization rejects new prompts until completion.
+
 A steering message enters after the current assistant turn and its tool calls. A follow-up enters after the current run finishes its pending work. `steer()` and `followUp()` expose those behaviors directly and return `"queued"` if the input was queued (including after an extension transformed it), or `"handled"` if an extension consumed it.
 
 `abort()` stops the active operation and waits for the session to become idle. `waitForIdle()` waits without aborting it.

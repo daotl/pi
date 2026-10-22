@@ -2981,6 +2981,11 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		if (this._isAgentRunActive || this.agent.signal) {
+			throw new Error(
+				"Agent is already processing. Use steer() or followUp() to queue messages, or wait for completion.",
+			);
+		}
 		this._agentRunAbortRequested = false;
 		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
 		this._failedResponse = undefined;
@@ -3392,8 +3397,13 @@ export class AgentSession {
 			expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 		}
 
-		// If streaming, queue via steer() or followUp() based on option
-		if (this.isStreaming) {
+		// Preflight can yield to another run; queue or reject before publishing this prompt's loadout.
+		const dispatchToActiveRun = async (): Promise<void> => {
+			if (!this.isStreaming && !this.agent.signal) {
+				throw new Error(
+					"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
+				);
+			}
 			if (!options?.streamingBehavior) {
 				throw new Error(
 					"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
@@ -3405,6 +3415,9 @@ export class AgentSession {
 				await this._queueSteer(expandedText, currentImages);
 			}
 			preflightResult?.("queued");
+		};
+		if (this.isStreaming || this.agent.signal || this.isCompacting) {
+			await dispatchToActiveRun();
 			return;
 		}
 
@@ -3431,12 +3444,20 @@ export class AgentSession {
 			}
 			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 		}
+		if (this.isStreaming || this.agent.signal || this.isCompacting) {
+			await dispatchToActiveRun();
+			return;
+		}
 
 		// Check if we need to compact before sending (catches aborted responses).
 		// The user's new prompt is sent below, so do not call agent.continue() here.
 		const lastAssistant = this._findLastAssistantMessage();
 		if (lastAssistant) {
 			await this._checkCompaction(lastAssistant, false);
+		}
+		if (this.isStreaming || this.agent.signal || this.isCompacting) {
+			await dispatchToActiveRun();
+			return;
 		}
 
 		// Emit before_agent_start before normalizing images so extension-driven model
@@ -3447,6 +3468,10 @@ export class AgentSession {
 			currentImages,
 			this._baseSystemPromptOptions,
 		);
+		if (this.isStreaming || this.agent.signal || this.isCompacting) {
+			await dispatchToActiveRun();
+			return;
+		}
 		// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
 		// which updates the live loadout instead. An explicit edit wins; otherwise the live
 		// loadout is authoritative, so a setActiveTools() call is not undone here.
@@ -3456,6 +3481,10 @@ export class AgentSession {
 		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
 
 		const normalized = await this._normalizePromptImages(currentImages);
+		if (this.isStreaming || this.agent.signal || this.isCompacting) {
+			await dispatchToActiveRun();
+			return;
+		}
 		const userText = normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
 
 		// Build messages only after hooks and image normalization have completed.
