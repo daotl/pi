@@ -896,6 +896,7 @@ describe("durable length recovery", () => {
 
 	it("gives a distinct queued follow-up its own length-recovery budget", async () => {
 		let queued = false;
+		const requests: Array<{ text: string; prefill: boolean }> = [];
 		const harness = await createHarness({
 			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
 			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
@@ -918,12 +919,17 @@ describe("durable length recovery", () => {
 			],
 		});
 		harnesses.push(harness);
-		harness.setResponses([
-			fauxAssistantMessage("first partial", { stopReason: "length" }),
-			fauxAssistantMessage("first recovered"),
-			() => fauxAssistantMessage("follow-up partial", { stopReason: "length", timestamp: Date.now() + 1_000 }),
-			() => fauxAssistantMessage("follow-up recovered", { timestamp: Date.now() + 2_000 }),
-		]);
+		harness.setResponses(
+			["first partial", "first recovered", "follow-up partial", "follow-up recovered"].map(
+				(text, index) => (context, options) => {
+					requests.push({ text: JSON.stringify(context.messages), prefill: options?.returnPrefill === true });
+					return fauxAssistantMessage(text, {
+						stopReason: index % 2 === 0 ? "length" : "stop",
+						timestamp: Date.now() + index * 1000,
+					});
+				},
+			),
+		);
 
 		await harness.session.prompt("x".repeat(5000));
 
@@ -938,11 +944,20 @@ describe("durable length recovery", () => {
 			.getEntries()
 			.flatMap((entry) => (entry.type === "context_edit" ? [entry.targetId] : []));
 		expect(lengthIds).toHaveLength(2);
-		// The first length response overflows the tiny context window and is durably
-		// omitted before the compaction retry. The follow-up length response does not
-		// overflow; it is recovered by prefill continuation (the partial is kept for
-		// return_prefill, not omitted) - each still gets its own recovery.
-		expect(omitted).toEqual([lengthIds[0]]);
+		// Both independent length recoveries omit their attempts; this faux API does not support prefills.
+		expect(omitted).toEqual(expect.arrayContaining(lengthIds));
+		expect(requests[2]?.text).toContain("distinct follow-up");
+		expect(requests.every((request) => !request.prefill)).toBe(true);
+		expect(harness.sessionManager.getEntries()).toContainEqual(
+			expect.objectContaining({
+				type: "message",
+				message: expect.objectContaining({
+					role: "assistant",
+					content: [{ type: "text", text: "first recovered" }],
+				}),
+			}),
+		);
+		expect(harness.session.getLastAssistantText()).toBe("follow-up recovered");
 		expect(harness.faux.state.callCount).toBe(4);
 	});
 
