@@ -113,6 +113,12 @@ A queued compact takes precedence over a boundary continuation decision. After c
 
 If compaction is cancelled while finding its cut point, preparation stops before `session_before_compact` handlers run. A started automatic compaction emits its aborted completion event whether preparation produced a usable candidate or not.
 
+Cancellation before checkpoint publication, including during final summary tokenization, leaves the previous model context unchanged. If the built-in summary request already completed, Pi records that physical provider/model's charge once as a context-invisible usage entry. Cancelling before the summary completes creates no completed charge. Once the checkpoint is committed, cancellation during the final chat-template/multimodal context count does not roll it back or bill the summary again.
+
+If writing the checkpoint fails, Pi likewise retains the completed built-in summary charge. If its usage entry cannot be written either, the charge stays pending in the active session and must be persisted before the next accepted prompt, continuation or compaction dispatches. Pending receipts are consumed after successful storage, before notifications, so a notification error cannot duplicate a charge. Unwritten pending receipts do not survive process exit. Extension-supplied summaries do not invent a physical provider/model attribution.
+
+Session runtime replacement and shutdown also drain pending summary charges before invalidating the outgoing session; a failed drain rejects replacement and leaves that session available for retry. Recovered usage notifications during a run occur only after that run or compaction owns the session, so a subscriber cannot start a competing continuation inside publication.
+
 A compact accepted after the final turn boundary, including from `agent_before_settle`, runs before `agent_settled` for both prompts and standalone continuations. It does not start another model request solely because it was queued late.
 
 ### Split user-message spans

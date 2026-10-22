@@ -44,6 +44,7 @@ import {
 	retryDelayMs,
 } from "@earendil-works/pi-ai";
 import type {
+	Api,
 	AssistantMessage,
 	AuthResult,
 	ImageContent,
@@ -484,6 +485,8 @@ export class AgentSession {
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
+	/** Completed built-in summary charges not yet published as a checkpoint or usage entry. */
+	private _pendingCompactionUsage: Array<{ provider: string; model: string; usage: Usage }> = [];
 	private _overflowRecoveryAttempted = false;
 	/** A manual /compact queued while the agent was streaming, to run at the next turn boundary. */
 	private _queuedCompact?: { options?: CompactOptions | string };
@@ -924,6 +927,7 @@ export class AgentSession {
 	private _installAgentRequestProjection(): void {
 		const previousPrepareRequest = this.agent.prepareRequest;
 		this.agent.prepareRequest = async (request, signal) => {
+			this._flushPendingCompactionUsage();
 			if (this._prefillRestoreFailed && this._pendingPrefill) {
 				this._restorePrefill(this._prefillRestorePoint ?? null, this._pendingPrefill);
 			}
@@ -1658,6 +1662,11 @@ export class AgentSession {
 	/** Refresh the public finalized transcript from the canonical session projection. */
 	refreshContext(): void {
 		this._refreshFinalizedContext();
+	}
+
+	/** Persist completed summary receipts before replacement, without notifying outgoing subscribers. */
+	flushPendingUsage(): void {
+		this._flushPendingCompactionUsage(false);
 	}
 
 	/** Full agent state */
@@ -3014,6 +3023,7 @@ export class AgentSession {
 		this._recordSelection();
 		this._isAgentRunActive = true;
 		try {
+			this._flushPendingCompactionUsage();
 			await this.agent.prompt(messages);
 			// Always restore a captured prefix before honoring cancellation after a retry.
 			while (true) {
@@ -3081,6 +3091,7 @@ export class AgentSession {
 		this._failedResponse = undefined;
 		this._isAgentRunActive = true;
 		try {
+			this._flushPendingCompactionUsage();
 			await this._continueOnce(prefill);
 			this._refreshFinalizedContext();
 			// Post-run handling restores an interrupted prefill even when the run was aborted.
@@ -4141,10 +4152,10 @@ export class AgentSession {
 		customInstructions: string | undefined,
 		signal: AbortSignal,
 		reason: "manual" | "threshold" | "overflow",
-	): Promise<CompactionResult> {
+	): Promise<CompactionResult & { usageModel: Model<Api> }> {
 		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
 		const request = await this._getSummarizationRequestAuth(model, signal);
-		return compact(
+		const result = await compact(
 			preparation,
 			request.model,
 			request.apiKey,
@@ -4160,6 +4171,7 @@ export class AgentSession {
 			this.agent.state.systemPrompt,
 			this.agent,
 		);
+		return { ...result, usageModel: request.model };
 	}
 
 	private _clearManualCompactionState(): void {
@@ -4167,14 +4179,33 @@ export class AgentSession {
 		this._resolveIdleWaitIfIdle();
 	}
 
+	private _flushPendingCompactionUsage(notify = true): void {
+		while (this._pendingCompactionUsage.length > 0) {
+			const receipt = this._pendingCompactionUsage[0];
+			const entry = this.sessionManager.appendUsage("compaction", receipt.provider, receipt.model, receipt.usage);
+			// Consume only after publication; a listener failure must not charge it again.
+			this._pendingCompactionUsage.shift();
+			if (notify) this._emit({ type: "entry_appended", entry });
+		}
+	}
+
+	private _retainCompactionUsage(usage: Usage | undefined, model: Model<Api> | undefined): void {
+		if (!usage || !model) return;
+		this._pendingCompactionUsage.push({ provider: model.provider, model: model.id, usage: structuredClone(usage) });
+		try {
+			this._flushPendingCompactionUsage();
+		} catch {
+			// Keep the original failure; an unwritten receipt remains owned by this session.
+		}
+	}
+
 	/**
 	 * Record a finished compaction with real token counts.
 	 *
-	 * Tokenizes the summary (for the summaries-block limit) and the full
-	 * post-compaction context (for the footer) via the model's `/tokenize`
-	 * endpoint when available, appends the compaction entry, and rebuilds the
-	 * context. All tokenization is best-effort: any failure leaves the counts
-	 * undefined so the chars/4 estimate and the footer "?" remain the fallback.
+	 * Counts summary text before checkpoint publication, then the full chat-template
+	 * context (including multimodal content) for the footer. Cancellation before
+	 * publication discards the checkpoint, not a completed built-in summary charge.
+	 * Late counting failure leaves the committed checkpoint and existing estimate fallback.
 	 */
 	private async _finalizeCompaction(
 		summary: string,
@@ -4183,12 +4214,19 @@ export class AgentSession {
 		details: unknown,
 		fromExtension: boolean,
 		usage: Usage | undefined,
+		usageModel: Model<Api> | undefined,
 		signal?: AbortSignal,
 	): Promise<{ newEntries: SessionEntry[]; estimatedTokensAfter: number }> {
+		const throwIfCancelled = (): void => {
+			if (!signal?.aborted) return;
+			this._retainCompactionUsage(usage, usageModel);
+			throw new Error("Compaction cancelled");
+		};
+		throwIfCancelled();
 		let auth: RequestAuth | undefined;
 		if (this.model) {
 			try {
-				auth = await this._getSummarizationRequestAuth(this.model);
+				auth = await this._getSummarizationRequestAuth(this.model, signal);
 			} catch {
 				auth = undefined;
 			}
@@ -4209,15 +4247,21 @@ export class AgentSession {
 			}
 		}
 
-		this.sessionManager.appendCompaction(
-			summary,
-			firstKeptEntryId,
-			tokensBefore,
-			details,
-			fromExtension,
-			usage,
-			summaryTokens,
-		);
+		throwIfCancelled();
+		try {
+			this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
+				usage,
+				summaryTokens,
+			);
+		} catch (error) {
+			this._retainCompactionUsage(usage, usageModel);
+			throw error;
+		}
 		const newEntries = this.sessionManager.getEntries();
 		const sessionContext = this.sessionManager.buildSessionContext();
 		this.agent.state.messages = sessionContext.messages;
@@ -4386,6 +4430,7 @@ export class AgentSession {
 		let cancelledByExtension = false;
 
 		try {
+			this._flushPendingCompactionUsage();
 			const model = this.model;
 			if (!model) {
 				throw new Error(formatNoModelSelectedMessage());
@@ -4452,6 +4497,7 @@ export class AgentSession {
 			let firstKeptEntryId: string;
 			let tokensBefore: number;
 			let usage: Usage | undefined;
+			let usageModel: Model<Api> | undefined;
 			let details: unknown;
 
 			if (extensionCompaction) {
@@ -4475,11 +4521,8 @@ export class AgentSession {
 				firstKeptEntryId = result.firstKeptEntryId;
 				tokensBefore = result.tokensBefore;
 				usage = result.usage;
+				usageModel = result.usageModel;
 				details = result.details;
-			}
-
-			if (this._compactionAbortController.signal.aborted) {
-				throw new Error("Compaction cancelled");
 			}
 
 			const { newEntries, estimatedTokensAfter } = await this._finalizeCompaction(
@@ -4489,6 +4532,7 @@ export class AgentSession {
 				details,
 				fromExtension,
 				usage,
+				usageModel,
 				this._compactionAbortController.signal,
 			);
 
@@ -4760,6 +4804,7 @@ export class AgentSession {
 
 			abortController = new AbortController();
 			this._autoCompactionAbortController = abortController;
+			this._flushPendingCompactionUsage();
 			started = true;
 			this._emit({ type: "compaction_start", reason });
 			abortController.signal.throwIfAborted();
@@ -4814,6 +4859,7 @@ export class AgentSession {
 			let firstKeptEntryId: string;
 			let tokensBefore: number;
 			let usage: Usage | undefined;
+			let usageModel: Model<Api> | undefined;
 			let details: unknown;
 
 			if (extensionCompaction) {
@@ -4837,9 +4883,9 @@ export class AgentSession {
 				firstKeptEntryId = compactResult.firstKeptEntryId;
 				tokensBefore = compactResult.tokensBefore;
 				usage = compactResult.usage;
+				usageModel = compactResult.usageModel;
 				details = compactResult.details;
 			}
-			abortController.signal.throwIfAborted();
 
 			const { newEntries, estimatedTokensAfter } = await this._finalizeCompaction(
 				summary,
@@ -4848,6 +4894,7 @@ export class AgentSession {
 				details,
 				fromExtension,
 				usage,
+				usageModel,
 				this._autoCompactionAbortController.signal,
 			);
 

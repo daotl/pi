@@ -168,11 +168,13 @@ export class AgentSessionRuntime {
 		// Settle any active response first so the aborted turn (including tool
 		// results) is persisted to the outgoing session before it is replaced.
 		await this.session.abort();
+		this.session.flushPendingUsage();
 		await emitSessionShutdownEvent(this.session.extensionRunner, {
 			type: "session_shutdown",
 			reason,
 			targetSessionFile,
 		});
+		this.session.flushPendingUsage();
 		this.beforeSessionInvalidate?.();
 		this.session.dispose();
 	}
@@ -207,9 +209,11 @@ export class AgentSessionRuntime {
 		}
 
 		const previousSessionFile = this.session.sessionFile;
-		const sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
+		let sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
 		assertSessionCwdExists(sessionManager, this.cwd);
 		await this.teardownCurrent("resume", sessionManager.getSessionFile());
+		// Shutdown can publish outgoing receipts, including when resuming the same file.
+		sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
 		this.apply(
 			await this.createRuntime({
 				cwd: sessionManager.getCwd(),
@@ -386,9 +390,10 @@ export class AgentSessionRuntime {
 			copyFileSync(resolvedPath, destinationPath, constants.COPYFILE_EXCL);
 		}
 
-		const sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
+		let sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
 		assertSessionCwdExists(sessionManager, this.cwd);
 		await this.teardownCurrent("resume", sessionManager.getSessionFile());
+		sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
 		this.apply(
 			await this.createRuntime({
 				cwd: sessionManager.getCwd(),
@@ -402,10 +407,13 @@ export class AgentSessionRuntime {
 	}
 
 	async dispose(): Promise<void> {
+		await this.session.abort();
+		this.session.flushPendingUsage();
 		await emitSessionShutdownEvent(this.session.extensionRunner, {
 			type: "session_shutdown",
 			reason: "quit",
 		});
+		this.session.flushPendingUsage();
 		this.beforeSessionInvalidate?.();
 		this.session.dispose();
 	}

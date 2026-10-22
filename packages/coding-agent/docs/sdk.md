@@ -57,6 +57,8 @@ See the checked [sessions example](../examples/sdk/11-sessions.ts) for creating,
 
 `AgentSessionRuntime` adds `newSession()`, `switchSession()`, `fork()`, and `importFromJsonl()`. Each operation replaces the active `AgentSession` and recreates services for the target working directory.
 
+Runtime replacement and `runtime.dispose()` first settle active work and persist pending completed-summary usage to the outgoing session. A storage error rejects before shutdown/invalidation so the existing session can retry; shutdown handlers see the persisted totals. A second storage-only drain after those handlers preserves any additional pending charges before invalidation. Same-file resume/import reloads the target after outgoing publication. Hosts managing raw sessions can `await session.abort()` then call `session.flushPendingUsage()` before `session.dispose()`; the flush is synchronous, propagates storage errors, and does not notify outgoing subscribers. Raw `session.dispose()` remains best-effort cleanup, not a durability barrier.
+
 After a runtime replacement, subscriptions belong to the old `AgentSession` and must be rebound. See the [session runtime example](../examples/sdk/13-session-runtime.ts).
 
 ## Prompting

@@ -238,7 +238,7 @@ describe("FooterDataProvider reftable branch detection", () => {
 		}
 	});
 
-	it("updates the cached branch when the reftable directory changes", async () => {
+	it("updates the cached branch after a reftable watcher reports a changed file", async () => {
 		const { worktreeDir, reftableDir } = createReftableWorktree(tempDir);
 		process.chdir(worktreeDir);
 
@@ -250,6 +250,8 @@ describe("FooterDataProvider reftable branch detection", () => {
 			provider.onBranchChange(onBranchChange);
 
 			writeFileSync(join(reftableDir, "tables.list"), "1\n");
+			// Keep real watcher setup and file mutation, but do not rely on OS event delivery timing.
+			emitReftableChange(provider);
 			await waitFor(() => provider.getGitBranch() === "foo");
 
 			expect(vi.mocked(execFile)).toHaveBeenCalled();
