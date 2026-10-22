@@ -167,7 +167,7 @@ import {
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
-import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
+import { combineUsage, getUsageTotals } from "./usage-totals.ts";
 import {
 	findLatestResponse,
 	getBranchSelection,
@@ -5548,7 +5548,13 @@ export class AgentSession {
 		} else {
 			this.sessionManager.resetLeaf();
 		}
-		const restoredMessageId = this.sessionManager.appendMessage(prefill as Message);
+		const sourceId = this._entryIdsByMessage.get(prefill);
+		const source = sourceId ? this.sessionManager.getEntry(sourceId) : undefined;
+		const restoredMessageId = this.sessionManager.appendMessage(
+			prefill as Message,
+			source?.usageSourceId ?? sourceId,
+		);
+		this._entryIdsByMessage.set(prefill, restoredMessageId);
 		// Re-append trailing entries (e.g. a compaction entry) that were removed
 		// with the prefill so the restored transcript keeps them on the leaf path.
 		// If a trailing compaction's first kept entry was the removed prefill, its
@@ -5973,31 +5979,27 @@ export class AgentSession {
 		let toolResults = 0;
 		let totalMessages = 0;
 		let toolCalls = 0;
-		const usageTotals = createUsageTotals();
+		const entries = this.sessionManager.getEntries();
+		const usageTotals = getUsageTotals(entries);
+		const seen = new Set<string>();
 
-		for (const entry of this.sessionManager.getEntries()) {
-			if (entry.type === "usage") {
-				addUsageToTotals(usageTotals, entry.usage);
-			} else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
-				addUsageToTotals(usageTotals, entry.usage);
-			}
+		for (const entry of entries) {
 			if (entry.type !== "message") continue;
+			const logicalId = entry.usageSourceId ?? entry.id;
+			if (seen.has(logicalId)) continue;
+			seen.add(logicalId);
 			totalMessages++;
 			const message = entry.message;
 			if (message.role === "user") {
 				userMessages++;
 			} else if (message.role === "toolResult") {
 				toolResults++;
-				if (message.usage) {
-					addUsageToTotals(usageTotals, message.usage);
-				}
 			} else if (message.role === "assistant") {
 				assistantMessages++;
 				const assistantMsg = message as AssistantMessage;
 				if (Array.isArray(assistantMsg.content)) {
 					toolCalls += assistantMsg.content.filter((c) => c.type === "toolCall").length;
 				}
-				addUsageToTotals(usageTotals, assistantMsg.usage);
 			}
 		}
 

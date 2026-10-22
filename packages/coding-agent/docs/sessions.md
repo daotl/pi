@@ -75,6 +75,8 @@ Use `--session` when you already know the session path or ID. Use `--fork` to cr
 
 If persisting deferred bash output or context-only extension messages fails, the active prompt or continuation reports the storage error and releases its run ownership. Successfully appended records are not replayed; records not yet written remain pending for the next accepted prompt. This recovery state is in memory and does not survive a process crash before it is written.
 
+Edits, surgical deletions and failed-prefill restoration can create context-only copies of earlier entries. Session stats, footer, cost breakdowns and HTML export count each recorded charge identity once, including abandoned history. Independent equal-valued provider calls, including regenerated swipe responses, remain separate charges; equal amounts alone never identify a replay. Existing histories without replay identities are not retroactively deduplicated.
+
 ## Export or share a session
 
 Use `/export` to write the current session as HTML or JSONL. Use `/share` to upload it and get a viewer link. Pi uses a Radius artifact when Radius authentication is configured; otherwise, it uses a private GitHub gist.

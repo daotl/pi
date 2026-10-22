@@ -57,11 +57,12 @@ export interface UsageCostBreakdownEntry {
 	tokens: number;
 }
 
-/** Group model-attributed usage by model and all other usage into a separate bucket. */
-export function getUsageCostBreakdown(entries: SessionEntry[]): UsageCostBreakdownEntry[] {
-	const totalsByKey = new Map<string, UsageTotals>();
-
+/** Iterate actual charges once, retaining distinct calls even when their usage values are equal. */
+function* billableUsages(entries: SessionEntry[]): Generator<{ key: string; usage: Usage }> {
+	const seen = new Set<string>();
 	for (const entry of entries) {
+		const chargeId = entry.usageSourceId ?? entry.id;
+		if (seen.has(chargeId)) continue;
 		let key: string | undefined;
 		let usage: Usage | undefined;
 		if (entry.type === "message" && entry.message.role === "assistant") {
@@ -78,7 +79,22 @@ export function getUsageCostBreakdown(entries: SessionEntry[]): UsageCostBreakdo
 			usage = entry.usage;
 		}
 		if (!key || !usage) continue;
+		seen.add(chargeId);
+		yield { key, usage };
+	}
+}
 
+/** Sum billed usage across all history, excluding context-only mirrors of the same charge. */
+export function getUsageTotals(entries: SessionEntry[]): UsageTotals {
+	const totals = createUsageTotals();
+	for (const { usage } of billableUsages(entries)) addUsageToTotals(totals, usage);
+	return totals;
+}
+
+/** Group model-attributed usage by model and all other usage into a separate bucket. */
+export function getUsageCostBreakdown(entries: SessionEntry[]): UsageCostBreakdownEntry[] {
+	const totalsByKey = new Map<string, UsageTotals>();
+	for (const { key, usage } of billableUsages(entries)) {
 		let totals = totalsByKey.get(key);
 		if (!totals) {
 			totals = createUsageTotals();

@@ -12,7 +12,7 @@
         bytes[i] = binary.charCodeAt(i);
       }
       const data = JSON.parse(new TextDecoder('utf-8').decode(bytes));
-      const { header, entries, leafId: defaultLeafId, systemPrompt, tools, renderedTools } = data;
+      const { header, entries, leafId: defaultLeafId, systemPrompt, tools, renderedTools, usageTotals } = data;
 
       // ============================================================
       // URL PARAMETER HANDLING
@@ -1347,29 +1347,19 @@
       function computeStats(entryList) {
         let userMessages = 0, assistantMessages = 0, toolResults = 0;
         let customMessages = 0, compactions = 0, branchSummaries = 0, toolCalls = 0;
-        const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-        const cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
         const models = new Set();
+        const seen = new Set();
 
         for (const entry of entryList) {
+          const logicalId = entry.usageSourceId ?? entry.id;
+          if (seen.has(logicalId)) continue;
+          seen.add(logicalId);
           if (entry.type === 'message') {
             const msg = entry.message;
             if (msg.role === 'user') userMessages++;
             if (msg.role === 'assistant') {
               assistantMessages++;
               if (msg.model) models.add(msg.provider ? `${msg.provider}/${msg.model}` : msg.model);
-              if (msg.usage) {
-                tokens.input += msg.usage.input || 0;
-                tokens.output += msg.usage.output || 0;
-                tokens.cacheRead += msg.usage.cacheRead || 0;
-                tokens.cacheWrite += msg.usage.cacheWrite || 0;
-                if (msg.usage.cost) {
-                  cost.input += msg.usage.cost.input || 0;
-                  cost.output += msg.usage.cost.output || 0;
-                  cost.cacheRead += msg.usage.cost.cacheRead || 0;
-                  cost.cacheWrite += msg.usage.cost.cacheWrite || 0;
-                }
-              }
               toolCalls += msg.content.filter(c => c.type === 'toolCall').length;
             }
             if (msg.role === 'toolResult') toolResults++;
@@ -1382,19 +1372,18 @@
           }
         }
 
-        return { userMessages, assistantMessages, toolResults, customMessages, compactions, branchSummaries, toolCalls, tokens, cost, models: Array.from(models) };
+        return { userMessages, assistantMessages, toolResults, customMessages, compactions, branchSummaries, toolCalls, models: Array.from(models) };
       }
 
       const globalStats = computeStats(entries);
 
       function renderHeader() {
-        const totalCost = globalStats.cost.input + globalStats.cost.output + globalStats.cost.cacheRead + globalStats.cost.cacheWrite;
 
         const tokenParts = [];
-        if (globalStats.tokens.input) tokenParts.push(`↑${formatTokens(globalStats.tokens.input)}`);
-        if (globalStats.tokens.output) tokenParts.push(`↓${formatTokens(globalStats.tokens.output)}`);
-        if (globalStats.tokens.cacheRead) tokenParts.push(`R${formatTokens(globalStats.tokens.cacheRead)}`);
-        if (globalStats.tokens.cacheWrite) tokenParts.push(`W${formatTokens(globalStats.tokens.cacheWrite)}`);
+        if (usageTotals.input) tokenParts.push(`↑${formatTokens(usageTotals.input)}`);
+        if (usageTotals.output) tokenParts.push(`↓${formatTokens(usageTotals.output)}`);
+        if (usageTotals.cacheRead) tokenParts.push(`R${formatTokens(usageTotals.cacheRead)}`);
+        if (usageTotals.cacheWrite) tokenParts.push(`W${formatTokens(usageTotals.cacheWrite)}`);
 
         const msgParts = [];
         if (globalStats.userMessages) msgParts.push(`${globalStats.userMessages} user`);
@@ -1422,7 +1411,7 @@
               <div class="info-item"><span class="info-label">Messages:</span><span class="info-value">${msgParts.join(', ') || '0'}</span></div>
               <div class="info-item"><span class="info-label">Tool Calls:</span><span class="info-value">${globalStats.toolCalls}</span></div>
               <div class="info-item"><span class="info-label">Tokens:</span><span class="info-value">${tokenParts.join(' ') || '0'}</span></div>
-              <div class="info-item"><span class="info-label">Cost:</span><span class="info-value">$${totalCost.toFixed(3)}</span></div>
+              <div class="info-item"><span class="info-label">Cost:</span><span class="info-value">$${usageTotals.cost.toFixed(3)}</span></div>
             </div>
           </div>`;
 

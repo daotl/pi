@@ -33,6 +33,7 @@ function createSession(options: {
 	if (usage !== undefined) {
 		entries.push({
 			type: "message",
+			id: "assistant-charge",
 			message: {
 				role: "assistant",
 				usage,
@@ -43,6 +44,7 @@ function createSession(options: {
 	if (options.branchUsage !== undefined) {
 		entries.push({
 			type: "branch_summary",
+			id: "branch-charge",
 			usage: options.branchUsage,
 		});
 	}
@@ -50,6 +52,7 @@ function createSession(options: {
 	if (options.compactionUsage !== undefined) {
 		entries.push({
 			type: "compaction",
+			id: "compaction-charge",
 			usage: options.compactionUsage,
 		});
 	}
@@ -57,6 +60,7 @@ function createSession(options: {
 	if (options.toolUsage !== undefined) {
 		entries.push({
 			type: "message",
+			id: "tool-charge",
 			message: {
 				role: "toolResult",
 				usage: options.toolUsage,
@@ -262,7 +266,9 @@ describe("FooterComponent width handling", () => {
 		const footer = new FooterComponent(session, createFooterData(1));
 		expect(stripAnsi(footer.render(120)[1])).toContain("$0.500");
 
-		session.sessionManager.getEntries().push({ type: "message", message: { role: "assistant", usage } } as never);
+		session.sessionManager
+			.getEntries()
+			.push({ id: "second-assistant-charge", type: "message", message: { role: "assistant", usage } } as never);
 		expect(stripAnsi(footer.render(120)[1])).toContain("$1.000");
 	});
 

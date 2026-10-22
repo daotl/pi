@@ -20,6 +20,7 @@ it("persists the rejected terminal charge while restoring the original prefill i
 		});
 		harness.setResponses([fauxAssistantMessage("original partial", { stopReason: "aborted" })]);
 		await harness.session.prompt("initial request");
+		const before = harness.session.getSessionStats();
 		const usage = {
 			input: 11,
 			output: 7,
@@ -44,6 +45,15 @@ it("persists the rejected terminal charge while restoring the original prefill i
 		await harness.session.continue();
 		expect(harness.session.getLastAssistantText()).toBe("original partial");
 		expect(harness.session.isIdle).toBe(true);
+		const stats = harness.session.getSessionStats();
+		expect(stats.tokens).toEqual({
+			input: before.tokens.input + usage.input,
+			output: before.tokens.output + usage.output,
+			cacheRead: before.tokens.cacheRead + usage.cacheRead,
+			cacheWrite: before.tokens.cacheWrite + usage.cacheWrite,
+			total: before.tokens.total + usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
+		});
+		expect(stats.cost).toBe(before.cost + usage.cost.total);
 		const reopened = SessionManager.open(manager.getSessionFile()!);
 		const receipts = reopened
 			.getEntries()

@@ -56,8 +56,11 @@ interface SessionEntryBase {
   id: string;           // Usually an 8-char hex ID; may fall back to a full UUID
   parentId: string | null;  // Parent entry ID (null for a root entry)
   timestamp: string;    // ISO timestamp
+  usageSourceId?: string; // Original charge ID when this entry replays already billed context
 }
 ```
+
+Token/cost totals and model breakdowns count each `usageSourceId ?? id` once across all history. Context-only tail clones and restored prefixes keep their usage for display without adding another charge; separate actual responses remain separate charges even when their reported usage values are identical. Message statistics use the same logical identity. Existing entries without the optional field retain their own entry ID as identity.
 
 ## Entry Types
 

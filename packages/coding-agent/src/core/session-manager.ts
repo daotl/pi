@@ -68,6 +68,8 @@ export interface SessionEntryBase {
 	id: string;
 	parentId: string | null;
 	timestamp: string;
+	/** Original charge identity retained by context-only replay/clone; usage remains available for display. */
+	usageSourceId?: string;
 	/**
 	 * Set when the entry was soft-deleted (hidden from the chat and from model
 	 * context, but still stored in the session file); cleared on restore. ISO
@@ -1381,14 +1383,16 @@ export class SessionManager {
 	 * Reason: we want these to be top-level entries in the session, not message session entries,
 	 * so it is easier to find them.
 	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
+	 * Pass usageSourceId only when replaying an already billed contribution, not for a new provider response.
 	 */
-	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+	appendMessage(message: Message | CustomMessage | BashExecutionMessage, usageSourceId?: string): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			message,
+			...(usageSourceId !== undefined ? { usageSourceId } : {}),
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1721,6 +1725,7 @@ export class SessionManager {
 						parentId: this.leafId,
 						timestamp,
 						message: source.message,
+						usageSourceId: source.usageSourceId ?? source.id,
 						...(source.deletedAt !== undefined ? { deletedAt: source.deletedAt } : {}),
 					};
 					this._appendEntry(entry);
@@ -1747,6 +1752,8 @@ export class SessionManager {
 						details: e.details,
 						fromHook: e.fromHook,
 						summaryTokens: e.summaryTokens,
+						usage: e.usage,
+						usageSourceId: e.usageSourceId ?? e.id,
 						...(e.deletedAt !== undefined ? { deletedAt: e.deletedAt } : {}),
 					};
 					this._appendEntry(entry);
@@ -1791,7 +1798,27 @@ export class SessionManager {
 						summary: e.summary,
 						details: e.details,
 						fromHook: e.fromHook,
+						usage: e.usage,
+						usageSourceId: e.usageSourceId ?? e.id,
 						...(e.deletedAt !== undefined ? { deletedAt: e.deletedAt } : {}),
+					};
+					this._appendEntry(entry);
+					id = entry.id;
+					break;
+				}
+				case "usage": {
+					const entry: UsageEntry = {
+						type: "usage",
+						id: generateId(this.byId),
+						parentId: this.leafId,
+						timestamp,
+						kind: source.kind,
+						provider: source.provider,
+						model: source.model,
+						usage: source.usage,
+						usageSourceId: source.usageSourceId ?? source.id,
+						...(source.note !== undefined ? { note: source.note } : {}),
+						...(source.deletedAt !== undefined ? { deletedAt: source.deletedAt } : {}),
 					};
 					this._appendEntry(entry);
 					id = entry.id;
@@ -2295,7 +2322,12 @@ export class SessionManager {
 				pendingRemovedIds.length = 0;
 			}
 
-			const newEntry: SessionEntry = { ...entry, id: newId, parentId: this.leafId };
+			const newEntry: SessionEntry = {
+				...entry,
+				id: newId,
+				parentId: this.leafId,
+				usageSourceId: entry.usageSourceId ?? entry.id,
+			};
 			delete newEntry.supersededBy;
 			// The source entry stays on an abandoned branch: mark it superseded
 			// so it is not mistaken for a real alternative (swipe version).
@@ -2451,7 +2483,12 @@ export class SessionManager {
 			const newId = generateId(this.byId);
 			idMap.set(entry.id, newId);
 
-			const newEntry: SessionEntry = { ...entry, id: newId, parentId: this.leafId };
+			const newEntry: SessionEntry = {
+				...entry,
+				id: newId,
+				parentId: this.leafId,
+				usageSourceId: entry.usageSourceId ?? entry.id,
+			};
 			delete newEntry.supersededBy;
 			// The source entry stays on an abandoned branch: mark it superseded
 			// so it is not mistaken for a real alternative (swipe version).
