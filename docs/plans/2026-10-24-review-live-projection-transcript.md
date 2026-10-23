@@ -1,0 +1,30 @@
+# Review: provenance-aware live projection transcript
+
+## Final source and contract
+
+P08 coordinated cutover, candidate #32 `65007d6c75cb16d08fbe47934e923bc53abaea1b`, final patch `audit-patches/...diff:911-914,1263-1399,1586-1758`. Builds on completed inflight-safe rebuild `f8f970927` and unified selected-entry presentation `554fb6827`; keeps their run-ownership/reload and selected-summary contracts. No tokenizer text-count downgrade, new mutation producer protocol, scheduler or deletion semantics.
+
+InteractiveMode previously reconverted raw buildContextEntries rather than canonical replacements/omissions and the captured-prefix omission already implemented by AgentSession._buildLiveProjection. Expose that existing implementation as getSessionProjection, without a second projection algorithm. Initial/rebuild render projected contributions with source IDs for chronological presentation, preserve source custom state/cache-warm rows, and transfer raw assistant-identity cache-miss attribution onto its projected assistant. Existing renderSessionItems callers/4167 direct fixture migrate the explicit cache-miss map and ProjectedSessionEntry signatures without fallback defaults.
+
+transcript_changed immediately rebuilds the live projection and retains capture/run reconciliation ownership through settlement. turn_end rebuilds after assistant/tool-result persistence so verified continuation replacement is visible once. message_end is intentionally not a rebuild point: Session dispatches it before replacement persistence. Native source review exposed a gap in the frozen patch's consumed turn latch: restoration storage failure clears capture after the last turn and refreshes without another notification. The adapted flag is not consumed at turn_end; agent_settled rebuilds and clears it before shutdown/scheduled work. Runs without invalidation are not redrawn. No universal context_edit/recovery omission notification coverage claim; that broader producer link remains separately unresolved.
+
+## Actual consumer proof
+
+New suite owner uses harness/faux provider and initialized real InteractiveMode/SessionRuntime/xterm. Edited assistant and omitted displayed custom contributions render correctly on initial/rebuild; cache miss remains once for the billed raw source despite copied projected content. Submitted /continue success/failure hold a real provider step: reopening the file while held still contains the durable selected prefix; UI hides only that captured contribution and keeps state-only extension renderer, visible custom note and Cache warm. Completion/restoration and rebuild show expected canonical prefix once. Automatic transient prefill retries keep at most one visible assistant across updates and recover once. Empty early faux deltas are allowed, but a substantive update is independently required. Independent text/count assertions require one prefix-bearing row and one expected-prefix occurrence; failed length-origin restoration explicitly retains its truncation notice. The earlier self-rendered expected-output oracle was removed; narrow read-only proof follow-up found no actionable issue.
+
+Valid RED **4 failed / 0 passed, 2.72s**: raw replacement/omission display, two held prefix captures, automatic retry stale prefix. Initial completed-stop fixture did not start a supported continuation and is not product RED. Original exact-one-per-update assertion rejected empty early updates; replaced by at-most-one plus required substantive content, not a production relaxation.
+
+Review-repair RED **1 failed / 4 controls passed, 4.56s**: actual submitted continuation, one-shot restoration write failure armed after error turn, real extension agent_settled observer confirms canonical prefix present but UI absent immediately before internal settlement; without repair it remains absent afterward. The capture-owned settlement rebuild restores it once without manual rebuild, preserves the surfaced storage error, and renders the prefix in xterm.
+
+Final post-oracle-cleanup focused **86 passed / 8 files, 10.33s**: live-projection-transcript, inflight-appearance-rebuild, interactive-mode-compaction, 4167 pending-tool owner, durable-prefill-publication, durable-prefill-failure, session-context-edit and interactive-tui. Final full check **1768 files / No fixes applied, 12.02s**. These results supersede the pre-cleanup 16.54s/12.53s receipts. Existing independent file-backed summary reopen controls remain covered. No paid API/network.
+
+## Bounded review and limitations
+
+Code review: skipped (ce-code-review unavailable). Supplemental native source/proof reviews are not CE/cross-model receipts. Source review identified the failed-restoration stale path; both read-only follow-ups found no additional actionable findings after the actual RED and capture-owned settlement repair. Neither independently executed tests. No physical-terminal proof. New continuation test opens SessionManager for durable content, not a second interactive resumed mode; initial/rebuild controls are actual UI. Broader context_edit/recovery invalidation remains unresolved and is not silently folded into P08. SDK projection exposes existing source/message references, not immutable snapshots or streaming-message objects.
+
+Owned paths: AgentSession, InteractiveMode, new suite owner, existing 4167 fixture, SDK/sessions guides and this review. No changelog on crystal. Normal explicit-path implementation commit precedes fixed-tree aggregate; review-only amendment records exact tested SHA separately. Overall migration remains open.
+
+## Fixed committed-tree aggregate
+
+Normal implementation commit `f1c2f0c66` includes all seven owned paths; hook **1768 files / No fixes applied, 11.70s**. Isolated root `./test.sh` on that fixed source/test/guide tree: **8690 passed / 0 failed / 936 skipped, 96.82s**, `artifact://4865`. No product path changed during aggregate. The following review-only amendment records this receipt; tested SHA remains `f1c2f0c66`, not the amended SHA. Recovery-only protected snapshot: **749 files / 0 mismatches**; original manifest unavailable.
+

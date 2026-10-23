@@ -29,6 +29,8 @@ The [complete minimal example](../examples/sdk/01-minimal.ts) also streams text 
 
 Read current state through `session.messages`, `session.model`, `session.thinkingLevel`, `session.systemPrompt`, and `session.getActiveToolNames()`.
 
+`session.getSessionProjection()` returns finalized live contributions as `entries: { sourceEntry, messages }[]`, their flattened `messages`, and the selected model/thinking state. Reuse this view when a UI needs durable provenance alongside context replacements and omissions. A captured continuation prefix retains its source entry but contributes no live messages until restored or replaced. State-only custom/usage entries may also have empty messages; render their own display metadata separately rather than discarding them. This view does not include the assistant response currently streaming.
+
 `session.systemPrompt` is read-only and returns the current effective system prompt, including changes that have not yet been sent to the model. Tool changes are declared to the model before the next request.
 
 Explicit `setCustomSystemPrompt()` and granular `reloadSystemPromptFromFiles()`/`reloadSkillsFromFiles()`/`reloadAllFromFiles()` updates reject while an agent run, compaction or tree summary owns the session. If saving the updated snapshot fails, the previous effective prompt construction and skill metadata remain active for subsequent requests. Loader caches may already reflect changed files; another explicit update retries publication from those current resources.

@@ -124,9 +124,9 @@ import { DefaultPackageManager } from "../../core/package-manager.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import {
+	type ProjectedSessionEntry,
 	type SessionEntry,
 	SessionManager,
-	sessionEntryToContextMessages,
 	type UsageEntry,
 } from "../../core/session-manager.ts";
 import type { FullscreenExitOutput, TuiMode } from "../../core/settings-manager.ts";
@@ -828,6 +828,7 @@ export class InteractiveMode {
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
 	private readonly entriesRenderedByBoundaryCompaction = new Set<string>();
 	private streamingMessage: AssistantMessage | undefined = undefined;
+	private reconcileTranscriptThroughSettlement = false;
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
@@ -3911,9 +3912,8 @@ export class InteractiveMode {
 				break;
 
 			case "transcript_changed":
-				// The transcript was modified outside normal message events (e.g.,
-				// prefill capture/restore during retry). Re-render from the session
-				// log so the UI reflects deletions and restorations.
+				// Reconcile capture/restore immediately and replacement after message persistence.
+				this.reconcileTranscriptThroughSettlement = true;
 				this.rebuildChatFromMessages();
 				this.refreshEffectiveResources();
 				this.ui.requestRender();
@@ -4081,6 +4081,13 @@ export class InteractiveMode {
 				break;
 			}
 
+			case "turn_end":
+				if (this.reconcileTranscriptThroughSettlement) {
+					this.rebuildChatFromMessages();
+					this.ui.requestRender();
+				}
+				break;
+
 			case "agent_end":
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
@@ -4097,6 +4104,11 @@ export class InteractiveMode {
 				break;
 
 			case "agent_settled":
+				if (this.reconcileTranscriptThroughSettlement) {
+					this.reconcileTranscriptThroughSettlement = false;
+					this.rebuildChatFromMessages();
+					this.ui.requestRender();
+				}
 				await this.checkShutdownRequested();
 				this.fireDueScheduledMessages();
 				break;
@@ -4406,15 +4418,11 @@ export class InteractiveMode {
 
 	private renderSessionItems(
 		items: readonly RenderSessionItem[],
+		cacheMisses: ReadonlyMap<AssistantMessage, CacheMiss>,
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
 		this.pendingTools.clear();
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
-		// Cache misses are not persisted, unlike successful cache-warming usage.
-		// Re-derive them and inject them after the assistant messages that paid for them.
-		const cacheMisses = this.settingsManager.getShowCacheMissNotices()
-			? collectCacheMisses(this.sessionManager.getEntries(), this.session.modelRuntime)
-			: new Map<AssistantMessage, CacheMiss>();
 
 		if (options.updateFooter) {
 			this.footer.invalidate();
@@ -4498,34 +4506,45 @@ export class InteractiveMode {
 	}
 
 	/**
-	 * Render session entries to chat. Used for initial load and rebuild after compaction.
-	 * @param entries Compaction-aware session entries to render
+	 * Render live projected contributions while preserving state-only display entries.
+	 * @param entries Projected messages and their durable source entries
 	 * @param options.updateFooter Update footer state
 	 * @param options.populateHistory Add user messages to editor history
 	 */
 	private renderSessionEntries(
-		entries: SessionEntry[],
+		entries: ProjectedSessionEntry[],
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
 		// Order only selected display entries; the model's context prefix stays unchanged.
 		if (entries.length > 0 && this.settingsManager.getCompactionSummaryPlacement() === "chronological") {
-			const selected = new Map(entries.map((entry) => [entry.id, entry]));
+			const selected = new Map(entries.map((entry) => [entry.sourceEntry.id, entry]));
 			entries = this.sessionManager.getBranch().flatMap((entry) => {
 				const visible = selected.get(entry.id);
 				return visible ? [visible] : [];
 			});
 		}
-		const items = entries.flatMap((entry): RenderSessionItem[] => {
+		const sourceMisses = this.settingsManager.getShowCacheMissNotices()
+			? collectCacheMisses(this.sessionManager.getEntries(), this.session.modelRuntime)
+			: new Map<AssistantMessage, CacheMiss>();
+		const projectedMisses = new Map<AssistantMessage, CacheMiss>();
+		const items = entries.flatMap(({ sourceEntry: entry, messages }): RenderSessionItem[] => {
+			if (entry.type === "message" && entry.message.role === "assistant") {
+				const miss = sourceMisses.get(entry.message);
+				if (miss) {
+					for (const message of messages) {
+						if (message.role === "assistant") projectedMisses.set(message, miss);
+					}
+				}
+			}
 			if (entry.type === "custom" || (entry.type === "usage" && entry.kind === "cache_warm")) {
 				return [entry];
 			}
-			const messages = sessionEntryToContextMessages(entry);
 			if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage && messages.length > 0) {
 				return [...messages, { type: "compaction_cost", kind: entry.type, usage: entry.usage }];
 			}
 			return messages;
 		});
-		this.renderSessionItems(items, options);
+		this.renderSessionItems(items, projectedMisses, options);
 	}
 
 	private addCacheWarmingUsage(entry: UsageEntry): void {
@@ -4628,7 +4647,7 @@ export class InteractiveMode {
 
 	renderInitialMessages(): void {
 		this.refreshEffectiveResources();
-		const entries = this.sessionManager.buildContextEntries();
+		const { entries } = this.session.getSessionProjection();
 		this.renderSessionEntries(entries, {
 			updateFooter: true,
 			populateHistory: true,
@@ -4682,7 +4701,7 @@ export class InteractiveMode {
 	private rebuildChatFromMessages(): void {
 		const liveTools = this.session.isStreaming ? new Map(this.pendingTools) : undefined;
 		this.chatContainer.clear();
-		this.renderSessionEntries(this.sessionManager.buildContextEntries());
+		this.renderSessionEntries(this.session.getSessionProjection().entries);
 		if (this.streamingComponent) this.chatContainer.addChild(this.streamingComponent);
 		for (const [toolCallId, component] of liveTools ?? []) {
 			const rebuilt = this.pendingTools.get(toolCallId);
@@ -6848,10 +6867,8 @@ export class InteractiveMode {
 	/**
 	 * Continue the session by sending the LLM the existing messages.
 	 *
-	 * Prefill continuation (for openai-completions providers) is handled inside
-	 * AgentSession.continue(): the last assistant message is removed from the
-	 * transcript and re-sent with return_prefill, and restored if the
-	 * continuation fails.
+	 * AgentSession keeps the original answer durable while its continuation streams.
+	 * The live projection hides only its captured contribution until replacement or restoration.
 	 */
 	private async handleContinueCommand(): Promise<void> {
 		if (this.session.isCompacting) {

@@ -79,6 +79,10 @@ Trailing system-policy patches do not hide an interrupted assistant from continu
 
 While an interrupted assistant is being continued, its original prefix and suffix remain selected in the session file. A verified completion replaces them in one atomic write. A failed or truncated continuation restores the original prefix together with replayable recovery entries; failed restoration is retried before the next request. Selecting another branch through the tree discards that abandoned branch's pending recovery. Recovery state not yet written remains in memory and does not survive process exit.
 
+Initial transcript loading and rebuilds use projected content: context replacements are shown and omissions are hidden, while state-only extension rows and cache-warming notices remain visible. During interrupted prefill continuation, the live transcript hides the captured original contribution without deleting it from storage. It reconciles the replacement after the completed response is persisted at `turn_end`; restoration updates the transcript immediately. Cache-miss notices remain attributed to the original billed assistant even when its displayed content is replaced.
+
+Capture-triggered transcript reconciliation remains active through run settlement. If restoring the saved prefix fails to persist after the last turn, settlement refreshes the display from the finalized projection before shutdown or scheduled work; the storage error is still shown and pending recovery semantics are unchanged.
+
 Continuing a completed assistant answer without supported prefill or new queued input rejects without deleting or regenerating that answer. Interrupted error/aborted responses on providers without prefill support can retry from their input; their original response stays in raw history and an append-only context omission removes it from the retry request.
 
 See [Compaction Reference](compaction.md) for thresholds, retained boundaries, branch-summary behavior, and extension hooks.

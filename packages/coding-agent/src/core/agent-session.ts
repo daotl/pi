@@ -1882,6 +1882,11 @@ export class AgentSession {
 		return this.agent.state.messages;
 	}
 
+	/** Finalized contributions with durable sources; captured continuation prefixes remain omitted until restored or replaced. */
+	getSessionProjection(): SessionProjection {
+		return this._buildLiveProjection();
+	}
+
 	/** Current steering mode */
 	get steeringMode(): "all" | "one-at-a-time" {
 		return this.agent.steeringMode;
