@@ -398,6 +398,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			model: model.id,
 		});
 	};
+	const standardStreamFunction: Agent["streamFunction"] = async (model, context, options) => {
+		const requestOptions = buildRequestOptions(model, options);
+		// Compaction and summaries use their own routing ids; only session requests
+		// replace the cache entry, so warming restarts from them. Keep warming while
+		// the current transcript still extends the request's prefix. Agent state may
+		// shallow-copy the messages array or refresh the model object without changing
+		// the provider request, so top-level object identity is not a valid cache key.
+		if (options?.sessionId === sessionManager.getSessionId()) {
+			cacheWarmer.start({ model, context, options: requestOptions }, cacheContextIsCurrent(model));
+		}
+		return modelRuntime.streamSimple(model, context, requestOptions);
+	};
 
 	const agent = new Agent({
 		initialState: {
@@ -408,18 +420,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			messages: existingSession.messages,
 		},
 		convertToLlm: convertToLlmWithBlockImages,
-		streamFn: async (model, context, options) => {
-			const requestOptions = buildRequestOptions(model, options);
-			// Compaction and summaries use their own routing ids; only session requests
-			// replace the cache entry, so warming restarts from them. Keep warming while
-			// the current transcript still extends the request's prefix. Agent state may
-			// shallow-copy the messages array or refresh the model object without changing
-			// the provider request, so top-level object identity is not a valid cache key.
-			if (options?.sessionId === sessionManager.getSessionId()) {
-				cacheWarmer.start({ model, context, options: requestOptions }, cacheContextIsCurrent(model));
-			}
-			return modelRuntime.streamSimple(model, context, requestOptions);
-		},
+		streamFn: standardStreamFunction,
 		onPayload: transformProviderPayload,
 		onResponse: handleProviderResponse,
 		onProviderStreamEvent: handleProviderStreamEvent,
@@ -464,6 +465,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		allowedToolNames,
 		excludedToolNames,
 		extensionRunnerRef,
+		extensionPayloadTransform: transformProviderPayload,
+		standardStreamFunction,
 		sessionStartEvent: options.sessionStartEvent,
 		restoreSystemPrompt: options.restoreSystemPrompt,
 	});

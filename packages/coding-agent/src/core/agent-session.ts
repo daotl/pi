@@ -31,6 +31,7 @@ import {
 	isHarnessMessage,
 	type PrepareNextTurnContext,
 	prefillEchoComplete,
+	prefixUserMessages,
 	runToolCall,
 	stripTrailingHarnessMessages,
 	TerminalResponseError,
@@ -41,9 +42,14 @@ import {
 	contentToTokenizeText,
 	countChatTokens,
 	countTokens,
+	countTokensWithRetry,
+	createInitialSystemMessage,
 	getCurrentSystemMessage,
 	getSystemMessageText,
+	type RetryPolicy,
 	retryDelayMs,
+	toToolDeclaration,
+	uuidv7,
 } from "@earendil-works/pi-ai";
 import type {
 	Api,
@@ -64,6 +70,7 @@ import {
 	cleanupSessionResources,
 	getSupportedThinkingLevels,
 	isContextOverflow,
+	isKnownApiProvider,
 	isRecoverableLength,
 	isRetryableAssistantError,
 	modelsAreEqual,
@@ -149,6 +156,7 @@ import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.t
 import { exportSessionToJsonl } from "./session-export.ts";
 import {
 	type BranchSummaryEntry,
+	buildSessionProjection,
 	type CompactionEntry,
 	type ContextEditEntry,
 	getLatestCompactionEntry,
@@ -330,6 +338,10 @@ export interface AgentSessionConfig {
 	baseToolsOverride?: Record<string, AgentTool>;
 	/** Mutable ref used by Agent to access the current ExtensionRunner */
 	extensionRunnerRef?: { current?: ExtensionRunner };
+	/** SDK payload bridge whose identity is known; active provider policies still deny direct counting. */
+	extensionPayloadTransform?: Agent["onPayload"];
+	/** Exact SDK dispatch wrapper; custom transports cannot authorize direct tokenizer uploads. */
+	standardStreamFunction?: Agent["streamFunction"];
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
 	/**
@@ -559,6 +571,8 @@ export class AgentSession {
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
+	private _extensionPayloadTransform?: Agent["onPayload"];
+	private _standardStreamFunction?: Agent["streamFunction"];
 	private _initialActiveToolNames?: string[];
 	private _usesDefaultTools: boolean;
 	private _allowedToolNames?: Set<string>;
@@ -624,6 +638,8 @@ export class AgentSession {
 			this._cacheWarmer.onWarmed = (entry) => this._emit({ type: "entry_appended", entry });
 		}
 		this._extensionRunnerRef = config.extensionRunnerRef;
+		this._extensionPayloadTransform = config.extensionPayloadTransform;
+		this._standardStreamFunction = config.standardStreamFunction;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._usesDefaultTools = config.usesDefaultTools ?? false;
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
@@ -4494,6 +4510,42 @@ export class AgentSession {
 		this._resolveIdleWaitIfIdle();
 	}
 
+	/** Give counting policies the same system baseline as model requests. */
+	private _getTokenizationContext(messages: AgentMessage[]): AgentMessage[] {
+		if (messages[0]?.role === "system") return messages;
+		const baseline = this.agent.state.messages[0];
+		const system =
+			baseline?.role === "system"
+				? baseline
+				: createInitialSystemMessage(this.systemPrompt, this.agent.state.tools.map(toToolDeclaration));
+		return system ? [system, ...messages] : messages;
+	}
+
+	/** History attribution and direct upload permission depend on live dispatch identity, not API labels. */
+	private _requestHistoryPolicy(model: Model<Api>, direct = false): boolean {
+		if (
+			(this.agent.onPayload && this.agent.onPayload !== this._extensionPayloadTransform) ||
+			this._extensionRunner.hasHandlers("before_provider_request") ||
+			this._extensionRunner.hasHandlers("before_provider_headers")
+		)
+			return false;
+		if (this.agent.streamFunction === streamSimple) {
+			return (
+				isKnownApiProvider(model.api, direct) &&
+				(!this._modelRuntime.getProvider(model.provider) ||
+					this._modelRuntime.canAttributeRequestHistory(model, direct))
+			);
+		}
+		return (
+			this.agent.streamFunction === this._standardStreamFunction &&
+			this._modelRuntime.canAttributeRequestHistory(model, direct)
+		);
+	}
+
+	private _canUploadTokenizationText(model: Model<Api>): boolean {
+		return this._requestHistoryPolicy(model, true);
+	}
+
 	private _flushPendingCompactionUsage(notify = true): void {
 		while (this._pendingCompactionUsage.length > 0) {
 			const receipt = this._pendingCompactionUsage[0];
@@ -4539,9 +4591,10 @@ export class AgentSession {
 		};
 		throwIfCancelled();
 		let auth: RequestAuth | undefined;
-		if (this.model) {
+		const countedModel = this.model;
+		if (countedModel && !isVirtualModel(countedModel) && this._canUploadTokenizationText(countedModel)) {
 			try {
-				auth = await this._getSummarizationRequestAuth(this.model, signal);
+				auth = await this._getSummarizationRequestAuth(countedModel, signal);
 			} catch {
 				auth = undefined;
 			}
@@ -4550,13 +4603,57 @@ export class AgentSession {
 		let summaryTokens: number | undefined;
 		if (auth) {
 			try {
-				summaryTokens = await countTokens(auth.model, {
-					text: summary,
-					apiKey: auth.apiKey,
-					headers: auth.headers,
-					env: auth.env,
-					signal,
-				});
+				// Build the prospective request without publishing a checkpoint or changing indexes.
+				const timestamp = new Date().toISOString();
+				const prospective: CompactionEntry = {
+					type: "compaction",
+					id: uuidv7(),
+					parentId: this.sessionManager.getLeafId(),
+					timestamp,
+					summary,
+					firstKeptEntryId,
+					tokensBefore,
+					systemMessage: getCurrentSystemMessage(this.sessionManager.buildSessionProjection().messages),
+				};
+				const projection = buildSessionProjection(
+					[...this.sessionManager.getBranch(), prospective],
+					prospective.id,
+					undefined,
+					{ summaryBlockMaxTokens: this.settingsManager.getSummaryBlockMaxTokens() },
+				);
+				const summaryMessage = projection.entries
+					.find((entry) => entry.sourceEntry === prospective)
+					?.messages.find((message) => message.role === "compactionSummary");
+				const transform = this.agent.transformContext;
+				const converter = this.agent.convertToLlm;
+				const input = structuredClone(this._getTokenizationContext(projection.messages));
+				const transformed = this.agent.transformContext ? await this.agent.transformContext(input, signal) : input;
+				const converted = await this.agent.convertForRequest(transformed);
+				const recheckedInput = structuredClone(this._getTokenizationContext(projection.messages));
+				const rechecked = this.agent.transformContext
+					? await this.agent.transformContext(recheckedInput, signal)
+					: recheckedInput;
+				if (
+					summaryMessage &&
+					transform === this.agent.transformContext &&
+					converter === this.agent.convertToLlm &&
+					isDeepStrictEqual(rechecked, transformed) &&
+					transformed.some((message) => isDeepStrictEqual(message, summaryMessage)) &&
+					isDeepStrictEqual(
+						converted,
+						convertToLlm(prefixUserMessages(transformed, this.agent.incomingMessagePrefix)),
+					) &&
+					this._canUploadTokenizationText(auth.model) &&
+					!signal?.aborted
+				) {
+					summaryTokens = await countTokens(auth.model, {
+						text: summary,
+						apiKey: auth.apiKey,
+						headers: auth.headers,
+						env: auth.env,
+						signal,
+					});
+				}
 			} catch {
 				summaryTokens = undefined;
 			}
@@ -4585,22 +4682,26 @@ export class AgentSession {
 		let contextTokens: number | undefined;
 		if (auth) {
 			try {
-				const llmMessages = await this.agent.convertForRequest(sessionContext.messages);
-				// The chat tokenize endpoint applies the chat template and counts
-				// multimodal content, so send the exact messages a real inference
-				// request would use. If the converted messages do not already carry a
-				// leading system message (the session projection may omit it), prepend
-				// the system prompt so the count matches the chat request.
-				let chatMessages: unknown[];
-				if (llmMessages.some((m) => m.role === "system")) {
-					chatMessages = llmMessages;
-				} else {
-					const systemPrompt = this.agent.state.systemPrompt;
-					chatMessages =
-						systemPrompt.length > 0 ? [{ role: "system", content: systemPrompt }, ...llmMessages] : llmMessages;
-				}
+				const transform = this.agent.transformContext;
+				const converter = this.agent.convertToLlm;
+				const input = structuredClone(this._getTokenizationContext(sessionContext.messages));
+				const transformed = this.agent.transformContext ? await this.agent.transformContext(input, signal) : input;
+				const llmMessages = await this.agent.convertForRequest(transformed);
+				const recheckedInput = structuredClone(this._getTokenizationContext(sessionContext.messages));
+				const rechecked = this.agent.transformContext
+					? await this.agent.transformContext(recheckedInput, signal)
+					: recheckedInput;
+				if (
+					transform !== this.agent.transformContext ||
+					converter !== this.agent.convertToLlm ||
+					!isDeepStrictEqual(rechecked, transformed)
+				)
+					throw new Error("Tokenizer context policy changed");
+				// Respect policy removal of system/tools; never reinsert raw authority after conversion.
+				if (!this._canUploadTokenizationText(auth.model) || signal?.aborted)
+					throw new Error("Tokenizer request policy changed");
 				const count = await countChatTokens(auth.model, {
-					messages: chatMessages,
+					messages: llmMessages,
 					apiKey: auth.apiKey,
 					headers: auth.headers,
 					env: auth.env,
@@ -4625,32 +4726,92 @@ export class AgentSession {
 	 * failures per the configured retry policy, and falling back to the chars/4
 	 * estimate only when the endpoint is unsupported or retries are exhausted.
 	 */
-	private _createCompactionTokenCounter(auth: RequestAuth, signal: AbortSignal): TokenCounter {
+	private _createCompactionTokenCounter(initialAuth: RequestAuth, signal: AbortSignal): TokenCounter {
 		this._syncSummaryBlockMaxTokens();
+		const model = initialAuth.model;
+		const retryPolicy: RetryPolicy = this.settingsManager.getRetrySettings();
+		const contextMessages = structuredClone(
+			this._getTokenizationContext(this.sessionManager.buildSessionProjection().messages),
+		);
+		let unavailable = false;
 		return async (messages) => {
-			const llmMessages = await this.agent.convertForRequest(messages);
-			let text = "";
-			let imageCount = 0;
-			for (const m of llmMessages) {
-				const serialized = contentToTokenizeText(m.content);
-				text += serialized.text;
-				imageCount += serialized.imageCount;
-			}
+			const fragmentMessages = structuredClone(messages);
+			const estimate = estimateMessagesTokens(fragmentMessages);
+			if (
+				signal.aborted ||
+				unavailable ||
+				!this._canUploadTokenizationText(model) ||
+				!fragmentMessages.every((message) => contextMessages.some((source) => isDeepStrictEqual(message, source)))
+			)
+				return estimate;
+			let auth: RequestAuth | undefined;
 			try {
-				const count = await countTokens(auth.model, {
-					text,
-					apiKey: auth.apiKey,
-					headers: auth.headers,
-					env: auth.env,
+				let imageCount = 0;
+				const options = {
+					text: "",
 					signal,
-				});
-				// Images are not text and cannot be counted by /tokenize; add the estimate.
-				if (count !== undefined) return count + Math.ceil((imageCount * ESTIMATED_IMAGE_CHARS) / 4);
-				return messages.reduce((sum, message) => sum + estimateTokens(message), 0);
-			} catch {
-				// A transient /tokenize failure must not break the compaction; fall back
-				// to the chars/4 estimate.
-				return messages.reduce((sum, message) => sum + estimateTokens(message), 0);
+					apiKey: initialAuth.apiKey,
+					headers: initialAuth.headers,
+					env: initialAuth.env,
+				};
+				const count = await countTokensWithRetry(
+					model,
+					options,
+					retryPolicy,
+					() => {
+						unavailable = true;
+					},
+					async () => {
+						if (signal.aborted || unavailable || !this._canUploadTokenizationText(model)) return false;
+						auth = await this._getSummarizationRequestAuth(model, signal);
+						const transform = this.agent.transformContext;
+						const converter = this.agent.convertToLlm;
+						const input = structuredClone(contextMessages);
+						const transformed = this.agent.transformContext
+							? await this.agent.transformContext(input, signal)
+							: input;
+						if (signal.aborted || !isDeepStrictEqual(transformed, contextMessages)) return false;
+						const converted = await this.agent.convertForRequest(transformed);
+						// The converter may yield while a transform's captured policy changes.
+						const recheckedInput = structuredClone(contextMessages);
+						const rechecked = this.agent.transformContext
+							? await this.agent.transformContext(recheckedInput, signal)
+							: recheckedInput;
+						if (!isDeepStrictEqual(rechecked, contextMessages)) return false;
+						if (
+							transform !== this.agent.transformContext ||
+							converter !== this.agent.convertToLlm ||
+							signal.aborted ||
+							unavailable ||
+							!this._canUploadTokenizationText(auth.model) ||
+							!isDeepStrictEqual(
+								converted,
+								convertToLlm(prefixUserMessages(contextMessages, this.agent.incomingMessagePrefix)),
+							)
+						)
+							return false;
+						// Serialize only after the complete request proves this standard per-message mapping.
+						// Read the prefix again: a host can change it while auth or policy conversion awaits.
+						const fragments = convertToLlm(
+							prefixUserMessages(fragmentMessages, this.agent.incomingMessagePrefix),
+						);
+						options.text = "";
+						imageCount = 0;
+						for (const message of fragments) {
+							const serialized = contentToTokenizeText(message.content);
+							options.text += serialized.text;
+							imageCount += serialized.imageCount;
+						}
+						options.apiKey = auth.apiKey;
+						options.headers = auth.headers;
+						options.env = auth.env;
+						return auth.model.baseUrl === model.baseUrl;
+					},
+				);
+				return count === undefined ? estimate : count + Math.ceil((imageCount * ESTIMATED_IMAGE_CHARS) / 4);
+			} catch (error) {
+				if (signal.aborted) throw error;
+				return estimate;
 			}
 		};
 	}

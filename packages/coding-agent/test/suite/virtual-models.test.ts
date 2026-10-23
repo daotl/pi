@@ -129,7 +129,7 @@ describe("AgentSession virtual models", () => {
 	});
 
 	it("routes the compact-and-retry after a truncated response as a retry", async () => {
-		const { harness, requests, reasons } = await createRoutedHarness(defaultRoute, {
+		const { harness, requests } = await createRoutedHarness(defaultRoute, {
 			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
@@ -147,11 +147,13 @@ describe("AgentSession virtual models", () => {
 		await harness.session.prompt("x".repeat(5000));
 
 		expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toEqual(["overflow"]);
-		// Compaction may fold the prompt into the summary, so the retry is not a new user turn.
-		// The split-turn overflow compaction routes the virtual model for both halves.
-		expect(reasons()).toEqual(["user", "direct", "direct", "retry"]);
-		expect(requests[3].failed?.model.id).toBe("large");
-		expect(requests[3].failed?.message.stopReason).toBe("length");
+		// Compaction may fold the prompt into the summary, but recovery remains a retry
+		// of the physical response rather than a new user turn.
+		const retry = requests.findLast((request) => request.reason === "retry");
+		expect(retry?.failed?.model.id).toBe("large");
+		expect(retry?.failed?.message.stopReason).toBe("length");
+		expect(harness.session.getLastAssistantText()).toBe("done");
+		expect(harness.session.model).toMatchObject({ provider: "router", id: "auto" });
 	});
 
 	it("routes requests after extension messages as continuations", async () => {
@@ -320,9 +322,10 @@ describe("AgentSession virtual models", () => {
 
 	it("stores router state on the branch and passes it to later requests", async () => {
 		const states: unknown[] = [];
-		const { harness, reasons } = await createRoutedHarness(
+		const { harness } = await createRoutedHarness(
 			(request, ctx) => {
-				states.push(request.state);
+				if (request.reason !== "direct") states.push(request.state);
+				else expect(request.state).toBeUndefined();
 				const turns = (request.state as { turns: number } | undefined)?.turns ?? 0;
 				const route = defaultRoute(request, ctx);
 				// Returning request.state keeps it without storing it again. Direct requests neither get nor store state.
@@ -354,18 +357,15 @@ describe("AgentSession virtual models", () => {
 
 		await harness.session.compact();
 
-		expect(reasons()).toEqual(["user", "continuation", "user", "direct", "direct", "direct"]);
-		expect(states).toEqual([undefined, { turns: 1 }, { turns: 1 }, undefined, undefined, undefined]);
-		expect(stored()).toHaveLength(2);
+		expect(states).toEqual([undefined, { turns: 1 }, { turns: 1 }]);
+		expect(stored()).toEqual([
+			{ provider: "router", modelId: "auto", state: { turns: 1 } },
+			{ provider: "router", modelId: "auto", state: { turns: 2 } },
+		]);
 	});
 
 	it("does not route compactions that an extension supplies", async () => {
-		const route: Route = (request, ctx) => {
-			// The extension supplies the summary, but token counting still routes the
-			// virtual model to a physical one (same logic as the built-in summary).
-			return defaultRoute(request, ctx);
-		};
-		const { harness, reasons } = await createRoutedHarness(route, {
+		const { harness } = await createRoutedHarness(defaultRoute, {
 			settings: { compaction: { keepRecentTokens: 1 } },
 			extensionFactories: [
 				(pi) => {
@@ -382,15 +382,13 @@ describe("AgentSession virtual models", () => {
 		const result = await harness.session.compact();
 
 		expect(result.summary).toBe("extension summary");
-		// The extension supplies the summary, so no LLM summarization runs; token
-		// counting still routes the virtual model (the split-turn path counts both
-		// halves).
-		expect(reasons()).toEqual(["user", "user", "direct", "direct"]);
+		// No model response is consumed for an extension-supplied checkpoint.
+		expect(harness.faux.state.callCount).toBe(2);
 	});
 
 	it("routes compaction summaries before sizing them", async () => {
 		const summaries: string[] = [];
-		const { harness, reasons } = await createRoutedHarness(defaultRoute, {
+		const { harness } = await createRoutedHarness(defaultRoute, {
 			settings: { compaction: { keepRecentTokens: 1 } },
 		});
 		const summary: FauxResponseStep = (_context, options, _state, model) => {
@@ -405,8 +403,6 @@ describe("AgentSession virtual models", () => {
 		const result = await harness.session.compact();
 
 		expect(result.summary).toContain("summary");
-		// The single summarization call plus the cut-point and post-compaction token counts.
-		expect(reasons()).toEqual(["user", "user", "direct", "direct", "direct"]);
 		// The router's thinking level applies, and the output budget respects the large model's 4000 tokens.
 		expect(summaries).toEqual(["large:low:4000"]);
 	});
