@@ -204,6 +204,8 @@ Extensions can store any JSON-serializable data in `details`. The default compac
 
 See [`prepareCompaction()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) and [`compact()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) for the implementation. For direct programmatic summarization, `generateSummary()` returns the summary text and `generateSummaryWithUsage()` returns `{ text, usage, fileOps }`. File operations come from attributable converted request history; custom transports or final payload/header policies conservatively omit reconstructed tags when attribution cannot be proved.
 
+Direct compaction, branch-summary and bug-report summary headers use `ProviderHeaders` (`string | null` values). A `null` value suppresses a provider default header, including generated `Authorization`. Authentication preserves that marker until the final case-insensitive header merge; compaction also preserves it through optional token counting.
+
 ### SDK migration: checkpoint messages
 
 `generateSummary()` and `generateSummaryWithUsage()` no longer accept the ignored positional `previousSummary` argument. Pass earlier checkpoints as ordered `compactionSummary` messages in `currentMessages` instead. `thinkingLevel` now immediately follows `customInstructions`; remove the obsolete argument from positional calls so later stream, retry and policy options do not shift accidentally. Earlier checkpoints remain context, not a target to fold into the new summary. `CompactionPreparation.previousSummary` remains extension metadata and is not removed.

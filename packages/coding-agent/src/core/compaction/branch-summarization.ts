@@ -6,7 +6,7 @@
  */
 
 import type { Agent, AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
-import type { RetryCallbacks, RetryPolicy } from "@earendil-works/pi-ai";
+import type { ProviderHeaders, RetryCallbacks, RetryPolicy } from "@earendil-works/pi-ai";
 import { contentText, getCurrentSystemMessage, normalizeContext, toToolDeclaration } from "@earendil-works/pi-ai";
 import { clampMaxTokensToInput, isContextClampingApi } from "@earendil-works/pi-ai/api/simple-options";
 import type { Api, Message, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
@@ -76,7 +76,7 @@ export interface GenerateBranchSummaryOptions {
 	/** API key for the model */
 	apiKey?: string;
 	/** Request headers for the model */
-	headers?: Record<string, string>;
+	headers?: ProviderHeaders;
 	/** Provider-scoped environment values for the model */
 	env?: Record<string, string>;
 	/** Abort signal for cancellation */

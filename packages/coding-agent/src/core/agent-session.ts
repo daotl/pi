@@ -277,12 +277,6 @@ export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 // Types
 // ============================================================================
 
-function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<string, string> | undefined {
-	return headers
-		? Object.fromEntries(Object.entries(headers).filter((entry): entry is [string, string] => entry[1] !== null))
-		: undefined;
-}
-
 /**
  * Extract the raw text content of an editable message (user or assistant).
  * Non-text blocks (images, tool calls, reasoning) are ignored. Returns
@@ -452,7 +446,7 @@ export interface CompactOptions {
 interface RequestAuth {
 	model: Model<any>;
 	apiKey?: string;
-	headers?: Record<string, string>;
+	headers?: ProviderHeaders;
 	env?: Record<string, string>;
 }
 
@@ -682,7 +676,7 @@ export class AgentSession {
 	): Promise<{
 		model: Model<any>;
 		apiKey?: string;
-		headers?: Record<string, string>;
+		headers?: ProviderHeaders;
 		env?: Record<string, string>;
 	}> {
 		let result: AuthResult | undefined;
@@ -700,7 +694,7 @@ export class AgentSession {
 			return {
 				model: requestModel,
 				apiKey: result.auth.apiKey,
-				headers: withoutDeletedHeaders(result.auth.headers),
+				headers: result.auth.headers,
 				env: result.env,
 			};
 		}
@@ -722,7 +716,7 @@ export class AgentSession {
 	): Promise<{
 		model: Model<any>;
 		apiKey?: string;
-		headers?: Record<string, string>;
+		headers?: ProviderHeaders;
 		env?: Record<string, string>;
 		thinkingLevel: ThinkingLevel;
 	}> {
@@ -745,7 +739,7 @@ export class AgentSession {
 			return {
 				model: requestModel,
 				apiKey: result.auth.apiKey,
-				headers: withoutDeletedHeaders(result.auth.headers),
+				headers: result.auth.headers,
 				env: result.env,
 				thinkingLevel,
 			};

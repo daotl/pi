@@ -508,3 +508,46 @@ it.each(["preparation", "summary", "final-context"] as const)(
 		}
 	},
 );
+
+it.each(["sdk-compact", "sdk-branch", "sdk-bug-report", "wrapped-sdk-compact"] as const)(
+	"preserves resolved auth header suppression for %s requests",
+	async (operation) => {
+		const fixture = await nativeFixture();
+		const resolveAuth = fixture.session.modelRuntime.getAuth.bind(fixture.session.modelRuntime);
+		vi.spyOn(fixture.session.modelRuntime, "getAuth").mockImplementation(async (model, options) => {
+			const result = await resolveAuth(model, options);
+			if (!result) throw new Error("Missing fixture auth");
+			return { ...result, auth: { ...result.auth, headers: { ...result.auth.headers, authorization: null } } };
+		});
+		if (operation === "wrapped-sdk-compact") {
+			const sdkStream = fixture.session.agent.streamFunction;
+			fixture.session.agent.streamFunction = (...args) => sdkStream(...args);
+		}
+		if (operation === "sdk-branch") {
+			const target = fixture.manager
+				.getBranch()
+				.find((entry) => entry.type === "message" && entry.message.role === "assistant");
+			if (!target) throw new Error("Missing earlier branch target");
+			const result = await fixture.session.navigateTree(target.id, { summarize: true });
+			expect(result.summaryEntry?.summary).toContain("safe checkpoint");
+		} else if (operation === "sdk-bug-report") {
+			await expect(fixture.session.summarizeForBugReport({ signal: new AbortController().signal })).resolves.toBe(
+				"safe checkpoint",
+			);
+		} else {
+			expect((await fixture.session.compact({ keepRecentMessages: 2 })).summary).toContain("safe checkpoint");
+		}
+		expect(fixture.summaries.map((request) => request.authorization)).toEqual([null]);
+		for (const request of fixture.summaries) {
+			expect(request.body.toLowerCase()).not.toContain("authorization");
+			expect(request.body).not.toContain("offline-tokenizer-key");
+		}
+		if (operation === "sdk-compact") {
+			expect(fixture.uploads.find((request) => request.url.endsWith("/tokenize"))?.authorization).toBeNull();
+			expect(
+				fixture.uploads.find((request) => request.url.endsWith("/chat/completions/input_tokens"))?.authorization,
+			).toBeNull();
+			expect(fixture.session.getContextUsage()?.tokens).toBe(100);
+		}
+	},
+);
