@@ -63,6 +63,8 @@ tui.start();
 
 Main-screen streaming can resume inside a logical line taller than the viewport when the preceding physical rows are unchanged. Resume points preserve complete graphemes, SGR styling and OSC 8 links; exact OSC 133 A/B/C markers are skipped rather than replayed. Changes above the visible resume point, pending-wrap ambiguity, images or other effectful escape sequences retain the full-redraw fallback.
 
+Fullscreen rendering wraps built-in content within a synchronous renderer-local scope, including layout measurement, overlays and the final document printed on exit. It does not change regular-mode wrapping preferences; exceptions restore the previous scope.
+
 ```typescript
 import { type TUI, TuiAltScreen, TuiMainScreen } from "@earendil-works/pi-tui";
 

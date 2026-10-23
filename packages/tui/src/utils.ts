@@ -1254,6 +1254,7 @@ export function isPadLinesToWidth(): boolean {
 // padLinesToWidth: wrapping can be enabled without padding. Enabling padLinesToWidth
 // forces wrapping on, since padded lines must fit within the terminal width.
 let wrapLinesToWidth = false;
+let renderWrapLinesToWidth = false;
 
 export function setWrapLinesToWidth(enabled: boolean): void {
 	wrapLinesToWidth = enabled;
@@ -1263,9 +1264,20 @@ export function isWrapLinesToWidth(): boolean {
 	return wrapLinesToWidth;
 }
 
+/** Force wrapping for synchronous rendering without changing the caller's preference. */
+export function withWrappedLines<T>(render: () => T): T {
+	const previous = renderWrapLinesToWidth;
+	renderWrapLinesToWidth = true;
+	try {
+		return render();
+	} finally {
+		renderWrapLinesToWidth = previous;
+	}
+}
+
 /** Whether lines should be wrapped at the terminal width (padLines forces it on). */
 export function shouldWrapLinesToWidth(): boolean {
-	return padLinesToWidth || wrapLinesToWidth;
+	return padLinesToWidth || wrapLinesToWidth || renderWrapLinesToWidth;
 }
 
 /**

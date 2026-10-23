@@ -56,6 +56,7 @@ import {
 	stripTerminalSequences,
 	truncateToWidth,
 	visibleWidth,
+	withWrappedLines,
 } from "./utils.ts";
 import { WheelScrollAccelerator, type WheelScrollLines } from "./wheel-scroll.ts";
 
@@ -325,7 +326,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	}
 
 	override render(width: number): string[] {
-		return this.layoutRoot?.render(width) ?? super.render(width);
+		return withWrappedLines(() => this.layoutRoot?.render(width) ?? super.render(width));
 	}
 
 	protected override getMountedRoots(): readonly Component[] {
@@ -1670,6 +1671,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 	protected override doRender(): void {
 		if (this.stopped || !this.altScreenActive) return;
+		withWrappedLines(() => this.renderScreen());
+	}
+
+	private renderScreen(): void {
 		const width = Math.max(1, this.terminal.columns);
 		const height = Math.max(1, this.terminal.rows);
 		const root = this.layoutRoot ?? this.implicitScrollView;

@@ -7,6 +7,7 @@ import {
 } from "../src/alt-screen-search.ts";
 import { HStack } from "../src/components/h-stack.ts";
 import { Image } from "../src/components/image.ts";
+import { Markdown } from "../src/components/markdown.ts";
 import { MouseRegion } from "../src/components/mouse-region.ts";
 import { ScrollView } from "../src/components/scroll-view.ts";
 import { SelectList } from "../src/components/select-list.ts";
@@ -22,7 +23,16 @@ import {
 } from "../src/terminal-image.ts";
 import type { TuiMouseEvent } from "../src/tui.ts";
 import { TuiAltScreen } from "../src/tui-alt-screen.ts";
-import { stripTerminalSequences, visibleWidth } from "../src/utils.ts";
+import { TuiMainScreen } from "../src/tui-main-screen.ts";
+import {
+	isPadLinesToWidth,
+	isWrapLinesToWidth,
+	setPadLinesToWidth,
+	setWrapLinesToWidth,
+	stripTerminalSequences,
+	visibleWidth,
+} from "../src/utils.ts";
+import { defaultMarkdownTheme } from "./test-themes.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -62,6 +72,108 @@ class RecordingTerminal extends VirtualTerminal {
 }
 
 describe("TuiAltScreen", () => {
+	for (const { name, create } of [
+		{ name: "Text", create: (content: string) => new Text(content, 0, 0) },
+		{ name: "Markdown", create: (content: string) => new Markdown(content, 0, 0, defaultMarkdownTheme) },
+	]) {
+		for (const explicitLayout of [false, true]) {
+			it(`locally wraps ${name} through ${explicitLayout ? "explicit" : "implicit"} fullscreen measurement and final document`, async () => {
+				const previousPad = isPadLinesToWidth();
+				const previousWrap = isWrapLinesToWidth();
+				setPadLinesToWidth(false);
+				setWrapLinesToWidth(false);
+				const content = "0123456789abcdefghijABCDEFGHIJklmnopqrstUVWXYZabcd";
+				const expected = ["0123456789", "abcdefghij", "ABCDEFGHIJ", "klmnopqrst", "UVWXYZabcd"];
+				const component = create(content);
+				const terminal = new VirtualTerminal(10, 2);
+				const tui = new TuiAltScreen(terminal);
+				const regular = new TuiMainScreen(new VirtualTerminal(10, 6));
+				regular.addChild(component);
+				assert.deepStrictEqual(regular.render(10), [content]);
+				if (explicitLayout)
+					tui.setLayoutRoot(new VStack([new ScrollView(component, { follow: "end", primary: true })]));
+				else tui.addChild(component);
+				try {
+					tui.start();
+					await terminal.waitForRender();
+					assert.deepStrictEqual(terminal.getViewport(), expected.slice(3));
+					assert.strictEqual(tui.viewportTop, 3);
+					assert.deepStrictEqual(regular.render(10), [content]);
+					assert.strictEqual(isWrapLinesToWidth(), false);
+					assert.strictEqual(isPadLinesToWidth(), false);
+					tui.scrollToTop();
+					await terminal.waitForRender();
+					assert.deepStrictEqual(terminal.getViewport(), expected.slice(0, 2));
+					tui.scrollBy(2);
+					await terminal.waitForRender();
+					assert.deepStrictEqual(terminal.getViewport(), expected.slice(2, 4));
+					tui.stop();
+					await terminal.flush();
+					assert.deepStrictEqual(
+						terminal.getScrollBuffer().filter((line) => line !== ""),
+						expected,
+					);
+					assert.deepStrictEqual(regular.render(10), [content]);
+				} finally {
+					tui.stop({ preserveScreen: true });
+					setPadLinesToWidth(previousPad);
+					setWrapLinesToWidth(previousWrap);
+				}
+			});
+		}
+		it(`locally wraps fullscreen ${name} overlays without changing transcript preferences`, async () => {
+			const previousPad = isPadLinesToWidth();
+			const previousWrap = isWrapLinesToWidth();
+			setPadLinesToWidth(false);
+			setWrapLinesToWidth(false);
+			const component = create("0123456789abcdefghijABCDEFGHIJ");
+			const terminal = new VirtualTerminal(10, 4);
+			const tui = new TuiAltScreen(terminal);
+			tui.showOverlay(component, { width: 10, row: 0, col: 0 });
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				assert.deepStrictEqual(terminal.getViewport(), ["0123456789", "abcdefghij", "ABCDEFGHIJ", ""]);
+				assert.deepStrictEqual(component.render(10), ["0123456789abcdefghijABCDEFGHIJ"]);
+			} finally {
+				tui.stop({ preserveScreen: true });
+				setPadLinesToWidth(previousPad);
+				setWrapLinesToWidth(previousWrap);
+			}
+		});
+	}
+
+	for (const layoutFrame of [false, true]) {
+		it(`restores transcript policy when fullscreen ${layoutFrame ? "frame" : "document"} throws`, () => {
+			const previousPad = isPadLinesToWidth();
+			const previousWrap = isWrapLinesToWidth();
+			setPadLinesToWidth(false);
+			setWrapLinesToWidth(false);
+			const tui = new TuiAltScreen(new VirtualTerminal(10, 2));
+			const text = new Text("0123456789abcdefghij", 0, 0);
+			const failure = new Error("fullscreen render failure");
+			let rendered: string[] | undefined;
+			tui.setLayoutRoot({
+				render: (width) => {
+					rendered = text.render(width);
+					throw failure;
+				},
+				invalidate: () => {},
+			});
+			try {
+				if (layoutFrame) tui.start();
+				assert.throws(() => (layoutFrame ? tui.renderNow() : tui.render(10)), failure);
+				assert.deepStrictEqual(rendered, ["0123456789", "abcdefghij"]);
+				assert.deepStrictEqual(text.render(10), ["0123456789abcdefghij"]);
+				assert.strictEqual(isWrapLinesToWidth(), false);
+			} finally {
+				tui.stop({ preserveScreen: true });
+				setPadLinesToWidth(previousPad);
+				setWrapLinesToWidth(previousWrap);
+			}
+		});
+	}
+
 	it("renders a terminal-height viewport and preserves manual scroll position", async () => {
 		const terminal = new VirtualTerminal(20, 4);
 		const tui = new TuiAltScreen(terminal);

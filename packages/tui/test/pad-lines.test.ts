@@ -10,6 +10,7 @@ import {
 	setWrapLinesToWidth,
 	shouldWrapLinesToWidth,
 	visibleWidth,
+	withWrappedLines,
 } from "../src/utils.ts";
 import { defaultMarkdownTheme } from "./test-themes.ts";
 
@@ -182,6 +183,30 @@ describe("padLines (default off)", () => {
 
 		const content = lines.filter((line) => line.trim() !== "");
 		assert.ok(content.length > 1, "Text should wrap when wrapLines is enabled");
+	});
+
+	it("preserves outer wrapping after a nested render throws and restores the caller afterward", () => {
+		const text = new Text("0123456789abcdefghij", 0, 0);
+		const wrapped = ["0123456789", "abcdefghij"];
+		const failure = new Error("nested wrapping failure");
+		withWrappedLines(() => {
+			assert.strictEqual(shouldWrapLinesToWidth(), true);
+			assert.deepStrictEqual(text.render(10), wrapped);
+			assert.throws(
+				() =>
+					withWrappedLines(() => {
+						assert.deepStrictEqual(text.render(10), wrapped);
+						throw failure;
+					}),
+				(error) => error === failure,
+			);
+			assert.strictEqual(shouldWrapLinesToWidth(), true);
+			assert.deepStrictEqual(text.render(10), wrapped);
+			assert.strictEqual(isWrapLinesToWidth(), false);
+			assert.strictEqual(isPadLinesToWidth(), false);
+		});
+		assert.deepStrictEqual(text.render(10), ["0123456789abcdefghij"]);
+		assert.strictEqual(shouldWrapLinesToWidth(), false);
 	});
 });
 
