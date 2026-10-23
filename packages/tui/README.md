@@ -61,6 +61,8 @@ tui.start();
 - `TuiMainScreen` renders into the main terminal buffer and preserves terminal scrollback.
 - `TuiAltScreen` renders a fixed-height viewport in the alternate terminal buffer with application-owned scrolling. When stopped, it restores the main buffer and prints the complete final document.
 
+Main-screen streaming can resume inside a logical line taller than the viewport when the preceding physical rows are unchanged. Resume points preserve complete graphemes, SGR styling and OSC 8 links; exact OSC 133 A/B/C markers are skipped rather than replayed. Changes above the visible resume point, pending-wrap ambiguity, images or other effectful escape sequences retain the full-redraw fallback.
+
 ```typescript
 import { type TUI, TuiAltScreen, TuiMainScreen } from "@earendil-works/pi-tui";
 

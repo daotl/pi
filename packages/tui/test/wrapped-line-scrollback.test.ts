@@ -4,6 +4,7 @@ import { Markdown } from "../src/components/markdown.ts";
 import type { Terminal } from "../src/terminal.ts";
 import type { Component } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
+import { isPadLinesToWidth, isWrapLinesToWidth, setPadLinesToWidth, setWrapLinesToWidth } from "../src/utils.ts";
 import { defaultMarkdownTheme } from "./test-themes.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
@@ -15,6 +16,7 @@ import { VirtualTerminal } from "./virtual-terminal.ts";
 class ScrollbackClearSpyTerminal implements Terminal {
 	private readonly inner: VirtualTerminal;
 	clearScrollbackCount = 0;
+	writes: string[] = [];
 
 	constructor(cols: number, rows: number) {
 		this.inner = new VirtualTerminal(cols, rows);
@@ -34,6 +36,7 @@ class ScrollbackClearSpyTerminal implements Terminal {
 		await this.inner.drainInput(maxMs, idleMs);
 	}
 	write(data: string): void {
+		this.writes.push(data);
 		if (data.includes("\x1b[3J")) this.clearScrollbackCount += 1;
 		this.inner.write(data);
 	}
@@ -387,4 +390,147 @@ describe("TUI wrapped-line scrollback integrity (wrapping disabled)", () => {
 		await assertMatchesReference(terminal, [...log, stream], cols, rows, "after embedded-newline partial segment");
 		tui.stop();
 	});
+
+	for (const { label, cols, chunk } of [
+		{ label: "ASCII words", cols: 40, chunk: "stream words continue " },
+		{ label: "Han", cols: 40, chunk: "天地玄黃宇宙洪荒日月盈昃" },
+		{ label: "odd-width Kana", cols: 41, chunk: "あいうえおかきくけこさしすせそ" },
+		{ label: "combining Kana", cols: 41, chunk: "か\u3099き\u3099く\u3099け\u3099こ\u3099" },
+	]) {
+		it(`resumes a tall B/C-framed ${label} paragraph without clearing or replaying history`, async () => {
+			const previousPad = isPadLinesToWidth();
+			const previousWrap = isWrapLinesToWidth();
+			setPadLinesToWidth(false);
+			setWrapLinesToWidth(false);
+			const terminal = new ScrollbackClearSpyTerminal(cols, 8);
+			const tui = new TuiMainScreen(terminal);
+			const history = Array.from({ length: 12 }, (_, i) => `history ${i}`);
+			let paragraph = (label === "ASCII words" ? "prefix " : "") + chunk.repeat(40);
+			const lines = () => [...history, `\x1b]133;B\x07\x1b]133;C\x07${paragraph}`, "> input"];
+			tui.addChild(new TestComponent(lines));
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				terminal.clearScrollbackCount = 0;
+				for (const character of Array.from(chunk)) {
+					paragraph += character;
+					terminal.writes = [];
+					tui.requestRender();
+					await terminal.waitForRender();
+					assert.strictEqual(terminal.clearScrollbackCount, 0, "stream must preserve scrollback");
+					assert.ok(!terminal.writes.join("").includes("history 0"), "unchanged history must not replay");
+					assert.ok(!terminal.writes.join("").includes("\x1b]133;"), "prompt markers must not replay");
+					await assertMatchesReference(terminal.delegate, lines(), cols, 8, label);
+				}
+			} finally {
+				tui.stop();
+				setPadLinesToWidth(previousPad);
+				setWrapLinesToWidth(previousWrap);
+			}
+		});
+	}
+
+	it("resumes exact BEL/ST OSC 133 A/B/C markers but rejects effectful prefixes", async () => {
+		for (const terminator of ["\x07", "\x1b\\"]) {
+			for (const marker of ["A", "B", "C", "D", "A;extra"]) {
+				const terminal = new ScrollbackClearSpyTerminal(20, 6);
+				const tui = new TuiMainScreen(terminal);
+				let paragraph = `\x1b]133;${marker}${terminator}\x1b[3m${"row words\n".repeat(9)}tail words `;
+				const lines = () => ["history", paragraph, "input"];
+				tui.addChild(new TestComponent(lines));
+				try {
+					tui.start();
+					await terminal.waitForRender();
+					terminal.clearScrollbackCount = 0;
+					terminal.writes = [];
+					paragraph += "more";
+					tui.requestRender();
+					await terminal.waitForRender();
+					const safe = marker.length === 1 && marker !== "D";
+					assert.strictEqual(terminal.clearScrollbackCount, safe ? 0 : 1, `marker ${marker}`);
+					if (safe) assert.ok(!terminal.writes.join("").includes("\x1b]133;"));
+					await assertMatchesReference(terminal.delegate, lines(), 20, 6, `marker ${marker}`);
+				} finally {
+					tui.stop();
+				}
+			}
+		}
+		for (const controlEscape of ["\x1b]0;title\x07", "\x1b[1C"]) {
+			const terminal = new ScrollbackClearSpyTerminal(20, 6);
+			const tui = new TuiMainScreen(terminal);
+			let paragraph = `${"row words\n".repeat(9)}tail ${controlEscape}end `;
+			tui.addChild(new TestComponent(() => [paragraph]));
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				terminal.clearScrollbackCount = 0;
+				paragraph += "more";
+				tui.requestRender();
+				await terminal.waitForRender();
+				assert.strictEqual(terminal.clearScrollbackCount, 1, "effectful escape requires redraw");
+			} finally {
+				tui.stop();
+			}
+		}
+	});
+
+	it("keeps styled CJK combining, variation-selector and pending-wrap tails identical to a clean render", async () => {
+		for (const { prefix, oldTail, newTail } of [
+			{ prefix: `\x1b[3m\x1b]8;;https://example.com\x07${"界".repeat(120)}`, oldTail: "\u0301rest", newTail: "Xyz" },
+			{ prefix: "界".repeat(120), oldTail: "foo", newTail: "\r\n次" },
+			{ prefix: "界".repeat(120), oldTail: "foo", newTail: "" },
+			{ prefix: `${"界".repeat(99)}x`, oldTail: "©", newTail: "©\ufe0f" },
+			{ prefix: `${"row words\n".repeat(9)}${"x".repeat(19)} `, oldTail: "foo", newTail: "\r\nbar" },
+			{ prefix: `${"row words\n".repeat(9)}word `, oldTail: "\u0301rest", newTail: "Xyz" },
+		]) {
+			const terminal = new ScrollbackClearSpyTerminal(20, 6);
+			const tui = new TuiMainScreen(terminal);
+			let paragraph = `${prefix}${oldTail}\x1b]8;;\x07\x1b[m`;
+			const lines = () => ["history", paragraph, "input"];
+			tui.addChild(new TestComponent(lines));
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				paragraph = `${prefix}${newTail}\x1b]8;;\x07\x1b[m`;
+				tui.requestRender();
+				await terminal.waitForRender();
+				await assertMatchesReference(terminal.delegate, lines(), 20, 6, `tail ${JSON.stringify(newTail)}`);
+			} finally {
+				tui.stop();
+			}
+		}
+	});
+
+	for (const { label, oldTail, newTail } of [
+		{ label: "ANSI-separated combining mark", oldTail: "\x1b[31m\u0301rest", newTail: "\x1b[31mXyz" },
+		{ label: "carriage-return overwrite", oldTail: "\rABCDE", newTail: "\rX" },
+		{ label: "changed cursor escape", oldTail: "\x1b[2DABCDE", newTail: "\x1b[1DX" },
+	]) {
+		it(`redraws unsafe ${label} tails without preserving stale prefix cells`, async () => {
+			const previousPad = isPadLinesToWidth();
+			const previousWrap = isWrapLinesToWidth();
+			setPadLinesToWidth(false);
+			setWrapLinesToWidth(false);
+			const terminal = new ScrollbackClearSpyTerminal(20, 6);
+			const tui = new TuiMainScreen(terminal);
+			const prefix = `${"row words\n".repeat(9)}word `;
+			let paragraph = prefix + oldTail;
+			const lines = () => [paragraph];
+			tui.addChild(new TestComponent(lines));
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				terminal.clearScrollbackCount = 0;
+				paragraph = prefix + newTail;
+				tui.requestRender();
+				await terminal.waitForRender();
+				await assertMatchesReference(terminal.delegate, lines(), 20, 6, label);
+				assert.strictEqual(terminal.clearScrollbackCount, 1, "unsafe preserved cells require full redraw");
+			} finally {
+				tui.stop();
+				setPadLinesToWidth(previousPad);
+				setWrapLinesToWidth(previousWrap);
+			}
+		});
+	}
 });

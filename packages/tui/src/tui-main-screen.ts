@@ -3,7 +3,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
 import { CURSOR_MARKER, type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
-import { shouldWrapLinesToWidth, terminalLineRows, visibleWidth } from "./utils.ts";
+import {
+	extractAnsiCode,
+	getGraphemeSegmenter,
+	shouldWrapLinesToWidth,
+	terminalLineRows,
+	visibleWidth,
+} from "./utils.ts";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 const MAX_RENDER_WRITE_CHARS = 1024 * 1024;
@@ -108,6 +114,105 @@ function extractKittyImageRows(line: string): number {
 
 function isTermuxSession(): boolean {
 	return Boolean(process.env.TERMUX_VERSION);
+}
+
+const EXTENDS_PREVIOUS_GRAPHEME = /^(?:\p{M}|\u200c|\u200d|\ufe0e|\ufe0f)/u;
+
+interface LineTailRewrite {
+	index: number;
+	row: number;
+	col: number;
+	stylePrefix: string;
+}
+
+/** Resume only after unchanged whitespace or a complete unchanged grapheme at the same physical boundary. */
+function planLineTailRewrite(oldLine: string, newLine: string, width: number): LineTailRewrite | null {
+	for (const line of [oldLine, newLine]) {
+		for (let position = 0; position < line.length; position++) {
+			const code = line.charCodeAt(position);
+			if (code === 0x1b) {
+				const ansi = extractAnsiCode(line, position);
+				if (!ansi) return null;
+				const isStyle = /^\x1b\[[0-9;:]*m$/.test(ansi.code) || ansi.code.startsWith("\x1b]8;");
+				if (!isStyle && !/^\x1b\]133;[ABC](?:\x07|\x1b\\)$/.test(ansi.code)) return null;
+				position += ansi.length - 1;
+			} else if (
+				code < 0x20 &&
+				code !== 0x09 &&
+				code !== 0x0a &&
+				!(code === 0x0d && line.charCodeAt(position + 1) === 0x0a)
+			) {
+				return null;
+			}
+		}
+	}
+	const limit = Math.min(oldLine.length, newLine.length);
+	let common = 0;
+	while (common < limit && oldLine.charCodeAt(common) === newLine.charCodeAt(common)) common++;
+	let physicalIndex = 0;
+	let physicalRow = 0;
+	const oldBoundaries = [0];
+	terminalLineRows(oldLine, width, undefined, (boundary) => oldBoundaries.push(boundary));
+	const oldGraphemes = getGraphemeSegmenter().segment(oldLine);
+	const newGraphemes = getGraphemeSegmenter().segment(newLine);
+	let row = 0;
+	terminalLineRows(newLine, width, undefined, (boundary) => {
+		row++;
+		if (boundary >= common || oldBoundaries[row] !== boundary) return;
+		const oldGrapheme = oldGraphemes.containing(boundary);
+		const newGrapheme = newGraphemes.containing(boundary);
+		if (
+			oldGrapheme?.index === boundary &&
+			newGrapheme?.index === boundary &&
+			boundary + oldGrapheme.segment.length <= common &&
+			boundary + newGrapheme.segment.length <= common
+		) {
+			physicalIndex = boundary;
+			physicalRow = row;
+		}
+	});
+	let index = 0;
+	let stylePrefix = "";
+	let styles = "";
+	let i = 0;
+	while (i < common) {
+		if (i === physicalIndex && i > index) {
+			index = i;
+			stylePrefix = styles;
+		}
+		const ansi = extractAnsiCode(newLine, i);
+		if (ansi) {
+			if (i + ansi.length > common) break;
+			const isStyle = (ansi.code.startsWith("\x1b[") && ansi.code.endsWith("m")) || ansi.code.startsWith("\x1b]8;");
+			const isPromptMarker = /^\x1b\]133;[ABC](?:\x07|\x1b\\)$/.test(ansi.code);
+			if (!isStyle && !isPromptMarker) return null;
+			if (isStyle) styles += ansi.code;
+			i += ansi.length;
+			continue;
+		}
+		const code = newLine.charCodeAt(i);
+		i++;
+		if (code === 0x20 || code === 0x0a) {
+			index = i;
+			stylePrefix = styles;
+		}
+	}
+	if (index === 0) return null;
+	for (const line of [oldLine, newLine]) {
+		let next = index;
+		let ansi = extractAnsiCode(line, next);
+		while (ansi) {
+			next += ansi.length;
+			ansi = extractAnsiCode(line, next);
+		}
+		if (EXTENDS_PREVIOUS_GRAPHEME.test(line.slice(next, next + 2))) return null;
+	}
+	if (index === physicalIndex) return { index, row: physicalRow, col: 0, stylePrefix };
+	const cursor = { index, row: 0, col: 0 };
+	terminalLineRows(`${newLine.slice(0, index)}\x1b[m `, width, cursor);
+	// A space at exact fill leaves a pending wrap whose row depends on the changed tail.
+	if (cursor.col === 0 && cursor.row > 0 && newLine.charCodeAt(index - 1) !== 0x0a) return null;
+	return { index, row: cursor.row, col: cursor.col, stylePrefix };
 }
 
 export interface TuiMainScreenRenderState {
@@ -574,14 +679,20 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			return;
 		}
 
-		// Differential rendering can only touch what was actually visible.
-		// If the first changed line's terminal row is above the previous viewport, we need
-		// a full redraw. (offsets are terminal rows, so compare against prevViewportTop.)
+		// A logical line may start in scrollback while its unchanged prefix reaches the viewport.
 		const firstChangedRow = newLayout.offsets[firstChanged];
+		let tailRewrite: LineTailRewrite | null = null;
 		if (firstChangedRow < prevViewportTop) {
-			logRedraw(`firstChanged < viewportTop (${firstChangedRow} < ${prevViewportTop})`);
-			fullRender(true);
-			return;
+			const oldLine = this.previousLines[firstChanged];
+			const newLine = newLines[firstChanged];
+			if (oldLine !== undefined && !isImageLine(oldLine) && !isImageLine(newLine)) {
+				tailRewrite = planLineTailRewrite(oldLine, newLine, width);
+			}
+			if (tailRewrite === null || firstChangedRow + tailRewrite.row < prevViewportTop) {
+				logRedraw(`firstChanged < viewportTop (${firstChangedRow} < ${prevViewportTop})`);
+				fullRender(true);
+				return;
+			}
 		}
 
 		// Render from first changed line to end
@@ -592,7 +703,10 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const prevViewportBottom = prevViewportTop + height - 1;
 		// Terminal row where the first changed logical line starts (appendStart targets
 		// the last previous row so the \r\n below advances onto the new content).
-		const moveTargetRow = appendStart && !layoutChanged ? prevLayout.totalRows - 1 : newLayout.offsets[firstChanged];
+		const moveTargetRow =
+			appendStart && !layoutChanged
+				? prevLayout.totalRows - 1
+				: newLayout.offsets[firstChanged] + (tailRewrite?.row ?? 0);
 		if (moveTargetRow > prevViewportBottom) {
 			const currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
 			const moveToBottom = height - 1 - currentScreenRow;
@@ -657,13 +771,16 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			// into the scrollback), and emitting extra "\r\n" pairs past the bottom row
 			// would scroll a freshly-cleared blank row into the scrollback instead,
 			// permanently misaligning it by one row.
-			const newLineRows = isImage ? 1 : (newLayout.offsets[i + 1] ?? newLayout.totalRows) - newLayout.offsets[i];
-			const clearRows = Math.max(1, Math.min(newLineRows, viewportTop + height - 1 - newLayout.offsets[i] + 1));
-			output.append("\x1b[2K");
+			const tail = i === firstChanged ? tailRewrite : null;
+			const columnMove = tail && tail.col > 0 ? `\x1b[${tail.col + 1}G` : "";
+			const startRow = newLayout.offsets[i] + (tail?.row ?? 0);
+			const lineEndRow = isImage ? startRow + 1 : (newLayout.offsets[i + 1] ?? newLayout.totalRows);
+			const clearRows = Math.max(1, Math.min(lineEndRow - startRow, viewportTop + height - startRow));
+			output.append(tail ? `${columnMove}\x1b[K` : "\x1b[2K");
 			for (let r = 1; r < clearRows; r++) {
 				output.append("\r\n\x1b[2K");
 			}
-			if (clearRows > 1) output.append(`\x1b[${clearRows - 1}A`);
+			if (clearRows > 1) output.append(`\x1b[${clearRows - 1}A${columnMove}`);
 			// When line wrapping is disabled, message content is written unwrapped so the
 			// terminal itself may reflow long lines - allow lines wider than the terminal.
 			if (!isImage && visibleWidth(line) > width && shouldWrapLinesToWidth()) {
@@ -694,7 +811,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				].join("\n");
 				throw new Error(errorMsg);
 			}
-			output.append(line);
+			output.append(tail ? tail.stylePrefix + line.slice(tail.index) : line);
 		}
 
 		// Track where cursor ended up after rendering. In the stable-layout differential
