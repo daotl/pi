@@ -58,18 +58,22 @@ async function createSchedulingMode(options: HarnessOptions = {}) {
 		fireScheduledMessage(id: number): void;
 		deferOrRunScheduledAction(entry: ScheduledMessage): void;
 		clearScheduledMessages(): void;
+		queueCompactionMessage(text: string, mode: "steer" | "followUp"): void;
+		flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
+		compactionQueuedMessages: Array<{ text: string; mode: "steer" | "followUp" }>;
 		scheduledMessages: ScheduledMessage[];
 		deferredScheduledActions: ScheduledMessage[];
 	};
 	return {
 		harness,
 		mode,
+		runtime,
 		internal,
 		terminal,
 		cleanup: async () => {
 			internal.clearScheduledMessages();
-			await harness.session.abort();
-			await harness.session.waitForIdle();
+			await runtime.session.abort();
+			await runtime.session.waitForIdle();
 			mode.stop();
 			await runtime.dispose();
 			harness.cleanup();
@@ -467,6 +471,385 @@ it("advances after a foreign-run fallback is handled without another run", async
 		foreign.resolve();
 		await initialRun?.catch(() => {});
 		await foreignRun?.catch(() => {});
+		await ui.cleanup();
+	}
+});
+
+it.each(["started", "handled"] as const)("retains compaction queue ownership through %s preflight", async (outcome) => {
+	const entered = Promise.withResolvers<void>();
+	const preflight = Promise.withResolvers<void>();
+	const response = Promise.withResolvers<void>();
+	const ui = await createSchedulingMode({
+		extensionFactories: [
+			(pi) => {
+				pi.on("input", async (event) => {
+					if (event.text === "queued ordinary" && outcome === "handled") {
+						entered.resolve();
+						await preflight.promise;
+						return { action: "handled" };
+					}
+				});
+				pi.on("before_agent_start", async (event) => {
+					if (event.prompt === "queued ordinary" && outcome === "started") {
+						entered.resolve();
+						await preflight.promise;
+					}
+				});
+			},
+		],
+	});
+	const requests: string[] = [];
+	ui.harness.setResponses([
+		async (context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			await response.promise;
+			return fauxAssistantMessage("queued response");
+		},
+		(context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			return fauxAssistantMessage("scheduled response");
+		},
+	]);
+	let delivery: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		ui.internal.queueCompactionMessage("queued ordinary", "followUp");
+		delivery = ui.internal.flushCompactionQueue({ willRetry: false });
+		await entered.promise;
+		await ui.internal.handleScheduleCommand('\n<pi_edit id="-1" role="user">scheduled edit</pi_edit>');
+		ui.internal.fireDueScheduledMessages();
+		await setImmediate();
+		expect(requests).toEqual([]);
+		expect(ui.harness.session.messages.map(getMessageText)).not.toContain("scheduled edit");
+		preflight.resolve();
+		await vi.waitFor(() => expect(requests).toEqual([outcome === "started" ? "queued ordinary" : "scheduled edit"]));
+		response.resolve();
+		await delivery;
+		await vi.waitFor(() =>
+			expect(requests).toEqual(outcome === "started" ? ["queued ordinary", "scheduled edit"] : ["scheduled edit"]),
+		);
+		await ui.harness.session.waitForIdle();
+	} finally {
+		preflight.resolve();
+		response.resolve();
+		await delivery?.catch(() => {});
+		await ui.cleanup();
+	}
+});
+
+it("drains input added during owned preflight before deferred schedules", async () => {
+	const queuedEntered = Promise.withResolvers<void>();
+	const queuedGate = Promise.withResolvers<void>();
+	const response = Promise.withResolvers<void>();
+	const ui = await createSchedulingMode({
+		extensionFactories: [
+			(pi) => {
+				pi.on("before_agent_start", async (event) => {
+					if (event.prompt === "first queued") {
+						queuedEntered.resolve();
+						await queuedGate.promise;
+					}
+				});
+			},
+		],
+	});
+	const requests: string[] = [];
+	let delivery: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		ui.harness.setResponses([fauxAssistantMessage("seed response")]);
+		await ui.harness.session.prompt("seed request");
+		ui.harness.setResponses([
+			async (context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				await response.promise;
+				return fauxAssistantMessage("first response");
+			},
+			(context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				return fauxAssistantMessage("second response");
+			},
+			(context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				return fauxAssistantMessage("scheduled response");
+			},
+		]);
+		ui.internal.queueCompactionMessage("first queued", "followUp");
+		delivery = ui.internal.flushCompactionQueue({ willRetry: false });
+		await queuedEntered.promise;
+		ui.internal.queueCompactionMessage("second queued", "followUp");
+		await ui.internal.handleScheduleCommand('\n<pi_edit id="-1" role="user">after nested queue</pi_edit>');
+		queuedGate.resolve();
+		await vi.waitFor(() => expect(requests).toEqual(["first queued"]));
+		response.resolve();
+		await delivery;
+		await vi.waitFor(() => expect(requests).toEqual(["first queued", "second queued", "after nested queue"]));
+		await ui.harness.session.waitForIdle();
+	} finally {
+		queuedGate.resolve();
+		response.resolve();
+		await delivery?.catch(() => {});
+		await ui.cleanup();
+	}
+});
+
+it("retains a rejected queue batch ahead of newer input without dispatching its rest", async () => {
+	const entered = Promise.withResolvers<void>();
+	const gate = Promise.withResolvers<void>();
+	const inputs: string[] = [];
+	const ui = await createSchedulingMode({
+		withConfiguredAuth: false,
+		extensionFactories: [
+			(pi) => {
+				pi.on("input", async (event) => {
+					inputs.push(event.text);
+					if (event.text === "rejected first") {
+						entered.resolve();
+						await gate.promise;
+					}
+				});
+			},
+		],
+	});
+	let delivery: Promise<void> | undefined;
+	const errors = vi.spyOn(ui.mode as unknown as { showError(text: string): void }, "showError");
+	const auth = vi.spyOn(ui.harness.session.modelRuntime, "checkAuth");
+	try {
+		await ui.mode.init();
+		ui.internal.queueCompactionMessage("rejected first", "followUp");
+		ui.internal.queueCompactionMessage("original rest", "followUp");
+		delivery = ui.internal.flushCompactionQueue();
+		await entered.promise;
+		ui.internal.queueCompactionMessage("newer input", "followUp");
+		await ui.internal.handleScheduleCommand('\n<pi_edit id="-1" role="user">must remain scheduled</pi_edit>');
+		auth.mockRejectedValueOnce(new Error("injected queued authentication failure"));
+		gate.resolve();
+		await delivery;
+		await setImmediate();
+		expect(inputs).toEqual(["rejected first"]);
+		expect(ui.internal.compactionQueuedMessages.map((entry) => entry.text)).toEqual([
+			"rejected first",
+			"original rest",
+			"newer input",
+		]);
+		expect(errors.mock.calls.map(([text]) => text)).toEqual([
+			expect.stringContaining("Failed to send queued messages: injected queued authentication failure"),
+		]);
+		ui.internal.fireDueScheduledMessages();
+		await setImmediate();
+		expect(ui.harness.session.messages.map(getMessageText)).not.toContain("must remain scheduled");
+		expect(ui.harness.session.isIdle).toBe(true);
+		auth.mockResolvedValue({ type: "api_key" });
+		const requests: string[] = [];
+		ui.harness.setResponses(
+			Array.from({ length: 4 }, () => (context) => {
+				const text = context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!;
+				requests.push(text);
+				return fauxAssistantMessage(`completed ${text}`);
+			}),
+		);
+		await ui.internal.flushCompactionQueue();
+		await vi.waitFor(() =>
+			expect(requests).toEqual(["rejected first", "original rest", "newer input", "must remain scheduled"]),
+		);
+		await ui.harness.session.waitForIdle();
+		expect(ui.internal.compactionQueuedMessages).toEqual([]);
+	} finally {
+		gate.resolve();
+		await delivery?.catch(() => {});
+		auth.mockRestore();
+		errors.mockRestore();
+		await ui.cleanup();
+	}
+});
+
+it("preserves queued steering while a real agent run is active", async () => {
+	const ui = await createSchedulingMode();
+	const response = Promise.withResolvers<void>();
+	const requests: string[] = [];
+	ui.harness.setResponses([
+		async () => {
+			requests.push("start");
+			await response.promise;
+			return fauxAssistantMessage("initial");
+		},
+		(context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			return fauxAssistantMessage("redirected");
+		},
+	]);
+	let running: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		running = ui.harness.session.prompt("start");
+		await vi.waitFor(() => expect(requests).toEqual(["start"]));
+		ui.internal.queueCompactionMessage("change direction", "steer");
+		await ui.internal.flushCompactionQueue({ willRetry: false });
+		expect(ui.harness.session.getSteeringMessages()).toEqual(["change direction"]);
+		expect(ui.harness.session.getFollowUpMessages()).toEqual([]);
+		response.resolve();
+		await running;
+		expect(requests).toEqual(["start", "change direction"]);
+		expect(ui.harness.session.getLastAssistantText()).toBe("redirected");
+	} finally {
+		response.resolve();
+		await running?.catch(() => {});
+		await ui.cleanup();
+	}
+});
+
+it("keeps a child queue delivery owned after its scheduled extension command returns handled", async () => {
+	const entered = Promise.withResolvers<void>();
+	const preflight = Promise.withResolvers<void>();
+	const response = Promise.withResolvers<void>();
+	const initial = Promise.withResolvers<void>();
+	let startChild: () => void = () => {
+		throw new Error("Child dispatcher not installed");
+	};
+	const ui = await createSchedulingMode({
+		extensionFactories: [
+			(pi) => {
+				pi.registerCommand("flush-child", {
+					handler: async () => {
+						startChild();
+					},
+				});
+				pi.on("before_agent_start", async (event) => {
+					if (event.prompt === "child queued input") {
+						entered.resolve();
+						await preflight.promise;
+					}
+				});
+			},
+		],
+	});
+	let child: Promise<void> | undefined;
+	startChild = () => {
+		ui.internal.queueCompactionMessage("child queued input", "followUp");
+		child = ui.internal.flushCompactionQueue();
+	};
+	const requests: string[] = [];
+	ui.harness.setResponses([
+		async () => {
+			requests.push("seed parent run");
+			await initial.promise;
+			return fauxAssistantMessage("seed parent response");
+		},
+		async (context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			await response.promise;
+			return fauxAssistantMessage("child response");
+		},
+		(context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			return fauxAssistantMessage("next response");
+		},
+	]);
+	let initialRun: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		initialRun = ui.harness.session.prompt("seed parent run");
+		await vi.waitFor(() => expect(requests).toEqual(["seed parent run"]));
+		await ui.internal.handleScheduleCommand("\n/flush-child");
+		await ui.internal.handleScheduleCommand('\n<pi_edit id="-1" role="user">after child queue</pi_edit>');
+		initial.resolve();
+		await initialRun;
+		await entered.promise;
+		await setImmediate();
+		ui.internal.fireDueScheduledMessages();
+		await setImmediate();
+		expect(requests).toEqual(["seed parent run"]);
+		expect(ui.harness.session.messages.map(getMessageText)).not.toContain("after child queue");
+		preflight.resolve();
+		await vi.waitFor(() => expect(requests).toEqual(["seed parent run", "child queued input"]));
+		response.resolve();
+		await child;
+		await vi.waitFor(() => expect(requests).toEqual(["seed parent run", "child queued input", "after child queue"]));
+		await ui.harness.session.waitForIdle();
+	} finally {
+		initial.resolve();
+		preflight.resolve();
+		response.resolve();
+		await child?.catch(() => {});
+		await initialRun?.catch(() => {});
+		await ui.cleanup();
+	}
+});
+
+it("stops an outgoing queue batch after its command replaces the runtime", async () => {
+	const ui = await createSchedulingMode({
+		extensionFactories: [
+			(pi) => {
+				pi.registerCommand("replace-runtime", {
+					handler: async (_args, context) => {
+						await context.newSession();
+					},
+				});
+			},
+		],
+	});
+	const outgoingInputs: string[] = [];
+	ui.harness.setResponses([
+		(context) => {
+			outgoingInputs.push(...context.messages.filter((message) => message.role === "user").map(getMessageText));
+			return fauxAssistantMessage("unexpected outgoing response");
+		},
+	]);
+	try {
+		await ui.mode.init();
+		const outgoing = ui.harness.session;
+		ui.internal.queueCompactionMessage("/replace-runtime", "followUp");
+		ui.internal.queueCompactionMessage("stale outgoing input", "followUp");
+		await ui.internal.flushCompactionQueue();
+		expect(ui.runtime.session).not.toBe(outgoing);
+		expect(outgoingInputs).toEqual([]);
+		expect(outgoing.messages.map(getMessageText)).not.toContain("stale outgoing input");
+		expect(ui.runtime.session.messages.map(getMessageText)).not.toContain("stale outgoing input");
+		expect(ui.internal.compactionQueuedMessages).toEqual([]);
+	} finally {
 		await ui.cleanup();
 	}
 });

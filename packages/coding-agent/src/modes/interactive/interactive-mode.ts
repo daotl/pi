@@ -872,6 +872,7 @@ export class InteractiveMode {
 
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
+	private compactionQueueDeliveryPending?: object;
 	// A /continue issued while compaction is running, deferred until the session
 	// is idle (compaction complete and any queued compaction messages drained).
 	private pendingCompactionContinue = false;
@@ -2538,6 +2539,7 @@ export class InteractiveMode {
 		this.chatContainer.clear();
 		this.pendingMessagesContainer.clear();
 		this.compactionQueuedMessages = [];
+		this.compactionQueueDeliveryPending = undefined;
 		this.clearScheduledMessages();
 		this.clearHeartbeats();
 		this.streamingComponent = undefined;
@@ -5232,17 +5234,23 @@ export class InteractiveMode {
 	}
 
 	private async flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
-		if (this.compactionQueuedMessages.length === 0) {
+		if (this.compactionQueueDeliveryPending || this.compactionQueuedMessages.length === 0) {
 			return;
 		}
 
+		const delivery = {};
+		this.compactionQueueDeliveryPending = delivery;
+		const session = this.session;
 		const queuedMessages = [...this.compactionQueuedMessages];
 		this.compactionQueuedMessages = [];
 		this.updatePendingMessagesDisplay();
+		let queueRestored = false;
 
 		const restoreQueue = (error: unknown) => {
+			if (queueRestored || this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
+			queueRestored = true;
 			this.session.clearQueue();
-			this.compactionQueuedMessages = queuedMessages;
+			this.compactionQueuedMessages = [...queuedMessages, ...this.compactionQueuedMessages];
 			this.updatePendingMessagesDisplay();
 			this.showError(
 				`Failed to send queued message${queuedMessages.length > 1 ? "s" : ""}: ${
@@ -5255,6 +5263,7 @@ export class InteractiveMode {
 			if (options?.willRetry) {
 				// When retry is pending, queue messages for the retry turn
 				for (const message of queuedMessages) {
+					if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 					if (this.isExtensionCommand(message.text)) {
 						await this.session.prompt(message.text);
 					} else if (message.mode === "followUp") {
@@ -5262,6 +5271,7 @@ export class InteractiveMode {
 					} else {
 						await this.session.steer(message.text);
 					}
+					if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 				}
 				this.updatePendingMessagesDisplay();
 				return;
@@ -5273,6 +5283,7 @@ export class InteractiveMode {
 				// All extension commands - execute them all
 				for (const message of queuedMessages) {
 					await this.session.prompt(message.text);
+					if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 				}
 				return;
 			}
@@ -5284,17 +5295,30 @@ export class InteractiveMode {
 
 			for (const message of preCommands) {
 				await this.session.prompt(message.text);
+				if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 			}
 
 			// Start a prompt when idle, or queue it into a run still finishing compaction.
-			const promptPromise = this.session
-				.prompt(firstPrompt.text, { streamingBehavior: firstPrompt.mode })
-				.catch((error) => {
-					restoreQueue(error);
-				});
+			const dispatched = Promise.withResolvers<void>();
+			let dispatchFailure: { error: unknown } | undefined;
+			const promptPromise = session.prompt(firstPrompt.text, {
+				streamingBehavior: firstPrompt.mode,
+				preflightResult: () => dispatched.resolve(),
+			});
+			void promptPromise.then(
+				() => dispatched.resolve(),
+				(error: unknown) => {
+					dispatchFailure = { error };
+					dispatched.resolve();
+				},
+			);
+			await dispatched.promise;
+			if (dispatchFailure) throw dispatchFailure.error;
+			if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 
 			// Queue remaining messages
 			for (const message of rest) {
+				if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 				if (this.isExtensionCommand(message.text)) {
 					await this.session.prompt(message.text);
 				} else if (message.mode === "followUp") {
@@ -5302,11 +5326,21 @@ export class InteractiveMode {
 				} else {
 					await this.session.steer(message.text);
 				}
+				if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 			}
 			this.updatePendingMessagesDisplay();
-			void promptPromise;
+			await promptPromise;
 		} catch (error) {
 			restoreQueue(error);
+		} finally {
+			if (this.compactionQueueDeliveryPending === delivery && this.session === session) {
+				this.compactionQueueDeliveryPending = undefined;
+				if (!queueRestored && !session.isCompacting && this.compactionQueuedMessages.length > 0) {
+					void this.flushCompactionQueue({ willRetry: options?.willRetry });
+				} else if (session.isIdle) {
+					this.fireDueScheduledMessages();
+				}
+			}
 		}
 	}
 
@@ -6157,7 +6191,12 @@ export class InteractiveMode {
 
 	/** Run a scheduled continue/edit+continue once the session is idle. */
 	private deferOrRunScheduledAction(entry: ScheduledMessage): void {
-		if (this.session.isStreaming || this.session.isCompacting) {
+		if (
+			this.session.isStreaming ||
+			this.session.isCompacting ||
+			this.settledDeliveryPending ||
+			this.compactionQueueDeliveryPending
+		) {
 			this.deferredScheduledActions.push(entry);
 			return;
 		}
@@ -6237,7 +6276,13 @@ export class InteractiveMode {
 
 	/** Drain eligible settled work in creation order while one dispatch owns preflight. */
 	private fireDueScheduledMessages(): void {
-		if (!this.session.isIdle || this.settledDeliveryPending) return;
+		if (
+			!this.session.isIdle ||
+			this.settledDeliveryPending ||
+			this.compactionQueueDeliveryPending ||
+			this.compactionQueuedMessages.length > 0
+		)
+			return;
 		let deferredIndex = -1;
 		for (let i = 0; i < this.deferredScheduledActions.length; i++) {
 			if (
@@ -9132,6 +9177,7 @@ export class InteractiveMode {
 			this.ui.terminal.setProgress(false);
 		}
 		this.clearScheduledMessages();
+		this.compactionQueueDeliveryPending = undefined;
 		this.clearHeartbeats();
 		this.clearStatusIndicator();
 		this.themeController.disableAutoSync();

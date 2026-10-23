@@ -87,6 +87,8 @@ Continuing a completed assistant answer without supported prefill or new queued 
 
 Settled-trigger schedules and deferred edit/continue actions drain only while the session is idle. Eligible numbered entries use their original creation IDs, including timed actions that became due in reverse order. One settled delivery excludes later settled work during asynchronous prompt preflight. Accepted run/queue dispatch waits for a subsequent settlement; handled inputs/commands and rejected or no-op edits advance without requiring an unrelated run. This does not change ordinary timed-message follow-up behavior during an active run.
 
+Compaction-queued delivery keeps an independent owner while its first prompt passes preflight and runs. Later queued input drains before settled schedules, including when the parent extension command has already returned. The rest of a batch is queued only after the first prompt is accepted or handled. If that first prompt is rejected, the original batch remains ahead of newer queued input for explicit retry, and settled schedules do not bypass it; existing steering/follow-up modes are preserved.
+
 See [Compaction Reference](compaction.md) for thresholds, retained boundaries, branch-summary behavior, and extension hooks.
 
 ## Control session storage
