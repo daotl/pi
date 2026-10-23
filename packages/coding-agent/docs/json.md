@@ -156,6 +156,8 @@ The `entry` value uses a persisted [session entry type](session-format.md#entry-
 
 If compaction was aborted, `result` is absent and `aborted` is true. If it failed, `result` is absent, `aborted` is false, and `errorMessage` describes the failure. Successful overflow recovery sets `willRetry` to true before Pi retries the prompt.
 
+If automatic preparation finds nothing to summarize after `compaction_start`, Pi still emits `compaction_end` with no `result` or `errorMessage`, `aborted: false`, and `willRetry: false`. This closes the lifecycle without a failure notice or checkpoint. An already-compacted tail detected before starting emits neither event.
+
 See [Compaction and Branch Summaries](compaction.md) for result semantics.
 
 ## Retry events

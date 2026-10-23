@@ -420,6 +420,56 @@ describe("AgentSession compaction characterization", () => {
 		expect(getStreamCallCount()).toBe(1);
 	});
 
+	it.each(["threshold", "overflow"] as const)(
+		"closes a started %s compaction when preparation has no summary input",
+		async (reason) => {
+			const failures: string[] = [];
+			const harness = await createHarness({
+				settings: { compaction: { keepRecentTokens: 100_000 } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_compact_failed", (event) => {
+							failures.push(event.reason);
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.sessionManager.appendMessage({ role: "user", content: "small retained question", timestamp: 1 });
+			harness.sessionManager.appendMessage(fauxAssistantMessage("small retained answer"));
+			harness.session.refreshContext();
+			const before = structuredClone(harness.sessionManager.getEntries());
+			const internals = harness.session as unknown as SessionWithCompactionInternals;
+			expect(await internals._runAutoCompaction(reason, true)).toBe(false);
+			expect(
+				harness.events.filter((event) => event.type === "compaction_start" || event.type === "compaction_end"),
+			).toEqual([
+				{ type: "compaction_start", reason },
+				{ type: "compaction_end", reason, result: undefined, aborted: false, willRetry: false },
+			]);
+			expect(harness.sessionManager.getEntries()).toEqual(before);
+			expect(harness.faux.state.callCount).toBe(0);
+			expect(harness.session.isCompacting).toBe(false);
+			expect(harness.session.isIdle).toBe(true);
+			expect(failures).toEqual([]);
+		},
+	);
+
+	it("keeps an already-compacted tail eventless", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.sessionManager.appendMessage({ role: "user", content: "compacted", timestamp: 1 });
+		harness.sessionManager.appendCompaction("checkpoint", null, 10);
+		harness.session.refreshContext();
+		const internals = harness.session as unknown as SessionWithCompactionInternals;
+		expect(await internals._runAutoCompaction("threshold", false)).toBe(false);
+		expect(
+			harness.events.filter((event) => event.type === "compaction_start" || event.type === "compaction_end"),
+		).toEqual([]);
+		expect(harness.faux.state.callCount).toBe(0);
+		expect(harness.session.isIdle).toBe(true);
+	});
+
 	it("notifies extensions when auto-compaction fails", async () => {
 		const failedEvents: Array<{
 			reason: "manual" | "threshold" | "overflow";

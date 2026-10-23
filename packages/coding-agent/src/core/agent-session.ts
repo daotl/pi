@@ -5340,8 +5340,8 @@ export class AgentSession {
 			);
 			abortController.signal.throwIfAborted();
 			if (!preparation) {
-				// Session needs migration: the tail could not be mapped to kept entries.
-				this._autoCompactionAbortController = undefined;
+				// Nothing to summarize; close the started compaction without a result or failure notice.
+				this._emit({ type: "compaction_end", reason, result: undefined, aborted: false, willRetry: false });
 				return false;
 			}
 

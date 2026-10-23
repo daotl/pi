@@ -7,6 +7,54 @@ import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 
 describe("InteractiveMode compaction events", () => {
+	test("restores Escape and clears progress and status after a no-result automatic compaction", async () => {
+		initTheme("dark");
+		const defaultEscape = vi.fn();
+		const progress: boolean[] = [];
+		const indicators = new Set<string>();
+		const context = {
+			isInitialized: true,
+			footer: { invalidate: vi.fn() },
+			autoCompactionEscapeHandler: undefined as (() => void) | undefined,
+			retryEscapeHandler: undefined as (() => void) | undefined,
+			defaultEditor: { onEscape: defaultEscape as () => void },
+			settingsManager: { getShowTerminalProgress: () => true },
+			session: { abortCompaction: vi.fn() },
+			ui: {
+				requestRender: vi.fn(),
+				terminal: {
+					setProgress: (active: boolean) => {
+						progress.push(active);
+					},
+				},
+			},
+			showStatusIndicator: () => {
+				indicators.add("compaction");
+			},
+			clearStatusIndicator: (kind: string) => {
+				indicators.delete(kind);
+			},
+			flushCompactionQueue: vi.fn().mockResolvedValue(undefined),
+			fireDueScheduledMessages: vi.fn(),
+			showStatus: vi.fn(),
+			showError: vi.fn(),
+		};
+		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent");
+		await Reflect.apply(handleEvent, context, [{ type: "compaction_start", reason: "threshold" }]);
+		expect(context.defaultEditor.onEscape).not.toBe(defaultEscape);
+		expect(progress).toEqual([true]);
+		expect([...indicators]).toEqual(["compaction"]);
+		await Reflect.apply(handleEvent, context, [
+			{ type: "compaction_end", reason: "threshold", result: undefined, aborted: false, willRetry: false },
+		]);
+		expect(context.defaultEditor.onEscape).toBe(defaultEscape);
+		expect(context.autoCompactionEscapeHandler).toBeUndefined();
+		expect(progress).toEqual([true, false]);
+		expect([...indicators]).toEqual([]);
+		expect(context.showStatus).not.toHaveBeenCalled();
+		expect(context.showError).not.toHaveBeenCalled();
+	});
+
 	test("uses the cache miss notice setting for compaction and branch summary costs", () => {
 		const usage: Usage = {
 			input: 10,
