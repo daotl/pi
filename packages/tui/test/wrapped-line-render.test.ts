@@ -2,6 +2,7 @@ import assert from "node:assert";
 import { describe, it } from "node:test";
 import { type Component, CURSOR_MARKER } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
+import { stripTerminalSequences, terminalLinePhysicalRows, terminalLineRows, visibleWidth } from "../src/utils.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class TestComponent implements Component {
@@ -13,6 +14,12 @@ class TestComponent implements Component {
 }
 
 describe("TUI wrapped-line differential rendering (wrapping disabled)", () => {
+	it("preserves text width while materializing forward cursor gaps for overlay restoration", () => {
+		const source = "a\x1b[2Cb";
+		assert.strictEqual(visibleWidth(source), 2);
+		assert.strictEqual(terminalLineRows(source, 10), 1);
+		assert.deepStrictEqual(terminalLinePhysicalRows(source, 10).map(stripTerminalSequences), ["a  b"]);
+	});
 	it("wraps independently rendered Indic constituents without pushing the footer cursor down", async () => {
 		const terminal = new VirtualTerminal(79, 6);
 		const tui = new TuiMainScreen(terminal, true);

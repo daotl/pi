@@ -576,6 +576,48 @@ export function terminalLineRows(
 	return position.rows;
 }
 
+/** Slice native-reflow rows without changing word boundaries or replaying semantic escapes. */
+export function terminalLinePhysicalRows(str: string, columns: number, startRow = 0, endRow = Infinity): string[] {
+	const normalized = normalizeTerminalOutput(str);
+	const boundaries = [0];
+	terminalLineRows(normalized, columns, undefined, (index) => boundaries.push(index));
+	boundaries.push(normalized.length);
+	const tracker = new AnsiCodeTracker();
+	const rows: string[] = [];
+	for (let row = 0; row < boundaries.length - 1; row++) {
+		const text = normalized.slice(boundaries[row], boundaries[row + 1]).replace(/\r?\n$/, "");
+		if (row >= startRow && row < endRow) {
+			const prefix = tracker.getActiveCodes();
+			// Only styles and cursor markers are safe to repaint; prompt zones and other
+			// semantic controls were already emitted by the transcript renderer.
+			let visible = "";
+			let i = 0;
+			while (i < text.length) {
+				const ansi = extractAnsiCode(text, i);
+				if (ansi) {
+					if ((ansi.code.startsWith("\x1b[") && ansi.code.endsWith("m")) || ansi.code.startsWith("\x1b]8;")) {
+						visible += ansi.code;
+					} else {
+						const forward = /^\x1b\[(\d*)C$/.exec(ansi.code);
+						if (forward) {
+							const column = Math.min(columns - 1, visibleWidth(visible));
+							const distance = Math.max(1, Number(forward[1] || 1));
+							visible += " ".repeat(Math.min(distance, Math.max(0, columns - 1 - column)));
+						}
+					}
+					i += ansi.length;
+				} else {
+					visible += text[i++];
+				}
+			}
+			rows.push(prefix + visible);
+		}
+		updateTrackerFromText(text, tracker);
+		if (row + 1 >= endRow) break;
+	}
+	return rows;
+}
+
 /** Length of the ANSI/OSC/APC escape sequence starting at `pos`, or 0 if there is none. */
 function ansiCodeLength(str: string, pos: number): number {
 	if (pos >= str.length || str.charCodeAt(pos) !== 0x1b) return 0;
@@ -710,7 +752,7 @@ class AnsiCodeTracker {
 		}
 
 		// Extract the parameters between \x1b[ and m
-		const match = ansiCode.match(/\x1b\[([\d;]*)m/);
+		const match = ansiCode.match(/^\x1b\[([\d;:]*)m$/);
 		if (!match) return;
 
 		const params = match[1];
@@ -725,6 +767,12 @@ class AnsiCodeTracker {
 		let i = 0;
 		while (i < parts.length) {
 			const code = Number.parseInt(parts[i], 10);
+			if (parts[i].includes(":")) {
+				if (code === 38) this.fgColor = parts[i];
+				else if (code === 48) this.bgColor = parts[i];
+				i++;
+				continue;
+			}
 
 			// Handle 256-color and RGB codes which consume multiple parameters
 			if (code === 38 || code === 48) {

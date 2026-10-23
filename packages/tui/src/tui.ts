@@ -13,7 +13,14 @@ import {
 	type TerminalColors,
 } from "./terminal-colors.ts";
 import { getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.ts";
-import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.ts";
+import {
+	extractSegments,
+	normalizeTerminalOutput,
+	sliceByColumn,
+	sliceWithWidth,
+	visibleWidth,
+	withWrappedLines,
+} from "./utils.ts";
 
 /**
  * Component interface - all components must implement this
@@ -1358,8 +1365,8 @@ export abstract class TuiBase extends Container implements TUI {
 			// (width and maxHeight don't depend on overlay height)
 			const { width, maxHeight } = this.resolveOverlayLayout(options, 0, termWidth, termHeight);
 
-			// Render component at calculated width
-			let overlayLines = component.render(width);
+			// Bound overlay layout without changing the transcript's native reflow policy.
+			let overlayLines = withWrappedLines(() => component.render(width));
 
 			// Apply maxHeight if specified
 			if (maxHeight !== undefined && overlayLines.length > maxHeight) {

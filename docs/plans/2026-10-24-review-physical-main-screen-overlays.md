@@ -1,0 +1,43 @@
+# Review: coordinated physical main-screen overlay painting
+
+## Final source chain and dependency boundary
+
+P16 final chain #23 `243015b85e9159c785bdfa09053bb9eac12aab74` (physical rows/transcript separation), #32 `65007d6c75cb16d08fbe47934e923bc53abaea1b` (overlay-local wrapping), #41 `6f9400463750fda6160b9b3b73d20ade24e7b7bb` (relative unknown origin), #42 `4ea1dc5e0cadea8894d956758a800c36ad870ac2` (stateless bottom reservation/empty lifecycle). Existing P14 safe-tail repairs, caret/physical occupancy and P15 editor/fullscreen scopes remain intact. The backup fake-cursor resolver is not imported; current direct SGR cursor architecture stays.
+
+Old main-screen rendering composited screen-relative overlays into logical transcript lines before layout/diff. Native-autowrapped continuation rows therefore received the wrong overlay row, showing text in the next logical line or hiding it; changing padded logical frames could replay/clear shell history and misplace the cursor. Narrow built-in overlays followed transcript wrapping-off and lost their suffix before height measurement.
+
+## Coordinated implementation
+
+Transcript render retains only transcript lines/layout. Before an update, restore previously overlaid physical rows so scrolling cannot archive overlay text. After transcript render, derive the current physical viewport and composite bounded overlays there, preserving base/overlay cursor routing. Physical row slicing reuses existing row-break/grapheme occupancy and ANSI tracker, carries SGR/OSC8 state and omits semantic prompt escapes. Skip zero-span Kitty placeholder positions and leave image placements alone.
+
+Painting is relative to tracked hardware row, not absolute screen row zero: shell output may precede the transcript. Line feeds reserve bottom overlay rows that cursor-down alone cannot create. Reservation adds no state/exported fields and does not change transcript maxLinesRendered. The physical shrink predicate uses totalRows, and first-frame detection uses never-rendered dimensions rather than empty previousLines so empty unchanged frames preserve ownership. Overlay components render inside the existing synchronous withWrappedLines scope before height/bounds measurement. No isolated intermediate absolute painter or overlayReservedRows field is added.
+
+## RED, controls and actual runtime proof
+
+Before product edits, final short-content/lifecycle owner produced **4 failed / 5 controls passed, 1.46s**: nonzero-origin viewport lost shell rows, native-reflow continuation was mistaken for next logical line, repeated hiding lost shell history, and growth hardware cursor y was wrong. Reservation/empty/resize/handoff cases already passed under some old logical-composition paths and are regression controls, not invented original defects.
+
+A second scoped current-source run produced **5 failed, 0.31s**. Narrow Text/Markdown lost gamma; physical continuation overlay targeted footer; styled continuation received no X. Kitty case failed only because actual Xfter had trailing padding; that failure is not credited as a product RED. After initial implementation the six-file matrix was **114/118** with only four trailing-padding differences. New overlay text assertions normalize trimEnd while retaining complete buffer row counts/order, cursor and style oracles; production padding is not changed.
+
+Pre-review post-format matrix **240 passed / 10 files, 20.58s**: short/lifecycle, options, renderer, style leak, CJK boundary, noncapturing, wrapped-row, safe-tail scrollback, fullscreen and pad-lines owners. Actual TuiMainScreen/TuiAltScreen writes go to unmodified xterm. Tests assert origin, exact cursor/full history, repeated open/update/hidden/reopen/top-bottom cycles with clearOnShrink, growth into scrollback without overlay archival, width/height redraw, empty unchanged frames and stopped renderer handoff. Narrow overlay bounds and base native policy restored; selected italic cell across a physical continuation is checked. Kitty zero-span placeholder remains followed by visible after content. Final repaired-tree results follow below.
+
+Pre-review check **1766 / No fixes applied, 11.91s**; earlier check passed but formatted four owned files (**12.43s**). Resize normally retains established full-redraw/history-reset semantics, not a new promise of shell-history preservation across resize; the Termux non-clearing path has the additional targeted repair below. No physical terminal, real Kitty graphics display, exhaustive style/OSC8 attributes, arbitrary cursor-effect content or full coding-agent interactive Enter proof is claimed. No ad-hoc scripts created.
+
+## Independent review and delivery
+
+Code review: skipped (ce-code-review unavailable). Bounded native source/proof reviews are supplemental, not portable CE or cross-model receipts; results follow actual delivery.
+
+Owned main-screen/utils/shared compositor source, four existing overlay/render/wrapped-row tests, TUI README and this review only. No dependency/catalog/changelog/branch/worktree/push changes. Normal explicit-path commit precedes fixed committed source/test/guide aggregate; review-only amendment records exact tested SHA separately from final SHA. Full 44-candidate migration remains open.
+
+### Review findings and narrowly authorized repairs
+
+PhysicalOverlaySourceReview found three concrete restoration defects. Actual targeted RED **3 failed, 0.41s**: colon RGB continuation changed from red to default foreground; `a CSI 2C b` restored as `ab` instead of `a  b`; a bottom overlay moved by Termux height-only growth left old Xine-9 cells behind. Source/proof reviewers ran no checks. The fixes preserve colon-form 38/48 colors in the existing tracker categories with existing 39/49/0 precedence; materialize the exact within-row forward-gap case as clamped blanks without changing public visibleWidth/terminalLineRows semantics; map old overlay absolute transcript rows into the resize-adjusted viewport before restoration and old-footprint discard. The old top is restored before renderTranscript applies its own height adjustment, preventing double adjustment.
+
+Explicit scope decision: no generic SGR replay log, horizontal mini-emulator or unsafe full-history redraw fallback. User narrowed cursor repair to the executed within-row forward-gap case; the broader C/D/G/K/CR tuple draft was removed and supplies no verification credit (its early run stopped at the first cursor-column assertion). Other cursor effects, wrap/caret effects of forward moves, unknown SGR attributes (such as overline) and non-color colon styles remain unsupported restoration limits; this is not general ANSI fidelity. The limited tracker is not claimed to preserve every possible style.
+
+Added real xterm foreground/background reset controls and exact helper text-width/row/backing control. Termux now checks exact eight-row viewport and entire fifteen-row buffer after 10→15→8 and after hide, including all ten transcript rows and explicit blank counts/order; temporary observation logs were removed. Actual targeted controls **7 passed, 0.69s**. Final post-format full owners **247 / 10 files, 20.49s**; final check **1766 / No fixes applied, 11.51s**. Prior check formatted three owned files (**12.23s**), and the exact-oracle formatting check fixed one test (**12.01s**), both followed by final proof.
+
+PhysicalOverlaySourceReview's bounded follow-ups confirmed all three exact counterexamples repaired within the explicitly narrowed scope, specifically validating old-layout/new-height backing selection and absolute footprint mapping. PhysicalOverlayProofReview confirmed exact final Termux row/history oracles and narrowly scoped color/gap controls with no actionable findings. Neither executed verification; their reports predate the delivered final 247-pass result. Recovery-only protection hashes matched **749 / zero mismatches** before these owned repairs.
+
+## Fixed committed-source/test/guide aggregate
+
+Normal explicit-path implementation commit `b9d79ae57` includes exactly nine owned source/test/guide/review paths; hook passed **1766 / No fixes applied**. Root `rtk proxy ./test.sh` on that fixed source/test/guide tree passed **8673 passed / 0 failed / 936 skipped**, exit 0, **96.79s**, full output `artifact://4723`. No next-unit source/test/guide changes occurred during execution. The following review-only amendment preserves product blobs and records aggregate against `b9d79ae57`, not the future final SHA. P16's bounded coordinated cutover closes after canonical synchronization, retaining explicit unsupported ANSI/control limits; full migration remains open.

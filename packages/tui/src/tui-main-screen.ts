@@ -7,6 +7,8 @@ import {
 	extractAnsiCode,
 	getGraphemeSegmenter,
 	shouldWrapLinesToWidth,
+	sliceByColumn,
+	terminalLinePhysicalRows,
 	terminalLineRows,
 	visibleWidth,
 } from "./utils.ts";
@@ -237,6 +239,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private hardwareCursorRow = 0;
 	private maxLinesRendered = 0;
 	private previousViewportTop = 0;
+	private overlaidRows: number[] = [];
+	private baseCursor: { row: number; col: number; wrappedRow: number } | null = null;
 
 	captureRenderState(): TuiMainScreenRenderState {
 		return {
@@ -271,6 +275,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.maxLinesRendered = 0;
 		this.previousViewportTop = 0;
 		this.previousLayout = null;
+		this.overlaidRows = [];
+		this.baseCursor = null;
 	}
 
 	protected override beforeTerminalStop(options: TuiStopOptions): void {
@@ -452,6 +458,120 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		if (this.stopped) return;
 		const width = this.terminal.columns;
 		const height = this.terminal.rows;
+		// Restore old overlay cells before transcript writes can scroll them into history.
+		if (
+			this.overlaidRows.length > 0 &&
+			this.previousLayout &&
+			this.previousWidth === width &&
+			(this.previousHeight === height || isTermuxSession())
+		) {
+			const previousTop = this.previousViewportTop;
+			const resizedTop =
+				this.previousHeight === height ? previousTop : Math.max(0, previousTop + this.previousHeight - height);
+			const rows = this.overlaidRows
+				.map((row) => previousTop + row - resizedTop)
+				.filter((row) => row >= 0 && row < height);
+			this.previousViewportTop = resizedTop;
+			this.paintViewportRows(this.physicalViewport(this.previousLines, this.previousLayout, width, height), rows);
+			this.previousViewportTop = previousTop;
+		}
+		this.overlaidRows = [];
+		this.renderTranscript();
+		if (!this.previousLayout || !this.hasOverlayEntries) return;
+		const viewport = this.physicalViewport(this.previousLines, this.previousLayout, width, height);
+		const markedViewport = [...viewport];
+		if (this.baseCursor) {
+			const row =
+				this.previousLayout.offsets[this.baseCursor.row] + this.baseCursor.wrappedRow - this.previousViewportTop;
+			if (row >= 0 && row < height) {
+				const col = this.baseCursor.col;
+				markedViewport[row] =
+					sliceByColumn(viewport[row], 0, col, true) +
+					CURSOR_MARKER +
+					sliceByColumn(viewport[row], col, width - col, true);
+			}
+		}
+		const composed = this.compositeOverlays(markedViewport, width, height);
+		const overlayCursor = this.extractCursorPosition(composed, height);
+		for (let row = 0; row < height; row++) {
+			if (composed[row] !== viewport[row]) this.overlaidRows.push(row);
+		}
+		const reset = this.applyLineResets(composed);
+		this.paintViewportRows(reset, this.overlaidRows);
+		if (overlayCursor) {
+			this.positionHardwareCursor(overlayCursor, {
+				offsets: Array.from({ length: height }, (_, row) => this.previousViewportTop + row),
+				totalRows: this.previousViewportTop + height,
+			});
+		} else {
+			this.positionHardwareCursor(this.isOverlayFocused() ? null : this.baseCursor, this.previousLayout);
+		}
+	}
+
+	private physicalViewport(
+		lines: string[],
+		layout: { offsets: number[]; totalRows: number },
+		width: number,
+		height: number,
+	): string[] {
+		const result = Array<string>(height).fill("");
+		const top = this.previousViewportTop;
+		for (let i = lines.length - 1; i >= 0; i--) {
+			const start = layout.offsets[i];
+			const end = layout.offsets[i + 1] ?? layout.totalRows;
+			if (end <= top) break;
+			if (end <= start) continue;
+			if (start >= top + height) continue;
+			if (isImageLine(lines[i])) {
+				// The compositor leaves existing image placements untouched.
+				for (let row = Math.max(top, start); row < Math.min(top + height, end); row++) {
+					result[row - top] = lines[i];
+				}
+				continue;
+			}
+			const first = Math.max(0, top - start);
+			const rows = terminalLinePhysicalRows(lines[i], width, first, top + height - start);
+			for (let row = 0; row < rows.length; row++) result[start + first + row - top] = rows[row];
+		}
+		return this.applyLineResets(result);
+	}
+
+	private paintViewportRows(lines: string[], rows: number[]): void {
+		if (rows.length === 0) return;
+		const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
+		output.append("\x1b[?2026h");
+		const lastRow = this.previousViewportTop + Math.max(...rows);
+		const reservedRows = this.maxLinesRendered;
+		if (lastRow >= reservedRows) {
+			const lastReservedRow = Math.max(0, reservedRows - 1);
+			const rowDelta = lastReservedRow - this.hardwareCursorRow;
+			if (rowDelta > 0) output.append(`\x1b[${rowDelta}B`);
+			else if (rowDelta < 0) output.append(`\x1b[${-rowDelta}A`);
+			// Line feeds create addressable rows and scroll shell history when necessary;
+			// cursor-down alone clamps at the physical screen bottom.
+			for (let row = lastReservedRow; row < lastRow; row++) output.append("\r\n");
+			this.hardwareCursorRow = lastRow;
+			// Overlay padding is not transcript growth. Replaying these feeds after
+			// reservation stays within addressable rows; keep shrink accounting unchanged.
+		}
+		for (const row of rows) {
+			if (isImageLine(lines[row])) continue;
+			// The transcript may start below shell output, so its screen origin is unknown.
+			const targetRow = this.previousViewportTop + row;
+			const rowDelta = targetRow - this.hardwareCursorRow;
+			if (rowDelta > 0) output.append(`\x1b[${rowDelta}B`);
+			else if (rowDelta < 0) output.append(`\x1b[${-rowDelta}A`);
+			output.append(`\r\x1b[2K${lines[row]}`);
+			this.hardwareCursorRow = targetRow;
+		}
+		output.append("\x1b[?2026l");
+		output.flush();
+	}
+
+	private renderTranscript(): void {
+		if (this.stopped) return;
+		const width = this.terminal.columns;
+		const height = this.terminal.rows;
 		const widthChanged = this.previousWidth !== 0 && this.previousWidth !== width;
 		const heightChanged = this.previousHeight !== 0 && this.previousHeight !== height;
 		const previousBufferLength = this.previousHeight > 0 ? this.previousViewportTop + this.previousHeight : height;
@@ -467,13 +587,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		// Render all components to get new lines
 		let newLines = this.render(width);
 
-		// Composite overlays into the rendered lines (before differential compare)
-		if (this.hasOverlayEntries) {
-			newLines = this.compositeOverlays(newLines, width, height);
-		}
-
 		// Extract cursor position before applying line resets (marker must be found first)
 		const cursorPos = this.extractCursorPosition(newLines, height);
+		this.baseCursor = cursorPos;
 
 		newLines = this.applyLineResets(newLines);
 
@@ -571,8 +687,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			fs.appendFileSync(logPath, msg);
 		};
 
-		// First render - just output everything without clearing (assumes clean screen)
-		if (this.previousLines.length === 0 && !widthChanged && !heightChanged) {
+		// A rendered empty transcript still owns cursor state.
+		if (this.previousWidth === 0 && this.previousHeight === 0 && !widthChanged && !heightChanged) {
 			logRedraw("first render");
 			fullRender(false);
 			return;
@@ -597,7 +713,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		// Content shrunk below the working area and no overlays - re-render to clear empty rows
 		// (overlays need the padding, so only do this when no overlays are active)
 		// Configurable via setClearOnShrink()
-		if (this.getClearOnShrink() && newLines.length < this.maxLinesRendered && !this.hasOverlayEntries) {
+		if (this.getClearOnShrink() && newLayout.totalRows < this.maxLinesRendered && !this.hasOverlayEntries) {
 			logRedraw(`clearOnShrink (maxLinesRendered=${this.maxLinesRendered})`);
 			fullRender(true);
 			return;
@@ -742,7 +858,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			const isImage = isImageLine(line);
 			const imageReservedRows = isImage ? this.getKittyImageReservedRows(newLines, i, renderEnd) : 1;
 			if (imageReservedRows > 1) {
-				const imageStartScreenRow = i - viewportTop;
+				const imageStartScreenRow = newLayout.offsets[i] - viewportTop;
 				if (imageStartScreenRow < 0 || imageStartScreenRow + imageReservedRows > height) {
 					logRedraw(
 						`kitty image pre-clear would scroll (${imageStartScreenRow} + ${imageReservedRows} > ${height})`,

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import { Image } from "../src/components/image.ts";
+import { Text } from "../src/components/text.ts";
 import type { Terminal } from "../src/terminal.ts";
 import {
 	deleteKittyImage,
@@ -15,7 +16,7 @@ import {
 } from "../src/terminal-image.ts";
 import type { Component, TUI } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
-import { setWrapLinesToWidth } from "../src/utils.ts";
+import { isWrapLinesToWidth, setWrapLinesToWidth } from "../src/utils.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class TestComponent implements Component {
@@ -953,5 +954,218 @@ describe("TUI differential rendering", () => {
 		]);
 
 		tui.stop();
+	});
+});
+
+describe("TUI overlays over native-reflow content", () => {
+	it("keeps content after reserved Kitty placeholders when an overlay opens and closes", async () => {
+		const terminal = new LoggingVirtualTerminal(20, 5);
+		const tui = new TuiMainScreen(terminal);
+		const base = new TestComponent();
+		base.lines = [encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 91, moveCursor: false }), "", "after"];
+		tui.addChild(base);
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[2], "after");
+			terminal.clearWrites();
+			const overlay = tui.showOverlay(new Text("X", 0, 0), { width: 1, row: 2, col: 0 });
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[2].trimEnd(), "Xfter");
+			overlay.hide();
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[2], "after");
+			assert.ok(!terminal.getWrites().includes("\x1b[3J"));
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("composes a screen-relative overlay on a physical continuation row without dropping text", async () => {
+		const terminal = new LoggingVirtualTerminal(10, 4);
+		const tui = new TuiMainScreen(terminal);
+		tui.addChild(new Text("abcdefghijABCDEFGHIJ0123456789", 0, 0));
+		tui.addChild(new Text("footer", 0, 0));
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), ["abcdefghij", "ABCDEFGHIJ", "0123456789", "footer"]);
+			terminal.clearWrites();
+			const overlay = tui.showOverlay(new Text("X", 0, 0), { width: 1, row: 1, col: 0 });
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), ["abcdefghij", "XBCDEFGHIJ", "0123456789", "footer"]);
+			assert.deepStrictEqual(overlay.getBounds(), { row: 1, col: 0, width: 1, height: 1 });
+			assert.strictEqual(isWrapLinesToWidth(), false, "overlay does not mutate transcript policy");
+			assert.ok(!terminal.getWrites().includes("\x1b[3J"), "opening preserves scrollback");
+			terminal.clearWrites();
+			overlay.hide();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), ["abcdefghij", "ABCDEFGHIJ", "0123456789", "footer"]);
+			assert.ok(!terminal.getWrites().includes("\x1b[3J"), "closing preserves scrollback");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("preserves offscreen history while opening, updating and hiding an overlay over wide styled rows", async () => {
+		const terminal = new LoggingVirtualTerminal(10, 4);
+		const tui = new TuiMainScreen(terminal);
+		const base = new TestComponent();
+		base.lines = ["history-0", "history-1", "\x1b[3m123456789界abcdefg\x1b[23m\nnext", "footer"];
+		tui.addChild(base);
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			const before = terminal.getScrollBuffer();
+			const history = before.slice(0, -4);
+			const viewport = terminal.getViewport();
+			terminal.clearWrites();
+			const overlay = tui.showOverlay(new Text("X", 0, 0), { width: 1, row: 1, col: 4 });
+			await terminal.waitForRender();
+			assert.deepStrictEqual(
+				terminal.getViewport().map((line) => line.trimEnd()),
+				["123456789", "界abXdefg", "next", "footer"],
+			);
+			assert.notStrictEqual(getCellItalic(terminal, 1, 0), 0, "style from the preceding physical row is resumed");
+			assert.deepStrictEqual(terminal.getScrollBuffer().slice(0, -4), history);
+			assert.ok(!terminal.getWrites().includes("history-0"), "opening does not replay transcript history");
+			assert.ok(!terminal.getWrites().includes("\x1b[3J"));
+			terminal.clearWrites();
+			base.lines[3] = "changed";
+			tui.requestRender();
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[3], "changed");
+			assert.ok(terminal.getViewport()[1].includes("X"));
+			overlay.hide();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), [...viewport.slice(0, 3), "changed"]);
+			assert.deepStrictEqual(terminal.getScrollBuffer().slice(0, -4), history);
+			assert.ok(!terminal.getWrites().includes("history-0"));
+			assert.ok(!terminal.getWrites().includes("\x1b[3J"));
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("restores colon-form color on a native continuation after overlay hide", async () => {
+		const terminal = new VirtualTerminal(10, 4);
+		const tui = new TuiMainScreen(terminal);
+		const base = new TestComponent();
+		base.lines = ["\x1b[38:2::255:0:0mabcdefghijABCDEFGHIJ"];
+		tui.addChild(base);
+		const foreground = () => {
+			const xterm = (terminal as unknown as { xterm: XtermTerminalType }).xterm;
+			const cell = xterm.buffer.active.getLine(xterm.buffer.active.viewportY + 1)?.getCell(1);
+			assert.ok(cell);
+			return { mode: cell.getFgColorMode(), color: cell.getFgColor() };
+		};
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			const before = foreground();
+			assert.strictEqual(before.color, 0xff0000);
+			const overlay = tui.showOverlay(new Text("X", 0, 0), { width: 1, row: 1, col: 0 });
+			await terminal.waitForRender();
+			overlay.hide();
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[1], "ABCDEFGHIJ");
+			assert.deepStrictEqual(foreground(), before);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	for (const reset of ["39", "49", "0"]) {
+		it(`preserves colon color reset ${reset} through overlay restoration`, async () => {
+			const terminal = new VirtualTerminal(10, 4);
+			const tui = new TuiMainScreen(terminal);
+			const base = new TestComponent();
+			base.lines = [`\x1b[38:2::255:0:0;48:2::0:0:255mabcdefghij\x1b[${reset}mABCDEFGHIJ`];
+			tui.addChild(base);
+			const colors = () => {
+				const xterm = (terminal as unknown as { xterm: XtermTerminalType }).xterm;
+				const cell = xterm.buffer.active.getLine(xterm.buffer.active.viewportY + 1)?.getCell(1);
+				assert.ok(cell);
+				return { fg: cell.getFgColor(), bg: cell.getBgColor() };
+			};
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				const before = colors();
+				assert.deepStrictEqual(before, { fg: reset === "49" ? 0xff0000 : -1, bg: reset === "39" ? 0x0000ff : -1 });
+				const overlay = tui.showOverlay(new Text("X", 0, 0), { width: 1, row: 1, col: 0 });
+				await terminal.waitForRender();
+				overlay.hide();
+				await terminal.waitForRender();
+				assert.deepStrictEqual(colors(), before);
+			} finally {
+				tui.stop();
+			}
+		});
+	}
+
+	it("restores cursor-positioned text after an overlay hides", async () => {
+		const terminal = new VirtualTerminal(10, 4);
+		const tui = new TuiMainScreen(terminal);
+		const base = new TestComponent();
+		base.lines = ["a\x1b[2Cb"];
+		tui.addChild(base);
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[0], "a  b");
+			const overlay = tui.showOverlay(new Text("X", 0, 0), { width: 1, row: 0, col: 0 });
+			await terminal.waitForRender();
+			overlay.hide();
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[0].trimEnd(), "a  b");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("restores a moved bottom overlay footprint on Termux height growth", async () => {
+		await withEnv({ TERMUX_VERSION: "1" }, async () => {
+			const terminal = new LoggingVirtualTerminal(20, 10);
+			const tui = new TuiMainScreen(terminal);
+			const base = new TestComponent();
+			base.lines = Array.from({ length: 10 }, (_, index) => `line-${index}`);
+			tui.addChild(base);
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				const overlay = tui.showOverlay(new Text("X", 0, 0), { width: 1, anchor: "bottom-left" });
+				await terminal.waitForRender();
+				assert.strictEqual(terminal.getViewport()[9].trimEnd(), "Xine-9");
+				terminal.clearWrites();
+				terminal.resize(20, 15);
+				await terminal.waitForRender();
+				assert.strictEqual(terminal.getViewport()[9], "line-9");
+				assert.strictEqual(terminal.getViewport()[14].trimEnd(), "X");
+				terminal.resize(20, 8);
+				await terminal.waitForRender();
+				assert.deepStrictEqual(
+					terminal.getViewport().map((line) => line.trimEnd()),
+					["line-7", "line-8", "line-9", "", "", "", "", "X"],
+				);
+				assert.deepStrictEqual(
+					terminal.getScrollBuffer().map((line) => line.trimEnd()),
+					[...base.lines, "", "", "", "", "X"],
+				);
+				overlay.hide();
+				await terminal.waitForRender();
+				assert.deepStrictEqual(
+					terminal.getViewport().map((line) => line.trimEnd()),
+					["line-7", "line-8", "line-9", "", "", "", "", ""],
+				);
+				assert.deepStrictEqual(
+					terminal.getScrollBuffer().map((line) => line.trimEnd()),
+					[...base.lines, "", "", "", "", ""],
+				);
+				assert.ok(!terminal.getWrites().includes("\x1b[3J"));
+			} finally {
+				tui.stop();
+			}
+		});
 	});
 });

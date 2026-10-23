@@ -1,7 +1,11 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
+import { Markdown } from "../src/components/markdown.ts";
+import { Text } from "../src/components/text.ts";
 import type { Component, TUI } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
+import { isPadLinesToWidth, isWrapLinesToWidth, setPadLinesToWidth, setWrapLinesToWidth } from "../src/utils.ts";
+import { defaultMarkdownTheme } from "./test-themes.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class StaticOverlay implements Component {
@@ -50,6 +54,77 @@ async function renderAndFlush(tui: TUI, terminal: VirtualTerminal): Promise<void
 }
 
 describe("TUI overlay options", () => {
+	describe("bounded content in native-reflow mode", () => {
+		for (const { name, create } of [
+			{ name: "Text", create: () => new Text("alpha beta gamma", 0, 0) },
+			{ name: "Markdown", create: () => new Markdown("**alpha beta** gamma", 0, 0, defaultMarkdownTheme) },
+		]) {
+			it(`wraps a narrow ${name} overlay and restores the native transcript on hide/show`, async () => {
+				const previousPad = isPadLinesToWidth();
+				const previousWrap = isWrapLinesToWidth();
+				setPadLinesToWidth(false);
+				setWrapLinesToWidth(false);
+				const terminal = new VirtualTerminal(20, 4);
+				const tui = new TuiMainScreen(terminal);
+				const sourceLines = [
+					"history-0",
+					"history-1",
+					"abcdefghijklmnopqrstABCDEFGHIJKLMNOPQRST0123456789",
+					"footer",
+				];
+				const base = new Text(sourceLines.join("\n"), 0, 0);
+				tui.addChild(base);
+				try {
+					tui.start();
+					await terminal.waitForRender();
+					const viewport = ["abcdefghijklmnopqrst", "ABCDEFGHIJKLMNOPQRST", "0123456789", "footer"];
+					assert.deepStrictEqual(terminal.getViewport(), viewport);
+					const history = terminal.getScrollBuffer().slice(0, -4);
+					assert.deepStrictEqual(history, ["history-0", "history-1"]);
+					const overlay = tui.showOverlay(create(), { width: 10, anchor: "bottom-left" });
+					await terminal.waitForRender();
+					const overlaid = ["abcdefghijklmnopqrst", "ABCDEFGHIJKLMNOPQRST", "alpha beta", "gamma"];
+					assert.deepStrictEqual(
+						terminal.getViewport().map((line, row) => (row < 2 ? line : line.trim())),
+						overlaid,
+					);
+					assert.deepStrictEqual(overlay.getBounds(), { row: 2, col: 0, width: 10, height: 2 });
+					assert.deepStrictEqual(terminal.getScrollBuffer().slice(0, -4), history);
+					assert.deepStrictEqual(
+						base.render(20),
+						sourceLines,
+						"base content remains native-reflow after overlay rendering",
+					);
+					assert.strictEqual(isWrapLinesToWidth(), false);
+					assert.strictEqual(isPadLinesToWidth(), false);
+
+					overlay.setHidden(true);
+					await terminal.waitForRender();
+					assert.deepStrictEqual(terminal.getViewport(), viewport);
+					assert.strictEqual(overlay.getBounds(), undefined);
+					assert.deepStrictEqual(terminal.getScrollBuffer().slice(0, -4), history);
+
+					overlay.setHidden(false);
+					await terminal.waitForRender();
+					assert.deepStrictEqual(
+						terminal.getViewport().map((line, row) => (row < 2 ? line : line.trim())),
+						overlaid,
+					);
+					assert.deepStrictEqual(overlay.getBounds(), { row: 2, col: 0, width: 10, height: 2 });
+
+					overlay.hide();
+					await terminal.waitForRender();
+					assert.deepStrictEqual(terminal.getViewport(), viewport);
+					assert.deepStrictEqual(terminal.getScrollBuffer().slice(0, -4), history);
+					assert.deepStrictEqual(base.render(20), sourceLines);
+				} finally {
+					tui.stop();
+					setPadLinesToWidth(previousPad);
+					setWrapLinesToWidth(previousWrap);
+				}
+			});
+		}
+	});
 	describe("width overflow protection", () => {
 		it("should truncate overlay lines that exceed declared width", async () => {
 			const terminal = new VirtualTerminal(80, 24);
