@@ -36,11 +36,13 @@ import {
 	sessionEntryToContextMessages,
 } from "../session-manager.ts";
 import {
+	canAttributeRequestHistory,
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
 	type FileOperations,
 	formatFileOperations,
+	type RequestHistoryPolicy,
 	SUMMARIZATION_SYSTEM_PROMPT,
 } from "./utils.ts";
 
@@ -751,7 +753,8 @@ export async function generateSummaryWithUsage(
 	sessionId?: string,
 	systemPrompt?: string,
 	agent?: Agent,
-): Promise<{ text: string; usage: Usage }> {
+	requestHistoryPolicy?: RequestHistoryPolicy,
+): Promise<{ text: string; usage: Usage; fileOps: FileOperations }> {
 	const maxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
@@ -779,6 +782,8 @@ export async function generateSummaryWithUsage(
 	const sourceMessages = structuredClone(currentMessages);
 
 	const instructionText = `Do not continue the conversation above. Output only the structured summary requested below.\n\n${basePrompt}`;
+	let fileOps = createFileOps();
+	let attributable = false;
 
 	const buildContext = async (attemptOptions: SimpleStreamOptions): Promise<TranscriptContext> => {
 		const llmMessages = await buildAgentSummarizationContext(agent, sourceMessages, signal, systemPrompt);
@@ -787,6 +792,14 @@ export async function generateSummaryWithUsage(
 			content: [{ type: "text", text: instructionText }],
 			timestamp: Date.now(),
 		};
+		fileOps = createFileOps();
+		attributable = canAttributeRequestHistory(model, agent, streamFn, requestHistoryPolicy);
+		if (attributable) {
+			for (const message of llmMessages) {
+				if (message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted")
+					extractFileOpsFromMessage(message, fileOps);
+			}
+		}
 		// Context/converter work can replace the policy while awaiting; read it immediately before dispatch.
 		if (agent) attemptOptions.onPayload = agent.onPayload;
 		return { messages: [...llmMessages, instruction] } as TranscriptContext;
@@ -816,7 +829,14 @@ export async function generateSummaryWithUsage(
 
 	const textContent = contentText(response.content);
 
-	return { text: textContent, usage: response.usage };
+	return {
+		text: textContent,
+		usage: response.usage,
+		fileOps:
+			attributable && canAttributeRequestHistory(model, agent, streamFn, requestHistoryPolicy)
+				? fileOps
+				: createFileOps(),
+	};
 }
 
 // ============================================================================
@@ -1121,6 +1141,7 @@ export async function compact(
 	sessionId?: string,
 	systemPrompt?: string,
 	agent?: Agent,
+	requestHistoryPolicy?: RequestHistoryPolicy,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -1129,7 +1150,6 @@ export async function compact(
 		isSplitTurn,
 		tokensBefore,
 		previousSummary,
-		fileOps,
 		settings,
 	} = preparation;
 
@@ -1160,12 +1180,13 @@ export async function compact(
 		sessionId,
 		systemPrompt,
 		agent,
+		requestHistoryPolicy,
 	);
 	let summary = result.text;
 	const summaryUsage = result.usage;
 
 	// Compute file lists and append to summary
-	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
+	const { readFiles, modifiedFiles } = computeFileLists(result.fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
 
 	if (!firstKeptEntryId) {

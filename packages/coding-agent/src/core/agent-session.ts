@@ -4507,6 +4507,7 @@ export class AgentSession {
 			undefined, // sessionId
 			this.agent.state.systemPrompt,
 			this.agent,
+			(model) => this._requestHistoryPolicy(model),
 		);
 		return { ...result, usageModel: request.model };
 	}
@@ -6418,6 +6419,7 @@ export class AgentSession {
 					retry: this.settingsManager.getRetrySettings(),
 					callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
 					agent: this.agent,
+					requestHistoryPolicy: (model) => this._requestHistoryPolicy(model),
 					contextProjection: this.sessionManager.buildSessionProjection(),
 				});
 				if (result.aborted) {

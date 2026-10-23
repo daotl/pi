@@ -20,7 +20,7 @@ Pi has two summarization mechanisms:
 | Compaction | Context exceeds threshold, or `/compact` | Summarize old messages to free up context |
 | Branch summarization | `/tree` navigation | Preserve context when switching branches |
 
-Both use closely related structured formats and track file operations cumulatively. Summarization requests disable prompt-cache writes because these one-off prompts are unlikely to be reused.
+Both use closely related structured formats and track attributable file operations. Summarization requests disable prompt-cache writes because these one-off prompts are unlikely to be reused.
 
 Each retry starts from a fresh copy of the fixed selected source history and reapplies the current context transform, converter and incoming-message prefix. Generated summary instructions are appended afterward and are not prefixed. The payload callback is read again after asynchronous policy work; a retry does not reuse a prior attempt's transformed messages. If policy removes an existing system baseline or tool declarations, summarization does not restore that private state afterward.
 
@@ -196,7 +196,7 @@ interface CompactionDetails {
 
 Extensions can store any JSON-serializable data in `details`. The default compaction tracks file operations, but custom extension implementations can use their own structure. Generated and extension-provided summaries store their LLM `usage` when available so session totals include summarization work.
 
-See [`prepareCompaction()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) and [`compact()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) for the implementation. For direct programmatic summarization, `generateSummary()` returns the summary text and `generateSummaryWithUsage()` returns `{ text, usage }`.
+See [`prepareCompaction()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) and [`compact()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) for the implementation. For direct programmatic summarization, `generateSummary()` returns the summary text and `generateSummaryWithUsage()` returns `{ text, usage, fileOps }`. File operations come from attributable converted request history; custom transports or final payload/header policies conservatively omit reconstructed tags when attribution cannot be proved.
 
 ## Branch Summarization
 
@@ -229,11 +229,11 @@ After navigation with summary:
          └─ E ─ F ─ [summary of B,C,D] (new leaf)
 ```
 
-### Cumulative File Tracking
+### Request-Derived File Tracking
 
-Default compaction and branch summarization track files cumulatively. Both extract file operations from tool calls in the messages being summarized. Compaction also carries file lists from the previous Pi-generated compaction. Branch summarization carries file lists from Pi-generated branch summaries in the entries it summarizes.
+Default compaction and branch summarization derive appended file-operation tags from successful-attempt policy-transformed and converted assistant tool calls. Error/aborted calls excluded by provider replay do not reappear through checkpoint metadata. Raw preparation details and internal nested-call records never restore a path removed from model-visible history.
 
-File tracking therefore accumulates across default compactions and nested default branch summaries. Pi does not automatically carry file lists from extension-generated summaries whose `fromHook` field is `true`; extensions manage their own `details` format.
+Earlier summaries remain ordinary policy-visible context and may retain their own file tags; their raw `details` are not independently reinserted after filtering. Each new file list describes attributable tool operations in that request, not an unconditionally accumulated archive. Extensions retain control of their own details format.
 
 ### BranchSummaryEntry Structure
 

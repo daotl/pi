@@ -2,8 +2,23 @@
  * Shared utilities for compaction and branch summarization.
  */
 
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { contentText, type Message } from "@earendil-works/pi-ai";
+import type { Agent, AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
+import { contentText, type Message, type Model } from "@earendil-works/pi-ai";
+import { isKnownApiProvider, streamSimple } from "@earendil-works/pi-ai/compat";
+
+/** Live authorization for reconstructing history before final provider payload policies. */
+export type RequestHistoryPolicy = (model: Model<string>, direct?: boolean) => boolean;
+
+export function canAttributeRequestHistory(
+	model: Model<string>,
+	agent: Agent | undefined,
+	streamFn: StreamFn | undefined,
+	policy?: RequestHistoryPolicy,
+): boolean {
+	if (agent && streamFn && streamFn !== agent.streamFunction) return false;
+	if (policy) return policy(model);
+	return !agent?.onPayload && (!streamFn || streamFn === streamSimple) && isKnownApiProvider(model.api);
+}
 
 // ============================================================================
 // File Operation Tracking

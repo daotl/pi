@@ -18,11 +18,13 @@ import {
 import type { ReadonlySessionManager, SessionEntry, SessionProjection } from "../session-manager.ts";
 import { completeSummarization, estimateTokens, getSummarizationFailure } from "./compaction.ts";
 import {
+	canAttributeRequestHistory,
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
 	type FileOperations,
 	formatFileOperations,
+	type RequestHistoryPolicy,
 	SUMMARIZATION_SYSTEM_PROMPT,
 } from "./utils.ts";
 
@@ -99,6 +101,8 @@ export interface GenerateBranchSummaryOptions {
 	 * sessionId, transport, etc.) should be mirrored for cache reuse.
 	 */
 	agent?: Agent;
+	/** Live session authorization for reconstructing pre-payload history. */
+	requestHistoryPolicy?: RequestHistoryPolicy;
 	/** Canonical old-branch projection used to recover policy preceding the retained range. */
 	contextProjection?: SessionProjection;
 }
@@ -332,7 +336,7 @@ export async function generateBranchSummary(
 	const contextWindow = model.contextWindow || 262144;
 	const tokenBudget = contextWindow - reserveTokens;
 
-	const { messages, fileOps, firstEntryId } = prepareBranchEntries(entries, tokenBudget);
+	const { messages, firstEntryId } = prepareBranchEntries(entries, tokenBudget);
 
 	if (messages.length === 0) {
 		return { summary: "No content to summarize" };
@@ -369,6 +373,8 @@ export async function generateBranchSummary(
 		instructions = BRANCH_SUMMARY_PROMPT;
 	}
 	const instructionText = `Do not continue the conversation above. Output only the structured summary requested below.\n\n${instructions}`;
+	let fileOps = createFileOps();
+	let attributable = false;
 
 	const buildContext = async (attemptOptions: SimpleStreamOptions) => {
 		const input = structuredClone(source);
@@ -378,6 +384,14 @@ export async function generateBranchSummary(
 		const llmMessages = agent
 			? await agent.convertForRequest(agent.transformContext ? await agent.transformContext(input, signal) : input)
 			: convertToLlm(input);
+		fileOps = createFileOps();
+		attributable = canAttributeRequestHistory(model, agent, streamFn, options.requestHistoryPolicy);
+		if (attributable) {
+			for (const message of llmMessages) {
+				if (message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted")
+					extractFileOpsFromMessage(message, fileOps);
+			}
+		}
 		const instruction: Message = {
 			role: "user",
 			content: [{ type: "text", text: instructionText }],
@@ -422,7 +436,11 @@ export async function generateBranchSummary(
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
 
 	// Compute file lists and append to summary
-	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
+	const { readFiles, modifiedFiles } = computeFileLists(
+		attributable && canAttributeRequestHistory(model, agent, streamFn, options.requestHistoryPolicy)
+			? fileOps
+			: createFileOps(),
+	);
 	summary += formatFileOperations(readFiles, modifiedFiles);
 
 	return {
