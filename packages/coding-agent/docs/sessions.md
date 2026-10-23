@@ -85,6 +85,8 @@ Capture-triggered transcript reconciliation remains active through run settlemen
 
 Continuing a completed assistant answer without supported prefill or new queued input rejects without deleting or regenerating that answer. Interrupted error/aborted responses on providers without prefill support can retry from their input; their original response stays in raw history and an append-only context omission removes it from the retry request.
 
+Settled-trigger schedules and deferred edit/continue actions drain only while the session is idle. Eligible numbered entries use their original creation IDs, including timed actions that became due in reverse order. One settled delivery excludes later settled work during asynchronous prompt preflight. Accepted run/queue dispatch waits for a subsequent settlement; handled inputs/commands and rejected or no-op edits advance without requiring an unrelated run. This does not change ordinary timed-message follow-up behavior during an active run.
+
 See [Compaction Reference](compaction.md) for thresholds, retained boundaries, branch-summary behavior, and extension hooks.
 
 ## Control session storage

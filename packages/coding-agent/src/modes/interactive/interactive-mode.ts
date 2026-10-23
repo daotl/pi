@@ -430,6 +430,10 @@ export interface ScheduledMessage {
 	isEdit?: boolean;
 }
 
+interface SettledDelivery {
+	phase: "preflight" | "run";
+}
+
 /** Recurring wake-up schedule: a fixed interval, or daily at a local time. */
 export type HeartbeatSchedule =
 	| { type: "interval"; intervalMs: number }
@@ -877,6 +881,7 @@ export class InteractiveMode {
 	// Deferred continue / edit+continue actions waiting for the session to settle.
 	private deferredScheduledActions: ScheduledMessage[] = [];
 	private nextScheduleId = 1;
+	private settledDeliveryPending?: SettledDelivery;
 
 	// Recurring heartbeats (/heartbeat)
 	private heartbeats: HeartbeatEntry[] = [];
@@ -4110,6 +4115,7 @@ export class InteractiveMode {
 					this.ui.requestRender();
 				}
 				await this.checkShutdownRequested();
+				if (this.settledDeliveryPending?.phase === "run") this.settledDeliveryPending = undefined;
 				this.fireDueScheduledMessages();
 				break;
 
@@ -6159,42 +6165,56 @@ export class InteractiveMode {
 	}
 
 	/** Apply a scheduled <pi_edit> payload (if any) and run a continue. */
-	private runScheduledAction(entry: ScheduledMessage): void {
+	private runScheduledAction(entry: ScheduledMessage, onComplete?: () => void): void {
 		void (async () => {
 			try {
 				if (entry.isEdit && !(await this.handleApplyMessageEdits(entry.text, { clearEditor: false }))) return;
 				await this.handleContinueCommand();
 			} catch (error: unknown) {
 				this.showError(error instanceof Error ? error.message : String(error));
+			} finally {
+				onComplete?.();
 			}
 		})();
 	}
 
-	private deliverScheduledMessage(text: string): void {
+	private deliverScheduledMessage(text: string, onDispatch?: (waitingForRun: boolean) => void): void {
 		if (this.session.isCompacting) {
 			// Flushed after compaction like user-typed queued messages.
 			this.compactionQueuedMessages.push({ text, mode: "followUp" });
 			this.updatePendingMessagesDisplay();
+			onDispatch?.(true);
 			return;
 		}
 		if (this.session.isStreaming) {
 			// Queue after the current task instead of interrupting each turn.
+			onDispatch?.(true);
 			void this.session.prompt(text, { streamingBehavior: "followUp" }).catch((error: unknown) => {
 				this.showError(error instanceof Error ? error.message : String(error));
 			});
 			return;
 		}
-		void this.session.prompt(text).catch((error: unknown) => {
-			// A concurrently fired scheduled message may have started streaming
-			// first; fall back to queueing after it.
-			if (error instanceof Error && error.message.includes("already processing")) {
-				void this.session.prompt(text, { streamingBehavior: "followUp" }).catch((inner: unknown) => {
-					this.showError(inner instanceof Error ? inner.message : String(inner));
-				});
-				return;
-			}
-			this.showError(error instanceof Error ? error.message : String(error));
-		});
+		void this.session
+			.prompt(text, {
+				preflightResult: (disposition) => onDispatch?.(disposition !== "handled"),
+			})
+			.catch((error: unknown) => {
+				// Preserve ordinary messages if another run won asynchronous preflight.
+				if (error instanceof Error && error.message.includes("already processing")) {
+					void this.session
+						.prompt(text, {
+							streamingBehavior: "followUp",
+							preflightResult: (disposition) => onDispatch?.(disposition !== "handled"),
+						})
+						.catch((inner: unknown) => {
+							this.showError(inner instanceof Error ? inner.message : String(inner));
+							onDispatch?.(false);
+						});
+					return;
+				}
+				this.showError(error instanceof Error ? error.message : String(error));
+				onDispatch?.(false);
+			});
 	}
 
 	/** Count a completed message toward message-count scheduled triggers. */
@@ -6215,26 +6235,51 @@ export class InteractiveMode {
 		}
 	}
 
-	/** Fire settled-trigger scheduled messages after the agent run completes. */
+	/** Drain eligible settled work in creation order while one dispatch owns preflight. */
 	private fireDueScheduledMessages(): void {
-		// Run one deferred continue/edit+continue action per settle, in order.
-		if (this.deferredScheduledActions.length > 0) {
-			const entry = this.deferredScheduledActions.shift();
-			if (entry) {
-				this.runScheduledAction(entry);
+		if (!this.session.isIdle || this.settledDeliveryPending) return;
+		let deferredIndex = -1;
+		for (let i = 0; i < this.deferredScheduledActions.length; i++) {
+			if (
+				deferredIndex < 0 ||
+				this.deferredScheduledActions[i].id < this.deferredScheduledActions[deferredIndex].id
+			) {
+				deferredIndex = i;
 			}
 		}
-		// A /continue queued during compaction runs once the session is idle
-		// (after compaction and any queued compaction messages have drained).
-		if (this.pendingCompactionContinue && !this.session.isStreaming && !this.session.isCompacting) {
-			this.pendingCompactionContinue = false;
-			void this.handleContinueCommand();
+		const deferred = this.deferredScheduledActions[deferredIndex];
+		let due: ScheduledMessage | undefined;
+		for (const entry of this.scheduledMessages) {
+			if (entry.when.type === "settled" && (!due || entry.id < due.id)) due = entry;
 		}
-		// Fire one settled message per agent_settled; further settled messages
-		// fire after the runs they start, preserving queue order.
-		const due = this.scheduledMessages.find((entry) => entry.when.type === "settled");
+		if (!deferred && !due && !this.pendingCompactionContinue) return;
+		const delivery: SettledDelivery = { phase: "preflight" };
+		this.settledDeliveryPending = delivery;
+		const finish = (waitingForRun: boolean) => {
+			if (waitingForRun) {
+				if (this.settledDeliveryPending === delivery) delivery.phase = "run";
+				return;
+			}
+			queueMicrotask(() => {
+				if (this.settledDeliveryPending !== delivery) return;
+				this.settledDeliveryPending = undefined;
+				this.fireDueScheduledMessages();
+			});
+		};
+		if (deferred && (!due || deferred.id < due.id)) {
+			this.deferredScheduledActions.splice(deferredIndex, 1);
+			this.runScheduledAction(deferred, () => finish(false));
+			return;
+		}
+		if (this.pendingCompactionContinue) {
+			this.pendingCompactionContinue = false;
+			void this.handleContinueCommand().finally(() => finish(false));
+			return;
+		}
 		if (due) {
-			this.fireScheduledMessage(due.id);
+			this.scheduledMessages.splice(this.scheduledMessages.indexOf(due), 1);
+			if (due.isContinue || due.isEdit) this.runScheduledAction(due, () => finish(false));
+			else this.deliverScheduledMessage(due.text, finish);
 		}
 	}
 
@@ -6245,6 +6290,7 @@ export class InteractiveMode {
 		this.scheduledMessages = [];
 		this.deferredScheduledActions = [];
 		this.pendingCompactionContinue = false;
+		this.settledDeliveryPending = undefined;
 	}
 
 	/**
