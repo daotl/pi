@@ -165,7 +165,6 @@ it("preserves structured tool history for an arbitrary custom stream within its 
 		undefined,
 		undefined,
 		undefined,
-		undefined,
 		(requestModel, context, options) => {
 			contexts.push(structuredClone(context.messages));
 			requestedCaps.push(options?.maxTokens);
@@ -198,7 +197,6 @@ it("rejects an oversized converted request before native dispatch when bounded h
 			{ ...selected, contextWindow: 10000 },
 			4096,
 			"offline",
-			undefined,
 			undefined,
 			undefined,
 			undefined,
@@ -477,7 +475,6 @@ it.each([0, 1, 2])(
 			undefined,
 			undefined,
 			undefined,
-			undefined,
 			native,
 			undefined,
 			undefined,
@@ -536,7 +533,6 @@ it.each([0, 1, 2])(
 			model,
 			4096,
 			"offline",
-			undefined,
 			undefined,
 			undefined,
 			undefined,

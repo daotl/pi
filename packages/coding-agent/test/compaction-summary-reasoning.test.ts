@@ -83,7 +83,6 @@ describe("generateSummary reasoning options", () => {
 			undefined,
 			undefined,
 			undefined,
-			undefined,
 			"medium",
 		);
 
@@ -192,7 +191,6 @@ describe("generateSummary reasoning options", () => {
 			undefined,
 			undefined,
 			undefined,
-			undefined,
 			agent,
 		);
 		const context = completeSimpleMock.mock.calls[0][1] as TranscriptContext;
@@ -212,17 +210,7 @@ describe("generateSummary reasoning options", () => {
 	});
 
 	it("does not set reasoning when thinking is off", async () => {
-		await generateSummary(
-			messages,
-			createModel(true),
-			2000,
-			"test-key",
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			"off",
-		);
+		await generateSummary(messages, createModel(true), 2000, "test-key", undefined, undefined, undefined, "off");
 
 		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
 		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({
@@ -232,17 +220,7 @@ describe("generateSummary reasoning options", () => {
 	});
 
 	it("does not set reasoning for non-reasoning models", async () => {
-		await generateSummary(
-			messages,
-			createModel(false),
-			2000,
-			"test-key",
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			"medium",
-		);
+		await generateSummary(messages, createModel(false), 2000, "test-key", undefined, undefined, undefined, "medium");
 
 		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
 		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({

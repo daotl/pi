@@ -730,10 +730,7 @@ export async function completeSummarization(
 	return retryAssistantCall(produce, retry, requestOptions.signal, callbacks);
 }
 
-/**
- * Generate a summary of the conversation using the LLM.
- * If previousSummary is provided, uses the update prompt to merge.
- */
+/** Generate a summary; earlier checkpoints belong in the ordered message prefix. */
 export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
@@ -742,7 +739,6 @@ export async function generateSummary(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	customInstructions?: string,
-	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
 	streamFn?: StreamFn,
 	env?: Record<string, string>,
@@ -761,7 +757,6 @@ export async function generateSummary(
 			headers,
 			signal,
 			customInstructions,
-			previousSummary,
 			thinkingLevel,
 			streamFn,
 			env,
@@ -774,7 +769,7 @@ export async function generateSummary(
 	).text;
 }
 
-/** Generate or update a conversation summary and return its provider usage. */
+/** Generate a checkpoint and return provider usage plus attributable file operations. */
 export async function generateSummaryWithUsage(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
@@ -783,7 +778,6 @@ export async function generateSummaryWithUsage(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	customInstructions?: string,
-	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
 	streamFn?: StreamFn,
 	env?: Record<string, string>,
@@ -804,15 +798,7 @@ export async function generateSummaryWithUsage(
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
 
-	// Retained for API compatibility; the previous summaries are provided as
-	// messages in the request prefix and are no longer folded into the instruction.
-	void previousSummary;
-
-	// Multiple previous summaries live in the request prefix (as their own
-	// messages) for cache fidelity, so they are NOT re-folded here. Every
-	// compaction summarizes only the messages being cut with the base prompt; the
-	// previous summaries are context, not a target to update. `previousSummary` is
-	// kept in the signature for API compatibility but no longer drives folding.
+	// Previous checkpoints remain context messages, not a target to fold into this summary.
 	let basePrompt = SUMMARIZATION_PROMPT;
 	if (customInstructions) {
 		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
@@ -1233,15 +1219,8 @@ export async function compact(
 	requestHistoryPolicy?: RequestHistoryPolicy,
 	usesAdapterOutputClamp?: (model: Model<Api>) => boolean,
 ): Promise<CompactionResult> {
-	const {
-		firstKeptEntryId,
-		messagesToSummarize,
-		turnPrefixMessages,
-		isSplitTurn,
-		tokensBefore,
-		previousSummary,
-		settings,
-	} = preparation;
+	const { firstKeptEntryId, messagesToSummarize, turnPrefixMessages, isSplitTurn, tokensBefore, settings } =
+		preparation;
 
 	// Summarize exactly the chat messages being replaced (previous summaries + history + turn
 	// prefix) in a single call. The request is byte-identical to a normal chat request up to the
@@ -1261,7 +1240,6 @@ export async function compact(
 		headers,
 		signal,
 		customInstructions,
-		previousSummary,
 		thinkingLevel,
 		streamFn,
 		env,

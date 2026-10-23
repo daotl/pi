@@ -58,7 +58,6 @@ async function summarize(operation: Operation, agent: Agent, streamFn: AgentStre
 			undefined,
 			focus,
 			undefined,
-			undefined,
 			streamFn,
 			undefined,
 			retry,
