@@ -49,6 +49,8 @@ A submitted batch of `pi_edit`/`pi_swipe` blocks is one durable history change: 
 
 Substring copy searches the active projected content, including custom messages, with context replacements applied and omitted messages excluded. Editable user/assistant indices are shared by copy output, numeric edit lookup, substring editing and the forkable-message inventory; custom messages carry no editable index. Projection changes this view without rewriting the original stored messages.
 
+Failures returned by an interactive editor submission are displayed as errors instead of escaping the asynchronous submit callback. Existing command-specific error messages and storage rollback rules still apply; this boundary does not roll back earlier command side effects or catch detached background tasks.
+
 For the persisted tree and entry types, see [Session Format](session-format.md).
 
 ## Manage conversation context

@@ -3515,7 +3515,7 @@ export class InteractiveMode {
 	}
 
 	private setupEditorSubmitHandler(): void {
-		this.defaultEditor.onSubmit = async (text: string) => {
+		const submit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
 
@@ -3828,6 +3828,10 @@ export class InteractiveMode {
 			}
 			this.editor.addToHistory?.(text);
 		};
+		this.defaultEditor.onSubmit = (text: string) =>
+			submit(text).catch((error: unknown) => {
+				this.showError(error instanceof Error ? error.message : String(error));
+			});
 	}
 
 	private subscribeToAgent(): void {

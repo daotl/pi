@@ -8,15 +8,16 @@ import { DefaultResourceLoader } from "../../src/core/resource-loader.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
-import { createHarness } from "./harness.ts";
+import { createHarness, getMessageText } from "./harness.ts";
 
 vi.mock("fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof fs>();
-	return { ...actual, appendFileSync: vi.fn(actual.appendFileSync) };
+	return { ...actual, appendFileSync: vi.fn(actual.appendFileSync), renameSync: vi.fn(actual.renameSync) };
 });
 beforeEach(async () => {
 	const actual = await vi.importActual<typeof fs>("fs");
 	vi.mocked(fs.appendFileSync).mockReset().mockImplementation(actual.appendFileSync);
+	vi.mocked(fs.renameSync).mockReset().mockImplementation(actual.renameSync);
 });
 afterEach(() => vi.useRealTimers());
 
@@ -305,3 +306,58 @@ it.each(["/update", "/update system-prompt", "/update skills", "/system-prompt s
 		}
 	},
 );
+
+it("reports a submitted deletion persistence failure without publishing history", async () => {
+	const cwd = fs.mkdtempSync(join(tmpdir(), "pi-submit-error-boundary-"));
+	const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+	const harness = await createHarness({
+		cwd,
+		sessionManager: manager,
+		settings: { retry: { enabled: false }, compaction: { enabled: false } },
+	});
+	try {
+		harness.setResponses([fauxAssistantMessage("retained answer")]);
+		await harness.session.prompt("retained question");
+		const bytes = fs.readFileSync(manager.getSessionFile()!);
+		const entries = structuredClone(manager.getEntries());
+		const messages = structuredClone(harness.session.messages);
+		const leaf = manager.getLeafId();
+		const calls = harness.faux.state.callCount;
+		const errors: string[] = [];
+		const context = Object.assign(Object.create(InteractiveMode.prototype), {
+			runtimeHost: { session: harness.session },
+			defaultEditor: {} as { onSubmit?: (text: string) => Promise<void> },
+			editor: { setText: (_text: string) => {} },
+			chatContainer: new Container(),
+			showError: (message: string) => errors.push(message),
+			showStatus: (_message: string) => {},
+			renderInitialMessages: () => {},
+			flushCompactionQueue: async () => {},
+		}) as { setupEditorSubmitHandler(): void; defaultEditor: { onSubmit?: (text: string) => Promise<void> } };
+		context.setupEditorSubmitHandler();
+		vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+			throw new Error("submitted deletion disk failure");
+		});
+		await expect(context.defaultEditor.onSubmit!("/delete 1")).resolves.toBeUndefined();
+		expect(errors).toEqual(["submitted deletion disk failure"]);
+		expect(fs.readFileSync(manager.getSessionFile()!)).toEqual(bytes);
+		expect(manager.getEntries()).toEqual(entries);
+		expect(manager.getLeafId()).toBe(leaf);
+		expect(harness.session.messages).toEqual(messages);
+		expect(harness.faux.state.callCount).toBe(calls);
+		expect(harness.session.isIdle).toBe(true);
+		await context.defaultEditor.onSubmit!("/delete 1");
+		expect(errors).toEqual(["submitted deletion disk failure"]);
+		const visibleTexts = harness.session.messages.filter((message) => message.role !== "system").map(getMessageText);
+		const reopenedTexts = SessionManager.open(manager.getSessionFile()!)
+			.buildSessionContext()
+			.messages.filter((message) => message.role !== "system")
+			.map(getMessageText);
+		expect(visibleTexts).toEqual(["retained question"]);
+		expect(reopenedTexts).toEqual(visibleTexts);
+		expect(harness.faux.state.callCount).toBe(calls);
+	} finally {
+		harness.cleanup();
+		fs.rmSync(cwd, { recursive: true, force: true });
+	}
+});
