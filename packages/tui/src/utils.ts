@@ -174,21 +174,62 @@ function finalizeTruncatedResult(
 	return pad ? result + " ".repeat(Math.max(0, maxWidth - visibleWidth)) : result;
 }
 
+interface TerminalCellPosition {
+	columns: number;
+	rows: number;
+	column: number;
+	cursor?: { index: number; row: number; col: number };
+	cursorPending: boolean;
+	cursorCaptured: boolean;
+	rowBreak?: (index: number) => void;
+	textIndex?: number;
+}
+
+/** Advance one terminal glyph, not a whole cluster of separately rendered glyphs. */
+function advanceTerminalCell(position: TerminalCellPosition, width: number): void {
+	if (width === 0 || position.cursorCaptured) return;
+	if (position.column > 0 && position.column + width > position.columns) {
+		position.rows++;
+		position.column = 0;
+		position.rowBreak?.(position.textIndex!);
+	}
+	if (position.cursor && position.cursorPending) {
+		position.cursor.row = position.rows - 1;
+		position.cursor.col = position.column;
+		position.cursorCaptured = true;
+		return;
+	}
+	position.column += width;
+}
+
 /**
  * Calculate the terminal width of a single grapheme cluster.
  * Based on code from the string-width library, but includes a possible-emoji
  * check to avoid running the RGI_Emoji regex unnecessarily.
  */
-function graphemeWidth(segment: string): number {
+function graphemeWidth(segment: string, position?: TerminalCellPosition): number {
 	if (segment.length === 1) {
 		const code = segment.charCodeAt(0);
-		if (code >= 0x20 && code <= 0x7e) return 1;
+		if (code >= 0x20 && code <= 0x7e) {
+			if (position) advanceTerminalCell(position, 1);
+			return 1;
+		}
 		if (code === 0x09) return 3;
 	}
 
 	// Some marks occupy cells even without a base character.
 	if (terminalSpacingMarkRegex.test(segment)) {
-		return [...segment].length;
+		const width = [...segment].length;
+		if (position) {
+			const startIndex = position.textIndex ?? 0;
+			let offset = 0;
+			for (const char of segment) {
+				if (position.rowBreak) position.textIndex = startIndex + offset;
+				advanceTerminalCell(position, 1);
+				offset += char.length;
+			}
+		}
+		return width;
 	}
 
 	// Zero-width clusters
@@ -198,6 +239,7 @@ function graphemeWidth(segment: string): number {
 
 	// Emoji check with pre-filter
 	if (couldBeEmoji(segment) && rgiEmojiRegex.test(segment)) {
+		if (position) advanceTerminalCell(position, 2);
 		return 2;
 	}
 
@@ -212,10 +254,12 @@ function graphemeWidth(segment: string): number {
 	// full-width emoji in terminals, even when isolated during streaming.
 	// Keep width conservative (2) to avoid terminal auto-wrap drift artifacts.
 	if (cp >= 0x1f1e6 && cp <= 0x1f1ff) {
+		if (position) advanceTerminalCell(position, 2);
 		return 2;
 	}
 
 	let width = eastAsianWidth(cp);
+	if (position) advanceTerminalCell(position, width);
 
 	// Intl.Segmenter can group multiple terminal-spacing code points into one
 	// grapheme. Count trailing visible code points that terminals may allocate
@@ -223,9 +267,13 @@ function graphemeWidth(segment: string): number {
 	// Thai/Lao AM vowels.
 	let followsMark = false;
 	const chars = [...base];
+	const startIndex = position?.textIndex ?? 0;
+	let offset = segment.length - base.length + chars[0].length;
 	for (const char of chars.slice(1)) {
+		if (position?.rowBreak) position.textIndex = startIndex + offset;
 		if (terminalSpacingMarkRegex.test(char)) {
 			width += 1;
+			if (position) advanceTerminalCell(position, 1);
 			followsMark = false;
 		} else if (markCharRegex.test(char)) {
 			followsMark = true;
@@ -233,12 +281,16 @@ function graphemeWidth(segment: string): number {
 			const c = char.codePointAt(0)!;
 			if (followsMark || (c >= 0xff00 && c <= 0xffef)) {
 				// halfwidth + fullwidth forms
-				width += eastAsianWidth(c);
+				const cellWidth = eastAsianWidth(c);
+				width += cellWidth;
+				if (position) advanceTerminalCell(position, cellWidth);
 			} else if (c === 0x0e33 || c === 0x0eb3) {
 				width += 1;
+				if (position) advanceTerminalCell(position, 1);
 			}
 			followsMark = false;
 		}
+		offset += char.length;
 	}
 
 	return width;
@@ -432,10 +484,10 @@ export function extractAnsiCode(str: string, pos: number): { code: string; lengt
  * Width of a string made of printable ASCII, tabs, and ANSI escape sequences, or -1 if it contains
  * anything else. Matches `visibleWidth` for those strings without allocating.
  */
-function asciiVisibleWidth(str: string): number {
+function asciiVisibleWidth(str: string, endIndex = str.length): number {
 	let width = 0;
 	let i = 0;
-	while (i < str.length) {
+	while (i < endIndex) {
 		const code = str.charCodeAt(i);
 		if (code >= 0x20 && code <= 0x7e) {
 			width++;
@@ -452,6 +504,76 @@ function asciiVisibleWidth(str: string): number {
 		}
 	}
 	return width;
+}
+
+/** Count physical rows; optionally locate an ANSI cursor marker using the same wrap decisions. */
+export function terminalLineRows(
+	str: string,
+	columns: number,
+	cursor?: { index: number; row: number; col: number },
+	rowBreak?: (index: number) => void,
+): number {
+	const asciiWidth = asciiVisibleWidth(str);
+	if (asciiWidth !== -1 && !rowBreak) {
+		if (cursor) {
+			const prefixWidth = asciiVisibleWidth(str, cursor.index);
+			cursor.row = Math.floor(prefixWidth / columns);
+			cursor.col = prefixWidth % columns;
+		}
+		return Math.max(1, Math.ceil(asciiWidth / columns));
+	}
+
+	const position: TerminalCellPosition = {
+		columns,
+		rows: 1,
+		column: 0,
+		cursor,
+		cursorPending: false,
+		cursorCaptured: false,
+		rowBreak,
+		textIndex: 0,
+	};
+	let i = 0;
+	while (i < str.length) {
+		const ansiLength = ansiCodeLength(str, i);
+		if (ansiLength > 0) {
+			if (cursor && i === cursor.index) position.cursorPending = true;
+			i += ansiLength;
+			continue;
+		}
+		let end = str.indexOf("\x1b", i + 1);
+		while (end !== -1 && ansiCodeLength(str, end) === 0) end = str.indexOf("\x1b", end + 1);
+		if (end === -1) end = str.length;
+		for (const { segment, index } of graphemeSegmenter.segment(str.slice(i, end))) {
+			if (rowBreak) position.textIndex = i + index;
+			if (segment === "\r" || segment === "\n" || segment === "\r\n") {
+				if (cursor && position.cursorPending) {
+					cursor.row = position.rows - 1;
+					cursor.col = position.column;
+					return position.rows;
+				}
+				if (segment !== "\r") {
+					position.rows++;
+					rowBreak?.(i + index + segment.length);
+				}
+				position.column = 0; // normalizeTerminalOutput emits CRLF for visible LF.
+				continue;
+			}
+			if (segment === "\t") {
+				// A normalized tab is three independently wrapping spaces.
+				for (let cell = 0; cell < 3; cell++) advanceTerminalCell(position, 1);
+			} else {
+				graphemeWidth(segment, position);
+			}
+			if (position.cursorCaptured) return position.rows;
+		}
+		i = end;
+	}
+	if (cursor) {
+		cursor.row = position.rows - 1;
+		cursor.col = position.column;
+	}
+	return position.rows;
 }
 
 /** Length of the ANSI/OSC/APC escape sequence starting at `pos`, or 0 if there is none. */

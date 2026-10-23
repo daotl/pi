@@ -2,8 +2,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
-import { type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
-import { shouldWrapLinesToWidth, visibleWidth } from "./utils.ts";
+import { CURSOR_MARKER, type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
+import { shouldWrapLinesToWidth, terminalLineRows, visibleWidth } from "./utils.ts";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 const MAX_RENDER_WRITE_CHARS = 1024 * 1024;
@@ -171,7 +171,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	protected override beforeTerminalStop(options: TuiStopOptions): void {
 		if (options.preserveScreen || this.previousLines.length === 0) return;
 		this.terminal.write(" ");
-		const targetRow = this.previousLines.length;
+		const targetRow = this.previousLayout?.totalRows ?? this.previousLines.length;
 		const lineDiff = targetRow - this.hardwareCursorRow;
 		if (lineDiff > 0) this.terminal.write(`\x1b[${lineDiff}B`);
 		else if (lineDiff < 0) this.terminal.write(`\x1b[${-lineDiff}A`);
@@ -247,47 +247,6 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		return this.deleteKittyImages(ids);
 	}
 
-	private lineRows(line: string, width: number): number {
-		if (isImageLine(line)) return 1;
-		if (!line.includes("\n")) {
-			return Math.max(1, Math.ceil(visibleWidth(line) / width));
-		}
-		// A line may contain embedded newlines (e.g. a markdown paragraph with a hard line
-		// break or inline latex spanning lines). Simulate the terminal: a bare \n advances
-		// a row AND resets the column to 0 (the pty translates LF to CR+LF), so each
-		// segment starts at column 0 regardless of the previous segment's width. Keeping
-		// the column across a newline would overcount rows for embedded-newline lines.
-		// Miscounting here is not harmless: an overcount makes the differential renderer
-		// scroll a stale blank row into the scrollback, an undercount leaves stale
-		// fragments behind (duplicated lines).
-		const segments = line.split("\n");
-		let row = 0;
-		let col = 0; // column in [0, width]; col === width means a pending wrap
-		for (let s = 0; s < segments.length; s++) {
-			const segmentWidth = visibleWidth(segments[s]);
-			if (segmentWidth > 0) {
-				if (col === width) {
-					row += 1; // pending wrap materialized by the next character
-					col = 0;
-				}
-				row += Math.floor((col + segmentWidth - 1) / width);
-				col = (col + segmentWidth) % width;
-				if (col === 0) {
-					col = width; // pending wrap at the exact row boundary
-				}
-			}
-			if (s < segments.length - 1) {
-				// A bare \n is translated to CR+LF by the terminal pty (onlcr), so it always
-				// advances a row AND resets the column to 0, whether or not a pending wrap
-				// was latched. Keeping the column across a newline overcounts rows for
-				// embedded-newline lines (e.g. a markdown paragraph with a hard break).
-				row += 1;
-				col = 0;
-			}
-		}
-		return Math.max(1, row + 1);
-	}
-
 	/**
 	 * Start row (terminal) and total rows for a rendered line array. With line wrapping
 	 * disabled (the default), wide lines reflow in the terminal, so each logical line
@@ -306,7 +265,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				}
 				i += reservedRows;
 			} else {
-				totalRows += this.lineRows(lines[i], width);
+				totalRows += terminalLineRows(lines[i], width);
 				i += 1;
 			}
 		}
@@ -364,6 +323,24 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			if (newOffsets[i] !== prevOffsets[i]) return true;
 		}
 		return false;
+	}
+
+	protected override extractCursorPosition(
+		lines: string[],
+		height: number,
+	): { row: number; col: number; wrappedRow: number } | null {
+		const viewportTop = Math.max(0, lines.length - height);
+		const width = this.terminal.columns;
+		for (let row = lines.length - 1; row >= viewportTop; row--) {
+			const line = lines[row];
+			const markerIndex = line.indexOf(CURSOR_MARKER);
+			if (markerIndex === -1) continue;
+			const cursor = { index: markerIndex, row: 0, col: 0 };
+			terminalLineRows(line, width, cursor);
+			lines[row] = line.slice(0, markerIndex) + line.slice(markerIndex + CURSOR_MARKER.length);
+			return { row, col: cursor.col % width, wrappedRow: cursor.row + Math.floor(cursor.col / width) };
+		}
+		return null;
 	}
 
 	protected override doRender(): void {
@@ -680,7 +657,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			// into the scrollback), and emitting extra "\r\n" pairs past the bottom row
 			// would scroll a freshly-cleared blank row into the scrollback instead,
 			// permanently misaligning it by one row.
-			const newLineRows = this.lineRows(line, width);
+			const newLineRows = isImage ? 1 : (newLayout.offsets[i + 1] ?? newLayout.totalRows) - newLayout.offsets[i];
 			const clearRows = Math.max(1, Math.min(newLineRows, viewportTop + height - 1 - newLayout.offsets[i] + 1));
 			output.append("\x1b[2K");
 			for (let r = 1; r < clearRows; r++) {
@@ -800,7 +777,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	 * @param layout Terminal-row layout of the rendered lines
 	 */
 	private positionHardwareCursor(
-		cursorPos: { row: number; col: number } | null,
+		cursorPos: { row: number; col: number; wrappedRow: number } | null,
 		layout: { offsets: number[]; totalRows: number },
 	): void {
 		if (!cursorPos || layout.totalRows <= 0) {
@@ -808,14 +785,10 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			return;
 		}
 
-		// The cursor position is logical (line index + column). Convert to the actual
-		// terminal row/column, accounting for wrapped (multi-row) lines.
-		const width = this.terminal.columns;
+		// The marker supplies the physical offset, including wide glyphs that wrap early.
 		const logicalRow = Math.max(0, Math.min(cursorPos.row, layout.offsets.length - 1));
-		const wrappedRow = Math.floor(cursorPos.col / width);
-		const wrappedCol = cursorPos.col % width;
-		const targetRow = Math.max(0, Math.min(layout.offsets[logicalRow] + wrappedRow, layout.totalRows - 1));
-		const targetCol = Math.max(0, wrappedCol);
+		const targetRow = Math.max(0, Math.min(layout.offsets[logicalRow] + cursorPos.wrappedRow, layout.totalRows - 1));
+		const targetCol = Math.max(0, cursorPos.col);
 
 		// Move cursor from current position to target
 		const rowDelta = targetRow - this.hardwareCursorRow;

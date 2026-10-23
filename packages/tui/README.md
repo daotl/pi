@@ -756,6 +756,8 @@ if (matchesKey(data, Key.enter)) {
 
 Both renderers wrap updates in **synchronized output** (`\x1b[?2026h` ... `\x1b[?2026l`) for atomic, flicker-free rendering.
 
+Main-screen row and hardware-cursor accounting follows terminal glyph placement, not total string width divided by columns. Wide glyphs that cannot fit the remaining cells wrap before drawing; independently rendered spacing constituents within an Indic cluster advance separately. Visible newline/carriage-return and pending-wrap behavior use the same walker, while recognized control-string payloads do not consume rows. The existing `visibleWidth()` measurement remains a width-only operation.
+
 ## Terminal Interface
 
 The TUI works with any object implementing the `Terminal` interface:

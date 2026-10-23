@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import type { Component } from "../src/tui.ts";
+import { type Component, CURSOR_MARKER } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
@@ -13,6 +13,239 @@ class TestComponent implements Component {
 }
 
 describe("TUI wrapped-line differential rendering (wrapping disabled)", () => {
+	it("wraps independently rendered Indic constituents without pushing the footer cursor down", async () => {
+		const terminal = new VirtualTerminal(79, 6);
+		const tui = new TuiMainScreen(terminal, true);
+		const component = new TestComponent();
+		const body = "र्क".repeat(79);
+		component.lines = ["Header", body, `Footer${CURSOR_MARKER}`];
+		tui.addChild(component);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			const expectedBody = [`${"र्क".repeat(39)}र्`, `क${"र्क".repeat(39)}`];
+			assert.deepStrictEqual(terminal.getViewport(), ["Header", ...expectedBody, "Footer", "", ""]);
+			assert.deepStrictEqual(terminal.getCursorPosition(), { x: 6, y: 3 });
+
+			component.lines = ["Changed", body, `Footer${CURSOR_MARKER}`];
+			tui.requestRender();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), ["Changed", ...expectedBody, "Footer", "", ""]);
+			assert.deepStrictEqual(terminal.getCursorPosition(), { x: 6, y: 3 });
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("positions the hardware cursor before a wide glyph that wraps and after the last glyph", async () => {
+		const terminal = new VirtualTerminal(79, 6);
+		const tui = new TuiMainScreen(terminal, true);
+		const component = new TestComponent();
+		let wide = `${"界".repeat(78)}${CURSOR_MARKER}界`;
+		component.lines = ["Header", wide, "Footer"];
+		tui.addChild(component);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), [
+				"Header",
+				"界".repeat(39),
+				"界".repeat(39),
+				"界",
+				"Footer",
+				"",
+			]);
+			assert.deepStrictEqual(terminal.getCursorPosition(), { x: 0, y: 3 });
+
+			component.lines = ["Changed", wide, "Footer"];
+			tui.requestRender();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), [
+				"Changed",
+				"界".repeat(39),
+				"界".repeat(39),
+				"界",
+				"Footer",
+				"",
+			]);
+			assert.deepStrictEqual(terminal.getCursorPosition(), { x: 0, y: 3 });
+
+			wide = `${"界".repeat(79)}${CURSOR_MARKER}`;
+			component.lines = ["Changed", wide, "Footer"];
+			tui.requestRender();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), [
+				"Changed",
+				"界".repeat(39),
+				"界".repeat(39),
+				"界",
+				"Footer",
+				"",
+			]);
+			assert.deepStrictEqual(terminal.getCursorPosition(), { x: 2, y: 3 });
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("positions the hardware cursor after embedded newlines without counting control payload newlines", async () => {
+		const terminal = new VirtualTerminal(8, 6);
+		const tui = new TuiMainScreen(terminal, true);
+		const component = new TestComponent();
+		const payload = "\x1b]0;hidden\ntext\x07\x1b_hidden\ntext\x1b\\";
+		component.lines = ["Header", `abc\n${payload}12${CURSOR_MARKER}3456`, "Footer"];
+		tui.addChild(component);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), ["Header", "abc", "123456", "Footer", "", ""]);
+			assert.deepStrictEqual(terminal.getCursorPosition(), { x: 2, y: 2 });
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("keeps ASCII cursor positions across exact-width wraps and zero-width controls", async () => {
+		const terminal = new VirtualTerminal(8, 5);
+		const tui = new TuiMainScreen(terminal, true);
+		const component = new TestComponent();
+		component.lines = ["Header", `abcdefgh${CURSOR_MARKER}\x1b[31m\u0301\x1b[0mX`, "Footer"];
+		tui.addChild(component);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), ["Header", "abcdefgh", "X", "Footer", ""]);
+			assert.deepStrictEqual(terminal.getCursorPosition(), { x: 0, y: 2 });
+
+			component.lines = ["Header", `abcdefgh${CURSOR_MARKER}`, "Footer"];
+			tui.requestRender();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), ["Header", "abcdefgh", "Footer", "", ""]);
+			assert.deepStrictEqual(terminal.getCursorPosition(), { x: 0, y: 2 });
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("preserves three CJK rows at an odd terminal width when the header changes", async () => {
+		const terminal = new VirtualTerminal(79, 6);
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		const wide = "界".repeat(79);
+		component.lines = ["Header", wide, "Footer"];
+		tui.addChild(component);
+		tui.start();
+		let stopped = false;
+		try {
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), [
+				"Header",
+				"界".repeat(39),
+				"界".repeat(39),
+				"界",
+				"Footer",
+				"",
+			]);
+			assert.deepStrictEqual(terminal.getCursorPosition(), { x: 6, y: 4 });
+
+			component.lines = ["Changed", wide, "Footer"];
+			tui.requestRender();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), [
+				"Changed",
+				"界".repeat(39),
+				"界".repeat(39),
+				"界",
+				"Footer",
+				"",
+			]);
+			assert.deepStrictEqual(terminal.getCursorPosition(), { x: 7, y: 0 });
+			tui.stop();
+			stopped = true;
+			terminal.write("shell prompt");
+			await terminal.flush();
+			assert.deepStrictEqual(
+				terminal
+					.getScrollBuffer()
+					.slice(0, 7)
+					.map((line) => line.trimEnd()),
+				["Changed", "界".repeat(39), "界".repeat(39), "界", "Footer", "", "shell prompt"],
+			);
+		} finally {
+			if (!stopped) tui.stop();
+		}
+	});
+
+	it("starts embedded newlines at column zero and preserves rows when the header changes", async () => {
+		const terminal = new VirtualTerminal(8, 6);
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		component.lines = ["Header", "abc\n123456", "Footer"];
+		tui.addChild(component);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), ["Header", "abc", "123456", "Footer", "", ""]);
+			assert.deepStrictEqual(terminal.getCursorPosition(), { x: 6, y: 3 });
+
+			component.lines = ["Changed", "abc\n123456", "Footer"];
+			tui.requestRender();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), ["Changed", "abc", "123456", "Footer", "", ""]);
+			assert.deepStrictEqual(terminal.getCursorPosition(), { x: 7, y: 0 });
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("materializes exact-width pending wraps only for visible glyphs", async () => {
+		const terminal = new VirtualTerminal(8, 11);
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		const pending = "abcdefgh\x1b[31m\u0301\x1b[0m";
+		const payload = "\x1b]0;hidden\ntext\x07\x1b_hidden\ntext\x1b\\";
+		const content = [pending, `${pending}\nN`, `${pending}X`, `abc\r\n123456`, `abc\rZ`, `end${payload}`];
+		component.lines = ["Header", ...content];
+		tui.addChild(component);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), [
+				"Header",
+				"abcdefgh",
+				"abcdefgh",
+				"N",
+				"abcdefgh",
+				"X",
+				"abc",
+				"123456",
+				"Zbc",
+				"end",
+				"",
+			]);
+			assert.deepStrictEqual(terminal.getCursorPosition(), { x: 3, y: 9 });
+
+			component.lines = ["Changed", ...content];
+			tui.requestRender();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), [
+				"Changed",
+				"abcdefgh",
+				"abcdefgh",
+				"N",
+				"abcdefgh",
+				"X",
+				"abc",
+				"123456",
+				"Zbc",
+				"end",
+				"",
+			]);
+			assert.deepStrictEqual(terminal.getCursorPosition(), { x: 7, y: 0 });
+		} finally {
+			tui.stop();
+		}
+	});
 	it("positions a later changed line below a wrapped (multi-row) line", async () => {
 		const terminal = new VirtualTerminal(20, 6);
 		const tui = new TuiMainScreen(terminal);
