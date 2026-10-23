@@ -7,7 +7,12 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import type { PromptDisposition, QueuedInputDisposition, SessionStats } from "../../core/agent-session.ts";
+import type {
+	CompactOptions,
+	PromptDisposition,
+	QueuedInputDisposition,
+	SessionStats,
+} from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
@@ -18,6 +23,9 @@ import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "
 // ============================================================================
 // Types
 // ============================================================================
+
+/** Retention and summary options for the existing compact RPC command. */
+export type RpcCompactOptions = CompactOptions;
 
 /** Distributive Omit that works with union types */
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
@@ -325,8 +333,17 @@ export class RpcClient {
 	/**
 	 * Compact session context.
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
-		const response = await this.send({ type: "compact", customInstructions }, 0);
+	async compact(options?: RpcCompactOptions | string): Promise<CompactionResult> {
+		const opts = typeof options === "string" ? { customInstructions: options } : options;
+		const response = await this.send(
+			{
+				type: "compact",
+				customInstructions: opts?.customInstructions,
+				keepRecentTokens: opts?.keepRecentTokens,
+				keepRecentMessages: opts?.keepRecentMessages,
+			},
+			0,
+		);
 		return this.getData(response);
 	}
 

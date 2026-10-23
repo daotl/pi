@@ -377,6 +377,20 @@ With custom instructions:
 {"type": "compact", "customInstructions": "Focus on code changes"}
 ```
 
+Override retained recent history:
+```json
+{"type": "compact", "customInstructions": "Focus on code changes", "keepRecentMessages": 4}
+{"type": "compact", "keepRecentTokens": 2000}
+{"type": "compact", "keepRecentMessages": 4, "keepRecentTokens": 2000}
+```
+
+- `keepRecentTokens` overrides the configured token budget. `0` selects the latest valid cut point; tool-call boundaries may still retain recent history.
+- `keepRecentMessages` selects recent context-visible non-system entries, aligned to a valid message/tool-group boundary. `0` selects the latest valid cut point.
+- When both are supplied, the later cut wins: the option retaining less history takes precedence. With neither, configured `keepRecentTokens` applies.
+- If no older history can be summarized, compaction fails with `Nothing to compact` and leaves history unchanged.
+
+The exported TypeScript client accepts `client.compact({ customInstructions, keepRecentTokens, keepRecentMessages })`. Import `RpcCompactOptions` from `@earendil-works/pi-coding-agent`; this names the core retention contract, distinct from the extension `CompactOptions`. Existing `client.compact("Focus on code changes")` and `client.compact()` remain supported. Compaction keeps its existing unbounded response wait rather than a generic request timeout.
+
 Response:
 ```json
 {

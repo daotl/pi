@@ -420,6 +420,7 @@ export {
 	RpcClient,
 	type RpcClientOptions,
 	type RpcCommand,
+	type RpcCompactOptions,
 	type RpcEventListener,
 	type RpcExtensionUIRequest,
 	type RpcExtensionUIResponse,
