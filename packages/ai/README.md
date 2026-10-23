@@ -1516,6 +1516,12 @@ Notes:
 - By default, each streamed chunk is emitted on its own microtask. Set `tokensPerSecond` to pace chunk delivery in real time.
 - The intended use is one deterministic scripted flow per handle. If you need independent concurrent flows, create separate faux providers with distinct `provider` ids.
 
+## Optional Tokenizer Requests
+
+`countTokensWithRetry(model, options, retryPolicy, onUnavailable?, canRequest?)` retries transient `/tokenize` failures. The optional `canRequest` callback is awaited before every attempt, including retries after backoff. Returning false stops without uploading text or credentials; rejection propagates. Cancellation is checked before and after authorization.
+
+`onUnavailable` reports a definitive unusable endpoint for non-empty text. Policy denial, cancellation, empty input and exhausted transient retries do not mark the endpoint unavailable. `countChatTokens` remains the separate chat-template-aware counting API.
+
 ## Cross-Provider Handoffs
 
 The library supports seamless handoffs between different LLM providers within the same conversation. This allows you to switch models mid-conversation while preserving context, including thinking blocks, tool calls, and tool results.

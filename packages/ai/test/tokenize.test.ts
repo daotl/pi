@@ -205,4 +205,162 @@ describe("countTokens", () => {
 			await countTokens(model("http://host:8080"), { text: "x", fetch: neverFetched, signal: aborted.signal }),
 		).toBeUndefined();
 	});
+
+	it("awaits authorization before sending text or credentials", async () => {
+		const authorization = Promise.withResolvers<boolean>();
+		const requests: RequestInit[] = [];
+		let unavailable = false;
+		const request = countTokensWithRetry(
+			model("http://host:8080"),
+			{
+				text: "PRIVATE HISTORY",
+				apiKey: "private-key",
+				fetch: mockFetch(async (_url, init) => {
+					requests.push(init);
+					return Response.json({ tokens: [1] });
+				}),
+			},
+			retryPolicy,
+			() => {
+				unavailable = true;
+			},
+			() => authorization.promise,
+		);
+		await Promise.resolve();
+		expect(requests).toEqual([]);
+		authorization.resolve(false);
+		await expect(request).resolves.toBeUndefined();
+		expect(requests).toEqual([]);
+		expect(unavailable).toBe(false);
+	});
+
+	it("rechecks authorization after a transient attempt without reporting unavailability", async () => {
+		const requests: string[] = [];
+		let permitted = true;
+		let unavailable = false;
+		const count = await countTokensWithRetry(
+			model("http://host:8080"),
+			{
+				text: "first permitted history",
+				fetch: mockFetch(async (_url, init) => {
+					requests.push(String(init.body));
+					permitted = false;
+					return new Response("transient", { status: 503 });
+				}),
+			},
+			retryPolicy,
+			() => {
+				unavailable = true;
+			},
+			async () => permitted,
+		);
+		expect(count).toBeUndefined();
+		expect(requests).toEqual([JSON.stringify({ content: "first permitted history" })]);
+		expect(unavailable).toBe(false);
+	});
+
+	it("does not dispatch if cancellation arrives while authorization is pending", async () => {
+		const authorization = Promise.withResolvers<boolean>();
+		const controller = new AbortController();
+		let dispatched = false;
+		let unavailable = false;
+		const request = countTokensWithRetry(
+			model("http://host:8080"),
+			{
+				text: "private",
+				signal: controller.signal,
+				fetch: mockFetch(async () => {
+					dispatched = true;
+					return Response.json({ tokens: [1] });
+				}),
+			},
+			retryPolicy,
+			() => {
+				unavailable = true;
+			},
+			() => authorization.promise,
+		);
+		controller.abort();
+		authorization.resolve(true);
+		await expect(request).resolves.toBeUndefined();
+		expect(dispatched).toBe(false);
+		expect(unavailable).toBe(false);
+	});
+
+	it("propagates authorization failure without dispatch or endpoint poisoning", async () => {
+		const failure = new Error("authorization failed");
+		let dispatched = false;
+		let unavailable = false;
+		await expect(
+			countTokensWithRetry(
+				model("http://host:8080"),
+				{
+					text: "private",
+					fetch: mockFetch(async () => {
+						dispatched = true;
+						return Response.json({ tokens: [1] });
+					}),
+				},
+				retryPolicy,
+				() => {
+					unavailable = true;
+				},
+				async () => {
+					throw failure;
+				},
+			),
+		).rejects.toBe(failure);
+		expect(dispatched).toBe(false);
+		expect(unavailable).toBe(false);
+	});
+
+	it("preserves exact counts after asynchronous authorization allows dispatch", async () => {
+		const authorization = Promise.withResolvers<boolean>();
+		const requests: string[] = [];
+		const request = countTokensWithRetry(
+			model("http://host:8080"),
+			{
+				text: "authorized history",
+				fetch: mockFetch(async (_url, init) => {
+					requests.push(String(init.body));
+					return Response.json({ tokens: [1, 2, 3] });
+				}),
+			},
+			retryPolicy,
+			undefined,
+			() => authorization.promise,
+		);
+		await Promise.resolve();
+		expect(requests).toEqual([]);
+		authorization.resolve(true);
+		await expect(request).resolves.toBe(3);
+		expect(requests).toEqual([JSON.stringify({ content: "authorized history" })]);
+	});
+
+	it.each(["unavailable", "empty", "exhausted", "success"] as const)(
+		"reports only definitive non-empty unavailability: %s",
+		async (kind) => {
+			let endpointUnavailable = false;
+			const count = await countTokensWithRetry(
+				model("http://host:8080"),
+				{
+					text: kind === "empty" ? "" : "history",
+					fetch: mockFetch(async () =>
+						kind === "exhausted"
+							? new Response("transient", { status: 503 })
+							: kind === "success"
+								? Response.json({ tokens: [1, 2] })
+								: new Response("unsupported", { status: 404 }),
+					),
+				},
+				{ enabled: false, maxRetries: 0, baseDelayMs: 0 },
+				() => {
+					endpointUnavailable = true;
+				},
+				async () => true,
+			);
+			expect(endpointUnavailable).toBe(kind === "unavailable");
+			expect(count).toBe(kind === "success" ? 2 : undefined);
+		},
+	);
 });

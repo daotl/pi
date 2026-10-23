@@ -263,17 +263,25 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
  *
  * Returns undefined after exhausting retries (or on abort), so the caller falls
  * back to an estimate rather than failing the whole operation.
+ * onUnavailable reports only a definitive unusable endpoint for non-empty text, not
+ * cancellation, policy denial, or exhausted transient retries. canRequest is awaited
+ * before each attempt; rejection propagates without uploading text or credentials.
  */
 export async function countTokensWithRetry(
 	model: Model<any>,
 	options: CountTokensOptions,
 	policy: RetryPolicy | undefined,
+	onUnavailable?: () => void,
+	canRequest?: () => boolean | Promise<boolean>,
 ): Promise<number | undefined> {
 	const maxAttempts = policy?.enabled ? policy.maxRetries : 0;
 	let attempt = 0;
 	for (;;) {
+		if (options.signal?.aborted || (canRequest && !(await canRequest())) || options.signal?.aborted) return undefined;
 		try {
-			return await countTokens(model, options);
+			const count = await countTokens(model, options);
+			if (count === undefined && options.text && !options.signal?.aborted) onUnavailable?.();
+			return count;
 		} catch (error) {
 			if (!(error instanceof TokenizeTransientError)) throw error;
 			if (attempt >= maxAttempts) return undefined;
