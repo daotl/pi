@@ -88,6 +88,8 @@ What the LLM sees:
 
 On repeated compactions, each new compaction summarizes only the messages being cut. Every prior summary is kept as its own message in the context prefix (oldest first), so no summary is ever re-summarized into a summary-of-summaries. The LLM sees `system prompt + [summary 1, summary 2, ...] + [kept messages]`. Because the summaries block grows with each compaction, its size is bounded by `summaryBlockMaxTokens` (default 16384); when the block exceeds the limit, the oldest summaries are dropped from the context view (never the most recent). A limit of `0` keeps only the most recent summary, matching the pre-feature single-summary behavior. Dropped summaries remain in the JSONL file; only the context view is filtered.
 
+The transcript uses `compaction.summaryPlacement` consistently on initial load, after normal or extension-boundary compaction, on rebuild and when reopening a session. `context` shows selected summaries before the retained messages; `chronological` shows those same selected entries in active-branch order. Both modes use persisted summary timestamps and billing usage, exclude summaries outside the block limit, and leave the model's summaries-first context order unchanged.
+
 When the structured history fits, the summarization request keeps the normal chat prefix (system prompt plus the summaries block and messages being cut, minus the preserved tail); only the summarization instruction is appended. Oversized converted tool history uses the bounded fallback described above instead of claiming prefix identity.
 
 ### Token counting

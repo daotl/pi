@@ -42,8 +42,9 @@ type RenderSessionContextThis = {
 		getShowImages(): boolean;
 		getImageWidthCells(): number;
 		getShowCacheMissNotices(): boolean;
+		getCompactionSummaryPlacement(): "context";
 	};
-	sessionManager: { getCwd(): string; getEntries(): SessionEntry[] };
+	sessionManager: { getCwd(): string; getEntries(): SessionEntry[]; getBranch(): SessionEntry[] };
 	session: { retryAttempt: number; modelRegistry: { find(provider: string, modelId: string): undefined } };
 	toolOutputExpanded: boolean;
 	isInitialized: boolean;
@@ -73,8 +74,9 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 			getShowImages: () => false,
 			getImageWidthCells: () => 60,
 			getShowCacheMissNotices: () => false,
+			getCompactionSummaryPlacement: () => "context",
 		},
-		sessionManager: { getCwd: () => process.cwd(), getEntries: () => [] },
+		sessionManager: { getCwd: () => process.cwd(), getEntries: () => [], getBranch: () => [] },
 		session: { retryAttempt: 0, modelRegistry: { find: () => undefined } },
 		toolOutputExpanded: false,
 		isInitialized: true,

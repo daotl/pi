@@ -113,7 +113,7 @@ import {
 	formatMessageForSwipe,
 	isMessageEdit,
 } from "../../core/message-edit.ts";
-import { createCompactionSummaryMessage, createCustomMessage } from "../../core/messages.ts";
+import { createCustomMessage } from "../../core/messages.ts";
 import {
 	defaultModelPerProvider,
 	findExactModelReferenceMatch,
@@ -3898,25 +3898,13 @@ export class InteractiveMode {
 					this.ui.requestRender();
 				} else if (event.entry.type === "compaction") {
 					const entries = this.sessionManager.buildContextEntries();
-					if (entries[0]?.id !== event.entry.id) break;
-					this.chatContainer.clear();
+					if (!entries.some((entry) => entry.id === event.entry.id)) break;
 					const branch = this.sessionManager.getBranch();
 					const compactionIndex = branch.findIndex((entry) => entry.id === event.entry.id);
-					const entriesAfterCompaction = new Set(branch.slice(compactionIndex + 1).map((entry) => entry.id));
-					const retainedEntries = entries.slice(1);
-					this.renderSessionEntries(retainedEntries.filter((entry) => !entriesAfterCompaction.has(entry.id)));
-					this.addMessageToChat(
-						createCompactionSummaryMessage(event.entry.summary, event.entry.tokensBefore, event.entry.timestamp),
-					);
-					if (event.entry.usage) {
-						this.addCompactionCostNotice({
-							type: "compaction_cost",
-							kind: "compaction",
-							usage: event.entry.usage,
-						});
+					this.rebuildChatFromMessages();
+					for (let i = compactionIndex + 1; i < branch.length; i++) {
+						this.entriesRenderedByBoundaryCompaction.add(branch[i].id);
 					}
-					this.renderSessionEntries(retainedEntries.filter((entry) => entriesAfterCompaction.has(entry.id)));
-					for (const entryId of entriesAfterCompaction) this.entriesRenderedByBoundaryCompaction.add(entryId);
 					this.footer.invalidate();
 					this.ui.requestRender();
 				}
@@ -4153,36 +4141,7 @@ export class InteractiveMode {
 					}
 				} else if (event.result) {
 					this.footer.invalidateSessionStats();
-					if (this.settingsManager.getCompactionSummaryPlacement() === "chronological") {
-						// Chronological placement: the summary is appended at the end of the
-						// chat, when compaction happened (the original mainline behavior).
-						const entries = this.sessionManager.buildContextEntries();
-						if (entries[0]?.type !== "compaction") {
-							throw new Error("Completed compaction is missing from the session context");
-						}
-						this.chatContainer.clear();
-						this.renderSessionEntries(entries.slice(1));
-						this.addMessageToChat(
-							createCompactionSummaryMessage(
-								event.result.summary,
-								event.result.tokensBefore,
-								new Date().toISOString(),
-							),
-						);
-						if (event.result.usage) {
-							this.addCompactionCostNotice({
-								type: "compaction_cost",
-								kind: "compaction",
-								usage: event.result.usage,
-							});
-						}
-					} else {
-						// Default "context" placement: the summary is stored as a compaction
-						// entry at its real position (before the kept messages). Rebuild the
-						// chat from context entries so the summary renders before the kept
-						// range, with the compaction cost notice inline.
-						this.rebuildChatFromMessages();
-					}
+					this.rebuildChatFromMessages();
 					this.footer.invalidate();
 				} else if (event.errorMessage) {
 					if (event.reason === "manual") {
@@ -4548,6 +4507,14 @@ export class InteractiveMode {
 		entries: SessionEntry[],
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
+		// Order only selected display entries; the model's context prefix stays unchanged.
+		if (entries.length > 0 && this.settingsManager.getCompactionSummaryPlacement() === "chronological") {
+			const selected = new Map(entries.map((entry) => [entry.id, entry]));
+			entries = this.sessionManager.getBranch().flatMap((entry) => {
+				const visible = selected.get(entry.id);
+				return visible ? [visible] : [];
+			});
+		}
 		const items = entries.flatMap((entry): RenderSessionItem[] => {
 			if (entry.type === "custom" || (entry.type === "usage" && entry.kind === "cache_warm")) {
 				return [entry];
