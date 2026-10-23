@@ -68,6 +68,8 @@ A successful `prompt` response means the prompt was accepted, queued, or handled
 
 Continue consuming [events](json.md) after that response. `agent_end` marks the end of one low-level agent run, but retries, overflow recovery, compaction, steering, or follow-up work can still follow. Wait for `agent_settled` when the client needs to know Pi will not continue automatically.
 
+Retry events use `maxAttempts: null` for an unlimited retry budget and a number for a finite limit. Handle both values; see [Retry events](json.md#retry-events).
+
 Subscribe before sending a prompt to avoid missing a fast completion. `RpcClient.promptAndWait()` does this internally. If using separate `RpcClient` calls, install the event listener before `prompt()` and call `waitForIdle()` only while a run is active.
 
 ## Errors

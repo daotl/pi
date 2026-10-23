@@ -14,8 +14,17 @@ type JsonMessageUpdateEvent = {
 	assistantMessageEvent: ToJsonAssistantMessageEvent<MessageUpdateEvent["assistantMessageEvent"]>;
 };
 
+type RetryStartEvent = Extract<AgentSessionEvent, { type: "auto_retry_start" | "summarization_retry_scheduled" }>;
+type ToJsonRetryStartEvent<T> = T extends RetryStartEvent
+	? Omit<T, "maxAttempts"> & { maxAttempts: number | null }
+	: never;
+type JsonRetryStartEvent = ToJsonRetryStartEvent<RetryStartEvent>;
+
 /** Session event shape emitted by the JSON and RPC stdout protocols. */
-export type JsonAgentSessionEvent = Exclude<AgentSessionEvent, { type: "message_update" }> | JsonMessageUpdateEvent;
+export type JsonAgentSessionEvent =
+	| Exclude<AgentSessionEvent, { type: "message_update" | RetryStartEvent["type"] }>
+	| JsonMessageUpdateEvent
+	| JsonRetryStartEvent;
 
 function toJsonAssistantMessageEvent(
 	event: MessageUpdateEvent["assistantMessageEvent"],
@@ -46,6 +55,12 @@ function toJsonAssistantMessageEvent(
 export function toJsonEvent(event: MessageUpdateEvent): JsonMessageUpdateEvent;
 export function toJsonEvent(event: AgentSessionEvent): JsonAgentSessionEvent;
 export function toJsonEvent(event: AgentSessionEvent): JsonAgentSessionEvent {
+	if (event.type === "auto_retry_start" || event.type === "summarization_retry_scheduled") {
+		return {
+			...event,
+			maxAttempts: event.maxAttempts === Number.POSITIVE_INFINITY ? null : event.maxAttempts,
+		};
+	}
 	if (event.type !== "message_update") {
 		return event;
 	}

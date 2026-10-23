@@ -179,6 +179,8 @@ Compaction and branch-summary retry emit:
 
 For a branch summary, `source` is `"branchSummary"` and `reason` is absent. The `reason` on a compaction retry is `"manual"`, `"threshold"`, or `"overflow"`.
 
+`auto_retry_start.maxAttempts` and `summarization_retry_scheduled.maxAttempts` are `number | null` on the JSON/RPC wire. `null` means unlimited retries (the default); finite configured limits remain numbers. In-process `AgentSessionEvent` keeps `Infinity` for the unlimited limit.
+
 ## RPC-only events
 
 A direct RPC [`bash`](rpc-commands.md#bash) command emits one `bash_execution_update` for each output chunk. Its optional `id` matches the command ID. The final command response can contain truncated output, but these events stream all output:
@@ -197,7 +199,7 @@ Extension UI records are a separate RPC subprotocol, not `AgentSessionEvent` val
 
 ## TypeScript types
 
-The SDK's `AgentSessionEvent` contains cumulative streaming snapshots for in-process consumers. JSON and RPC transform only `message_update`:
+The SDK's `AgentSessionEvent` contains cumulative streaming snapshots and an infinite retry limit for in-process consumers. JSON and RPC project `message_update` and retry-limit events:
 
 ```typescript
 type WithoutPartial<T> = T extends { partial: unknown } ? Omit<T, "partial"> : T;
@@ -206,13 +208,19 @@ type JsonAssistantMessageEvent<T> = T extends { type: "toolcall_start"; partial:
   ? WithoutPartial<T> & { id: string; toolName: string }
   : WithoutPartial<T>;
 
+type RetryLimitEvent = Extract<AgentSessionEvent, { type: "auto_retry_start" | "summarization_retry_scheduled" }>;
+type JsonRetryLimitEvent<T> = T extends { maxAttempts: number }
+  ? Omit<T, "maxAttempts"> & { maxAttempts: number | null }
+  : never;
+
 type JsonAgentSessionEvent =
-  | Exclude<AgentSessionEvent, { type: "message_update" }>
+  | Exclude<AgentSessionEvent, { type: "message_update" | RetryLimitEvent["type"] }>
   | {
       type: "message_update";
       usage: Usage;
       assistantMessageEvent: JsonAssistantMessageEvent<AssistantMessageEvent>;
-    };
+    }
+  | JsonRetryLimitEvent<RetryLimitEvent>;
 ```
 
 Use the exported `JsonAgentSessionEvent` type from `@earendil-works/pi-coding-agent`. Its implementation is in [`json-event.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/modes/json-event.ts).
