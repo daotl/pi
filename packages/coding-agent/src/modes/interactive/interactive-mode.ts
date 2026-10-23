@@ -4148,6 +4148,7 @@ export class InteractiveMode {
 						this.showStatus("Auto-compaction cancelled");
 					}
 				} else if (event.result) {
+					this.footer.invalidateSessionStats();
 					if (this.settingsManager.getCompactionSummaryPlacement() === "chronological") {
 						// Chronological placement: the summary is appended at the end of the
 						// chat, when compaction happened (the original mainline behavior).

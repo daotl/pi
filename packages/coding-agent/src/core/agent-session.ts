@@ -506,13 +506,17 @@ export class AgentSession {
 	private _queuedCompact?: { options?: CompactOptions | string };
 	/** Whether the run stopped at a turn boundary for a queued /compact while tool results were pending a response. */
 	private _queuedCompactResume = false;
-	/**
-	 * Exact-ish token count of the post-compaction context (system prompt +
-	 * summaries + kept messages) from the model's /tokenize endpoint, when
-	 * available. Shown in the footer until the next assistant response reports
-	 * real usage. Undefined when the server has no /tokenize (footer shows "?").
-	 */
-	private _postCompactionContextTokens: number | undefined = undefined;
+	/** Exact post-compaction chat count, valid only for the counted canonical context and model. */
+	private _postCompactionContextTokens:
+		| {
+				tokens: number;
+				compactionId: string;
+				contextEditId: string | undefined;
+				leafId: string | null;
+				model: Model<string>;
+		  }
+		| undefined;
+	private _latestContextEditId: string | undefined;
 	private _summaryBlockMaxTokens: number;
 	private _contextSettingsChanged = false;
 
@@ -1152,7 +1156,9 @@ export class AgentSession {
 	private _refreshFinalizedContext(): void {
 		this._syncSummaryBlockMaxTokens();
 		const projection = this._buildLiveProjection();
+		this._latestContextEditId = undefined;
 		for (const entry of projection.entries) {
+			if (entry.sourceEntry.type === "context_edit") this._latestContextEditId = entry.sourceEntry.id;
 			for (const message of entry.messages) this._entryIdsByMessage.set(message, entry.sourceEntry.id);
 		}
 		this.agent.state.messages = projection.messages;
@@ -4660,8 +4666,9 @@ export class AgentSession {
 		}
 
 		throwIfCancelled();
+		let compactionId: string;
 		try {
-			this.sessionManager.appendCompaction(
+			compactionId = this.sessionManager.appendCompaction(
 				summary,
 				firstKeptEntryId,
 				tokensBefore,
@@ -4675,9 +4682,12 @@ export class AgentSession {
 			throw error;
 		}
 		const newEntries = this.sessionManager.getEntries();
+		this._refreshFinalizedContext();
 		const sessionContext = this.sessionManager.buildSessionContext();
-		this.agent.state.messages = sessionContext.messages;
 		const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
+		const leafId = this.sessionManager.getLeafId();
+		const contextEditId = this._latestContextEditId;
+		const summaryBlockMaxTokens = this.settingsManager.getSummaryBlockMaxTokens();
 
 		let contextTokens: number | undefined;
 		if (auth) {
@@ -4713,9 +4723,12 @@ export class AgentSession {
 				contextTokens = undefined;
 			}
 		}
-		// Never leave the footer count undefined (mainline's "?"): fall back to the
-		// chars/4 estimate when /tokenize is unsupported, aborted, or retries exhaust.
-		this._postCompactionContextTokens = contextTokens ?? estimatedTokensAfter;
+		this._postCompactionContextTokens =
+			contextTokens === undefined ||
+			!countedModel ||
+			summaryBlockMaxTokens !== this.settingsManager.getSummaryBlockMaxTokens()
+				? undefined
+				: { tokens: contextTokens, compactionId, contextEditId, leafId, model: countedModel };
 
 		return { newEntries, estimatedTokensAfter };
 	}
@@ -6602,35 +6615,37 @@ export class AgentSession {
 		const latestCompaction = getLatestCompactionEntry(branch);
 
 		if (latestCompaction) {
-			// Check if there's a valid assistant usage after the compaction boundary
-			const compactionIndex = branch.lastIndexOf(latestCompaction);
-			let hasPostCompactionUsage = false;
-			for (let i = branch.length - 1; i > compactionIndex; i--) {
-				const entry = branch[i];
-				if (entry.type === "message" && entry.message.role === "assistant") {
-					const assistant = entry.message;
-					if (assistant.stopReason !== "aborted" && assistant.stopReason !== "error") {
-						const contextTokens = calculateContextTokens(assistant.usage);
-						if (contextTokens > 0) {
-							hasPostCompactionUsage = true;
-							break;
-						}
-					}
-				}
-			}
-
+			let contextEditId: string | undefined;
+			const projectedAssistants = new Set(
+				projection.entries.flatMap((entry) => {
+					if (entry.sourceEntry.type === "context_edit") contextEditId = entry.sourceEntry.id;
+					return entry.messages.some(
+						(message) =>
+							message.role === "assistant" &&
+							message.stopReason !== "aborted" &&
+							message.stopReason !== "error" &&
+							calculateContextTokens(message.usage) > 0,
+					)
+						? [entry.sourceEntry.id]
+						: [];
+				}),
+			);
+			const compactionIndex = branch.findIndex((entry) => entry.id === latestCompaction.id);
+			const hasPostCompactionUsage = branch
+				.slice(compactionIndex + 1)
+				.some((entry) => projectedAssistants.has(entry.id));
 			if (!hasPostCompactionUsage) {
-				// Right after compaction there is no post-compaction usage yet. If the
-				// model server exposed /tokenize we recorded an exact-ish count of the
-				// new context; show it until the next assistant response reports usage.
-				if (this._postCompactionContextTokens !== undefined && this._postCompactionContextTokens > 0) {
-					return {
-						tokens: this._postCompactionContextTokens,
-						contextWindow,
-						percent: (this._postCompactionContextTokens / contextWindow) * 100,
-					};
-				}
-				return { tokens: null, contextWindow, percent: null };
+				const counted = this._postCompactionContextTokens;
+				const tokens =
+					counted?.compactionId === latestCompaction.id &&
+					counted.contextEditId === contextEditId &&
+					counted.leafId === this.sessionManager.getLeafId() &&
+					counted.model === model
+						? counted.tokens
+						: undefined;
+				return tokens !== undefined && tokens > 0
+					? { tokens, contextWindow, percent: (tokens / contextWindow) * 100 }
+					: { tokens: null, contextWindow, percent: null };
 			}
 		}
 

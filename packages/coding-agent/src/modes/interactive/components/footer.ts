@@ -52,6 +52,7 @@ interface SessionStats {
 	leafId: string | null;
 	entryCount: number;
 	limitsModel: unknown;
+	summaryBlockMaxTokens: number;
 	usageTotals: UsageTotals;
 	latestCacheHitRate: number | undefined;
 	contextUsage: ContextUsage | undefined;
@@ -93,6 +94,11 @@ export class FooterComponent implements Component {
 		// No-op: git branch is cached/invalidated by provider
 	}
 
+	/** Refresh the asynchronous count published after the checkpoint entry. */
+	invalidateSessionStats(): void {
+		this.sessionStats = undefined;
+	}
+
 	/**
 	 * Clean up resources.
 	 * Git watcher cleanup now handled by provider.
@@ -103,8 +109,8 @@ export class FooterComponent implements Component {
 
 	/**
 	 * Usage totals and context usage scan the whole session, and the footer renders on every frame.
-	 * Entries are append-only and every append moves the leaf, so the results only change with the
-	 * session, leaf, entry count, or the model whose context window applies.
+	 * Entries are append-only and every append moves the leaf. The cache also follows the
+	 * limits model and summary budget; completed asynchronous compaction counts invalidate it explicitly.
 	 */
 	private getSessionStats(): SessionStats {
 		const sessionManager = this.session.sessionManager;
@@ -112,6 +118,7 @@ export class FooterComponent implements Component {
 		const sessionId = sessionManager.getSessionId();
 		const leafId = sessionManager.getLeafId();
 		const limitsModel = this.session.routedModel?.model ?? this.session.model;
+		const summaryBlockMaxTokens = this.session.settingsManager.getSummaryBlockMaxTokens();
 		const cached = this.sessionStats;
 		if (
 			cached &&
@@ -119,7 +126,8 @@ export class FooterComponent implements Component {
 			cached.sessionId === sessionId &&
 			cached.leafId === leafId &&
 			cached.entryCount === entryCount &&
-			cached.limitsModel === limitsModel
+			cached.limitsModel === limitsModel &&
+			cached.summaryBlockMaxTokens === summaryBlockMaxTokens
 		) {
 			return cached;
 		}
@@ -148,6 +156,7 @@ export class FooterComponent implements Component {
 			leafId,
 			entryCount,
 			limitsModel,
+			summaryBlockMaxTokens,
 			usageTotals,
 			latestCacheHitRate,
 			contextUsage,

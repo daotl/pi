@@ -88,6 +88,7 @@ function createSession(options: {
 		},
 		getContextUsage: () => ({ contextWindow: 200_000, percent: 12.3, tokens: 24_600 }),
 		routedModel: options.routedModel,
+		settingsManager: { getSummaryBlockMaxTokens: () => 16384 },
 		modelRuntime: {
 			isUsingSubscription: () => options.usingSubscription ?? false,
 		},

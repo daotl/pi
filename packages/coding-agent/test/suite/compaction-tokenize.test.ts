@@ -2,8 +2,8 @@
  * Integration test: after compaction, the summary is tokenized via the model
  * server's /tokenize endpoint, the exact count is stored on the compaction entry,
  * and the post-compaction context usage (footer) reflects the tokenized total
- * instead of "?". A server without /tokenize leaves both as the chars/4 / "?"
- * fallback.
+ * instead of "?". Unsupported counting retains local preparation estimates,
+ * while the footer stays unknown until a fresh exact count or provider usage.
  */
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
@@ -123,7 +123,7 @@ describe("compaction tokenization", () => {
 
 		fixture.setTokenizer(async () => new Response("no endpoint", { status: 404 }));
 
-		await fixture.session.compact({ keepRecentMessages: 1 });
+		const result = await fixture.session.compact({ keepRecentMessages: 1 });
 
 		const entries = fixture.manager.getEntries();
 		const compactionEntry = entries.find((e) => e.type === "compaction") as
@@ -132,11 +132,8 @@ describe("compaction tokenization", () => {
 		expect(compactionEntry).toBeDefined();
 		expect(compactionEntry!.summaryTokens).toBeUndefined();
 
-		// No /tokenize and no post-compaction usage: footer falls back to the
-		// chars/4 estimate. Crystal never shows "?" - the count is always present.
-		const usage = fixture.session.getContextUsage();
-		expect(usage?.percent).not.toBeNull();
-		expect(usage?.tokens).toBeGreaterThan(0);
+		expect(result.estimatedTokensAfter).toBeGreaterThan(0);
+		expect(fixture.session.getContextUsage()).toEqual({ tokens: null, contextWindow: 100000, percent: null });
 	});
 
 	it("does not retry /tokenize or /chat/completions/input_tokens on a transient failure and falls back to the estimate", async () => {
@@ -151,15 +148,13 @@ describe("compaction tokenization", () => {
 			throw new Error("ECONNREFUSED");
 		});
 
-		await fixture.session.compact({ keepRecentMessages: 1 });
+		const result = await fixture.session.compact({ keepRecentMessages: 1 });
 
 		// Two counting operations (summary + context), each a single attempt: no
 		// retry on the transient failure.
 		expect(calls).toBe(2);
-		const usage = fixture.session.getContextUsage();
-		expect(usage).toBeDefined();
-		expect(usage!.percent).not.toBeNull();
-		expect(usage!.tokens).toBeGreaterThan(0);
+		expect(result.estimatedTokensAfter).toBeGreaterThan(0);
+		expect(fixture.session.getContextUsage()).toEqual({ tokens: null, contextWindow: 100000, percent: null });
 	});
 	it.each([
 		{ mode: "manual", keepRecentTokens: 1 },
