@@ -386,7 +386,8 @@ export function getOsc8LinkAtColumn(line: string, column: number): string | unde
  * differential repaint. Their compatibility decompositions have the same cell
  * width but avoid stale-cell artifacts in terminal renderers. Visible tabs are
  * expanded to the fixed width used by layout so terminal tab stops cannot wrap
- * a logical line, while tabs inside terminal string sequences stay untouched.
+ * a logical line. Visible LF becomes CRLF explicitly rather than relying on terminal
+ * output processing; tabs and newlines inside terminal string sequences stay untouched.
  */
 const THAI_LAO_AM_REGEX = /[\u0e33\u0eb3]/;
 const THAI_LAO_AM_GLOBAL_REGEX = /[\u0e33\u0eb3]/g;
@@ -398,21 +399,25 @@ export function normalizeTerminalOutput(str: string): string {
 			char === "\u0e33" ? "\u0e4d\u0e32" : "\u0ecd\u0eb2",
 		);
 	}
-	if (!normalized.includes("\t")) return normalized;
+	if (!normalized.includes("\t") && !normalized.includes("\n")) return normalized;
 
 	let result = "";
+	let copyFrom = 0;
 	let i = 0;
 	while (i < normalized.length) {
-		const ansi = extractAnsiCode(normalized, i);
-		if (ansi) {
-			result += ansi.code;
-			i += ansi.length;
+		const ansiLength = ansiCodeLength(normalized, i);
+		if (ansiLength > 0) {
+			i += ansiLength;
 			continue;
 		}
-		result += normalized[i] === "\t" ? "   " : normalized[i];
+		const char = normalized[i];
+		if (char === "\t" || (char === "\n" && normalized[i - 1] !== "\r")) {
+			result += normalized.slice(copyFrom, i) + (char === "\t" ? "   " : "\r\n");
+			copyFrom = i + 1;
+		}
 		i++;
 	}
-	return result;
+	return copyFrom === 0 ? normalized : result + normalized.slice(copyFrom);
 }
 
 /**

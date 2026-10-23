@@ -264,6 +264,8 @@ interface Component {
 
 The TUI appends a full SGR reset and OSC 8 reset at the end of each rendered line. Styles do not carry across lines. If you emit multi-line text with styling, reapply styles per line or use `wrapTextWithAnsi()` so styles are preserved for each wrapped line.
 
+Before output, visible tabs become three spaces and visible LF becomes CRLF, so embedded newlines start at column zero without depending on terminal output processing. Existing CRLF is not doubled. Tab and newline bytes inside recognized ANSI/OSC/APC sequences remain unchanged; the existing Thai/Lao AM character normalization still applies. Logical component/editor text is not rewritten.
+
 ### Mouse Input
 
 `TuiAltScreen` normalizes SGR mouse input and hit-tests components and overlays. Events contain component-local `x`/`y`, absolute `screenX`/`screenY`, bounds, button, modifiers, click count, and wheel delta. `TuiMainScreen` does not capture mouse input because the terminal owns its scrollback.

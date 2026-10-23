@@ -1,5 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
+import xterm from "@xterm/headless";
 import type { Component, TUI } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
 import { extractSegments, normalizeTerminalOutput, sliceWithWidth, visibleWidth } from "../src/utils.ts";
@@ -67,6 +68,32 @@ describe("tab width accounting", () => {
 
 		for (const controlSequence of controlSequences) {
 			assert.strictEqual(normalizeTerminalOutput(`${controlSequence}label\ttext`), `${controlSequence}label   text`);
+		}
+	});
+
+	it("normalizes visible newlines without changing existing CRLF or control-string payloads", () => {
+		assert.strictEqual(normalizeTerminalOutput("abc\n123456\r\nnext\rZ"), "abc\r\n123456\r\nnext\rZ");
+		for (const sequence of [
+			"\x1b]8;;https://example.test/a\tb\npart\x07",
+			"\x1b]0;window\ttitle\npart\x1b\\",
+			"\x1b_payload\tdata\npart\x1b\\",
+		]) {
+			assert.strictEqual(normalizeTerminalOutput(`${sequence}label\ttext\nnext`), `${sequence}label   text\r\nnext`);
+		}
+	});
+
+	it("renders embedded LF at column zero on an unmodified terminal emulator", async () => {
+		const terminal = new xterm.Terminal({ cols: 12, rows: 4, allowProposedApi: true });
+		try {
+			const flushed = Promise.withResolvers<void>();
+			terminal.write(normalizeTerminalOutput("abc\n123456"), flushed.resolve);
+			await flushed.promise;
+			assert.strictEqual(terminal.buffer.active.getLine(0)?.translateToString(true), "abc");
+			assert.strictEqual(terminal.buffer.active.getLine(1)?.translateToString(true), "123456");
+			assert.strictEqual(terminal.buffer.active.cursorX, 6);
+			assert.strictEqual(terminal.buffer.active.cursorY, 1);
+		} finally {
+			terminal.dispose();
 		}
 	});
 
