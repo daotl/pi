@@ -152,6 +152,72 @@ describe("AgentSession substring /copy matching", () => {
 		expect(matches).toHaveLength(3);
 	});
 
+	it("matches projected replacements and omits hidden context without changing stored messages", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const manager = harness.sessionManager;
+		const user = manager.appendMessage({ role: "user", content: "copy-token user", timestamp: 1 });
+		const answer = manager.appendMessage(fauxAssistantMessage("raw assistant needle"));
+		const omitted = manager.appendMessage({ role: "user", content: "omitted copy-token", timestamp: 2 });
+		manager.appendContextEdit(answer, { content: [{ type: "text", text: "copy-token projected answer" }] });
+		manager.appendContextEdit(omitted, null);
+		const before = structuredClone(manager.getEntries());
+		const matches = harness.session.getCopyableMessagesContaining("copy-token");
+		expect(matches.map((match) => ({ text: getMessageText(match.message), index: match.editableIndex }))).toEqual([
+			{ text: "copy-token user", index: 1 },
+			{ text: "copy-token projected answer", index: 0 },
+		]);
+		expect(harness.session.getCopyableMessagesContaining("raw assistant needle")).toEqual([]);
+		expect(harness.session.getEditableMessage(0)?.entryId).toBe(answer);
+		expect(getMessageText(harness.session.getEditableMessage(0)?.message)).toBe("copy-token projected answer");
+		expect(harness.session.getEditableMessage(1)?.entryId).toBe(user);
+		expect(harness.session.getEditableMessage(2)).toBeUndefined();
+		expect(harness.session.getEditableMessagesContaining("projected answer")).toEqual([
+			{ index: 0, entryId: answer, message: matches[1].message },
+		]);
+		expect(
+			harness.session.getForkableMessages().map(({ entryId, index, text }) => ({ entryId, index, text })),
+		).toEqual([
+			{ entryId: user, index: 1, text: "copy-token user" },
+			{ entryId: answer, index: 0, text: "copy-token projected answer" },
+		]);
+		expect(manager.getEntries()).toEqual(before);
+		harness.session.applyMessageEdits(
+			'<pi_edit id="1" role="user"><pi_content>updated projected user</pi_content></pi_edit>',
+		);
+		expect(harness.session.getEditableMessageText(1)).toBe("updated projected user");
+		expect(harness.session.getEditableMessageText(0)).toBe("copy-token projected answer");
+		expect(harness.session.getCopyableMessagesContaining("omitted copy-token")).toEqual([]);
+		expect(harness.session.getCopyableMessagesContaining("raw assistant needle")).toEqual([]);
+		expect(harness.session.getEditableMessagesContaining("omitted copy-token")).toEqual([]);
+		expect(harness.session.getEditableMessage(2)).toBeUndefined();
+	});
+
+	it("includes custom_message projection in chronological copy matches without editable indices", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const manager = harness.sessionManager;
+		manager.appendMessage({ role: "user", content: "copy-token user", timestamp: 1 });
+		manager.appendCustomMessageEntry("shown", "copy-token shown custom", true);
+		const hidden = manager.appendCustomMessageEntry("hidden", "raw hidden custom", false);
+		manager.appendContextEdit(hidden, { content: "copy-token hidden replacement" });
+		const omitted = manager.appendCustomMessageEntry("omitted", "copy-token omitted custom", true);
+		manager.appendContextEdit(omitted, null);
+		manager.appendMessage(fauxAssistantMessage("copy-token answer"));
+		const matches = harness.session.getCopyableMessagesContaining("copy-token");
+		expect(
+			matches.map((match) => ({
+				text: harness.session.getMessageCopyText(match.message),
+				index: match.editableIndex,
+			})),
+		).toEqual([
+			{ text: "copy-token user", index: 1 },
+			{ text: "copy-token shown custom", index: undefined },
+			{ text: "copy-token hidden replacement", index: undefined },
+			{ text: "copy-token answer", index: 0 },
+		]);
+	});
+
 	it("substring copy returns no matches when nothing matches", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

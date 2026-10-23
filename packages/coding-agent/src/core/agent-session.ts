@@ -2485,17 +2485,8 @@ export class AgentSession {
 	 * skipped. Returns the entry and message at the given 0-based index.
 	 */
 	getEditableMessage(index: number): { entryId: string; message: AgentMessage } | undefined {
-		const entries = this.sessionManager.buildContextEntries();
-		const editable: { entryId: string; message: AgentMessage }[] = [];
-		for (const entry of entries) {
-			if (entry.type !== "message") continue;
-			const message = entry.message;
-			if (message.role !== "user" && message.role !== "assistant") continue;
-			if (message.role === "assistant" && isHarnessMessage(message)) continue;
-			editable.push({ entryId: entry.id, message });
-		}
-		const target = editable[editable.length - 1 - index];
-		return target;
+		const editable = this.getEditableMessageEntries();
+		return editable[editable.length - 1 - index];
 	}
 
 	/**
@@ -2737,14 +2728,14 @@ export class AgentSession {
 	}
 
 	private getEditableMessageEntries(): Array<{ entryId: string; message: AgentMessage }> {
-		const entries = this.sessionManager.buildContextEntries();
 		const editable: Array<{ entryId: string; message: AgentMessage }> = [];
-		for (const entry of entries) {
-			if (entry.type !== "message") continue;
-			const message = entry.message;
-			if (message.role !== "user" && message.role !== "assistant") continue;
-			if (message.role === "assistant" && isHarnessMessage(message)) continue;
-			editable.push({ entryId: entry.id, message });
+		for (const { sourceEntry, messages } of this.sessionManager.buildSessionProjection().entries) {
+			if (sourceEntry.type !== "message") continue;
+			for (const message of messages) {
+				if (message.role !== "user" && message.role !== "assistant") continue;
+				if (message.role === "assistant" && isHarnessMessage(message)) continue;
+				editable.push({ entryId: sourceEntry.id, message });
+			}
 		}
 		return editable;
 	}
@@ -6808,15 +6799,13 @@ export class AgentSession {
 			indexByEntryId.set(editable[i].entryId, editable.length - 1 - i);
 		}
 		const matches: Array<{ message: AgentMessage; editableIndex: number | undefined }> = [];
-		const entries = this.sessionManager.buildContextEntries();
-		for (const entry of entries) {
-			if (entry.type !== "message") continue;
-			const message = entry.message as AgentMessage;
-			if (message.role === "assistant" && isHarnessMessage(message)) continue;
-			const editableIndex = indexByEntryId.get(entry.id);
-			const haystack = this._messageSearchHaystack(message, editableIndex ?? 0);
-			if (haystack?.includes(substring)) {
-				matches.push({ message, editableIndex });
+		for (const { sourceEntry, messages } of this.sessionManager.buildSessionProjection().entries) {
+			if (sourceEntry.type !== "message" && sourceEntry.type !== "custom_message") continue;
+			for (const message of messages) {
+				if (message.role === "assistant" && isHarnessMessage(message)) continue;
+				const editableIndex = indexByEntryId.get(sourceEntry.id);
+				const haystack = this._messageSearchHaystack(message, editableIndex ?? 0);
+				if (haystack?.includes(substring)) matches.push({ message, editableIndex });
 			}
 		}
 		return matches;

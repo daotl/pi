@@ -47,6 +47,8 @@ When you leave a branch, Pi can summarize it and attach that summary to the bran
 
 A submitted batch of `pi_edit`/`pi_swipe` blocks is one durable history change: replacements, additions, new versions and in-place swipe edits either all publish or none do. A stale swipe or storage failure keeps the previous branch, transcript and file unchanged. Id0 keeps its current new-version behavior (root messages use replacement); `pi_swipe` keeps existing version timestamps and positions. Editing does not dispatch a model request.
 
+Substring copy searches the active projected content, including custom messages, with context replacements applied and omitted messages excluded. Editable user/assistant indices are shared by copy output, numeric edit lookup, substring editing and the forkable-message inventory; custom messages carry no editable index. Projection changes this view without rewriting the original stored messages.
+
 For the persisted tree and entry types, see [Session Format](session-format.md).
 
 ## Manage conversation context
