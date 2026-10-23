@@ -3,9 +3,11 @@ import { describe, expect, it } from "vitest";
 import {
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateProjectedContextTokens,
+	estimateTokens,
 	prepareCompaction,
 } from "../src/core/compaction/index.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
+import { getUsageTotals } from "../src/core/usage-totals.ts";
 
 function assistant(text: string): AssistantMessage {
 	return {
@@ -245,6 +247,66 @@ describe("session context edits", () => {
 		const estimate = estimateProjectedContextTokens(session.buildSessionProjection(), session.getBranch());
 		expect(estimate.usageTokens).toBe(0);
 		expect(estimate.tokens).toBeLessThan(100);
+	});
+
+	it.each(["replace", "remove"] as const)(
+		"does not treat %s tail-clone usage as a fresh context measurement",
+		(operation) => {
+			const session = SessionManager.inMemory();
+			const userId = session.appendMessage({ role: "user", content: "large input ".repeat(2_000), timestamp: 1 });
+			const response = assistant("small answer");
+			response.usage = { ...response.usage, input: 50_000, output: 1, totalTokens: 50_001 };
+			const originalId = session.appendMessage(response);
+			const charges = getUsageTotals(session.getEntries());
+			if (operation === "replace") {
+				session.replaceMessages([
+					{ entryId: userId, message: { role: "user", content: "small input", timestamp: 1 } },
+				]);
+			} else {
+				session.removeMessage(userId);
+			}
+			const projected = session.buildSessionProjection();
+			const clone = projected.entries.find(
+				(entry) => entry.sourceEntry.type === "message" && entry.sourceEntry.message.role === "assistant",
+			);
+			expect(clone?.sourceEntry.id).not.toBe(originalId);
+			expect(clone?.sourceEntry.usageSourceId).toBe(originalId);
+			const localTokens = projected.messages.reduce((total, message) => total + estimateTokens(message), 0);
+			expect(estimateProjectedContextTokens(projected, session.getBranch())).toEqual({
+				tokens: localTokens,
+				usageTokens: 0,
+				trailingTokens: localTokens,
+				lastUsageIndex: null,
+			});
+			expect(getUsageTotals(session.getEntries())).toEqual(charges);
+			expect(response.usage.totalTokens).toBe(50_001);
+		},
+	);
+
+	it("trusts independently generated alternatives and fresh responses after cloned history", () => {
+		const session = SessionManager.inMemory();
+		const userId = session.appendMessage({ role: "user", content: "question", timestamp: 1 });
+		const originalId = session.appendMessage(assistant("original answer"));
+		session.branch(userId);
+		const alternative = assistant("independent alternative");
+		alternative.usage = { ...alternative.usage, input: 4_000, output: 100, totalTokens: 4_100 };
+		const alternativeId = session.appendMessage(alternative);
+		expect(alternativeId).not.toBe(originalId);
+		expect(session.getEntry(alternativeId)?.usageSourceId).toBeUndefined();
+		expect(estimateProjectedContextTokens(session.buildSessionProjection(), session.getBranch()).usageTokens).toBe(
+			4_100,
+		);
+		session.replaceMessages([
+			{ entryId: userId, message: { role: "user", content: "edited question", timestamp: 1 } },
+		]);
+		session.appendMessage({ role: "user", content: "follow-up after edit", timestamp: 2 });
+		const fresh = assistant("fresh response");
+		fresh.usage = { ...fresh.usage, input: 2_000, output: 50, totalTokens: 2_050 };
+		const freshId = session.appendMessage(fresh);
+		expect(session.getEntry(freshId)?.usageSourceId).toBeUndefined();
+		expect(estimateProjectedContextTokens(session.buildSessionProjection(), session.getBranch()).usageTokens).toBe(
+			2_050,
+		);
 	});
 
 	it("includes effective system and tool context in edited estimates", () => {

@@ -221,7 +221,7 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 	};
 }
 
-/** Estimate projected context without trusting usage captured before a later edit or compaction. */
+/** Estimate projected context without trusting replayed usage or usage captured before a later edit or compaction. */
 export function estimateProjectedContextTokens(
 	projection: SessionProjection,
 	branchEntries: SessionEntry[],
@@ -233,7 +233,10 @@ export function estimateProjectedContextTokens(
 		for (const entry of projection.entries) {
 			const nextMessageIndex = projectedMessageIndex + entry.messages.length;
 			if (estimate.lastUsageIndex < nextMessageIndex) {
-				usageEntryId = entry.sourceEntry.id;
+				const sourceEntry = entry.sourceEntry;
+				if (sourceEntry.usageSourceId === undefined || sourceEntry.usageSourceId === sourceEntry.id) {
+					usageEntryId = sourceEntry.id;
+				}
 				break;
 			}
 			projectedMessageIndex = nextMessageIndex;
