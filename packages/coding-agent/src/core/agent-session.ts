@@ -1924,6 +1924,7 @@ export class AgentSession {
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
 			this._restoreBaseSystemPromptFromBranch();
+			this._emit({ type: "transcript_changed" });
 		}
 		return removed;
 	}
@@ -2492,6 +2493,7 @@ export class AgentSession {
 		if (removed) {
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
+			this._emit({ type: "transcript_changed" });
 		}
 		return removed;
 	}
@@ -2643,6 +2645,9 @@ export class AgentSession {
 		const sessionContext = this.sessionManager.buildSessionContext();
 		this.agent.state.messages = sessionContext.messages;
 		if (navigatedSwipe || versioned > 0) this._restoreBaseSystemPromptFromBranch(false);
+		if (replacements.length > 0 || newMessages.length > 0 || versioned > 0 || swiped > 0) {
+			this._emit({ type: "transcript_changed" });
+		}
 
 		return { edited: replacements.length, added: newMessages.length, versioned, swiped };
 	}

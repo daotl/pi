@@ -115,6 +115,8 @@ try {
 
 Session events report message updates, tool execution, queues, compaction, retries, and run lifecycle changes.
 
+Successful nonempty `deleteLastMessages()`, `deleteMessage()` and `applyMessageEdits()` emit `transcript_changed` after durable commit and their existing live-state refresh. Edit invalidation includes additions, replacements, new swipe versions and in-place swipe edits. No-op inputs and failed commits emit no invalidation. Subscribers can rebuild from `session.getSessionProjection()` for finalized content with durable provenance; this notification contract does not extend to other deletion, restoration or navigation APIs.
+
 `message_end` contains the authoritative completed message. `agent_end` marks the end of one low-level agent run, but automatic recovery or queued work can still follow.
 
 Use `agent_settled` when the host needs to know that Pi will not continue automatically.
