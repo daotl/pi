@@ -53,6 +53,8 @@ Failures returned by an interactive editor submission are displayed as errors in
 
 `/system-prompt set` accepts a space, tab or newline before its prompt text; bare `set` only shows the existing policy. For `/copy`, a number on the command line selects an editable message, while a payload beginning on the next line is copied literally, even when it contains only digits.
 
+Session deletion and restoration methods, including soft-delete, shred and swipe-version delete/restore, reject while an agent run, compaction or branch summary owns the session. The check happens before selecting or changing history. Wait for idle before retrying; successful idle deletion/restoration retains its existing semantics.
+
 For the persisted tree and entry types, see [Session Format](session-format.md).
 
 ## Manage conversation context

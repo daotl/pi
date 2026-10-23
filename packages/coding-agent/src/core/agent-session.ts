@@ -1907,6 +1907,10 @@ export class AgentSession {
 	get sessionId(): string {
 		return this.sessionManager.getSessionId();
 	}
+	private _assertHistoryMutationAllowed(): void {
+		if (this.isStreaming) throw new Error("Cannot modify history while the agent is running.");
+		if (this.isCompacting) throw new Error("Cannot modify history while compaction is in progress.");
+	}
 
 	/**
 	 * Delete the last `count` non-harness messages from the session. Harness
@@ -1916,6 +1920,7 @@ export class AgentSession {
 	 * removed.
 	 */
 	deleteLastMessages(count: number): number {
+		this._assertHistoryMutationAllowed();
 		const removed = this.sessionManager.removeLastMessages(count);
 		if (removed > 0) {
 			const sessionContext = this.sessionManager.buildSessionContext();
@@ -2041,6 +2046,7 @@ export class AgentSession {
 	 * nothing was deletable).
 	 */
 	softDeleteLastMessages(count: number): DeletableUnit[] {
+		this._assertHistoryMutationAllowed();
 		const targets = this._expandToSwipeSiblings(this._consumeDeletableUnits(count));
 		const marked = this.sessionManager.softDeleteUnits(
 			targets.map((unit) => ({ entryId: unit.entry.id, toolCallId: unit.toolCallId })),
@@ -2056,6 +2062,7 @@ export class AgentSession {
 	 * if the entry is not on the active leaf path.
 	 */
 	softDeleteMessage(entryId: string): boolean {
+		this._assertHistoryMutationAllowed();
 		const entry = this.sessionManager.getEntry(entryId);
 		if (!entry || entry.deletedAt !== undefined) return false;
 		if (!this.sessionManager.getBranch().some((branchEntry) => branchEntry.id === entryId)) return false;
@@ -2075,6 +2082,7 @@ export class AgentSession {
 	 * Returns the consumed units (empty when nothing was deletable).
 	 */
 	shredLastMessages(count: number): DeletableUnit[] {
+		this._assertHistoryMutationAllowed();
 		const targets = this._consumeDeletableUnits(count);
 		if (targets.length === 0) return [];
 		const expanded = this._expandToSwipeSiblings(targets);
@@ -2255,6 +2263,7 @@ export class AgentSession {
 	 * message back before its results. Returns the selected version entries.
 	 */
 	deleteSwipeVersions(indices: number[]): DeletableUnit[] {
+		this._assertHistoryMutationAllowed();
 		const group = this.getSwipeGroup();
 		if (!group) return [];
 		const selected: SessionMessageEntry[] = [];
@@ -2297,6 +2306,7 @@ export class AgentSession {
 	 * with all its descendants. Returns the selected version entries.
 	 */
 	shredSwipeVersions(indices: number[]): DeletableUnit[] {
+		this._assertHistoryMutationAllowed();
 		const group = this.getSwipeGroup();
 		if (!group) return [];
 		const selected: SessionMessageEntry[] = [];
@@ -2392,6 +2402,7 @@ export class AgentSession {
 	 * positions. Returns the restored entries.
 	 */
 	restoreSwipeVersions(indices: number[]): SessionMessageEntry[] {
+		this._assertHistoryMutationAllowed();
 		const deleted = this.getDeletedSwipeVersions();
 		const selected: SessionMessageEntry[] = [];
 		for (const index of indices) {
@@ -2450,6 +2461,7 @@ export class AgentSession {
 	 * Returns the restored units.
 	 */
 	restoreDeletedMessages(count: number): DeletableUnit[] {
+		this._assertHistoryMutationAllowed();
 		const restored = this.sessionManager.restoreDeletedUnits(count);
 		if (restored.length > 0) {
 			this._rebuildMessagesFromSession();
@@ -2471,6 +2483,7 @@ export class AgentSession {
 	 * Returns false if the entry is not a message on the active leaf path.
 	 */
 	deleteMessage(entryId: string): boolean {
+		this._assertHistoryMutationAllowed();
 		const removed = this.sessionManager.removeMessage(entryId);
 		if (removed) {
 			const sessionContext = this.sessionManager.buildSessionContext();
