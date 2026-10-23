@@ -9,13 +9,17 @@ import type { Agent, AgentMessage, StreamFn, ThinkingLevel } from "@earendil-wor
 import {
 	contentText,
 	getCurrentSystemMessage,
+	normalizeContext,
 	type RetryCallbacks,
 	type RetryPolicy,
 	retryAssistantCall,
 	toToolDeclaration,
 	uuidv7,
 } from "@earendil-works/pi-ai";
+import { clampMaxTokensToInput, isContextClampingApi } from "@earendil-works/pi-ai/api/simple-options";
+import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import type {
+	Api,
 	AssistantMessage,
 	Message,
 	Model,
@@ -24,7 +28,8 @@ import type {
 	TranscriptContext,
 	Usage,
 } from "@earendil-works/pi-ai/compat";
-import { completeSimple } from "@earendil-works/pi-ai/compat";
+import { completeSimple, isKnownApiProvider, streamSimple } from "@earendil-works/pi-ai/compat";
+import { estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
 import { convertToLlm } from "../messages.ts";
 import {
 	buildSessionProjection,
@@ -44,6 +49,7 @@ import {
 	formatFileOperations,
 	type RequestHistoryPolicy,
 	SUMMARIZATION_SYSTEM_PROMPT,
+	serializeConversation,
 } from "./utils.ts";
 
 // ============================================================================
@@ -659,6 +665,17 @@ function createSummarizationOptions(
 	return options;
 }
 
+/** Budget the converted request, never usage recorded against a different history. */
+function getSummarizationMaxTokens(model: Model<Api>, inputTokens: number, maxTokens: number): number | undefined {
+	const contextWindow = model.contextWindow > 0 ? model.contextWindow : 262144;
+	const outputTokens = Math.min(
+		Math.max(1, maxTokens),
+		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
+		contextWindow - inputTokens,
+	);
+	return outputTokens >= 1 ? outputTokens : undefined;
+}
+
 /**
  * Shared choke point for every compaction/branch-summary summarization call. Wraps the
  * single LLM call in {@link retryAssistantCall} so transient stream drops (e.g.
@@ -684,9 +701,31 @@ export async function completeSummarization(
 	const produce = async (): Promise<AssistantMessage> => {
 		const attemptOptions = { ...requestOptions };
 		const attemptContext = typeof context === "function" ? await context(attemptOptions) : structuredClone(context);
+		// Historical usage cannot size a newly converted summary request. Copy only
+		// assistant records here so builder-owned messages and canonical charges survive.
+		const requestContext = attemptContext.messages.some((message) => message.role === "assistant")
+			? {
+					...attemptContext,
+					messages: attemptContext.messages.map((message) =>
+						message.role === "assistant"
+							? {
+									...message,
+									usage: {
+										input: 0,
+										output: 0,
+										cacheRead: 0,
+										cacheWrite: 0,
+										totalTokens: 0,
+										cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+									},
+								}
+							: message,
+					),
+				}
+			: attemptContext;
 		return streamFn
-			? (await streamFn(model, attemptContext, attemptOptions)).result()
-			: completeSimple(model, attemptContext, attemptOptions);
+			? (await streamFn(model, requestContext, attemptOptions)).result()
+			: completeSimple(model, requestContext, attemptOptions);
 	};
 	return retryAssistantCall(produce, retry, requestOptions.signal, callbacks);
 }
@@ -754,6 +793,11 @@ export async function generateSummaryWithUsage(
 	systemPrompt?: string,
 	agent?: Agent,
 	requestHistoryPolicy?: RequestHistoryPolicy,
+	/** Native dispatch capability, independent of history attribution and upload permission. */
+	usesAdapterOutputClamp: (model: Model<Api>) => boolean = (requestModel) =>
+		(!streamFn || streamFn === streamSimple) &&
+		isContextClampingApi(requestModel.api) &&
+		isKnownApiProvider(requestModel.api),
 ): Promise<{ text: string; usage: Usage; fileOps: FileOperations }> {
 	const maxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
@@ -792,6 +836,51 @@ export async function generateSummaryWithUsage(
 			content: [{ type: "text", text: instructionText }],
 			timestamp: Date.now(),
 		};
+		let context = normalizeContext({ messages: [...llmMessages, instruction] });
+		const hasToolHistory = llmMessages.some((message) => message.role === "toolResult");
+		const inputTokens = hasToolHistory
+			? context.messages.reduce((total, message) => total + estimateMessageTokens(message), 0)
+			: 0;
+		let outputTokens = hasToolHistory ? getSummarizationMaxTokens(model, inputTokens, maxTokens) : undefined;
+		// Preserve tiny-window and intentional one-token controls; otherwise avoid
+		// admitting a request that leaves only the native adapter's emergency floor.
+		const hasAdapterHeadroom =
+			hasToolHistory &&
+			usesAdapterOutputClamp(model) &&
+			(!agent || !streamFn || streamFn === agent.streamFunction) &&
+			clampMaxTokensToInput(model, 0, maxTokens) > 1;
+		const exhaustedHeadroom =
+			hasAdapterHeadroom &&
+			outputTokens !== undefined &&
+			clampMaxTokensToInput(model, inputTokens, outputTokens) === 1;
+		if (hasToolHistory && (outputTokens === undefined || exhaustedHeadroom)) {
+			// Bound only converted, replay-eligible history; never restore raw data or
+			// move the committed retention boundary to accommodate a smaller model.
+			const baseline = getCurrentSystemMessage(llmMessages);
+			context = normalizeContext({
+				messages: [
+					...(baseline ? [baseline] : []),
+					{
+						role: "user",
+						content: serializeConversation(transformMessages(llmMessages, model)),
+						timestamp: Date.now(),
+					},
+					instruction,
+				],
+			});
+			const boundedInputTokens = context.messages.reduce(
+				(total, message) => total + estimateMessageTokens(message),
+				0,
+			);
+			outputTokens = getSummarizationMaxTokens(model, boundedInputTokens, maxTokens);
+			if (hasAdapterHeadroom && outputTokens !== undefined) {
+				outputTokens = clampMaxTokensToInput(model, boundedInputTokens, outputTokens);
+			}
+			if (outputTokens === undefined || (hasAdapterHeadroom && outputTokens <= 1)) {
+				throw new Error("Summarization failed: converted history exceeds the token budget");
+			}
+		}
+		if (hasToolHistory) attemptOptions.maxTokens = outputTokens;
 		fileOps = createFileOps();
 		attributable = canAttributeRequestHistory(model, agent, streamFn, requestHistoryPolicy);
 		if (attributable) {
@@ -802,7 +891,7 @@ export async function generateSummaryWithUsage(
 		}
 		// Context/converter work can replace the policy while awaiting; read it immediately before dispatch.
 		if (agent) attemptOptions.onPayload = agent.onPayload;
-		return { messages: [...llmMessages, instruction] } as TranscriptContext;
+		return context;
 	};
 
 	const completionOptions = createSummarizationOptions(
@@ -1142,6 +1231,7 @@ export async function compact(
 	systemPrompt?: string,
 	agent?: Agent,
 	requestHistoryPolicy?: RequestHistoryPolicy,
+	usesAdapterOutputClamp?: (model: Model<Api>) => boolean,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -1181,6 +1271,7 @@ export async function compact(
 		systemPrompt,
 		agent,
 		requestHistoryPolicy,
+		usesAdapterOutputClamp,
 	);
 	let summary = result.text;
 	const summaryUsage = result.usage;

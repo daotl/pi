@@ -12,10 +12,34 @@ import { estimateContextTokens } from "../utils/estimate.ts";
 const CONTEXT_SAFETY_TOKENS = 4096;
 const MIN_MAX_TOKENS = 1;
 
+/** Native simple-stream APIs that apply the context output ceiling below. */
+export function isContextClampingApi(api: Api): boolean {
+	switch (api) {
+		case "anthropic-messages":
+		case "openai-completions":
+		case "openai-responses":
+		case "openai-codex-responses":
+		case "azure-openai-responses":
+		case "google-generative-ai":
+		case "google-vertex":
+		case "mistral-conversations":
+		case "bedrock-converse-stream":
+			return true;
+		default:
+			return false;
+	}
+}
+
+/** Apply the adapter ceiling to a fresh input-token estimate. */
+export function clampMaxTokensToInput(model: Model<Api>, inputTokens: number, maxTokens: number): number {
+	if (model.contextWindow <= 0) return Math.max(MIN_MAX_TOKENS, maxTokens);
+	const available = model.contextWindow - inputTokens - CONTEXT_SAFETY_TOKENS;
+	return Math.min(maxTokens, Math.max(MIN_MAX_TOKENS, available));
+}
+
 export function clampMaxTokensToContext(model: Model<Api>, context: TranscriptContext, maxTokens: number): number {
 	if (model.contextWindow <= 0) return Math.max(MIN_MAX_TOKENS, maxTokens);
-	const available = model.contextWindow - estimateContextTokens(context).tokens - CONTEXT_SAFETY_TOKENS;
-	return Math.min(maxTokens, Math.max(MIN_MAX_TOKENS, available));
+	return clampMaxTokensToInput(model, estimateContextTokens(context).tokens, maxTokens);
 }
 
 export function buildBaseOptions(

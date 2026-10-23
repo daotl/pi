@@ -24,6 +24,10 @@ Both use closely related structured formats and track attributable file operatio
 
 Each retry starts from a fresh copy of the fixed selected source history and reapplies the current context transform, converter and incoming-message prefix. Generated summary instructions are appended afterward and are not prefixed. The payload callback is read again after asynchronous policy work; a retry does not reuse a prior attempt's transformed messages. If policy removes an existing system baseline or tool declarations, summarization does not restore that private state afterward.
 
+Historical assistant usage is cleared only on request-local summary copies, including standalone calls. Native adapter output limits therefore use the current converted request, not usage from a larger history or another model; stored billing and converter-owned messages remain unchanged.
+
+Compaction preserves fitting structured history. If converted tool results exceed the physical input window or leave only the verified native adapter's one-token emergency floor, it serializes already-converted, replay-eligible history with bounded tool-result text. It preserves the policy-visible system/tool state and selected kept boundary, then checks the complete bounded request again. A request that still cannot fit fails before dispatch. Arbitrary custom streams retain their physical-window budget rather than inheriting native safety allowances.
+
 ## Compaction
 
 ### When It Triggers
@@ -84,7 +88,7 @@ What the LLM sees:
 
 On repeated compactions, each new compaction summarizes only the messages being cut. Every prior summary is kept as its own message in the context prefix (oldest first), so no summary is ever re-summarized into a summary-of-summaries. The LLM sees `system prompt + [summary 1, summary 2, ...] + [kept messages]`. Because the summaries block grows with each compaction, its size is bounded by `summaryBlockMaxTokens` (default 16384); when the block exceeds the limit, the oldest summaries are dropped from the context view (never the most recent). A limit of `0` keeps only the most recent summary, matching the pre-feature single-summary behavior. Dropped summaries remain in the JSONL file; only the context view is filtered.
 
-The summarization request stays byte-identical to the normal chat prefix (system prompt plus the summaries block and the messages being cut, minus the preserved tail) so the provider KV cache is reused; only the summarization instruction is appended at the end.
+When the structured history fits, the summarization request keeps the normal chat prefix (system prompt plus the summaries block and messages being cut, minus the preserved tail); only the summarization instruction is appended. Oversized converted tool history uses the bounded fallback described above instead of claiming prefix identity.
 
 ### Token counting
 
@@ -211,6 +215,14 @@ When you use `/tree` to navigate to a different branch, Pi offers to summarize t
 3. **Prepare with budget**: Include messages up to token budget (newest first)
 4. **Generate summary**: Call LLM with structured format
 5. **Append entry**: Save `BranchSummaryEntry` at navigation point
+
+Branch summaries select canonical old-branch contributions, including context replacements and omissions, without restoring discarded checkpoint history or copying shared conversation into the abandoned range. Tool calls and matching results form complete groups; system patches remain transparent to matching, but user/custom/assistant boundaries stop association even when call IDs are reused.
+
+Selection includes restored system/tool state, generated instructions and output room. Verified native streams use the adapter's fresh-input estimator and safety allowance to remove older complete groups before arbitrary policy hooks run. Every converted retry request is checked again; expansion that removes useful output room fails before navigation or checkpoint publication. Final payload/header attribution is a separate capability and does not disable the native adapter budget. Custom streams keep their physical-window selection and configured output cap.
+
+Native output clamping has its own factory/registry dispatch-identity capability across Anthropic, OpenAI Completions/Responses/Codex, Azure Responses, Google/Vertex, Mistral and Bedrock simple adapters. This does not grant file-history attribution or tokenizer upload permission. Replacing either factory/provider dispatch function or installing a custom registry/extension wrapper revokes automatic native-budget treatment; restoring the original recognized dispatch restores it.
+
+For programmatic callers, `prepareBranchEntries(entries, tokenBudget, contextProjection?)` accepts chronological slices; pass the full canonical old-branch projection when summarizing a selected range. Its result is `{ messages, fileOps, totalTokens, budgetExceeded }`. `budgetExceeded` replaces `firstEntryId`; preceding authority is recovered from the projection rather than a raw entry boundary. Update consumers to inspect `budgetExceeded` for selection truncation. Input entries and their persisted parent IDs are not mutated.
 
 ```
 Tree before navigation:

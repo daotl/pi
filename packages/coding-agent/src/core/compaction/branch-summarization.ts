@@ -8,14 +8,17 @@
 import type { Agent, AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import type { RetryCallbacks, RetryPolicy } from "@earendil-works/pi-ai";
 import { contentText, getCurrentSystemMessage, normalizeContext, toToolDeclaration } from "@earendil-works/pi-ai";
-import type { Message, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
+import { clampMaxTokensToInput, isContextClampingApi } from "@earendil-works/pi-ai/api/simple-options";
+import type { Api, Message, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
+import { isKnownApiProvider, streamSimple } from "@earendil-works/pi-ai/compat";
+import { estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
+import { convertToLlm } from "../messages.ts";
 import {
-	convertToLlm,
-	createBranchSummaryMessage,
-	createCompactionSummaryMessage,
-	createCustomMessage,
-} from "../messages.ts";
-import type { ReadonlySessionManager, SessionEntry, SessionProjection } from "../session-manager.ts";
+	buildSessionProjection,
+	type ReadonlySessionManager,
+	type SessionEntry,
+	type SessionProjection,
+} from "../session-manager.ts";
 import { completeSummarization, estimateTokens, getSummarizationFailure } from "./compaction.ts";
 import {
 	canAttributeRequestHistory,
@@ -56,8 +59,8 @@ export interface BranchPreparation {
 	fileOps: FileOperations;
 	/** Total estimated tokens in messages */
 	totalTokens: number;
-	/** First retained source entry, for reconstructing preceding system state. */
-	firstEntryId?: string;
+	/** Whether the next complete history group exceeded the selection budget. */
+	budgetExceeded: boolean;
 }
 
 export interface CollectEntriesResult {
@@ -103,6 +106,8 @@ export interface GenerateBranchSummaryOptions {
 	agent?: Agent;
 	/** Live session authorization for reconstructing pre-payload history. */
 	requestHistoryPolicy?: RequestHistoryPolicy;
+	/** Native adapter output ceiling, independent of final payload attribution. */
+	usesAdapterOutputClamp?: (model: Model<Api>) => boolean;
 	/** Canonical old-branch projection used to recover policy preceding the retained range. */
 	contextProjection?: SessionProjection;
 }
@@ -167,34 +172,14 @@ export function collectEntriesForBranchSummary(
 // Entry to Message Conversion
 // ============================================================================
 
-/**
- * Extract AgentMessage from a session entry.
- * Similar to getMessageFromEntry in compaction.ts but also handles compaction entries.
- */
-function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
-	switch (entry.type) {
-		case "message":
-			// Skip tool results - context is in assistant's tool call
-			if (entry.message.role === "toolResult") return undefined;
-			return entry.message;
-
-		case "custom_message":
-			return createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp);
-
-		case "branch_summary":
-			return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
-
-		case "compaction":
-			return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
-
-		// These don't contribute to conversation content
-		case "thinking_level_change":
-		case "model_change":
-		case "custom":
-		case "label":
-		case "session_info":
-			return undefined;
-	}
+/** Public callers supply an ordered slice, not necessarily a connected session tree. */
+function projectBranchSlice(entries: SessionEntry[]): SessionProjection {
+	return buildSessionProjection(
+		entries.map((entry, index) => ({
+			...entry,
+			parentId: index > 0 ? entries[index - 1].id : null,
+		})),
+	);
 }
 
 /**
@@ -210,17 +195,33 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
  * @param entries - Entries in chronological order
  * @param tokenBudget - Maximum tokens to include (0 = no limit)
  */
-export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: number = 0): BranchPreparation {
+export function prepareBranchEntries(
+	entries: SessionEntry[],
+	tokenBudget: number = 0,
+	contextProjection: SessionProjection = projectBranchSlice(entries),
+): BranchPreparation {
+	return selectBranchEntries(entries, tokenBudget, contextProjection, true);
+}
+
+function selectBranchEntries(
+	entries: SessionEntry[],
+	tokenBudget: number,
+	contextProjection: SessionProjection,
+	allowSummaryOverflow: boolean,
+	budgetSystemMessages: boolean = true,
+): BranchPreparation {
+	const sourceIds = new Set(entries.map((entry) => entry.id));
+	const projected = contextProjection.entries.filter((entry) => sourceIds.has(entry.sourceEntry.id));
 	const messages: AgentMessage[] = [];
 	const fileOps = createFileOps();
 	let totalTokens = 0;
-	let firstEntryId: string | undefined;
+	let budgetExceeded = false;
 
 	// First pass: collect file ops from ALL entries (even if they don't fit in token budget)
 	// This ensures we capture cumulative file tracking from nested branch summaries
 	// Only extract from pi-generated summaries (fromHook !== true), not extension-generated ones
-	for (const entry of entries) {
-		if (entry.type === "branch_summary" && !entry.fromHook && entry.details) {
+	for (const { sourceEntry: entry, messages: projectedMessages } of projected) {
+		if (projectedMessages.length > 0 && entry.type === "branch_summary" && !entry.fromHook && entry.details) {
 			const details = entry.details as BranchSummaryDetails;
 			if (Array.isArray(details.readFiles)) {
 				for (const f of details.readFiles) fileOps.read.add(f);
@@ -234,37 +235,76 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		}
 	}
 
-	// Second pass: walk from newest to oldest, adding messages until token budget
-	for (let i = entries.length - 1; i >= 0; i--) {
-		const entry = entries[i];
-		const message = getMessageFromEntry(entry);
-		if (!message) continue;
-
-		// Extract file ops from assistant messages (tool calls)
-		extractFileOpsFromMessage(message, fileOps);
-
-		const tokens = estimateTokens(message);
-
-		// Check budget before adding
-		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
-			// If this is a summary entry, try to fit it anyway as it's important context
-			if (entry.type === "compaction" || entry.type === "branch_summary") {
-				if (totalTokens < tokenBudget * 0.9) {
-					messages.unshift(message);
-					totalTokens += tokens;
-					firstEntryId = entry.id;
+	// Second pass: walk from newest to oldest, adding messages until token budget.
+	// Defer results and intervening system updates until their conversational boundary.
+	// Systems are transparent to provider tool accounting; keep their original chronology
+	// with the call/results so truncation cannot create a failed replay. Public preparation
+	// budgets the whole group; generation defers authority sizing until policy conversion.
+	// User/custom and assistant boundaries still stop association, including reused call IDs.
+	const firstContribution = projected.findIndex((entry) => entry.messages.length > 0);
+	const pendingContributions: AgentMessage[][] = [];
+	for (let i = projected.length - 1; i >= 0; i--) {
+		const { sourceEntry: entry, messages: contribution } = projected[i];
+		if (contribution.length === 0) continue;
+		if (contribution.every((message) => message.role === "toolResult")) {
+			pendingContributions.push(contribution);
+			continue;
+		}
+		if (
+			i !== firstContribution &&
+			contribution.every((message) => message.role === "system") &&
+			pendingContributions.length > 0
+		) {
+			pendingContributions.push(contribution);
+			continue;
+		}
+		const callIds = new Set(
+			contribution.flatMap((message) =>
+				message.role === "assistant"
+					? message.content.flatMap((block) => (block.type === "toolCall" ? [block.id] : []))
+					: [],
+			),
+		);
+		const group = [...contribution];
+		for (let index = pendingContributions.length - 1; index >= 0; index--) {
+			for (const message of pendingContributions[index]) {
+				if (message.role === "system" || (message.role === "toolResult" && callIds.has(message.toolCallId))) {
+					group.push(message);
 				}
 			}
-			// Stop - we've hit the budget
-			break;
+		}
+		pendingContributions.length = 0;
+		// Generation retains authority for its single policy transform, but only
+		// conversational groups consume the source-history selection budget.
+		if (!budgetSystemMessages && group.every((message) => message.role === "system")) {
+			messages.unshift(...group);
+			continue;
+		}
+		let tokens = 0;
+		for (const message of group) {
+			extractFileOpsFromMessage(message, fileOps);
+			if (budgetSystemMessages || message.role !== "system") tokens += estimateTokens(message);
 		}
 
-		messages.unshift(message);
+		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
+			budgetExceeded = true;
+			if (
+				allowSummaryOverflow &&
+				(entry.type === "compaction" || entry.type === "branch_summary") &&
+				totalTokens < tokenBudget * 0.9
+			) {
+				messages.unshift(...group);
+				totalTokens += tokens;
+			} else if (!budgetSystemMessages) {
+				messages.unshift(...group.filter((message) => message.role === "system"));
+			}
+			break;
+		}
+		messages.unshift(...group);
 		totalTokens += tokens;
-		firstEntryId = entry.id;
 	}
 
-	return { messages, fileOps, totalTokens, firstEntryId };
+	return { messages, fileOps, totalTokens, budgetExceeded };
 }
 
 // ============================================================================
@@ -332,35 +372,37 @@ export async function generateBranchSummary(
 		contextProjection,
 	} = options;
 
-	// Token budget = context window minus reserved space for prompt + response
 	const contextWindow = model.contextWindow || 262144;
-	const tokenBudget = contextWindow - reserveTokens;
-
-	const { messages, firstEntryId } = prepareBranchEntries(entries, tokenBudget);
-
-	if (messages.length === 0) {
-		return { summary: "No content to summarize" };
-	}
-
-	// Reuse the same context pipeline as a normal turn so provider prompt caches
-	// stay valid. The summarization instruction is appended as a final user
-	// message so nothing is inserted before the existing prefix.
-	const source = structuredClone(messages);
-	const projectedStart = contextProjection?.entries.findIndex((entry) => entry.sourceEntry.id === firstEntryId) ?? -1;
-	if (contextProjection && projectedStart < 0) {
+	const maxTokens = Math.min(4096, model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY);
+	const usesAdapterOutputClamp =
+		options.usesAdapterOutputClamp ??
+		((requestModel: Model<Api>) =>
+			(!streamFn || streamFn === streamSimple) &&
+			isContextClampingApi(requestModel.api) &&
+			isKnownApiProvider(requestModel.api));
+	const nativeHeadroom = (): boolean =>
+		usesAdapterOutputClamp(model) &&
+		(!agent || !streamFn || streamFn === agent.streamFunction) &&
+		clampMaxTokensToInput(model, 0, maxTokens) > 1;
+	let tokenBudget = contextWindow - reserveTokens;
+	const budgetFailure = (): BranchSummaryResult => ({
+		error: `Branch summarization failed: newest message group exceeds the token budget (${tokenBudget} tokens)`,
+	});
+	const projection = contextProjection ?? projectBranchSlice(entries);
+	const projectedSourceIds = new Set(projection.entries.map((entry) => entry.sourceEntry.id));
+	if (
+		contextProjection &&
+		entries.some((entry) => entry.deletedAt === undefined) &&
+		!entries.some((entry) => projectedSourceIds.has(entry.id))
+	) {
 		return { error: "Branch summarization context projection does not contain the retained entry" };
 	}
-	const start = agent?.state.messages.indexOf(messages[0]) ?? -1;
-	const baseline = contextProjection
-		? getCurrentSystemMessage(contextProjection.entries.slice(0, projectedStart).flatMap((entry) => entry.messages))
-		: agent && start > 0
-			? getCurrentSystemMessage(agent.state.messages.slice(0, start))
-			: agent && start < 0
-				? getCurrentSystemMessage(agent.state.messages)
-				: undefined;
-	if (baseline) source.unshift(structuredClone(baseline));
-	else if (source[0]?.role !== "system" || (!agent && systemPrompt !== undefined)) {
-		source.unshift({ role: "system", content: systemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT, timestamp: 0 });
+	let preparation = selectBranchEntries(entries, tokenBudget, projection, true, false);
+	if (
+		preparation.messages.length === 0 ||
+		(preparation.budgetExceeded && preparation.messages.every((message) => message.role === "system"))
+	) {
+		return preparation.budgetExceeded ? budgetFailure() : { summary: "No content to summarize" };
 	}
 
 	// Build prompt
@@ -373,6 +415,76 @@ export async function generateBranchSummary(
 		instructions = BRANCH_SUMMARY_PROMPT;
 	}
 	const instructionText = `Do not continue the conversation above. Output only the structured summary requested below.\n\n${instructions}`;
+	const instruction: Message = {
+		role: "user",
+		content: [{ type: "text", text: instructionText }],
+		timestamp: Date.now(),
+	};
+	const promptBudget = contextWindow - maxTokens;
+	// Keep at least two output tokens rather than admitting the adapter's emergency floor.
+	const nativePromptBudget = clampMaxTokensToInput(model, 0, Number.POSITIVE_INFINITY) - 2;
+	let contextMessages: AgentMessage[];
+	while (true) {
+		const { messages } = preparation;
+		const firstMessageIndex = projection.messages.indexOf(messages[0]);
+		// Restore only preceding system state, never shared conversation. A standalone
+		// SDK slice can start with a patch; explicit projections/checkpoints stay authoritative.
+		const baseline = getCurrentSystemMessage(projection.messages.slice(0, Math.max(0, firstMessageIndex)));
+		const agentBaseline =
+			!baseline && !contextProjection && !projection.entries.some((entry) => entry.sourceEntry.type === "compaction")
+				? agent && getCurrentSystemMessage(agent.state.messages)
+				: undefined;
+		contextMessages = baseline
+			? [baseline, ...messages]
+			: agentBaseline
+				? [agentBaseline, ...messages.filter((message) => message.role !== "system")]
+				: messages;
+		const useNativeBudget = nativeHeadroom();
+		let requestTokens: number;
+		if (useNativeBudget) {
+			const requestMessages = convertToLlm([...contextMessages, instruction]);
+			if (requestMessages[0]?.role !== "system") {
+				requestMessages.unshift({
+					role: "system",
+					content: systemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT,
+					timestamp: 0,
+				});
+			}
+			requestTokens = requestMessages.reduce((total, message) => total + estimateMessageTokens(message), 0);
+		} else {
+			requestTokens =
+				contextMessages.reduce((total, message) => total + estimateTokens(message), 0) +
+				estimateTokens(instruction) +
+				(contextMessages[0]?.role === "system"
+					? 0
+					: estimateTokens({
+							role: "system",
+							content: systemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT,
+							timestamp: 0,
+						}));
+		}
+		const availablePromptBudget = useNativeBudget ? nativePromptBudget : promptBudget;
+		if (requestTokens <= availablePromptBudget) break;
+		// Re-select whole atomic groups before invoking arbitrary context hooks. Moving
+		// the cut can change the restored baseline, so size that new prefix again.
+		// A baseline that leaves no history budget may be removed by request policy;
+		// defer rejection until the single converted-request check below.
+		tokenBudget = preparation.totalTokens - (requestTokens - availablePromptBudget);
+		if (tokenBudget <= 0) break; // prepareBranchEntries(0) means unlimited.
+		const trimmed = selectBranchEntries(entries, tokenBudget, projection, false, false);
+		if (
+			!trimmed.messages.some((message) => message.role !== "system") ||
+			trimmed.messages.length >= messages.length
+		) {
+			break;
+		}
+		preparation = trimmed;
+	}
+	const source = structuredClone(contextMessages);
+	if (source[0]?.role !== "system" || (!agent && !contextProjection && systemPrompt !== undefined)) {
+		source.unshift({ role: "system", content: systemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT, timestamp: 0 });
+	}
+	const budgetError = new Error(budgetFailure().error);
 	let fileOps = createFileOps();
 	let attributable = false;
 
@@ -384,6 +496,15 @@ export async function generateBranchSummary(
 		const llmMessages = agent
 			? await agent.convertForRequest(agent.transformContext ? await agent.transformContext(input, signal) : input)
 			: convertToLlm(input);
+		const context = normalizeContext({ messages: [...llmMessages, instruction] });
+		const useNativeBudget = nativeHeadroom();
+		const inputTokens = context.messages.reduce(
+			(total, message) => total + (useNativeBudget ? estimateMessageTokens(message) : estimateTokens(message)),
+			0,
+		);
+		const outputTokens = useNativeBudget ? clampMaxTokensToInput(model, inputTokens, maxTokens) : maxTokens;
+		if (useNativeBudget ? outputTokens <= 1 : inputTokens > promptBudget) throw budgetError;
+		attemptOptions.maxTokens = outputTokens;
 		fileOps = createFileOps();
 		attributable = canAttributeRequestHistory(model, agent, streamFn, options.requestHistoryPolicy);
 		if (attributable) {
@@ -392,16 +513,9 @@ export async function generateBranchSummary(
 					extractFileOpsFromMessage(message, fileOps);
 			}
 		}
-		const instruction: Message = {
-			role: "user",
-			content: [{ type: "text", text: instructionText }],
-			timestamp: Date.now(),
-		};
 		if (agent) attemptOptions.onPayload = agent.onPayload;
-		return normalizeContext({ messages: [...llmMessages, instruction] });
+		return context;
 	};
-
-	const maxTokens = Math.min(4096, model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY);
 
 	// Call LLM for summarization. Prefer the session stream function so SDK
 	// request behavior (timeouts, retries, attribution headers) stays consistent
@@ -416,7 +530,13 @@ export async function generateBranchSummary(
 		requestOptions.onPayload = agent.onPayload;
 		requestOptions.onResponse = agent.onResponse;
 	}
-	const response = await completeSummarization(model, buildContext, requestOptions, streamFn, retry, callbacks);
+	const response = await completeSummarization(model, buildContext, requestOptions, streamFn, retry, callbacks).catch(
+		(error: unknown) => {
+			if (error === budgetError) return undefined;
+			throw error;
+		},
+	);
+	if (!response) return budgetFailure();
 
 	// Check if aborted or errored
 	if (response.stopReason === "aborted") {

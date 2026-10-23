@@ -31,6 +31,7 @@ export * from "./providers/images/register-builtins.ts";
 import { anthropicMessagesApi } from "./api/anthropic-messages.lazy.ts";
 import { azureOpenAIResponsesApi } from "./api/azure-openai-responses.lazy.ts";
 import { bedrockConverseStreamApi } from "./api/bedrock-converse-stream.lazy.ts";
+import { isContextClampingApiStreams, markContextClampingApi } from "./api/context-clamp-provenance.ts";
 import { googleGenerativeAIApi } from "./api/google-generative-ai.lazy.ts";
 import { googleVertexApi } from "./api/google-vertex.lazy.ts";
 import { mistralConversationsApi } from "./api/mistral-conversations.lazy.ts";
@@ -233,6 +234,7 @@ export function registerBuiltInApiProviders(): void {
 					streamSimple: registered.streamSimple,
 					direct: api === "openai-completions",
 				});
+				if (isContextClampingApiStreams(streams)) markContextClampingApi(registered);
 				builtinApiProviderInstances.set(api, registered);
 			}
 		}

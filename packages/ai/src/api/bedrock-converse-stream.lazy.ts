@@ -1,4 +1,5 @@
 import type { ProviderStreams } from "../types.ts";
+import { markContextClampingApi } from "./context-clamp-provenance.ts";
 import { lazyApi } from "./lazy.ts";
 
 /**
@@ -24,7 +25,9 @@ export function setBedrockProviderModule(module: ProviderStreams): void {
 }
 
 export const bedrockConverseStreamApi = (): ProviderStreams =>
-	lazyApi(
-		async () =>
-			bedrockModuleOverride ?? ((await importNodeOnlyApi("./bedrock-converse-stream.ts")) as ProviderStreams),
+	markContextClampingApi(
+		lazyApi(
+			async () =>
+				bedrockModuleOverride ?? ((await importNodeOnlyApi("./bedrock-converse-stream.ts")) as ProviderStreams),
+		),
 	);

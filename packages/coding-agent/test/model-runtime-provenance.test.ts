@@ -1,5 +1,11 @@
 import { createProvider, type Model, type ProviderStreams } from "@earendil-works/pi-ai";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
+import { azureOpenAIResponsesApi } from "@earendil-works/pi-ai/api/azure-openai-responses.lazy";
+import { bedrockConverseStreamApi } from "@earendil-works/pi-ai/api/bedrock-converse-stream.lazy";
+import { googleGenerativeAIApi } from "@earendil-works/pi-ai/api/google-generative-ai.lazy";
+import { googleVertexApi } from "@earendil-works/pi-ai/api/google-vertex.lazy";
+import { mistralConversationsApi } from "@earendil-works/pi-ai/api/mistral-conversations.lazy";
+import { openAICodexResponsesApi } from "@earendil-works/pi-ai/api/openai-codex-responses.lazy";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { registerApiProvider, registerFauxProvider, resetApiProviders } from "@earendil-works/pi-ai/compat";
@@ -99,3 +105,59 @@ it("revokes composed dispatch evidence when either entry point is replaced", asy
 	composed.streamSimple = original.streamSimple;
 	expect(runtime.canAttributeRequestHistory(model, true)).toBe(true);
 });
+
+it.each([
+	["openai-completions", openAICompletionsApi],
+	["anthropic-messages", anthropicMessagesApi],
+	["openai-responses", openAIResponsesApi],
+	["google-generative-ai", googleGenerativeAIApi],
+	["google-vertex", googleVertexApi],
+	["bedrock-converse-stream", bedrockConverseStreamApi],
+	["openai-codex-responses", openAICodexResponsesApi],
+	["azure-openai-responses", azureOpenAIResponsesApi],
+	["mistral-conversations", mistralConversationsApi],
+] as const)(
+	"revokes native %s output budgeting for replaced factory/provider/composed dispatch",
+	async (api, factory) => {
+		const runtime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false });
+		const streams = factory();
+		const native = provider(api, streams);
+		runtime.registerNativeProvider(native);
+		const model = native.getModels()[0];
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(true);
+		const simple = streams.streamSimple;
+		streams.streamSimple = (...args) => simple(...args);
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(false);
+		streams.streamSimple = simple;
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(true);
+		const original = native.stream;
+		native.stream = (...args) => original(...args);
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(false);
+		native.stream = original;
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(true);
+		const nativeSimple = native.streamSimple;
+		native.streamSimple = (...args) => nativeSimple(...args);
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(false);
+		native.streamSimple = nativeSimple;
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(true);
+		runtime.registerProvider(native.id, { api, apiKey: "offline" });
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(true);
+		const composed = runtime.getProvider(native.id)!;
+		const composedSimple = composed.streamSimple;
+		composed.streamSimple = (...args) => composedSimple(...args);
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(false);
+		composed.streamSimple = composedSimple;
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(true);
+		const composedStream = composed.stream;
+		composed.stream = (...args) => composedStream(...args);
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(false);
+		composed.stream = composedStream;
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(true);
+		registerApiProvider({ api, ...factory() });
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(false);
+		resetApiProviders();
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(true);
+		runtime.registerProvider(native.id, { api, streamSimple: (...args) => simple(...args), apiKey: "offline" });
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(false);
+	},
+);

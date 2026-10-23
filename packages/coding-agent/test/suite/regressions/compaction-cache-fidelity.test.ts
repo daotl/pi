@@ -1,16 +1,15 @@
-/**
- * Regression test for compaction cache fidelity: the compaction summarization request
- * MUST be byte-identical to the normal chat prefix up to the cut point
- * (system prompt + the head messages exactly as a normal turn would send them),
- * with only the summarize instruction appended at the end. If the head diverges,
- * the provider KV cache is lost and every interaction after compaction re-prefills.
+/** Fitting summary history preserves provider-visible conversation and image payloads.
+ * Request-local accounting metadata is not part of the provider cache prefix.
  */
 import {
 	type Context,
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
+	normalizeContext,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+import { convertMessages } from "@earendil-works/pi-ai/api/google-shared";
+import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it } from "vitest";
 import { createHarness, type Harness } from "../harness.ts";
 
@@ -116,11 +115,12 @@ describe("compaction cache fidelity", () => {
 		expect(capturedContent[0]).toEqual(expectedFirst);
 	});
 
-	it("summarization request head is byte-identical to the normal chat prefix", async () => {
+	it("preserves the provider-visible normal chat prefix while retaining canonical usage", async () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
 		// 3 user/assistant pairs = 6 messages. Keep the last 2, summarize the first 4.
 		seedPairs(harness, 3);
+		const canonical = structuredClone(harness.sessionManager.getEntries());
 
 		const agent = harness.session.agent;
 
@@ -148,10 +148,15 @@ describe("compaction cache fidelity", () => {
 		// head, nothing skipped).
 		const capturedHead = captured!.messages.filter((message) => message.role !== "system").slice(0, -1);
 		const expectedContent = expectedLlm.filter((message) => message.role !== "system");
-		expect(capturedHead).toEqual(expectedContent.slice(0, capturedHead.length));
+		const wireModel = getModel("google", "gemini-2.5-flash");
+		if (!wireModel) throw new Error("Missing Google converter fixture model");
+		expect(convertMessages(wireModel, normalizeContext({ messages: capturedHead }))).toEqual(
+			convertMessages(wireModel, normalizeContext({ messages: expectedContent.slice(0, capturedHead.length) })),
+		);
+		for (const entry of canonical) expect(harness.sessionManager.getEntry(entry.id)).toEqual(entry);
 	});
 
-	it("keeps image content byte-identical in the summarization request head", async () => {
+	it("preserves image payloads in the provider-visible summarization prefix", async () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
 		const now = Date.now();
@@ -179,6 +184,7 @@ describe("compaction cache fidelity", () => {
 		a1.usage = createUsage(10);
 		harness.sessionManager.appendMessage(a1);
 		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+		const canonical = structuredClone(harness.sessionManager.getEntries());
 
 		const agent = harness.session.agent;
 		const transformed = agent.transformContext
@@ -199,6 +205,24 @@ describe("compaction cache fidelity", () => {
 		// The single-call summarization request head must byte-match the chat prefix,
 		// including the image content block. A split turn that drops the history before
 		// the image would diverge here and lose the cache for everything after it.
-		expect(capturedHead).toEqual(expectedContent.slice(0, capturedHead.length));
+		const wireModel = getModel("google", "gemini-2.5-flash");
+		if (!wireModel) throw new Error("Missing Google converter fixture model");
+		const actualWire = convertMessages(wireModel, normalizeContext({ messages: capturedHead }));
+		expect(actualWire).toEqual(
+			convertMessages(wireModel, normalizeContext({ messages: expectedContent.slice(0, capturedHead.length) })),
+		);
+		expect(actualWire).toContainEqual({
+			role: "user",
+			parts: [
+				{ text: "here is the image" },
+				{
+					inlineData: {
+						mimeType: "image/png",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z4ZcAAAAASUVORK5CYII=",
+					},
+				},
+			],
+		});
+		for (const entry of canonical) expect(harness.sessionManager.getEntry(entry.id)).toEqual(entry);
 	});
 });

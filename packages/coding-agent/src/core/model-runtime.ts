@@ -78,6 +78,7 @@ import {
 	type ProviderConfigInput,
 	resolveCompatibilityRequestConfig,
 	resolveConfiguredModelHeaders,
+	usesProviderOutputClamp,
 	validateExtensionProvider,
 } from "./provider-composer.ts";
 import { withRemoteCatalog } from "./remote-catalog-provider.ts";
@@ -529,6 +530,13 @@ export class ModelRuntime implements Models {
 		if (isVirtualModel(model)) return false;
 		const provider = this.models.getProvider(model.provider);
 		return provider !== undefined && canAttributeProviderHistory(provider, model, direct);
+	}
+
+	/** @internal Rechecks the live native dispatch pair without granting history/upload authority. */
+	usesAdapterOutputClamp(model: Model<Api>): boolean {
+		if (isVirtualModel(model)) return false;
+		const provider = this.models.getProvider(model.provider);
+		return provider !== undefined && usesProviderOutputClamp(provider, model);
 	}
 
 	/** @internal Compatibility fallback for ModelRegistry when provider auth is unconfigured. */

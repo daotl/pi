@@ -51,6 +51,7 @@ import {
 	toToolDeclaration,
 	uuidv7,
 } from "@earendil-works/pi-ai";
+import { isContextClampingApi } from "@earendil-works/pi-ai/api/simple-options";
 import type {
 	Api,
 	AssistantMessage,
@@ -4508,6 +4509,7 @@ export class AgentSession {
 			this.agent.state.systemPrompt,
 			this.agent,
 			(model) => this._requestHistoryPolicy(model),
+			(model) => this._usesAdapterOutputClamp(model),
 		);
 		return { ...result, usageModel: request.model };
 	}
@@ -4526,6 +4528,20 @@ export class AgentSession {
 				? baseline
 				: createInitialSystemMessage(this.systemPrompt, this.agent.state.tools.map(toToolDeclaration));
 		return system ? [system, ...messages] : messages;
+	}
+
+	/** Native dispatch capability, independent of final payload attribution or tokenizer permission. */
+	private _usesAdapterOutputClamp(model: Model<Api>): boolean {
+		if (!isContextClampingApi(model.api)) return false;
+		if (this.agent.streamFunction === streamSimple) {
+			return (
+				isKnownApiProvider(model.api) &&
+				(!this._modelRuntime.getProvider(model.provider) || this._modelRuntime.usesAdapterOutputClamp(model))
+			);
+		}
+		return (
+			this.agent.streamFunction === this._standardStreamFunction && this._modelRuntime.usesAdapterOutputClamp(model)
+		);
 	}
 
 	/** History attribution and direct upload permission depend on live dispatch identity, not API labels. */
@@ -6420,6 +6436,7 @@ export class AgentSession {
 					callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
 					agent: this.agent,
 					requestHistoryPolicy: (model) => this._requestHistoryPolicy(model),
+					usesAdapterOutputClamp: (model) => this._usesAdapterOutputClamp(model),
 					contextProjection: this.sessionManager.buildSessionProjection(),
 				});
 				if (result.aborted) {

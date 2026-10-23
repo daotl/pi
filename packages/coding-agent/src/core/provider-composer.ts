@@ -26,6 +26,7 @@ import {
 	type StreamOptions,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
+import { isContextClampingApiStreams } from "@earendil-works/pi-ai/api/context-clamp-provenance";
 import { isHistoryPreservingApi } from "@earendil-works/pi-ai/api/history-provenance";
 import { isDirectOpenAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { getApiProvider, isKnownApiProvider } from "@earendil-works/pi-ai/compat";
@@ -44,6 +45,19 @@ const requestHistoryPolicies = new WeakMap<
 	Provider["streamSimple"],
 	{ stream: Provider["stream"]; policy: (model: Model<Api>, direct: boolean) => boolean }
 >();
+
+const outputClampPolicies = new WeakMap<
+	Provider["streamSimple"],
+	{ stream: Provider["stream"]; policy: (model: Model<Api>) => boolean }
+>();
+
+/** @internal Native output budgeting is independent of request-history attribution. */
+export function usesProviderOutputClamp(provider: Provider, model: Model<Api>): boolean {
+	const original = outputClampPolicies.get(provider.streamSimple);
+	if (original) return original.stream === provider.stream && original.policy(model);
+	const streams = getProviderApiStreams(provider, model);
+	return streams !== undefined && isContextClampingApiStreams(streams);
+}
 
 /** @internal History attribution and direct tokenizer credential permission are separate capabilities. */
 export function canAttributeProviderHistory(provider: Provider, model: Model<Api>, direct = false): boolean {
@@ -645,6 +659,15 @@ export function composeModelProvider(
 			if (extension?.streamSimple && model.api === extension.api) return false;
 			if (base && supportsBaseApi(model)) return canAttributeProviderHistory(base, model, direct);
 			return isKnownApiProvider(model.api, direct);
+		},
+	});
+	outputClampPolicies.set(provider.streamSimple, {
+		stream: provider.stream,
+		policy: (model) => {
+			if (extension?.streamSimple && model.api === extension.api) return false;
+			if (base && supportsBaseApi(model)) return usesProviderOutputClamp(base, model);
+			const api = getApiProvider(model.api);
+			return api !== undefined && isContextClampingApiStreams(api);
 		},
 	});
 
