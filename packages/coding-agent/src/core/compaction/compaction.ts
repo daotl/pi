@@ -265,8 +265,8 @@ export function shouldCompact(contextTokens: number, contextWindow: number, sett
 
 export const ESTIMATED_IMAGE_CHARS = 4800;
 
-/** Counts tokens for a set of session messages, used to find the compaction cut point. */
-export type TokenCounter = (messages: AgentMessage[]) => Promise<number>;
+/** Counts entry tokens; the optional signal cancels unneeded speculative batch work. */
+export type TokenCounter = (messages: AgentMessage[], signal?: AbortSignal) => Promise<number>;
 
 function estimateTextAndImageContentChars(content: string | Array<{ type: string; text?: string }>): number {
 	if (typeof content === "string") {
@@ -488,28 +488,49 @@ export async function findCutPoint(
 	if (keepRecentTokens !== undefined) {
 		let accumulatedTokens = 0;
 		let tokenCut = keepRecentTokens === 0 ? cutPoints[cutPoints.length - 1] : keepAllIndex;
-		// Older token counts cannot tighten the known message boundary.
-		for (let i = endIndex - 1; i >= countCut; i--) {
-			const entry = entries[i];
-			if (entry.type === "compaction") continue;
-			const contextMessages = sessionEntryToContextMessages(entry).filter((message) => message.role !== "system");
-			if (contextMessages.length === 0) continue;
-			const messageTokens = tokenCounter
-				? await tokenCounter(contextMessages)
-				: contextMessages.reduce((sum, message) => sum + estimateTokens(message), 0);
-			if (messageTokens === 0) continue;
-
-			// Include this entry only if it still fits; otherwise stop and keep the
-			// newer entries already accumulated.
-			if (accumulatedTokens + messageTokens > keepRecentTokens) {
-				// Prefer the closest valid cut point strictly after this entry. If
-				// trailing tool results exceed the budget by themselves, keep their
-				// preceding assistant tool call instead of falling back to the first
-				// message.
-				tokenCut = cutPoints.find((candidate) => candidate > i) ?? cutPoints[cutPoints.length - 1];
-				break;
+		let exceededBudget = false;
+		const batchSize = tokenCounter ? 4 : 1;
+		let nextIndex = endIndex - 1;
+		// Never speculate beyond the stricter known message-count boundary.
+		while (nextIndex >= countCut && !exceededBudget) {
+			const batch: { index: number; messages: AgentMessage[] }[] = [];
+			while (nextIndex >= countCut && batch.length < batchSize) {
+				const index = nextIndex--;
+				const entry = entries[index];
+				if (entry.type === "compaction") continue;
+				const messages = sessionEntryToContextMessages(entry).filter((message) => message.role !== "system");
+				if (messages.length > 0) batch.push({ index, messages });
 			}
-			accumulatedTokens += messageTokens;
+			const controller = new AbortController();
+			const counts = tokenCounter
+				? batch.map((entry) =>
+						Promise.resolve()
+							.then(() => tokenCounter(entry.messages, controller.signal))
+							.then(
+								(tokens) => ({ ok: true as const, tokens }),
+								(error: unknown) => ({ ok: false as const, error }),
+							),
+					)
+				: batch.map((entry) => ({
+						ok: true as const,
+						tokens: entry.messages.reduce((sum, message) => sum + estimateTokens(message), 0),
+					}));
+			try {
+				for (let index = 0; index < batch.length; index++) {
+					const count = await counts[index];
+					if (!count.ok) throw count.error;
+					if (count.tokens === 0) continue;
+					if (accumulatedTokens + count.tokens > keepRecentTokens) {
+						exceededBudget = true;
+						tokenCut =
+							cutPoints.find((candidate) => candidate > batch[index].index) ?? cutPoints[cutPoints.length - 1];
+						break;
+					}
+					accumulatedTokens += count.tokens;
+				}
+			} finally {
+				controller.abort();
+			}
 		}
 		candidates.push(tokenCut);
 	}
@@ -891,20 +912,47 @@ async function findProjectedCutPoint(
 	if (keepRecentTokens !== undefined) {
 		let accumulatedTokens = 0;
 		let tokenCut = keepRecentTokens === 0 ? cutPoints[cutPoints.length - 1] : keepAllIndex;
-		for (let i = endIndex - 1; i >= countCut; i--) {
-			if (entries[i].sourceEntry.type === "compaction") continue;
-			const contextMessages = entries[i].messages.filter((message) => message.role !== "system");
-			if (contextMessages.length === 0) continue;
-			const messageTokens = tokenCounter
-				? await tokenCounter(contextMessages)
-				: contextMessages.reduce((sum, message) => sum + estimateTokens(message), 0);
-			if (messageTokens === 0) continue;
-			if (accumulatedTokens + messageTokens > keepRecentTokens) {
-				exceededBudget = true;
-				tokenCut = cutPoints.find((candidate) => candidate > i) ?? cutPoints[cutPoints.length - 1];
-				break;
+		const batchSize = tokenCounter ? 4 : 1;
+		let nextIndex = endIndex - 1;
+		while (nextIndex >= countCut && !exceededBudget) {
+			const batch: { index: number; messages: AgentMessage[] }[] = [];
+			while (nextIndex >= countCut && batch.length < batchSize) {
+				const index = nextIndex--;
+				if (entries[index].sourceEntry.type === "compaction") continue;
+				const messages = entries[index].messages.filter((message) => message.role !== "system");
+				if (messages.length > 0) batch.push({ index, messages });
 			}
-			accumulatedTokens += messageTokens;
+			const controller = new AbortController();
+			// Observe every rejection immediately, even when an earlier count establishes the cutoff.
+			const counts = tokenCounter
+				? batch.map((entry) =>
+						Promise.resolve()
+							.then(() => tokenCounter(entry.messages, controller.signal))
+							.then(
+								(tokens) => ({ ok: true as const, tokens }),
+								(error: unknown) => ({ ok: false as const, error }),
+							),
+					)
+				: batch.map((entry) => ({
+						ok: true as const,
+						tokens: entry.messages.reduce((sum, message) => sum + estimateTokens(message), 0),
+					}));
+			try {
+				for (let index = 0; index < batch.length; index++) {
+					const count = await counts[index];
+					if (!count.ok) throw count.error;
+					if (count.tokens === 0) continue;
+					if (accumulatedTokens + count.tokens > keepRecentTokens) {
+						exceededBudget = true;
+						tokenCut =
+							cutPoints.find((candidate) => candidate > batch[index].index) ?? cutPoints[cutPoints.length - 1];
+						break;
+					}
+					accumulatedTokens += count.tokens;
+				}
+			} finally {
+				controller.abort();
+			}
 		}
 		candidates.push(tokenCut);
 	}

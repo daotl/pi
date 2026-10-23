@@ -6,13 +6,140 @@
  * while the footer stays unknown until a fresh exact count or provider usage.
  */
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createNativeTokenizerFixture, type NativeTokenizerFixture } from "./tokenizer-fixture.ts";
 
 describe("compaction tokenization", () => {
 	const fixtures: NativeTokenizerFixture[] = [];
 	afterEach(() => {
 		while (fixtures.length > 0) fixtures.pop()?.cleanup();
+	});
+
+	it("aborts unused native preparation requests without cancelling the compaction", async () => {
+		const fixture = await createNativeTokenizerFixture();
+		fixtures.push(fixture);
+		const requests: Array<{ signal: AbortSignal | undefined; resolve: () => void }> = [];
+		let summaryStarted = false;
+		fixture.setTokenizer(async (url, init) => {
+			if (url.endsWith("/chat/completions/input_tokens")) return Response.json({ input_tokens: 100 });
+			const body = JSON.parse(String(init?.body));
+			if (body.content === "safe checkpoint") {
+				summaryStarted = true;
+				return Response.json({ tokens: [1] });
+			}
+			if (requests.length === 0) {
+				requests.push({ signal: init?.signal ?? undefined, resolve: () => {} });
+				return Response.json({ tokens: [1] });
+			}
+			const deferred = Promise.withResolvers<Response>();
+			const signal = init?.signal ?? undefined;
+			requests.push({ signal, resolve: () => deferred.resolve(Response.json({ tokens: [1, 2] })) });
+			if (signal?.aborted) deferred.reject(new DOMException("Cancelled batch", "AbortError"));
+			else
+				signal?.addEventListener(
+					"abort",
+					() => deferred.reject(new DOMException("Cancelled batch", "AbortError")),
+					{ once: true },
+				);
+			return deferred.promise;
+		});
+		const outcome = fixture.session.compact({ keepRecentTokens: 1 }).then(
+			(result) => ({ result }),
+			(error: unknown) => ({ error }),
+		);
+		try {
+			await vi.waitFor(() => expect(requests).toHaveLength(4));
+			requests[1].resolve();
+			expect(await outcome).toMatchObject({ result: { summary: "safe checkpoint" } });
+			expect(summaryStarted).toBe(true);
+			expect(requests.slice(2).every((request) => request.signal?.aborted)).toBe(true);
+			expect(fixture.session.isCompacting).toBe(false);
+			expect(fixture.session.getContextUsage()?.tokens).toBe(100);
+		} finally {
+			for (const request of requests) request.resolve();
+			fixture.session.abortCompaction();
+			await outcome;
+		}
+	});
+
+	it("shares the initial unavailable preparation probe within a compaction", async () => {
+		let preparationBodies: string[] = [];
+		const fixture = await createNativeTokenizerFixture({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", () => ({ cancel: true }));
+				},
+			],
+		});
+		fixtures.push(fixture);
+		fixture.setTokenizer(async (_url, init) => {
+			preparationBodies.push(String(init?.body));
+			return new Response("unsupported", { status: 404 });
+		});
+		for (let attempt = 0; attempt < 2; attempt++) {
+			preparationBodies = [];
+			await expect(fixture.session.compact({ keepRecentTokens: 20 })).rejects.toThrow("Compaction cancelled");
+			expect(preparationBodies).toHaveLength(1);
+		}
+	});
+
+	it("runs four native counts concurrently after the capability probe succeeds", async () => {
+		const fixture = await createNativeTokenizerFixture();
+		fixtures.push(fixture);
+		const pending: Array<() => void> = [];
+		let calls = 0;
+		let active = 0;
+		let peak = 0;
+		let releaseAll = false;
+		fixture.setTokenizer(async (url, init) => {
+			if (url.endsWith("/chat/completions/input_tokens")) return Response.json({ input_tokens: 100 });
+			const body = JSON.parse(String(init?.body));
+			if (body.content === "safe checkpoint") return Response.json({ tokens: [1] });
+			calls++;
+			if (calls <= 4 || releaseAll) return Response.json({ tokens: [1] });
+			const deferred = Promise.withResolvers<Response>();
+			peak = Math.max(peak, ++active);
+			pending.push(() => {
+				active--;
+				deferred.resolve(Response.json({ tokens: [1] }));
+			});
+			return deferred.promise;
+		});
+		const outcome = fixture.session.compact({ keepRecentTokens: 8 }).then(
+			(result) => ({ result }),
+			(error: unknown) => ({ error }),
+		);
+		try {
+			await vi.waitFor(() => expect(pending).toHaveLength(4));
+			expect(peak).toBe(4);
+			releaseAll = true;
+			for (const release of pending) release();
+			expect(await outcome).toMatchObject({ result: { summary: "safe checkpoint" } });
+		} finally {
+			releaseAll = true;
+			for (const release of pending) release();
+			fixture.session.abortCompaction();
+			await outcome;
+		}
+	});
+
+	it("keeps optional counting failures local when the shared initial proof rejects", async () => {
+		const fixture = await createNativeTokenizerFixture();
+		fixtures.push(fixture);
+		let first = true;
+		const transform = fixture.session.agent.transformContext;
+		fixture.session.agent.transformContext = async (messages, signal) => {
+			if (first) {
+				first = false;
+				throw new Error("Initial counting policy unavailable");
+			}
+			return transform ? transform(messages, signal) : messages;
+		};
+		await expect(fixture.session.compact({ keepRecentTokens: 20 })).resolves.toMatchObject({
+			summary: "safe checkpoint",
+		});
+		expect(fixture.summaries).toHaveLength(1);
+		expect(fixture.session.isCompacting).toBe(false);
 	});
 
 	it("stores the /tokenize count on the entry and uses /chat/completions/input_tokens for context usage", async () => {

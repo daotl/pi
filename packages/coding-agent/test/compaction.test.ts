@@ -14,6 +14,7 @@ import {
 	getLastAssistantUsage,
 	prepareCompaction,
 	shouldCompact,
+	type TokenCounter,
 } from "../src/core/compaction/index.ts";
 import {
 	buildSessionContext,
@@ -297,6 +298,117 @@ describe("shouldCompact", () => {
 });
 
 describe("findCutPoint", () => {
+	it.each(["raw", "projected"] as const)("consumes bounded %s counts in newest-first order", async (mode) => {
+		const entries = Array.from({ length: 12 }, (_, index) => createMessageEntry(createUserMessage(String(index))));
+		const pending = new Map<string, (tokens: number) => void>();
+		const issued: string[] = [];
+		let released = false;
+		const counter: TokenCounter = (messages) => {
+			const message = messages[0];
+			if (message.role !== "user" || typeof message.content !== "string") throw new Error("Expected user entry");
+			issued.push(message.content);
+			if (released) return Promise.resolve(1);
+			const deferred = Promise.withResolvers<number>();
+			pending.set(message.content, deferred.resolve);
+			return deferred.promise;
+		};
+		const running =
+			mode === "raw"
+				? findCutPoint(entries, 0, entries.length, 5, 6, counter).then((cut) => entries[cut.firstKeptEntryIndex].id)
+				: prepareCompaction(
+						entries,
+						DEFAULT_COMPACTION_SETTINGS,
+						{ keepRecentTokens: 5, keepRecentMessages: 6 },
+						counter,
+					).then((preparation) => preparation?.firstKeptEntryId);
+		try {
+			for (let tick = 0; tick < 8; tick++) await Promise.resolve();
+			expect(issued).toEqual(["11", "10", "9", "8"]);
+			pending.get("8")?.(1);
+			pending.get("9")?.(8);
+			pending.get("10")?.(3);
+			pending.get("11")?.(2);
+			expect(await running).toBe(entries[10].id);
+			expect(issued).toEqual(["11", "10", "9", "8"]);
+		} finally {
+			released = true;
+			for (const resolve of pending.values()) resolve(1);
+			await running;
+		}
+	});
+
+	it("cancels only speculative batch work after a known cutoff", async () => {
+		const entries = Array.from({ length: 8 }, (_, index) => createMessageEntry(createUserMessage(String(index))));
+		const parent = new AbortController();
+		const signals: AbortSignal[] = [];
+		const pending = new Map<string, (tokens: number) => void>();
+		let released = false;
+		const counter: TokenCounter = (messages, signal) => {
+			const message = messages[0];
+			if (message.role !== "user" || typeof message.content !== "string") throw new Error("Expected user entry");
+			if (signal) signals.push(signal);
+			if (released) return Promise.resolve(1);
+			const deferred = Promise.withResolvers<number>();
+			pending.set(message.content, deferred.resolve);
+			signal?.addEventListener("abort", () => deferred.reject(new Error("Speculation cancelled")), { once: true });
+			return deferred.promise;
+		};
+		const running = findCutPoint(entries, 0, entries.length, 1, undefined, counter);
+		try {
+			for (let tick = 0; tick < 8; tick++) await Promise.resolve();
+			expect([...pending.keys()]).toEqual(["7", "6", "5", "4"]);
+			pending.get("7")?.(2);
+			expect(await running).toEqual({ firstKeptEntryIndex: 7, turnStartIndex: -1, isSplitTurn: false });
+			expect(signals).toHaveLength(4);
+			expect(signals.every((signal) => signal.aborted)).toBe(true);
+			expect(parent.signal.aborted).toBe(false);
+		} finally {
+			released = true;
+			for (const resolve of pending.values()) resolve(1);
+			await running;
+		}
+	});
+
+	it("starts another bounded batch only when the newest batch fits", async () => {
+		const entries = Array.from({ length: 10 }, (_, index) => createMessageEntry(createUserMessage(String(index))));
+		const issued: string[] = [];
+		const cut = await findCutPoint(entries, 0, entries.length, 6, undefined, async (messages) => {
+			const message = messages[0];
+			if (message.role !== "user" || typeof message.content !== "string") throw new Error("Expected user entry");
+			issued.push(message.content);
+			return 1;
+		});
+		expect(cut.firstKeptEntryIndex).toBe(4);
+		expect(issued).toEqual(["9", "8", "7", "6", "5", "4", "3", "2"]);
+	});
+
+	it.each(["before-cutoff", "after-cutoff"] as const)(
+		"handles speculative rejection %s in transcript order",
+		async (failure) => {
+			const entries = Array.from({ length: 8 }, (_, index) => createMessageEntry(createUserMessage(String(index))));
+			const newest = Promise.withResolvers<number>();
+			const failureError = new Error("count failure");
+			const signals: AbortSignal[] = [];
+			const counter: TokenCounter = (messages, signal) => {
+				const message = messages[0];
+				if (message.role !== "user" || typeof message.content !== "string") throw new Error("Expected user entry");
+				if (signal) signals.push(signal);
+				return message.content === "7" ? newest.promise : Promise.reject(failureError);
+			};
+			const running = findCutPoint(entries, 0, entries.length, 1, undefined, counter);
+			const outcome = running.then(
+				(cut) => ({ cut }),
+				(error: unknown) => ({ error }),
+			);
+			for (let tick = 0; tick < 8; tick++) await Promise.resolve();
+			newest.resolve(failure === "after-cutoff" ? 2 : 0);
+			if (failure === "before-cutoff") expect(await outcome).toEqual({ error: failureError });
+			else expect(await outcome).toMatchObject({ cut: { firstKeptEntryIndex: 7 } });
+			expect(signals).toHaveLength(4);
+			expect(signals.every((signal) => signal.aborted)).toBe(true);
+		},
+	);
+
 	it("should find cut point based on actual token differences", async () => {
 		// Create entries with cumulative token counts
 		const entries: SessionEntry[] = [];

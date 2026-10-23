@@ -4747,11 +4747,15 @@ export class AgentSession {
 			this._getTokenizationContext(this.sessionManager.buildSessionProjection().messages),
 		);
 		let unavailable = false;
-		return async (messages) => {
+		const endpointAbort = new AbortController();
+		let probing: Promise<number | undefined> | undefined;
+		let supported = false;
+		return async (messages, batchSignal) => {
+			const requestSignal = AbortSignal.any([signal, endpointAbort.signal, ...(batchSignal ? [batchSignal] : [])]);
 			const fragmentMessages = structuredClone(messages);
 			const estimate = estimateMessagesTokens(fragmentMessages);
 			if (
-				signal.aborted ||
+				requestSignal.aborted ||
 				unavailable ||
 				!this._canUploadTokenizationText(model) ||
 				!fragmentMessages.every((message) => contextMessages.some((source) => isDeepStrictEqual(message, source)))
@@ -4759,42 +4763,45 @@ export class AgentSession {
 				return estimate;
 			let auth: RequestAuth | undefined;
 			try {
+				if (probing) await probing;
+				if (unavailable || requestSignal.aborted || !this._canUploadTokenizationText(model)) return estimate;
 				let imageCount = 0;
 				const options = {
 					text: "",
-					signal,
+					signal: requestSignal,
 					apiKey: initialAuth.apiKey,
 					headers: initialAuth.headers,
 					env: initialAuth.env,
 				};
-				const count = await countTokensWithRetry(
+				const countRequest = countTokensWithRetry(
 					model,
 					options,
 					retryPolicy,
 					() => {
 						unavailable = true;
+						endpointAbort.abort();
 					},
 					async () => {
-						if (signal.aborted || unavailable || !this._canUploadTokenizationText(model)) return false;
-						auth = await this._getSummarizationRequestAuth(model, signal);
+						if (requestSignal.aborted || unavailable || !this._canUploadTokenizationText(model)) return false;
+						auth = await this._getSummarizationRequestAuth(model, requestSignal);
 						const transform = this.agent.transformContext;
 						const converter = this.agent.convertToLlm;
 						const input = structuredClone(contextMessages);
 						const transformed = this.agent.transformContext
-							? await this.agent.transformContext(input, signal)
+							? await this.agent.transformContext(input, requestSignal)
 							: input;
-						if (signal.aborted || !isDeepStrictEqual(transformed, contextMessages)) return false;
+						if (requestSignal.aborted || !isDeepStrictEqual(transformed, contextMessages)) return false;
 						const converted = await this.agent.convertForRequest(transformed);
 						// The converter may yield while a transform's captured policy changes.
 						const recheckedInput = structuredClone(contextMessages);
 						const rechecked = this.agent.transformContext
-							? await this.agent.transformContext(recheckedInput, signal)
+							? await this.agent.transformContext(recheckedInput, requestSignal)
 							: recheckedInput;
 						if (!isDeepStrictEqual(rechecked, contextMessages)) return false;
 						if (
 							transform !== this.agent.transformContext ||
 							converter !== this.agent.convertToLlm ||
-							signal.aborted ||
+							requestSignal.aborted ||
 							unavailable ||
 							!this._canUploadTokenizationText(auth.model) ||
 							!isDeepStrictEqual(
@@ -4821,6 +4828,14 @@ export class AgentSession {
 						return auth.model.baseUrl === model.baseUrl;
 					},
 				);
+				if (!supported) probing = countRequest;
+				let count: number | undefined;
+				try {
+					count = await countRequest;
+					if (count !== undefined) supported = true;
+				} finally {
+					if (probing === countRequest) probing = undefined;
+				}
 				return count === undefined ? estimate : count + Math.ceil((imageCount * ESTIMATED_IMAGE_CHARS) / 4);
 			} catch (error) {
 				if (signal.aborted) throw error;
