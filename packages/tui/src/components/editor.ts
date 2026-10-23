@@ -19,7 +19,6 @@ import {
 	getWordSegmenter,
 	isPadLinesToWidth,
 	isWhitespaceChar,
-	shouldWrapLinesToWidth,
 	sliceByColumn,
 	visibleWidth,
 } from "../utils.ts";
@@ -171,9 +170,8 @@ export function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl
 			wrapOppIndex = -1;
 		}
 
-		if (gWidth > maxWidth) {
-			// Single atomic segment wider than maxWidth (e.g. paste marker
-			// in a narrow terminal). Re-wrap it at grapheme granularity.
+		if (gWidth > maxWidth && isPasteMarker(grapheme) && preSegmented) {
+			// Only merged paste markers can split visually; real graphemes are indivisible.
 
 			// The segment remains logically atomic for cursor
 			// movement / editing — the split is purely visual for word-wrap layout.
@@ -212,6 +210,8 @@ export function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl
 
 	// Push final chunk.
 	chunks.push({ text: line.slice(chunkStart), startIndex: chunkStart, endIndex: line.length });
+	// A wide glyph may use the reserved cursor column; its end is on the next row.
+	if (currentWidth > maxWidth) chunks.push({ text: "", startIndex: line.length, endIndex: line.length });
 
 	return chunks;
 }
@@ -536,9 +536,9 @@ export class Editor implements Component, Focusable {
 		// Layout the text
 		const layoutLines = this.layoutText(layoutWidth);
 
-		// Calculate max visible lines: 30% of terminal height, minimum 5 lines
+		// Keep both borders and the cursor within short terminals.
 		const terminalRows = this.tui.terminal.rows;
-		const maxVisibleLines = Math.max(5, Math.floor(terminalRows * 0.3));
+		const maxVisibleLines = Math.max(1, Math.min(terminalRows - 2, Math.max(5, Math.floor(terminalRows * 0.3))));
 
 		// Find the cursor line index in layoutLines
 		let cursorLineIndex = layoutLines.findIndex((line) => line.hasCursor);
@@ -1025,10 +1025,8 @@ export class Editor implements Component, Focusable {
 			const isCurrentLine = i === this.state.cursorLine;
 			const lineVisibleWidth = visibleWidth(line);
 
-			// When line wrapping is disabled (the default), each logical line stays one
-			// layout line and the terminal reflows it, so copied text keeps its real
-			// line breaks instead of the editor's word-wrap points.
-			if (lineVisibleWidth <= contentWidth || !shouldWrapLinesToWidth()) {
+			// Editor display/navigation owns wrapping independently of transcript reflow.
+			if (lineVisibleWidth <= contentWidth) {
 				// Line fits in one layout line
 				if (isCurrentLine) {
 					layoutLines.push({
@@ -1856,9 +1854,7 @@ export class Editor implements Component, Focusable {
 			if (line.length === 0) {
 				// Empty line still takes one visual line
 				visualLines.push({ logicalLine: i, startCol: 0, length: 0 });
-				// With wrapping disabled the terminal reflows long lines; vertical
-				// navigation treats each logical line as one visual line.
-			} else if (lineVisWidth <= width || !shouldWrapLinesToWidth()) {
+			} else if (lineVisWidth <= width) {
 				visualLines.push({ logicalLine: i, startCol: 0, length: line.length });
 			} else {
 				// Line needs wrapping - use word-aware wrapping
@@ -1977,7 +1973,7 @@ export class Editor implements Component, Focusable {
 	private pageScroll(direction: -1 | 1): void {
 		this.lastAction = null;
 		const terminalRows = this.tui.terminal.rows;
-		const pageSize = Math.max(5, Math.floor(terminalRows * 0.3));
+		const pageSize = Math.max(1, Math.min(terminalRows - 2, Math.max(5, Math.floor(terminalRows * 0.3))));
 
 		const visualLines = this.buildVisualLineMap(this.lastWidth);
 		const currentVisualLine = this.findCurrentVisualLine(visualLines);

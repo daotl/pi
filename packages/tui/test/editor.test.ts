@@ -8,7 +8,13 @@ import { type AutocompleteProvider, CombinedAutocompleteProvider } from "../src/
 import { Editor, wordWrapLine } from "../src/components/editor.ts";
 import type { TUI } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
-import { setPadLinesToWidth, setWrapLinesToWidth, visibleWidth } from "../src/utils.ts";
+import {
+	isPadLinesToWidth,
+	isWrapLinesToWidth,
+	setPadLinesToWidth,
+	setWrapLinesToWidth,
+	visibleWidth,
+} from "../src/utils.ts";
 import { defaultEditorTheme } from "./test-themes.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
@@ -48,24 +54,6 @@ setPadLinesToWidth(true);
 describe("Editor wrapLines rendering", () => {
 	const longText = "a long line that exceeds the thirty column terminal width";
 
-	it("renders a long line as one line when wrapLines is off (default)", () => {
-		setPadLinesToWidth(false);
-		setWrapLinesToWidth(false);
-		try {
-			const editor = new Editor(createTestTUI(30, 24), defaultEditorTheme);
-			editor.setText(longText);
-			const rendered = editor.render(30).map(stripVTControlCharacters);
-			const line = rendered.find((l) => l.includes("a long line"));
-			assert.ok(line, "content line rendered");
-			assert.ok(
-				line.includes("terminal width"),
-				`one layout line carries the full text so the terminal reflows it, got: ${line}`,
-			);
-		} finally {
-			setPadLinesToWidth(true);
-		}
-	});
-
 	it("word-wraps a long line when wrapLines is on", () => {
 		setPadLinesToWidth(false);
 		setWrapLinesToWidth(true);
@@ -81,6 +69,121 @@ describe("Editor wrapLines rendering", () => {
 		} finally {
 			setWrapLinesToWidth(false);
 			setPadLinesToWidth(true);
+		}
+	});
+
+	it("word-wraps display without changing text when transcript wrapping is off", () => {
+		const previousPad = isPadLinesToWidth();
+		const previousWrap = isWrapLinesToWidth();
+		setPadLinesToWidth(false);
+		setWrapLinesToWidth(false);
+		try {
+			const editor = new Editor(createTestTUI(30, 24), defaultEditorTheme);
+			editor.setText(longText);
+			const content = editor.render(30).slice(1, -1).map(stripVTControlCharacters);
+			assert.ok(content.every((line) => visibleWidth(line) <= 30));
+			assert.ok(content.some((line) => line.includes("a long line") && !line.includes("terminal width")));
+			assert.ok(content.some((line) => line.includes("terminal width") && !line.includes("a long line")));
+			assert.strictEqual(editor.getText(), longText);
+		} finally {
+			setPadLinesToWidth(previousPad);
+			setWrapLinesToWidth(previousWrap);
+		}
+	});
+
+	it("keeps indivisible wide graphemes intact at one-column layout width", () => {
+		for (const glyph of ["界", "😀"]) {
+			assert.deepStrictEqual(wordWrapLine(glyph, 1), [
+				{ text: glyph, startIndex: 0, endIndex: glyph.length },
+				{ text: "", startIndex: glyph.length, endIndex: glyph.length },
+			]);
+			assert.deepStrictEqual(wordWrapLine(`A${glyph}B`, 1), [
+				{ text: "A", startIndex: 0, endIndex: 1 },
+				{ text: glyph, startIndex: 1, endIndex: 1 + glyph.length },
+				{ text: "B", startIndex: 1 + glyph.length, endIndex: 2 + glyph.length },
+			]);
+		}
+	});
+
+	it("bounds editor display and page movement on a four-row terminal", () => {
+		const editor = new Editor(createTestTUI(30, 4), defaultEditorTheme);
+		const draft = Array.from({ length: 12 }, (_, index) => `line${index}`).join("\n");
+		editor.setText(draft);
+		assert.strictEqual(editor.render(30).length, 4);
+		editor.handleInput("\x1b[5~");
+		assert.deepStrictEqual(editor.getCursor(), { line: 9, col: 5 });
+		assert.strictEqual(editor.getText(), draft);
+	});
+
+	it("keeps Home, visual navigation, resize and typing visible with transcript wrapping disabled", async () => {
+		const previousPad = isPadLinesToWidth();
+		const previousWrap = isWrapLinesToWidth();
+		setPadLinesToWidth(false);
+		setWrapLinesToWidth(false);
+		const terminal = new VirtualTerminal(80, 20);
+		const tui = new TuiMainScreen(terminal);
+		const editor = new Editor(tui, defaultEditorTheme);
+		const draft = `START${"a".repeat(1995)}`;
+		editor.setText(draft);
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			terminal.sendInput("\x1b[H");
+			await terminal.waitForRender();
+			let cursor = terminal.getCursorPosition();
+			assert.strictEqual(cursor.x, 0);
+			assert.ok(terminal.getViewport()[cursor.y]?.startsWith("START"));
+			terminal.sendInput("\x1b[B");
+			await terminal.waitForRender();
+			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 79 });
+			terminal.resize(40, 12);
+			await terminal.waitForRender();
+			cursor = terminal.getCursorPosition();
+			assert.strictEqual(cursor.x, 1);
+			assert.ok(terminal.getViewport()[cursor.y]?.startsWith("a".repeat(39)));
+			terminal.sendInput("X");
+			await terminal.waitForRender();
+			cursor = terminal.getCursorPosition();
+			assert.strictEqual(terminal.getViewport()[cursor.y]?.slice(cursor.x - 1, cursor.x), "X");
+			assert.strictEqual(editor.getExpandedText(), `${draft.slice(0, 79)}X${draft.slice(79)}`);
+			assert.deepStrictEqual(editor.getLines(), [editor.getExpandedText()]);
+		} finally {
+			tui.stop();
+			setPadLinesToWidth(previousPad);
+			setWrapLinesToWidth(previousWrap);
+		}
+	});
+
+	it("retains a wide draft and cursor when resized to two columns", async () => {
+		const previousPad = isPadLinesToWidth();
+		const previousWrap = isWrapLinesToWidth();
+		setPadLinesToWidth(false);
+		setWrapLinesToWidth(false);
+		const terminal = new VirtualTerminal(20, 10);
+		const tui = new TuiMainScreen(terminal);
+		const editor = new Editor(tui, defaultEditorTheme);
+		editor.setText("界");
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			terminal.resize(2, 10);
+			await terminal.waitForRender();
+			assert.ok(terminal.getViewport().includes("界"));
+			terminal.sendInput("X");
+			await terminal.waitForRender();
+			assert.strictEqual(editor.getExpandedText(), "界X");
+			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 2 });
+			const cursor = terminal.getCursorPosition();
+			assert.strictEqual(cursor.x, 1);
+			assert.ok(terminal.getViewport()[cursor.y]?.startsWith("X"));
+		} finally {
+			tui.stop();
+			setPadLinesToWidth(previousPad);
+			setWrapLinesToWidth(previousWrap);
 		}
 	});
 });

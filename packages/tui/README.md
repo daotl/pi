@@ -445,6 +445,8 @@ Clicking positions the cursor and gives the input keyboard focus in alternate-sc
 
 Multi-line text editor with autocomplete, file completion, paste handling, and vertical scrolling when content exceeds terminal height.
 
+The editor wraps display and vertical navigation independently of transcript wrapping. Its content viewport and Page Up/Down step use 30% of terminal height (normally at least five rows), bounded to leave two border rows on short terminals, with at least one content row. Display wrapping never inserts newlines into stored or submitted text. Indivisible wide graphemes stay intact in a narrow layout; paste markers may split visually but remain atomic for editing.
+
 ```typescript
 interface EditorTheme {
   borderColor: (str: string) => string;
