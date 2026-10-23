@@ -4713,8 +4713,18 @@ export class InteractiveMode {
 	}
 
 	private rebuildChatFromMessages(): void {
+		const liveTools = this.session.isStreaming ? new Map(this.pendingTools) : undefined;
 		this.chatContainer.clear();
 		this.renderSessionEntries(this.sessionManager.buildContextEntries());
+		if (this.streamingComponent) this.chatContainer.addChild(this.streamingComponent);
+		for (const [toolCallId, component] of liveTools ?? []) {
+			const rebuilt = this.pendingTools.get(toolCallId);
+			const index = rebuilt ? this.chatContainer.children.indexOf(rebuilt) : -1;
+			if (index >= 0) this.chatContainer.children[index] = component;
+			else this.chatContainer.addChild(component);
+			this.pendingTools.set(toolCallId, component);
+		}
+		this.chatContainer.invalidate();
 	}
 
 	// =========================================================================
