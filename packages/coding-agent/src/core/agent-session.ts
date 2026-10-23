@@ -2109,10 +2109,16 @@ export class AgentSession {
 			set.add(unit.toolCallId);
 		}
 		let removed = 0;
-		if (versionRootIds.length > 0) {
-			removed += this.sessionManager.removeEntriesWithDescendants(versionRootIds);
+		if (versionRootIds.length > 0 && (otherEntryIds.length > 0 || toolCallRemovals.size > 0)) {
+			this.sessionManager.editMessages((draft) => {
+				removed += draft.removeEntriesWithDescendants(versionRootIds);
+				removed += draft.removeEntries(otherEntryIds, toolCallRemovals);
+			});
+		} else if (versionRootIds.length > 0) {
+			removed = this.sessionManager.removeEntriesWithDescendants(versionRootIds);
+		} else if (otherEntryIds.length > 0 || toolCallRemovals.size > 0) {
+			removed = this.sessionManager.removeEntries(otherEntryIds, toolCallRemovals);
 		}
-		removed += this.sessionManager.removeEntries(otherEntryIds, toolCallRemovals);
 		if (removed > 0) {
 			this._rebuildMessagesFromSession();
 		}

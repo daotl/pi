@@ -55,6 +55,8 @@ Failures returned by an interactive editor submission are displayed as errors in
 
 Session deletion and restoration methods, including soft-delete, shred and swipe-version delete/restore, reject while an agent run, compaction or branch summary owns the session. The check happens before selecting or changing history. Wait for idle before retrying; successful idle deletion/restoration retains its existing semantics.
 
+A numeric `/shred` that selects both swipe-version subtrees and ordinary entries commits the complete selection atomically. If persistence fails, the previous file, selected branch and live transcript remain unchanged; retry after resolving the storage failure. Existing deletion-unit order and swipe-subtree expansion still apply.
+
 For the persisted tree and entry types, see [Session Format](session-format.md).
 
 ## Manage conversation context

@@ -7,6 +7,14 @@ import { SessionManager } from "../../src/core/session-manager.ts";
 import { getUsageTotals } from "../../src/core/usage-totals.ts";
 import { createHarness, getMessageText } from "./harness.ts";
 
+type StagedShredEntry = {
+	type: string;
+	id?: string;
+	parentId?: string | null;
+	leafId?: string | null;
+	message?: unknown;
+};
+
 vi.mock("fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof fs>();
 	return {
@@ -210,6 +218,77 @@ it("restores the committed non-current swipe branch's tools, not the abandoned r
 		const actual = await vi.importActual<typeof fs>("fs");
 		vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);
 		await harness.session.abort();
+		harness.cleanup();
+		fs.rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+it("keeps mixed swipe-subtree and ordinary-entry shredding unpublished when the final rewrite fails", async () => {
+	const cwd = fs.mkdtempSync(join(tmpdir(), "pi-mixed-shred-"));
+	const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+	const harness = await createHarness({
+		cwd,
+		sessionManager: manager,
+		settings: { retry: { enabled: false }, compaction: { enabled: false } },
+	});
+	try {
+		harness.setResponses([
+			fauxAssistantMessage("retained answer"),
+			fauxAssistantMessage("swipe first"),
+			fauxAssistantMessage("swipe second"),
+			fauxAssistantMessage("removed follow-up answer"),
+		]);
+		await harness.session.prompt("retained question");
+		await harness.session.prompt("selected ordinary question");
+		await harness.session.regenerateSwipe(harness.session.getSwipeGroup()!);
+		const versions = harness.session.getSwipeGroup()!.versions;
+		expect(versions.map((entry) => getMessageText(entry.message))).toEqual(["swipe first", "swipe second"]);
+		await harness.session.prompt("removed follow-up question");
+		const held = manager.getEntries();
+		const entries = structuredClone(held);
+		const leaf = manager.getLeafId();
+		const messages = structuredClone(harness.session.messages);
+		const tree = structuredClone(manager.getTree());
+		const file = manager.getSessionFile()!;
+		const bytes = fs.readFileSync(file);
+		const actual = await vi.importActual<typeof fs>("fs");
+		const failure = new Error("mixed shred final publication failure");
+		vi.mocked(fs.renameSync).mockImplementation((from, to) => {
+			const staged = fs
+				.readFileSync(from, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as StagedShredEntry);
+			let selected = staged.findLast((entry) => entry.type === "leaf")?.leafId ?? staged.at(-1)?.id;
+			let keepsQuestion = false;
+			while (selected) {
+				const entry = staged.find((candidate) => candidate.id === selected);
+				if (!entry) break;
+				if (getMessageText(entry.message) === "selected ordinary question") keepsQuestion = true;
+				selected = entry.parentId ?? undefined;
+			}
+			if (!keepsQuestion) throw failure;
+			actual.renameSync(from, to);
+		});
+		expect(() => harness.session.shredLastMessages(4)).toThrow(failure);
+		expect(fs.readFileSync(file)).toEqual(bytes);
+		expect(manager.getEntries()).toEqual(entries);
+		expect(manager.getLeafId()).toBe(leaf);
+		expect(manager.getTree()).toEqual(tree);
+		expect(harness.session.messages).toEqual(messages);
+		for (const entry of held) expect(manager.getEntry(entry.id)).toBe(entry);
+		expect(SessionManager.open(file).getEntries()).toEqual(entries);
+		vi.mocked(fs.renameSync).mockImplementation(actual.renameSync);
+		harness.session.shredLastMessages(4);
+		const visibleTexts = harness.session.messages.filter((message) => message.role !== "system").map(getMessageText);
+		expect(visibleTexts).toEqual(["retained question", "retained answer"]);
+		for (const entry of versions) expect(manager.getEntry(entry.id)).toBeUndefined();
+		const reopenedTexts = SessionManager.open(file)
+			.buildSessionContext()
+			.messages.filter((message) => message.role !== "system")
+			.map(getMessageText);
+		expect(reopenedTexts).toEqual(visibleTexts);
+	} finally {
 		harness.cleanup();
 		fs.rmSync(cwd, { recursive: true, force: true });
 	}
