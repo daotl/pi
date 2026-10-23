@@ -57,6 +57,8 @@ Session deletion and restoration methods, including soft-delete, shred and swipe
 
 A numeric `/shred` that selects both swipe-version subtrees and ordinary entries commits the complete selection atomically. If persistence fails, the previous file, selected branch and live transcript remain unchanged; retry after resolving the storage failure. Existing deletion-unit order and swipe-subtree expansion still apply.
 
+SDK `deleteLastMessages(count)` / `SessionManager.removeLastMessages(count)` count message entries in the current projection, not raw stored messages: omissions, system messages and assistant entries whose projected content is harness-empty do not consume the count. When removal crosses a compaction checkpoint, summaries and saved state remain, and retained boundaries are rebased without reviving summarized history, including on surviving sibling branches after reopening. Without a crossed checkpoint, suffix deletion still removes trailing entries and descendants. This SDK message-count contract does not change the CLI's separate deletable-unit order.
+
 For the persisted tree and entry types, see [Session Format](session-format.md).
 
 ## Manage conversation context

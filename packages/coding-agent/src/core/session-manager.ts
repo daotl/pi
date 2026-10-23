@@ -2116,44 +2116,77 @@ export class SessionManager {
 	}
 
 	/**
-	 * Remove the last `count` non-harness messages from the active leaf path,
-	 * along with any entries after the earliest removed message (including
-	 * trailing harness messages) and any branched descendants of removed
-	 * entries. Harness messages (aborts/errors with no real content) are
-	 * skipped when counting. The session file is rewritten. Returns the number
-	 * of non-harness messages removed.
+	 * Remove the last `count` visible non-harness messages from the active leaf path,
+	 * along with trailing harness messages and branched descendants of removed
+	 * entries. Compacted paths retain checkpoints, system state and metadata,
+	 * rebasing checkpoint boundaries past deleted messages. Harness messages and
+	 * messages omitted by the current projection are skipped when counting. The
+	 * session file is rewritten atomically. Returns the number removed.
 	 */
 	removeLastMessages(count: number): number {
 		if (count < 1) return 0;
 		const path = this.getBranch();
 		if (path.length === 0) return 0;
 
-		// Indices of deletable messages (non-harness, not soft-deleted message
-		// entries) on the leaf path.
+		const visibleIds = new Set<string>();
+		for (const { sourceEntry, messages } of this.buildSessionProjection().entries) {
+			if (sourceEntry.type !== "message" || sourceEntry.message.role === "system") continue;
+			if (
+				messages.some((message) => message.role !== "assistant" || (message.content && !isHarnessMessage(message)))
+			) {
+				visibleIds.add(sourceEntry.id);
+			}
+		}
 		const messageIndices: number[] = [];
 		for (let i = 0; i < path.length; i++) {
-			const entry = path[i];
-			if (entry.type !== "message") continue;
-			if (entry.deletedAt !== undefined) continue;
-			const msg = entry.message;
-			// Harness messages (aborts/errors with no real content) are not counted.
-			if (msg.role === "assistant") {
-				if (!msg.content || isHarnessMessage(msg)) continue;
-			}
-			messageIndices.push(i);
+			if (visibleIds.has(path[i].id)) messageIndices.push(i);
 		}
 		if (messageIndices.length === 0) return 0;
 
 		const removeCount = Math.min(count, messageIndices.length);
 		const firstDeleteIdx = messageIndices[messageIndices.length - removeCount];
 
-		// Remove everything from firstDeleteIdx to the end of the path, plus any
-		// descendants of those entries (branched-off children).
-		const removedIds = new Set(path.slice(firstDeleteIdx).map((e) => e.id));
+		const parentId = firstDeleteIdx > 0 ? path[firstDeleteIdx - 1].id : null;
+		const tail = path.slice(firstDeleteIdx);
+		if (!tail.some((entry) => entry.type === "compaction")) {
+			this._deleteMessageSubtrees(new Set(tail.map((entry) => entry.id)), parentId);
+			return removeCount;
+		}
+		const removedIds = new Set(
+			tail.filter((entry) => entry.type === "message" && entry.message.role !== "system").map((entry) => entry.id),
+		);
+		const retained = new Map<string, SessionEntry>();
+		let leafId = parentId;
+		for (const entry of tail) {
+			if ((entry.type === "label" || entry.type === "context_edit") && removedIds.has(entry.targetId)) {
+				removedIds.add(entry.id);
+			}
+		}
+		// Reconnect state before expanding descendants so checkpoints survive the removed messages.
+		for (const entry of tail) {
+			if (removedIds.has(entry.id)) continue;
+			const next = entry.parentId === leafId ? entry : { ...entry, parentId: leafId };
+			retained.set(next.id, next);
+			leafId = next.id;
+		}
+		this._deleteMessageSubtrees(removedIds, leafId, retained);
+		return removeCount;
+	}
+
+	/** Persist the complete removal before publishing indexes, entries and selected leaf. */
+	private _deleteMessageSubtrees(
+		removedIds: Set<string>,
+		leafId: string | null,
+		retained?: ReadonlyMap<string, SessionEntry>,
+	): void {
 		let changed = true;
 		while (changed) {
 			changed = false;
-			for (const entry of this.fileEntries) {
+			for (const original of this.fileEntries) {
+				const entry =
+					original.type === "session" || original.type === "leaf"
+						? original
+						: (retained?.get(original.id) ?? original);
 				if (
 					entry.type !== "session" &&
 					entry.type !== "leaf" &&
@@ -2167,10 +2200,23 @@ export class SessionManager {
 			}
 		}
 
-		const entries = this.fileEntries.filter((entry) => entry.type === "leaf" || !removedIds.has(entry.id));
-		const leafId = firstDeleteIdx > 0 ? path[firstDeleteIdx - 1].id : null;
+		const entries = this.fileEntries
+			.filter((entry) => entry.type === "leaf" || !removedIds.has(entry.id))
+			.map((original) => {
+				const entry =
+					original.type === "session" || original.type === "leaf"
+						? original
+						: (retained?.get(original.id) ?? original);
+				if (entry.type !== "compaction" || !removedIds.has(entry.firstKeptEntryId)) return entry;
+				// Each surviving checkpoint may belong to a different branch.
+				const originalPath = this.getBranch(entry.id);
+				const boundary = originalPath.findIndex((candidate) => candidate.id === entry.firstKeptEntryId);
+				const kept = originalPath
+					.slice(boundary + 1)
+					.find((candidate) => !removedIds.has(candidate.id) && candidate.deletedAt === undefined);
+				return { ...entry, firstKeptEntryId: kept?.id ?? entry.id };
+			});
 		this._commitEntries(entries, leafId);
-		return removeCount;
 	}
 
 	/**

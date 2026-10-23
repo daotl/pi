@@ -1913,11 +1913,10 @@ export class AgentSession {
 	}
 
 	/**
-	 * Delete the last `count` non-harness messages from the session. Harness
-	 * messages (aborts/errors with no real content) are skipped when counting
-	 * and removed if they trail the deletion point. Rebuilds the agent's message
-	 * state from the session log. Returns the number of non-harness messages
-	 * removed.
+	 * Delete the last `count` visible non-harness messages from the session projection.
+	 * System messages and omissions are not counted. Trailing harness messages are
+	 * removed; compacted paths retain checkpoints and state with rebased boundaries.
+	 * Rebuilds the agent's message state from the session log. Returns the number removed.
 	 */
 	deleteLastMessages(count: number): number {
 		this._assertHistoryMutationAllowed();

@@ -1,6 +1,23 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
+import * as fs from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../../src/core/session-manager.ts";
+
+vi.mock("fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof fs>();
+	return { ...actual, renameSync: vi.fn(actual.renameSync) };
+});
+
+const tempDirs: string[] = [];
+beforeEach(async () => {
+	const actual = await vi.importActual<typeof fs>("fs");
+	vi.mocked(fs.renameSync).mockReset().mockImplementation(actual.renameSync);
+});
+afterEach(() => {
+	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
 
 function createUsage() {
 	return {
@@ -192,5 +209,169 @@ describe("SessionManager.removeLastMessages", () => {
 		expect(session.getBranch()).toHaveLength(0);
 		expect(session.getEntries().some((e) => e.id === assistantId)).toBe(false);
 		expect(session.getEntries().some((e) => e.id === assistant2Id)).toBe(false);
+	});
+
+	it("counts the visible projected message instead of an omitted raw tail", () => {
+		const session = SessionManager.inMemory();
+		const visible = session.appendMessage(userMessage("visible", 1));
+		const hidden = session.appendMessage(userMessage("hidden", 2));
+		session.appendContextEdit(hidden, null);
+		expect(session.removeLastMessages(1)).toBe(1);
+		expect(session.buildSessionContext().messages).toEqual([]);
+		expect(session.getEntry(visible)).toBeUndefined();
+	});
+
+	it.each(["raw-harness", "projected-harness"] as const)(
+		"uses %s projected assistant content for counting",
+		(mode) => {
+			const session = SessionManager.inMemory();
+			const input = session.appendMessage(userMessage("question", 1));
+			const response = session.appendMessage(
+				assistantMessage(mode === "raw-harness" ? [] : [{ type: "text", text: "raw answer" }], 2, "aborted"),
+			);
+			session.appendContextEdit(response, {
+				content: mode === "raw-harness" ? [{ type: "text", text: "projected answer" }] : [],
+			});
+			expect(session.removeLastMessages(1)).toBe(1);
+			expect(session.buildSessionContext().messages).toEqual(
+				mode === "raw-harness" ? [userMessage("question", 1)] : [],
+			);
+			expect(session.getEntry(input) !== undefined).toBe(mode === "raw-harness");
+		},
+	);
+
+	it("does not count a trailing system policy as a deletable message", () => {
+		const session = SessionManager.inMemory();
+		session.appendMessage(userMessage("question", 1));
+		session.appendMessage(assistantMessage([{ type: "text", text: "answer" }], 2));
+		session.appendMessage({ role: "system", content: "policy", timestamp: 3 });
+		expect(session.removeLastMessages(1)).toBe(1);
+		expect(session.buildSessionContext().messages).toEqual([userMessage("question", 1)]);
+	});
+
+	it.each([1, 2, 99])("preserves compacted state and sibling history when removing %s projected messages", (count) => {
+		const dir = fs.mkdtempSync(join(tmpdir(), "pi-projected-delete-"));
+		tempDirs.push(dir);
+		const session = SessionManager.create(dir, dir);
+		session.appendMessage({ role: "system", content: "saved policy", timestamp: 0 });
+		const old = session.appendMessage(userMessage("summarized question", 1));
+		session.appendMessage(assistantMessage([{ type: "text", text: "summarized answer" }], 2));
+		const retained = session.appendMessage(userMessage("retained question", 3));
+		session.branch(old);
+		const sibling = session.appendMessage(assistantMessage([{ type: "text", text: "sibling answer" }], 4));
+		session.branch(retained);
+		const answer = session.appendMessage(assistantMessage([{ type: "text", text: "retained answer" }], 5));
+		const checkpoint = session.appendCompaction("saved summary", retained, 100, { source: "compaction" });
+		session.appendLabelChange(checkpoint, "checkpoint bookmark");
+		session.appendThinkingLevelChange("high");
+		session.appendCustomEntry("retained-state", { value: 42 });
+		session.appendMessage({ role: "system", content: "current policy", timestamp: 6 });
+		const policy = session.buildSessionContext().messages.filter((message) => message.role === "system");
+		const siblingBefore = structuredClone(session.getEntry(sibling));
+		const metadata = session
+			.getBranch()
+			.filter((entry) => entry.type === "custom" || entry.type === "thinking_level_change");
+		expect(session.removeLastMessages(count)).toBe(Math.min(count, 2));
+		for (const actual of [session, SessionManager.open(session.getSessionFile()!, dir)]) {
+			const messages = actual.buildSessionContext().messages;
+			expect(messages.filter((message) => message.role === "system")).toEqual(policy);
+			expect(messages.filter((message) => message.role !== "system")).toEqual([
+				expect.objectContaining({ role: "compactionSummary", summary: "saved summary" }),
+				...(count === 1 ? [userMessage("retained question", 3)] : []),
+			]);
+			expect(actual.getEntry(answer)).toBeUndefined();
+			expect(actual.getEntry(sibling)).toEqual(siblingBefore);
+			expect(actual.getLabel(checkpoint)).toBe("checkpoint bookmark");
+			expect(
+				actual.getBranch().filter((entry) => entry.type === "custom" || entry.type === "thinking_level_change"),
+			).toEqual(metadata);
+			expect(actual.getEntry(checkpoint)).toMatchObject({
+				firstKeptEntryId: count === 1 ? retained : checkpoint,
+				details: { source: "compaction" },
+			});
+		}
+	});
+
+	it("rebases surviving sibling checkpoints on their own paths", () => {
+		const dir = fs.mkdtempSync(join(tmpdir(), "pi-sibling-delete-"));
+		tempDirs.push(dir);
+		const session = SessionManager.create(dir, dir);
+		session.appendMessage(userMessage("old raw question", 1));
+		const retained = session.appendMessage(userMessage("retained question", 2));
+		session.appendMessage(assistantMessage([{ type: "text", text: "retained answer" }], 3));
+		const checkpoint = session.appendCompaction("first summary", retained, 100);
+		session.appendMessage(userMessage("sibling question", 4));
+		const siblingAnswer = assistantMessage([{ type: "text", text: "sibling answer" }], 5);
+		session.appendMessage(siblingAnswer);
+		const siblingCheckpoint = session.appendCompaction("sibling summary", retained, 150);
+		session.appendLabelChange(siblingCheckpoint, "sibling bookmark");
+		session.branch(checkpoint);
+		expect(session.removeLastMessages(2)).toBe(2);
+		for (const actual of [session, SessionManager.open(session.getSessionFile()!, dir)]) {
+			actual.branch(siblingCheckpoint);
+			expect(actual.buildSessionContext().messages).toEqual([
+				expect.objectContaining({ role: "compactionSummary", summary: "first summary" }),
+				expect.objectContaining({ role: "compactionSummary", summary: "sibling summary" }),
+				userMessage("sibling question", 4),
+				siblingAnswer,
+			]);
+			expect(actual.getEntry(siblingCheckpoint)).toMatchObject({ firstKeptEntryId: checkpoint });
+			expect(actual.getLabel(siblingCheckpoint)).toBe("sibling bookmark");
+		}
+	});
+
+	it("publishes no rebased checkpoint on rename failure and retries without resurrecting raw history", () => {
+		const dir = fs.mkdtempSync(join(tmpdir(), "pi-checkpoint-delete-failure-"));
+		tempDirs.push(dir);
+		const session = SessionManager.create(dir, dir);
+		session.appendMessage(userMessage("old raw question", 1));
+		const retained = session.appendMessage(userMessage("retained question", 2));
+		session.appendMessage(assistantMessage([{ type: "text", text: "retained answer" }], 3));
+		const checkpoint = session.appendCompaction("saved summary", retained, 100);
+		const held = session.getEntries();
+		const entries = structuredClone(held);
+		const projection = structuredClone(session.buildSessionProjection());
+		const leaf = session.getLeafId();
+		const file = session.getSessionFile()!;
+		const bytes = fs.readFileSync(file);
+		const failure = new Error("checkpoint deletion rename failure");
+		vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+			throw failure;
+		});
+		expect(() => session.removeLastMessages(99)).toThrow(failure);
+		expect(session.getEntries()).toEqual(entries);
+		expect(session.buildSessionProjection()).toEqual(projection);
+		expect(session.getLeafId()).toBe(leaf);
+		for (const entry of held) expect(session.getEntry(entry.id)).toBe(entry);
+		expect(fs.readFileSync(file)).toEqual(bytes);
+		expect(SessionManager.open(file, dir).buildSessionProjection()).toEqual(projection);
+		expect(session.removeLastMessages(99)).toBe(2);
+		expect(SessionManager.open(file, dir).buildSessionContext().messages).toEqual([
+			expect.objectContaining({ role: "compactionSummary", summary: "saved summary" }),
+		]);
+		expect(session.getEntry(checkpoint)).toMatchObject({ firstKeptEntryId: checkpoint });
+	});
+
+	it("does not rebase a visible checkpoint onto a soft-deleted boundary", () => {
+		const dir = fs.mkdtempSync(join(tmpdir(), "pi-hidden-checkpoint-boundary-"));
+		tempDirs.push(dir);
+		const session = SessionManager.create(dir, dir);
+		session.appendMessage(userMessage("summarized raw question", 1));
+		const retained = session.appendMessage(userMessage("retained question", 2));
+		const hidden = session.appendCompaction("hidden summary", retained, 100);
+		session.softDeleteUnits([{ entryId: hidden }]);
+		const visible = session.appendCompaction("visible summary", retained, 100);
+		expect(session.buildSessionContext().messages).toEqual([
+			expect.objectContaining({ role: "compactionSummary", summary: "visible summary" }),
+			userMessage("retained question", 2),
+		]);
+		expect(session.removeLastMessages(1)).toBe(1);
+		for (const actual of [session, SessionManager.open(session.getSessionFile()!, dir)]) {
+			expect(actual.buildSessionContext().messages).toEqual([
+				expect.objectContaining({ role: "compactionSummary", summary: "visible summary" }),
+			]);
+			expect(actual.getEntry(visible)).toMatchObject({ firstKeptEntryId: visible });
+			expect(actual.getEntry(hidden)?.deletedAt).toBeDefined();
+		}
 	});
 });
