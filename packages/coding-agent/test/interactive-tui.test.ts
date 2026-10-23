@@ -249,6 +249,26 @@ describe("InteractiveMode copy confirmation", () => {
 		clipboardMocks.copyToClipboard.mockResolvedValue(undefined);
 	});
 
+	it.each([
+		{ arg: "\n42", expected: "42" },
+		{ arg: "  \n0", expected: "0" },
+		{ arg: "0", expected: "<pi_content>assistant response</pi_content>" },
+	])("distinguishes literal next-line copy from same-line index for $arg", async ({ arg, expected }) => {
+		const context: CopyCommandContext = {
+			session: {
+				getEditableMessage: (index) =>
+					index === 0 ? { entryId: "answer", message: copyableAssistantMessage } : undefined,
+				getLastAssistantText: () => "assistant response",
+			},
+			ui: {} as CopyCommandContext["ui"],
+			showStatus: vi.fn(),
+			showError: vi.fn(),
+		};
+		await copyCommandPrototype.handleCopyCommand.call(context, arg);
+		expect(clipboardMocks.copyToClipboard).toHaveBeenCalledWith(expected);
+		expect(context.showError).not.toHaveBeenCalled();
+	});
+
 	it("copies an active fullscreen selection when copy-on-select is disabled", async () => {
 		const terminal = new RecordingTerminal(40, 4);
 		const ui = createInteractiveTui({

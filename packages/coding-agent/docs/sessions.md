@@ -51,6 +51,8 @@ Substring copy searches the active projected content, including custom messages,
 
 Failures returned by an interactive editor submission are displayed as errors instead of escaping the asynchronous submit callback. Existing command-specific error messages and storage rollback rules still apply; this boundary does not roll back earlier command side effects or catch detached background tasks.
 
+`/system-prompt set` accepts a space, tab or newline before its prompt text; bare `set` only shows the existing policy. For `/copy`, a number on the command line selects an editable message, while a payload beginning on the next line is copied literally, even when it contains only digits.
+
 For the persisted tree and entry types, see [Session Format](session-format.md).
 
 ## Manage conversation context

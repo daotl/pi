@@ -8385,8 +8385,9 @@ export class InteractiveMode {
 			this.showLoadedResources({ showDiagnosticsWhenQuiet: true });
 			return;
 		}
-		if (arg.startsWith("set ")) {
-			const text = arg.slice(4);
+		const setMatch = arg.match(/^set\s/);
+		if (setMatch) {
+			const text = arg.slice(setMatch[0].length);
 			if (text.trim().length === 0) {
 				this.session.setCustomSystemPrompt("");
 				this.showStatus("Custom system prompt cleared; using the file-based prompt");
@@ -8597,7 +8598,7 @@ export class InteractiveMode {
 				statusMessage = multiple
 					? `Copied ${matches.length} matching messages to clipboard`
 					: "Copied matching message to clipboard";
-			} else if (/^\d+$/.test(trimmed)) {
+			} else if (sameLine && /^\d+$/.test(trimmed)) {
 				// Numeric argument: copy the N-th editable message (skipping harness)
 				// in the /edit content format.
 				const index = Number.parseInt(trimmed, 10);

@@ -8,6 +8,7 @@ import { DefaultResourceLoader } from "../../src/core/resource-loader.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
+import { initTheme } from "../../src/modes/interactive/theme/theme.ts";
 import { createHarness, getMessageText } from "./harness.ts";
 
 vi.mock("fs", async (importOriginal) => {
@@ -361,3 +362,44 @@ it("reports a submitted deletion persistence failure without publishing history"
 		fs.rmSync(cwd, { recursive: true, force: true });
 	}
 });
+
+it.each(["\n", "\t", " "])(
+	"accepts whitespace %j after system-prompt set while bare set preserves policy",
+	async (separator) => {
+		initTheme("dark");
+		const harness = await createHarness({ settings: { retry: { enabled: false }, compaction: { enabled: false } } });
+		const errors: string[] = [];
+		const context = Object.assign(Object.create(InteractiveMode.prototype), {
+			runtimeHost: { session: harness.session },
+			defaultEditor: {} as { onSubmit?: (text: string) => Promise<void> },
+			editor: { setText: (_text: string) => {} },
+			chatContainer: new Container(),
+			showError: (message: string) => errors.push(message),
+			showStatus: (_message: string) => {},
+			showLoadedResources: () => {},
+			getMarkdownThemeWithSettings: () => ({}),
+			ui: { requestRender: () => {} },
+		}) as { setupEditorSubmitHandler(): void; defaultEditor: { onSubmit?: (text: string) => Promise<void> } };
+		try {
+			context.setupEditorSubmitHandler();
+			await context.defaultEditor.onSubmit!(`/system-prompt set${separator}Grammar-specific policy.`);
+			expect(errors).toEqual([]);
+			expect(harness.session.hasCustomSystemPrompt).toBe(true);
+			let providerPrompt = "";
+			harness.setResponses([
+				(request) => {
+					providerPrompt = getCurrentSystemPrompt(request.messages);
+					return fauxAssistantMessage("policy accepted");
+				},
+			]);
+			await harness.session.prompt("verify policy");
+			expect(providerPrompt).toContain("Grammar-specific policy.");
+			const before = harness.session.systemPrompt;
+			await context.defaultEditor.onSubmit!("/system-prompt set");
+			expect(harness.session.systemPrompt).toBe(before);
+			expect(errors).toEqual([]);
+		} finally {
+			harness.cleanup();
+		}
+	},
+);
