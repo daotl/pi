@@ -85,6 +85,8 @@ Canonical context edits remain authoritative on the next request. Ordinary proje
 
 `session.continue(prefill?)` accepts an optional assistant prefix. Automatic capture leaves its original session entry and ordered suffix selected on disk while omitting that contribution only from live/request context. A verified terminal echo atomically replaces the original contribution after message hooks run; a complete echoed abort can also be stored. A truncated abort or failed continuation restores the original prefix and replayable recovery entries before another request dispatches.
 
+A supplied prefix with any role other than `assistant` is rejected at the session entry boundary, before changing run state or publishing prompt/tool policy. This runtime check also applies to JavaScript callers; the TypeScript parameter type is not the validation boundary.
+
 If restoration cannot be written, the run rejects and releases ownership, but retains the recovery state in memory. The next accepted prompt or continuation retries restoration first. An accepted tree navigation supersedes recovery on the abandoned branch. `message_end` listeners still run before persistence; a completed response rejected by a listener or storage failure retains its charge as a content-free error receipt rather than a published answer.
 
 `abort()` stops the active operation and waits for the session to become idle. `waitForIdle()` waits without aborting it.

@@ -132,3 +132,30 @@ it("sends a post-tool assistant replacement once without guessing that its copy 
 		harness.cleanup();
 	}
 });
+
+it.each(["user", "system", "toolResult"] as const)(
+	"rejects a runtime %s prefill before publishing policy or lifecycle state",
+	async (role) => {
+		const harness = await createHarness({
+			fauxApi: "openai-completions",
+			settings: { retry: { enabled: false }, compaction: { enabled: false } },
+		});
+		try {
+			const beforeEntries = structuredClone(harness.sessionManager.getEntries());
+			const beforeMessages = structuredClone(harness.session.messages);
+			const beforeLeaf = harness.sessionManager.getLeafId();
+			const invalid = { role, content: "invalid assistant prefix", timestamp: 1 };
+			await expect(Reflect.apply(harness.session.continue, harness.session, [invalid])).rejects.toThrow(
+				"Prefill must be an assistant message",
+			);
+			expect(harness.sessionManager.getEntries()).toEqual(beforeEntries);
+			expect(harness.sessionManager.getLeafId()).toBe(beforeLeaf);
+			expect(harness.session.messages).toEqual(beforeMessages);
+			expect(harness.events).toEqual([]);
+			expect(harness.faux.state.callCount).toBe(0);
+			expect(harness.session.isIdle).toBe(true);
+		} finally {
+			harness.cleanup();
+		}
+	},
+);

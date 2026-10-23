@@ -3400,6 +3400,9 @@ export class AgentSession {
 	 * Omit it to capture the active canonical assistant without deleting durable history.
 	 */
 	async continue(prefill?: AssistantMessage): Promise<void> {
+		if (prefill && prefill.role !== "assistant") {
+			throw new Error("Prefill must be an assistant message");
+		}
 		if (this._isAgentRunActive) {
 			throw new Error(
 				"Agent is already processing. Use steer() or followUp() to queue messages, or wait for completion.",
