@@ -132,7 +132,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		expect(order).toEqual(["drainInput", "stop", "dispose"]);
 	});
 
-	test("interactive quit prints a resume hint for persisted sessions", async () => {
+	test("interactive quit appends the resume hint without erasing terminal history", async () => {
 		vi.spyOn(process, "exit").mockImplementation((() => {
 			throw new ProcessExitError();
 		}) as typeof process.exit);
@@ -147,9 +147,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 
 		expect(order).toEqual(["drainInput", "stop", "dispose"]);
 		const resumeCall = stdoutWrite.mock.calls.find((call) => String(call[0]).includes("To resume this session:"));
-		expect(resumeCall?.[0]).toBe(
-			`\x1b[2J\x1b[3J\x1b[H${chalk.dim("To resume this session:")} ${APP_NAME} --session test-session\n`,
-		);
+		expect(resumeCall?.[0]).toBe(`${chalk.dim("To resume this session:")} ${APP_NAME} --session test-session\n`);
 	});
 
 	test("signal-triggered shutdown does not print a resume hint", async () => {

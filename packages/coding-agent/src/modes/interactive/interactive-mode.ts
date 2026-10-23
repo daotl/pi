@@ -4774,14 +4774,9 @@ export class InteractiveMode {
 
 		const resumeCommand = formatResumeCommand(this.sessionManager);
 		if (resumeCommand) {
-			// Clear the screen and home the cursor, then write the resume hint on a
-			// clean terminal and flush it before exiting. process.exit(0) below does
-			// not wait for pending async stdout writes, which can truncate or
-			// interleave the hint with the last frame the differential renderer left
-			// at an unpredictable row (lines are unpadded by default, so stale
-			// trailing columns persist). Clearing the whole screen plus scrollback
-			// guarantees only the resume line is visible.
-			const hint = `\x1b[2J\x1b[3J\x1b[H${chalk.dim("To resume this session:")} ${resumeCommand}\n`;
+			// Append after existing output, including the fullscreen exit transcript.
+			// process.exit() does not wait for pending asynchronous stdout writes.
+			const hint = `${chalk.dim("To resume this session:")} ${resumeCommand}\n`;
 			await writeFlushedStdout(hint);
 		}
 
