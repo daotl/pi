@@ -206,6 +206,8 @@ Extensions can store any JSON-serializable data in `details`. The default compac
 
 See [`prepareCompaction()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) and [`compact()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) for the implementation. For direct programmatic summarization, `generateSummary()` returns the summary text and `generateSummaryWithUsage()` returns `{ text, usage, fileOps }`. File operations come from attributable converted request history; custom transports or final payload/header policies conservatively omit reconstructed tags when attribution cannot be proved.
 
+`findCutPoint()` is asynchronous; await its `Promise<CutPointResult>`. A custom token counter returns `Promise<number>` and may receive an abort signal for speculative work. The source-level `prepareCompaction()` helper is also asynchronous but is not exported from the root SDK package.
+
 Direct compaction, branch-summary and bug-report summary headers use `ProviderHeaders` (`string | null` values). A `null` value suppresses a provider default header, including generated `Authorization`. Authentication preserves that marker until the final case-insensitive header merge; compaction also preserves it through optional token counting.
 
 ### SDK migration: checkpoint messages
@@ -245,6 +247,8 @@ Selection includes restored system/tool state, generated instructions and output
 Native output clamping has its own factory/registry dispatch-identity capability across Anthropic, OpenAI Completions/Responses/Codex, Azure Responses, Google/Vertex, Mistral and Bedrock simple adapters. This does not grant file-history attribution or tokenizer upload permission. Replacing either factory/provider dispatch function or installing a custom registry/extension wrapper revokes automatic native-budget treatment; restoring the original recognized dispatch restores it.
 
 For programmatic callers, `prepareBranchEntries(entries, tokenBudget, contextProjection?)` accepts chronological slices; pass the full canonical old-branch projection when summarizing a selected range. Its result is `{ messages, fileOps, totalTokens, budgetExceeded }`. `budgetExceeded` replaces `firstEntryId`; preceding authority is recovered from the projection rather than a raw entry boundary. Update consumers to inspect `budgetExceeded` for selection truncation. Input entries and their persisted parent IDs are not mutated.
+
+For standalone `generateBranchSummary({ agent, ... })` calls, the Agent's current system/tool state supplies a baseline only when the selected projection has no preceding system baseline, no explicit `contextProjection`, and no compaction checkpoint. A supplied projection or checkpoint remains authoritative. This fallback does not copy shared conversation into the abandoned range.
 
 ```
 Tree before navigation:
