@@ -14,11 +14,7 @@ import { handlePackageCommand } from "../src/package-manager-cli.ts";
 import { allowNetwork } from "./test-network-env.ts";
 
 describe("package commands", () => {
-	// update/self-update flows are network operations; offline mode
-	// (PI_OFFLINE=1) skips updates and PI_SKIP_VERSION_CHECK=1 disables the
-	// update version check, so those flows cannot run under them.
-	const offline = process.env.PI_OFFLINE === "1";
-	const updatesDisabled = offline || process.env.PI_SKIP_VERSION_CHECK === "1";
+	// Update paths use fake package executables and mocked version responses, not registry access.
 	let tempDir: string;
 	let agentDir: string;
 	let projectDir: string;
@@ -292,7 +288,7 @@ describe("package commands", () => {
 		}
 	});
 
-	it.skipIf(offline)("uses saved project trust during update", async () => {
+	it("uses saved project trust during update", async () => {
 		mkdirSync(join(projectDir, ".pi"), { recursive: true });
 		const fakeNpmPath = join(tempDir, "fake-trusted-project-npm.cjs");
 		const recordPath = join(tempDir, "trusted-project-update.json");
@@ -541,7 +537,7 @@ describe("package commands", () => {
 		}
 	});
 
-	it.skipIf(updatesDisabled)("uses the update check version for forced self updates even when current", async () => {
+	it("uses the update check version for forced self updates even when current", async () => {
 		const globalPrefix = join(tempDir, "global-prefix");
 		const projectPrefix = join(tempDir, "project-prefix");
 		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@earendil-works", "pi-coding-agent");
@@ -601,7 +597,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 		}
 	});
 
-	it.skipIf(updatesDisabled)("uses the current package name when the update check omits packageName", async () => {
+	it("uses the current package name when the update check omits packageName", async () => {
 		const globalPrefix = join(tempDir, "global-prefix");
 		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@mariozechner", "pi-coding-agent");
 		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
@@ -647,7 +643,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 		}
 	});
 
-	it.skipIf(updatesDisabled)("installs the active package name from the update check during self-update", async () => {
+	it("installs the active package name from the update check during self-update", async () => {
 		const globalPrefix = join(tempDir, "global-prefix");
 		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@mariozechner", "pi-coding-agent");
 		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
@@ -698,7 +694,7 @@ else {
 		}
 	});
 
-	it.skipIf(updatesDisabled)("prints a pnpm metadata hint when self-update fails", async () => {
+	it("prints a pnpm metadata hint when self-update fails", async () => {
 		const globalRoot = join(tempDir, "pnpm", "global", "v11");
 		const selfPackageDir = join(globalRoot, "node_modules", "@earendil-works", "pi-coding-agent");
 		const fakeBinDir = join(tempDir, "bin");
@@ -742,7 +738,7 @@ else {
 		}
 	});
 
-	it.skipIf(updatesDisabled)("fails self-update when renamed npm package installation fails", async () => {
+	it("fails self-update when renamed npm package installation fails", async () => {
 		const globalPrefix = join(tempDir, "global-prefix");
 		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@mariozechner", "pi-coding-agent");
 		const fakeNpmPath = join(tempDir, "fake-npm-fail.cjs");

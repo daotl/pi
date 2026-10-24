@@ -87,9 +87,7 @@ async function runCli(args: string[]): Promise<{ stdout: string; stderr: string;
 }
 
 describe("stdout cleanliness in non-interactive modes", () => {
-	// The trusted-chatter tests expect the fake npm install to run at startup;
-	// offline mode (PI_OFFLINE=1) correctly skips package installs.
-	const offline = process.env.PI_OFFLINE === "1";
+	// Trusted startup chatter comes from a local fake npm executable.
 	it("prints --version to stdout when stdout is redirected", async () => {
 		const result = await runCli(["--version"]);
 
@@ -108,20 +106,17 @@ describe("stdout cleanliness in non-interactive modes", () => {
 		expect(result.stderr).not.toContain("found 0 vulnerabilities");
 	});
 
-	it.skipIf(offline)(
-		"keeps stdout empty for --mode json --help while routing trusted startup chatter to stderr",
-		async () => {
-			const result = await runCli(["--mode", "json", "--help", "--approve"]);
+	it("keeps stdout empty for --mode json --help while routing trusted startup chatter to stderr", async () => {
+		const result = await runCli(["--mode", "json", "--help", "--approve"]);
 
-			expect(result.code).toBe(0);
-			expect(result.stdout).toBe("");
-			expect(result.stderr).toContain("changed 1 package in 471ms");
-			expect(result.stderr).toContain("found 0 vulnerabilities");
-			expect(result.stderr).toContain("Usage:");
-		},
-	);
+		expect(result.code).toBe(0);
+		expect(result.stdout).toBe("");
+		expect(result.stderr).toContain("changed 1 package in 471ms");
+		expect(result.stderr).toContain("found 0 vulnerabilities");
+		expect(result.stderr).toContain("Usage:");
+	});
 
-	it.skipIf(offline)("keeps stdout empty for -p --help while routing trusted startup chatter to stderr", async () => {
+	it("keeps stdout empty for -p --help while routing trusted startup chatter to stderr", async () => {
 		const result = await runCli(["-p", "--help", "--approve"]);
 
 		expect(result.code).toBe(0);
