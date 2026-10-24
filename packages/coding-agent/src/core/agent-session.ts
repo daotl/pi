@@ -371,6 +371,8 @@ export interface PromptOptions {
 	source?: InputSource;
 	/** Internal hook used by RPC mode to observe how an accepted prompt was dispatched. Not called if the prompt is rejected. */
 	preflightResult?: (disposition: PromptDisposition) => void;
+	/** @internal Observe settlement-deferred execution failure after the original prompt returned. Settlement still propagates the original error, even if this observer throws. */
+	onDeferredError?: (error: unknown) => void;
 }
 
 /** Options for model/thinking mutations. */
@@ -3724,7 +3726,18 @@ export class AgentSession {
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		if (this._isEmittingAgentSettled) {
-			this._deferredSettledActions.push(async () => await this.prompt(text, options));
+			this._deferredSettledActions.push(async () => {
+				try {
+					await this.prompt(text, options);
+				} catch (error) {
+					try {
+						options?.onDeferredError?.(error);
+					} catch {
+						// An observer must not replace the deferred execution failure.
+					}
+					throw error;
+				}
+			});
 			return;
 		}
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;

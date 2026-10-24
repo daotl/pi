@@ -1,5 +1,5 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 const harnesses: Harness[] = [];
@@ -184,3 +184,51 @@ it.each(["followUp", "steer"] as const)(
 		}
 	},
 );
+
+it("preserves a settlement-deferred prompt error when its observer also throws", async () => {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const harness = await createHarness({
+		withConfiguredAuth: false,
+		settings: { compaction: { enabled: false }, retry: { enabled: false } },
+		extensionFactories: [
+			(pi) => {
+				pi.on("agent_settled", async () => {
+					entered.resolve();
+					await release.promise;
+				});
+			},
+		],
+	});
+	harnesses.push(harness);
+	const original = new Error("original deferred authentication failure");
+	const auth = vi.spyOn(harness.session.modelRuntime, "checkAuth").mockResolvedValue({ type: "api_key" });
+	const observed: unknown[] = [];
+	harness.setResponses([fauxAssistantMessage("seed answer")]);
+	const running = harness.session.prompt("seed request");
+	const outcome = running.then(
+		() => undefined,
+		(error: unknown) => error,
+	);
+	try {
+		await entered.promise;
+		await harness.session.prompt("deferred input", {
+			onDeferredError: (error) => {
+				observed.push(error);
+				throw new Error("observer failure must not win");
+			},
+		});
+		auth.mockRejectedValueOnce(original);
+		release.resolve();
+		expect(await outcome).toBe(original);
+		expect(observed).toEqual([original]);
+		expect(harness.session.messages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
+			"seed request",
+		]);
+	} finally {
+		release.resolve();
+		await outcome;
+		auth.mockRestore();
+		await harness.session.abort();
+	}
+});

@@ -434,6 +434,10 @@ interface SettledDelivery {
 	phase: "preflight" | "run";
 }
 
+interface HeartbeatDelivery {
+	preserveCadence: boolean;
+}
+
 /** Recurring wake-up schedule: a fixed interval, or daily at a local time. */
 export type HeartbeatSchedule =
 	| { type: "interval"; intervalMs: number }
@@ -896,6 +900,8 @@ export class InteractiveMode {
 	// accumulates during a working run, a server wait, or a retry.
 	private lastActivityAt = Date.now();
 	private heartbeatTicker?: ReturnType<typeof setInterval>;
+	private heartbeatStartPending?: HeartbeatDelivery;
+	private heartbeatRunActive = false;
 
 	// Shutdown state
 	private shutdownRequested = false;
@@ -4117,6 +4123,7 @@ export class InteractiveMode {
 					this.ui.requestRender();
 				}
 				await this.checkShutdownRequested();
+				this.heartbeatRunActive = false;
 				if (this.settledDeliveryPending?.phase === "run") this.settledDeliveryPending = undefined;
 				this.fireDueScheduledMessages();
 				break;
@@ -6195,6 +6202,7 @@ export class InteractiveMode {
 			this.session.isStreaming ||
 			this.session.isCompacting ||
 			this.settledDeliveryPending ||
+			this.heartbeatStartPending ||
 			this.compactionQueueDeliveryPending
 		) {
 			this.deferredScheduledActions.push(entry);
@@ -6217,16 +6225,28 @@ export class InteractiveMode {
 		})();
 	}
 
-	private deliverScheduledMessage(text: string, onDispatch?: (waitingForRun: boolean) => void): void {
+	private deliverScheduledMessage(
+		text: string,
+		onDispatch?: (waitingForRun: boolean) => void,
+		onOutcome?: (started: boolean) => void,
+	): void {
+		let outcomeReported = false;
+		const reportOutcome = (started: boolean) => {
+			if (outcomeReported) return;
+			outcomeReported = true;
+			onOutcome?.(started);
+		};
 		if (this.session.isCompacting) {
 			// Flushed after compaction like user-typed queued messages.
 			this.compactionQueuedMessages.push({ text, mode: "followUp" });
 			this.updatePendingMessagesDisplay();
+			reportOutcome(false);
 			onDispatch?.(true);
 			return;
 		}
 		if (this.session.isStreaming) {
 			// Queue after the current task instead of interrupting each turn.
+			reportOutcome(false);
 			onDispatch?.(true);
 			void this.session.prompt(text, { streamingBehavior: "followUp" }).catch((error: unknown) => {
 				this.showError(error instanceof Error ? error.message : String(error));
@@ -6235,15 +6255,27 @@ export class InteractiveMode {
 		}
 		void this.session
 			.prompt(text, {
-				preflightResult: (disposition) => onDispatch?.(disposition !== "handled"),
+				preflightResult: (disposition) => {
+					reportOutcome(disposition === "started");
+					onDispatch?.(disposition !== "handled");
+				},
+				onDeferredError: () => {
+					reportOutcome(false);
+					onDispatch?.(false);
+				},
 			})
 			.catch((error: unknown) => {
+				reportOutcome(false);
 				// Preserve ordinary messages if another run won asynchronous preflight.
 				if (error instanceof Error && error.message.includes("already processing")) {
 					void this.session
 						.prompt(text, {
 							streamingBehavior: "followUp",
 							preflightResult: (disposition) => onDispatch?.(disposition !== "handled"),
+							onDeferredError: () => {
+								reportOutcome(false);
+								onDispatch?.(false);
+							},
 						})
 						.catch((inner: unknown) => {
 							this.showError(inner instanceof Error ? inner.message : String(inner));
@@ -6279,6 +6311,7 @@ export class InteractiveMode {
 		if (
 			!this.session.isIdle ||
 			this.settledDeliveryPending ||
+			this.heartbeatStartPending ||
 			this.compactionQueueDeliveryPending ||
 			this.compactionQueuedMessages.length > 0
 		)
@@ -6597,6 +6630,8 @@ export class InteractiveMode {
 	 */
 	private markActivity(): void {
 		this.lastActivityAt = Date.now();
+		if (this.heartbeatStartPending) this.heartbeatStartPending.preserveCadence = false;
+		this.heartbeatRunActive = false;
 		for (const entry of this.heartbeats) {
 			if (entry.intervalMs !== null && !entry.paused && entry.nextFireAt !== null) {
 				entry.nextFireAt = this.lastActivityAt + entry.intervalMs;
@@ -6604,17 +6639,11 @@ export class InteractiveMode {
 		}
 	}
 
-	/**
-	 * Periodic check for interval heartbeats. Runs only while an armed interval
-	 * beat exists. While the session is active (streaming/compacting - which
-	 * covers working, processing, waiting on the server, and retries) the idle
-	 * clock is reset every tick so idle time never accumulates; only in the true
-	 * idle state does a beat fire, once its full interval has elapsed since the
-	 * last activity.
-	 */
+	/** Deliver one most-overdue interval beat per idle tick, preserving other deadlines for heartbeat-owned runs. */
 	private tickHeartbeats(): void {
 		const now = Date.now();
 		if (this.session.isStreaming || this.session.isCompacting) {
+			if (this.heartbeatRunActive) return;
 			// Active: reset the idle clock and every beat's deadline so nothing
 			// fires (or comes due) until the harness is genuinely idle again.
 			this.lastActivityAt = now;
@@ -6625,31 +6654,40 @@ export class InteractiveMode {
 			}
 			return;
 		}
+		if (
+			this.heartbeatStartPending ||
+			this.settledDeliveryPending ||
+			this.compactionQueueDeliveryPending ||
+			this.compactionQueuedMessages.length > 0
+		)
+			return;
+		this.heartbeatRunActive = false;
+		let due: HeartbeatEntry | undefined;
 		for (const entry of this.heartbeats) {
-			if (entry.intervalMs === null || entry.paused || entry.nextFireAt === null) continue;
-			if (now - this.lastActivityAt >= entry.intervalMs) {
-				// Fires only after continuous idle. Delivering a beat is itself
-				// activity, so reset the idle clock and re-arm before moving on.
-				entry.nextFireAt = null;
-				this.deliverHeartbeat(entry);
-				this.lastActivityAt = now;
-				this.armHeartbeat(entry);
-			}
+			if (entry.intervalMs === null || entry.paused || entry.nextFireAt === null || entry.nextFireAt > now) continue;
+			if (!due || entry.nextFireAt < due.nextFireAt!) due = entry;
 		}
+		if (!due || due.intervalMs === null) return;
+		due.nextFireAt = now + due.intervalMs;
+		this.deliverHeartbeat(due);
 	}
 
 	/** Deliver a heartbeat's payload (message or bare continue). */
 	private deliverHeartbeat(entry: HeartbeatEntry): void {
+		const session = this.session;
+		const delivery: HeartbeatDelivery = { preserveCadence: entry.intervalMs !== null };
+		this.heartbeatStartPending = delivery;
+		const onOutcome = (started: boolean) => {
+			if (this.heartbeatStartPending !== delivery || this.session !== session) return;
+			this.heartbeatStartPending = undefined;
+			this.heartbeatRunActive = started && delivery.preserveCadence;
+			if (!started) queueMicrotask(() => this.fireDueScheduledMessages());
+		};
 		if (entry.isContinue) {
-			// Bare continue, reusing the /schedule defer-or-run action path.
-			this.deferOrRunScheduledAction({
-				id: entry.id,
-				text: "",
-				when: { type: "time", at: Date.now() },
-				isContinue: true,
-			});
+			void this.handleContinueCommand();
+			onOutcome(session.isStreaming);
 		} else {
-			this.deliverScheduledMessage(entry.text);
+			this.deliverScheduledMessage(entry.text, undefined, onOutcome);
 		}
 	}
 
@@ -6719,8 +6757,15 @@ export class InteractiveMode {
 			return;
 		}
 
-		// Skip while Working or compacting: do not deliver anything, just re-arm.
-		if (this.session.isStreaming || this.session.isCompacting) {
+		// Daily occurrences are skipped, not deferred, while another delivery owns preflight.
+		if (
+			this.session.isStreaming ||
+			this.session.isCompacting ||
+			this.heartbeatStartPending ||
+			this.settledDeliveryPending ||
+			this.compactionQueueDeliveryPending ||
+			this.compactionQueuedMessages.length > 0
+		) {
 			this.armHeartbeat(entry);
 			return;
 		}
@@ -6837,6 +6882,8 @@ export class InteractiveMode {
 
 	/** Clear all heartbeats (session shutdown/restart). */
 	private clearHeartbeats(): void {
+		this.heartbeatStartPending = undefined;
+		this.heartbeatRunActive = false;
 		this.heartbeatLoadGeneration++;
 		for (const entry of this.heartbeats) {
 			if (entry.timer) clearTimeout(entry.timer);

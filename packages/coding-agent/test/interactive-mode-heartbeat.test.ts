@@ -191,6 +191,13 @@ type HeartbeatCommandContext = {
 	heartbeats: HeartbeatEntry[];
 	nextHeartbeatId: number;
 	heartbeatLoadGeneration: number;
+	compactionQueuedMessages: Array<{ text: string; mode: "steer" | "followUp" }>;
+	heartbeatStartPending?: { preserveCadence: boolean };
+	heartbeatRunActive: boolean;
+	settledDeliveryPending?: { phase: "preflight" | "run" };
+	compactionQueueDeliveryPending?: object;
+	fireDueScheduledMessages(): void;
+	handleContinueCommand(): Promise<void>;
 	session: { isStreaming: boolean; isCompacting: boolean };
 	sessionManager: { getCwd: () => string };
 	armHeartbeat: (entry: HeartbeatEntry) => void;
@@ -229,6 +236,13 @@ function makeContext(overrides: Partial<HeartbeatCommandContext> = {}): Heartbea
 		heartbeats: [],
 		nextHeartbeatId: 1,
 		heartbeatLoadGeneration: 0,
+		compactionQueuedMessages: [],
+		heartbeatStartPending: undefined,
+		heartbeatRunActive: false,
+		settledDeliveryPending: undefined,
+		compactionQueueDeliveryPending: undefined,
+		fireDueScheduledMessages: vi.fn(),
+		handleContinueCommand: vi.fn(async () => {}),
 		lastActivityAt: Date.now(),
 		heartbeatTicker: undefined,
 		session: { isStreaming: false, isCompacting: false },
@@ -566,28 +580,6 @@ describe("InteractiveMode interval heartbeat idle semantics", () => {
 		if (context.heartbeatTicker) clearInterval(context.heartbeatTicker);
 	});
 
-	it("fires after the idle interval elapses and re-arms", () => {
-		const context = armedContext();
-		context.lastActivityAt = Date.now() - 301_000; // > 5 minutes idle
-		heartbeatPrototype.tickHeartbeats.call(context);
-		expect(context.deliverScheduledMessage).toHaveBeenCalledWith("hi");
-		expect(context.deferOrRunScheduledAction).not.toHaveBeenCalled();
-		// Delivering resets the idle clock so the next beat is a full interval away.
-		expect(context.lastActivityAt).toBeGreaterThan(Date.now() - 2000);
-		expect(context.heartbeats[0].nextFireAt).toBeGreaterThan(Date.now());
-		if (context.heartbeatTicker) clearInterval(context.heartbeatTicker);
-	});
-
-	it("runs a bare continue for a message-less interval beat when due", () => {
-		const context = armedContext("5m");
-		context.heartbeats[0].isContinue = true;
-		context.lastActivityAt = Date.now() - 301_000;
-		heartbeatPrototype.tickHeartbeats.call(context);
-		expect(context.deliverScheduledMessage).not.toHaveBeenCalled();
-		expect(context.deferOrRunScheduledAction).toHaveBeenCalled();
-		if (context.heartbeatTicker) clearInterval(context.heartbeatTicker);
-	});
-
 	it("markActivity resets the idle clock and pushes the deadline out", () => {
 		const context = armedContext();
 		const entry = context.heartbeats[0];
@@ -668,32 +660,31 @@ describe("InteractiveMode heartbeat firing", () => {
 		expect(armHeartbeat).toHaveBeenCalledWith(context.heartbeats[0]);
 	});
 
-	it("delivers a message beat when idle", () => {
-		const armHeartbeat = vi.fn();
+	it("skips a daily occurrence during owned preflight and rearms for the next local day", async () => {
+		vi.useFakeTimers({ now: new Date(2030, 0, 1, 12, 0, 0) });
+		const entry = mkEntry(1, "12:01", "daily");
+		const delivered: string[] = [];
 		const context = makeContext({
-			armHeartbeat,
-			deliverScheduledMessage: vi.fn(),
-			deferOrRunScheduledAction: vi.fn(),
-			heartbeats: [mkEntry(1, "5m", "hi")],
+			heartbeats: [entry],
+			settledDeliveryPending: { phase: "preflight" },
+			deliverHeartbeat: (beat) => {
+				delivered.push(beat.text);
+			},
 		});
-		context.fireHeartbeat(1);
-		expect(context.deliverScheduledMessage).toHaveBeenCalledWith("hi");
-		expect(context.deferOrRunScheduledAction).not.toHaveBeenCalled();
-		expect(armHeartbeat).toHaveBeenCalledWith(context.heartbeats[0]);
-	});
-
-	it("runs a bare continue for a message-less beat when idle", () => {
-		const armHeartbeat = vi.fn();
-		const context = makeContext({
-			armHeartbeat,
-			deliverScheduledMessage: vi.fn(),
-			deferOrRunScheduledAction: vi.fn(),
-			heartbeats: [mkEntry(1, "5m", "")],
-		});
-		context.fireHeartbeat(1);
-		expect(context.deliverScheduledMessage).not.toHaveBeenCalled();
-		expect(context.deferOrRunScheduledAction).toHaveBeenCalled();
-		expect(armHeartbeat).toHaveBeenCalledWith(context.heartbeats[0]);
+		context.armHeartbeat = (beat) => heartbeatPrototype.armHeartbeat.call(context, beat);
+		try {
+			context.armHeartbeat(entry);
+			await vi.advanceTimersByTimeAsync(60_000);
+			expect(delivered).toEqual([]);
+			expect(entry.nextFireAt).toBe(new Date(2030, 0, 2, 12, 1, 0).getTime());
+			context.settledDeliveryPending = undefined;
+			await vi.advanceTimersByTimeAsync(86_400_000);
+			expect(delivered).toEqual(["daily"]);
+			expect(entry.nextFireAt).toBe(new Date(2030, 0, 3, 12, 1, 0).getTime());
+		} finally {
+			context.clearHeartbeats();
+			vi.useRealTimers();
+		}
 	});
 
 	it("does nothing for a paused beat", () => {

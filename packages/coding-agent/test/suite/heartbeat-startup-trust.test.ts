@@ -36,7 +36,7 @@ describe("startup heartbeat project trust", () => {
 			maybeWarnAboutAnthropicSubscriptionAuth(): Promise<void>;
 			getUserInput(): Promise<string>;
 			heartbeats: HeartbeatEntry[];
-			lastActivityAt: number;
+			markActivity(): void;
 			tickHeartbeats(): void;
 			clearHeartbeats(): void;
 			handleHeartbeatCommand(arg: string): Promise<void>;
@@ -54,8 +54,13 @@ describe("startup heartbeat project trust", () => {
 				trusted ? ["repository instruction"] : cli ? [""] : [],
 			);
 			if (!cli) {
-				internal.lastActivityAt = Date.now() - 2000;
+				const now = Date.now();
+				vi.useFakeTimers({ toFake: ["Date"] });
+				vi.setSystemTime(now - 2000);
+				internal.markActivity();
+				vi.setSystemTime(now);
 				internal.tickHeartbeats();
+				vi.useRealTimers();
 				if (trusted) {
 					await vi.waitFor(() =>
 						expect(
@@ -70,6 +75,7 @@ describe("startup heartbeat project trust", () => {
 				expect(internal.heartbeats.map((entry) => entry.text)).toEqual(["repository instruction"]);
 			}
 		} finally {
+			vi.useRealTimers();
 			internal.clearHeartbeats();
 			mode.stop();
 			harness.cleanup();

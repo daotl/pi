@@ -121,6 +121,8 @@ Successful nonempty `deleteLastMessages()`, `deleteMessage()` and `applyMessageE
 
 Use `agent_settled` when the host needs to know that Pi will not continue automatically.
 
+Prompts submitted from an `agent_settled` handler are deferred until those handlers finish and return immediately, so awaiting the original call does not await the deferred run. The internal `PromptOptions.onDeferredError` observer receives later deferred-execution failures; the original failure still propagates through the enclosing settlement path. Accepted dispatch reporting remains separate and does not report rejections.
+
 ## Configuring a session
 
 Without overrides, the factory creates a `ModelRuntime`, file-backed `SettingsManager`, persistent `SessionManager`, `DefaultResourceLoader`, and the configured default tools.

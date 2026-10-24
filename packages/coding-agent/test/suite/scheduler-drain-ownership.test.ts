@@ -5,7 +5,11 @@ import { expect, it, vi } from "vitest";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
 import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
 import { type AgentSessionServices, createAgentSessionFromServices } from "../../src/core/agent-session-services.ts";
-import { InteractiveMode, type ScheduledMessage } from "../../src/modes/interactive/interactive-mode.ts";
+import {
+	type HeartbeatEntry,
+	InteractiveMode,
+	type ScheduledMessage,
+} from "../../src/modes/interactive/interactive-mode.ts";
 import {
 	isMessageBackground,
 	isMessageSeparator,
@@ -58,6 +62,13 @@ async function createSchedulingMode(options: HarnessOptions = {}) {
 		fireScheduledMessage(id: number): void;
 		deferOrRunScheduledAction(entry: ScheduledMessage): void;
 		clearScheduledMessages(): void;
+		handleHeartbeatCommand(text: string): Promise<void>;
+		tickHeartbeats(): void;
+		fireHeartbeat(id: number): void;
+		clearHeartbeats(): void;
+		markActivity(): void;
+		heartbeats: HeartbeatEntry[];
+		editor: { getText(): string };
 		queueCompactionMessage(text: string, mode: "steer" | "followUp"): void;
 		flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
 		compactionQueuedMessages: Array<{ text: string; mode: "steer" | "followUp" }>;
@@ -72,6 +83,7 @@ async function createSchedulingMode(options: HarnessOptions = {}) {
 		terminal,
 		cleanup: async () => {
 			internal.clearScheduledMessages();
+			internal.clearHeartbeats();
 			await runtime.session.abort();
 			await runtime.session.waitForIdle();
 			mode.stop();
@@ -850,6 +862,364 @@ it("stops an outgoing queue batch after its command replaces the runtime", async
 		expect(ui.runtime.session.messages.map(getMessageText)).not.toContain("stale outgoing input");
 		expect(ui.internal.compactionQueuedMessages).toEqual([]);
 	} finally {
+		await ui.cleanup();
+	}
+});
+
+it.each(
+	(["interval", "daily"] as const).flatMap((schedule) =>
+		(["started", "handled", "rejected"] as const).map((outcome) => ({ schedule, outcome })),
+	),
+)(
+	"excludes settled work through $schedule heartbeat $outcome preflight after typing",
+	async ({ schedule, outcome }) => {
+		const entered = Promise.withResolvers<void>();
+		const preflight = Promise.withResolvers<void>();
+		const response = Promise.withResolvers<void>();
+		const ui = await createSchedulingMode({
+			withConfiguredAuth: outcome !== "rejected",
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async (event) => {
+						if (event.text === "owning heartbeat" && outcome !== "started") {
+							entered.resolve();
+							await preflight.promise;
+							if (outcome === "handled") return { action: "handled" };
+						}
+					});
+					pi.on("before_agent_start", async (event) => {
+						if (event.prompt === "owning heartbeat" && outcome === "started") {
+							entered.resolve();
+							await preflight.promise;
+						}
+					});
+				},
+			],
+		});
+		const requests: string[] = [];
+		ui.harness.setResponses([
+			async (context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				await response.promise;
+				return fauxAssistantMessage("first response");
+			},
+			(context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				return fauxAssistantMessage("scheduled response");
+			},
+		]);
+		const auth = outcome === "rejected" ? vi.spyOn(ui.harness.session.modelRuntime, "checkAuth") : undefined;
+		try {
+			await ui.mode.init();
+			await ui.internal.handleHeartbeatCommand(`${schedule === "interval" ? "5m" : "12:01"}\nowning heartbeat`);
+			const heartbeat = ui.internal.heartbeats[0];
+			if (schedule === "interval") {
+				const now = Date.now();
+				vi.useFakeTimers({ toFake: ["Date"] });
+				vi.setSystemTime(now - 301_000);
+				ui.internal.markActivity();
+				vi.setSystemTime(now);
+				ui.internal.tickHeartbeats();
+				vi.useRealTimers();
+			} else {
+				ui.internal.fireHeartbeat(heartbeat.id);
+				expect(heartbeat.nextFireAt).toBeGreaterThan(Date.now());
+				const next = new Date(heartbeat.nextFireAt!);
+				expect([next.getHours(), next.getMinutes(), next.getSeconds()]).toEqual([12, 1, 0]);
+				expect(heartbeat.timer).toBeDefined();
+			}
+			await entered.promise;
+			ui.terminal.sendInput("unsent draft");
+			expect(ui.internal.editor.getText()).toBe("unsent draft");
+			await ui.internal.handleScheduleCommand('\n<pi_edit id="-1" role="user">after heartbeat</pi_edit>');
+			ui.internal.fireDueScheduledMessages();
+			await setImmediate();
+			expect(requests).toEqual([]);
+			expect(ui.harness.session.messages.map(getMessageText)).not.toContain("after heartbeat");
+			auth?.mockResolvedValue({ type: "api_key" }).mockRejectedValueOnce(new Error("heartbeat auth rejected"));
+			preflight.resolve();
+			await vi.waitFor(() =>
+				expect(requests).toEqual([outcome === "started" ? "owning heartbeat" : "after heartbeat"]),
+			);
+			response.resolve();
+			await vi.waitFor(() =>
+				expect(requests).toEqual(
+					outcome === "started" ? ["owning heartbeat", "after heartbeat"] : ["after heartbeat"],
+				),
+			);
+			await ui.harness.session.waitForIdle();
+		} finally {
+			preflight.resolve();
+			response.resolve();
+			auth?.mockRestore();
+			await ui.cleanup();
+		}
+	},
+);
+
+it("preserves other interval deadlines through a heartbeat-owned run and serves the most overdue next", async () => {
+	const ui = await createSchedulingMode();
+	const response = Promise.withResolvers<void>();
+	const requests: string[] = [];
+	ui.harness.setResponses([
+		async (context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			await response.promise;
+			return fauxAssistantMessage("short response");
+		},
+		(context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			return fauxAssistantMessage("long response");
+		},
+	]);
+	try {
+		await ui.mode.init();
+		await ui.internal.handleHeartbeatCommand("1m\nshort beat");
+		await ui.internal.handleHeartbeatCommand("5m\nlong beat");
+		const now = Date.now();
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(now - 301_000);
+		ui.internal.markActivity();
+		vi.setSystemTime(now);
+		ui.internal.tickHeartbeats();
+		vi.useRealTimers();
+		await vi.waitFor(() => expect(requests).toEqual(["short beat"]));
+		const longDeadline = ui.internal.heartbeats[1].nextFireAt;
+		ui.internal.tickHeartbeats();
+		expect(ui.internal.heartbeats[1].nextFireAt).toBe(longDeadline);
+		response.resolve();
+		await ui.harness.session.waitForIdle();
+		ui.internal.tickHeartbeats();
+		await vi.waitFor(() => expect(requests).toEqual(["short beat", "long beat"]));
+		await ui.harness.session.waitForIdle();
+	} finally {
+		response.resolve();
+		await ui.cleanup();
+	}
+});
+
+it.each(
+	(["interval", "daily"] as const).flatMap((schedule) =>
+		(["started", "no-op"] as const).map((outcome) => ({ schedule, outcome })),
+	),
+)("hands off a bare $schedule heartbeat with $outcome continuation", async ({ schedule, outcome }) => {
+	const ui = await createSchedulingMode();
+	const response = Promise.withResolvers<void>();
+	const requests: string[] = [];
+	if (outcome === "no-op") {
+		ui.harness.sessionManager.appendMessage(fauxAssistantMessage("completed answer"));
+		ui.harness.session.refreshContext();
+	}
+	ui.harness.setResponses([
+		async (context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			await response.promise;
+			return fauxAssistantMessage(outcome === "started" ? "heartbeat continued" : "scheduled after no-op");
+		},
+		(context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			return fauxAssistantMessage("after bare response");
+		},
+	]);
+	try {
+		await ui.mode.init();
+		await ui.internal.handleHeartbeatCommand(schedule === "interval" ? "5m" : "12:01");
+		if (schedule === "interval") {
+			const now = Date.now();
+			vi.useFakeTimers({ toFake: ["Date"] });
+			vi.setSystemTime(now - 301_000);
+			ui.internal.markActivity();
+			vi.setSystemTime(now);
+			ui.internal.tickHeartbeats();
+			vi.useRealTimers();
+		} else {
+			const heartbeat = ui.internal.heartbeats[0];
+			ui.internal.fireHeartbeat(heartbeat.id);
+			expect(heartbeat.nextFireAt).toBeGreaterThan(Date.now());
+			expect(heartbeat.timer).toBeDefined();
+		}
+		await ui.internal.handleScheduleCommand('\n<pi_edit id="-1" role="user">after bare heartbeat</pi_edit>');
+		if (outcome === "started") {
+			await vi.waitFor(() => expect(requests).toEqual(["original context"]));
+			ui.internal.fireDueScheduledMessages();
+			await setImmediate();
+			expect(ui.harness.session.messages.map(getMessageText)).not.toContain("after bare heartbeat");
+			response.resolve();
+			await vi.waitFor(() => expect(requests).toEqual(["original context", "after bare heartbeat"]));
+		} else {
+			await vi.waitFor(() => expect(requests).toEqual(["after bare heartbeat"]));
+			response.resolve();
+		}
+		await ui.harness.session.waitForIdle();
+		expect(ui.harness.session.getLastAssistantText()).toBe(
+			outcome === "started" ? "after bare response" : "scheduled after no-op",
+		);
+	} finally {
+		response.resolve();
+		await ui.cleanup();
+	}
+});
+
+it("chooses the most overdue interval rather than array or interval order", async () => {
+	const ui = await createSchedulingMode();
+	const response = Promise.withResolvers<void>();
+	const requests: string[] = [];
+	ui.harness.setResponses([
+		async (context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			await response.promise;
+			return fauxAssistantMessage("overdue response");
+		},
+	]);
+	try {
+		await ui.mode.init();
+		await ui.internal.handleHeartbeatCommand("1m\nfirst array beat");
+		await ui.internal.handleHeartbeatCommand("5m\nmost overdue beat");
+		const now = Date.now();
+		ui.internal.heartbeats[0].nextFireAt = now - 1000;
+		ui.internal.heartbeats[1].nextFireAt = now - 2000;
+		ui.internal.tickHeartbeats();
+		await vi.waitFor(() => expect(requests).toEqual(["most overdue beat"]));
+		response.resolve();
+		await ui.harness.session.waitForIdle();
+	} finally {
+		response.resolve();
+		await ui.cleanup();
+	}
+});
+
+it("ignores a stopped heartbeat's late handled outcome", async () => {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const ui = await createSchedulingMode({
+		extensionFactories: [
+			(pi) => {
+				pi.on("input", async (event) => {
+					if (event.text === "outgoing heartbeat") {
+						entered.resolve();
+						await release.promise;
+						return { action: "handled" };
+					}
+				});
+			},
+		],
+	});
+	try {
+		await ui.mode.init();
+		await ui.internal.handleHeartbeatCommand("12:01\noutgoing heartbeat");
+		ui.internal.fireHeartbeat(ui.internal.heartbeats[0].id);
+		await entered.promise;
+		ui.mode.stop();
+		release.resolve();
+		await setImmediate();
+		await setImmediate();
+		expect(ui.internal.heartbeats).toEqual([]);
+		expect(ui.harness.session.messages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
+			"original context",
+		]);
+		expect(ui.internal.scheduledMessages).toEqual([]);
+	} finally {
+		release.resolve();
+		await ui.cleanup();
+	}
+});
+
+it("releases heartbeat preflight when a settlement-deferred prompt later rejects", async () => {
+	const settledEntered = Promise.withResolvers<void>();
+	const settledRelease = Promise.withResolvers<void>();
+	let heldOnce = false;
+	const ui = await createSchedulingMode({
+		withConfiguredAuth: false,
+		extensionFactories: [
+			(pi) => {
+				pi.on("agent_settled", async () => {
+					if (heldOnce) return;
+					heldOnce = true;
+					settledEntered.resolve();
+					await settledRelease.promise;
+				});
+			},
+		],
+	});
+	const auth = vi.spyOn(ui.harness.session.modelRuntime, "checkAuth").mockResolvedValue({ type: "api_key" });
+	const requests: string[] = [];
+	ui.harness.setResponses([
+		(context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			return fauxAssistantMessage("seed");
+		},
+		(context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			return fauxAssistantMessage("after rejected heartbeat");
+		},
+	]);
+	let running: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		running = ui.harness.session.prompt("seed request");
+		const outcome = running.then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		await settledEntered.promise;
+		await ui.internal.handleHeartbeatCommand("12:01\ndeferred heartbeat");
+		ui.internal.fireHeartbeat(ui.internal.heartbeats[0].id);
+		await ui.internal.handleScheduleCommand('\n<pi_edit id="-1" role="user">after deferred rejection</pi_edit>');
+		auth.mockRejectedValueOnce(new Error("deferred heartbeat authentication failed"));
+		settledRelease.resolve();
+		expect(await outcome).toBeInstanceOf(Error);
+		await setImmediate();
+		await vi.waitFor(() => expect(requests).toEqual(["seed request", "after deferred rejection"]));
+		await ui.harness.session.waitForIdle();
+	} finally {
+		settledRelease.resolve();
+		await running?.catch(() => {});
+		auth.mockRestore();
 		await ui.cleanup();
 	}
 });
