@@ -83,7 +83,7 @@ The nested event is one of:
 | `thinking_delta` | `contentIndex`, `delta` | Append thinking text to the block. |
 | `thinking_end` | `contentIndex`, `content` | The thinking block ended with authoritative content. |
 | `toolcall_start` | `contentIndex`, `id`, `toolName` | A tool-call block started. |
-| `toolcall_delta` | `contentIndex`, `delta` | Append serialized argument data. |
+| `toolcall_delta` | `contentIndex`, `delta`, optional `rawDelta` | Append serialized argument data from `delta` and raw model-format tool tokens from `rawDelta` independently. Raw-only updates can have an empty `delta`. |
 | `toolcall_end` | `contentIndex`, `toolCall` | The tool call ended with the complete `ToolCall`. |
 | `done` | `reason`, `message` | The provider stream completed successfully. |
 | `error` | `reason`, `error` | The provider stream ended with an error or abort message. |
