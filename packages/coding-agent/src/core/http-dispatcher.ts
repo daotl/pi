@@ -10,6 +10,7 @@ export const HTTP_IDLE_TIMEOUT_CHOICES = [
 	{ label: "1 min", timeoutMs: 60_000 },
 	{ label: "2 min", timeoutMs: 120_000 },
 	{ label: "5 min", timeoutMs: 300_000 },
+	{ label: "2 hr", timeoutMs: DEFAULT_HTTP_IDLE_TIMEOUT_MS },
 	{ label: "disabled", timeoutMs: 0 },
 ] as const;
 

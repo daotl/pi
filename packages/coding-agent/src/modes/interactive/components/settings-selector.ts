@@ -520,7 +520,7 @@ export class SettingsSelectorComponent extends Container {
 				id: "http-idle-timeout",
 				label: "HTTP idle timeout",
 				description:
-					"Maximum idle gap while waiting for HTTP headers or body chunks. Disable for local models that pause longer than five minutes.",
+					"Maximum idle gap while waiting for HTTP headers or body chunks. Disable for local models that can pause longer than the selected timeout.",
 				currentValue: formatHttpIdleTimeoutMs(config.httpIdleTimeoutMs),
 				values: HTTP_IDLE_TIMEOUT_CHOICES.map((choice) => choice.label),
 			},

@@ -1,5 +1,6 @@
 import { setKeybindings } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { DEFAULT_HTTP_IDLE_TIMEOUT_MS } from "../src/core/http-dispatcher.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import {
 	type SettingsCallbacks,
@@ -61,6 +62,34 @@ describe("SettingsSelectorComponent", () => {
 		// #9758: custom values from settings.json stay in the cycle.
 		cycle("Fullscreen wheel scrolling", 3);
 		expect(onWheelScrollLinesChange.mock.calls.flat()).toEqual([10, "auto", 1]);
+	});
+
+	it("lets a user reselect the two-hour default after choosing a shorter HTTP idle timeout", () => {
+		const config = {
+			httpIdleTimeoutMs: DEFAULT_HTTP_IDLE_TIMEOUT_MS,
+			warnings: {},
+			defaultModel: "not set",
+			availableDefaultModels: [],
+			availableThinkingLevels: [],
+			modelThinkingLevels: {},
+			availableThemes: [],
+		} as unknown as SettingsConfig;
+		let selected = config.httpIdleTimeoutMs;
+		const callbacks = {
+			onHttpIdleTimeoutMsChange: (value: number) => {
+				selected = value;
+			},
+		} as unknown as SettingsCallbacks;
+		const list = new SettingsSelectorComponent(config, callbacks).getSettingsList();
+		for (const character of "HTTP idle timeout") list.handleInput(character);
+		expect(stripAnsi(list.render(120).join("\n"))).toContain("2 hr");
+		list.handleInput("\r");
+		expect(selected).toBe(0);
+		list.handleInput("\r");
+		expect(selected).toBe(30_000);
+		for (let i = 0; i < 4; i++) list.handleInput("\r");
+		expect(selected).toBe(DEFAULT_HTTP_IDLE_TIMEOUT_MS);
+		expect(stripAnsi(list.render(120).join("\n"))).toContain("2 hr");
 	});
 
 	it("keeps the configured fixed theme marked while browsing", () => {
