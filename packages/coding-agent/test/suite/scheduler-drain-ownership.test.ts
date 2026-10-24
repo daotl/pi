@@ -1,5 +1,5 @@
 import { setImmediate } from "node:timers/promises";
-import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { type AssistantMessage, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { isPadLinesToWidth, isWrapLinesToWidth, setPadLinesToWidth, setWrapLinesToWidth } from "@earendil-works/pi-tui";
 import { expect, it, vi } from "vitest";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
@@ -60,6 +60,7 @@ async function createSchedulingMode(options: HarnessOptions = {}) {
 		handleScheduleCommand(text: string): Promise<void>;
 		fireDueScheduledMessages(): void;
 		fireScheduledMessage(id: number): void;
+		countScheduledMessageEvent(message: AssistantMessage): void;
 		deferOrRunScheduledAction(entry: ScheduledMessage): void;
 		clearScheduledMessages(): void;
 		handleHeartbeatCommand(text: string): Promise<void>;
@@ -1220,6 +1221,150 @@ it("releases heartbeat preflight when a settlement-deferred prompt later rejects
 		settledRelease.resolve();
 		await running?.catch(() => {});
 		auth.mockRestore();
+		await ui.cleanup();
+	}
+});
+
+it.each(["time", "messages"] as const)(
+	"orders direct %s deliveries behind an owning prompt preflight",
+	async (trigger) => {
+		const entered = Promise.withResolvers<void>();
+		const preflight = Promise.withResolvers<void>();
+		const response = Promise.withResolvers<void>();
+		const editResponse = Promise.withResolvers<void>();
+		const inputs: string[] = [];
+		const ui = await createSchedulingMode({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", (event) => {
+						inputs.push(event.text);
+					});
+					pi.on("before_agent_start", async (event) => {
+						if (event.prompt === "first direct") {
+							entered.resolve();
+							await preflight.promise;
+						}
+					});
+				},
+			],
+		});
+		const requests: string[] = [];
+		ui.harness.setResponses([
+			async (context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				await response.promise;
+				return fauxAssistantMessage("first direct response");
+			},
+			(context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				return fauxAssistantMessage("second direct response");
+			},
+			async (context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				await editResponse.promise;
+				return fauxAssistantMessage("edited response");
+			},
+		]);
+		const makeDue = () => {
+			if (trigger === "messages")
+				ui.internal.countScheduledMessageEvent(fauxAssistantMessage("trigger contribution"));
+			else {
+				vi.setSystemTime(Date.now() + 1);
+				for (const entry of [...ui.internal.scheduledMessages])
+					if (entry.when.type === "time") ui.internal.fireScheduledMessage(entry.id);
+			}
+		};
+		try {
+			await ui.mode.init();
+			vi.useFakeTimers({ toFake: ["Date"] });
+			await ui.internal.handleScheduleCommand(`${trigger === "time" ? "0.001s" : "1"}\nfirst direct`);
+			makeDue();
+			vi.useRealTimers();
+			await entered.promise;
+			vi.useFakeTimers({ toFake: ["Date"] });
+			await ui.internal.handleScheduleCommand(`${trigger === "time" ? "0.001s" : "1"}\nsecond direct`);
+			await ui.internal.handleScheduleCommand(
+				`${trigger === "time" ? "0.001s" : "1"}\n<pi_edit id="-1" role="user">direct edited context</pi_edit>`,
+			);
+			makeDue();
+			vi.useRealTimers();
+			await setImmediate();
+			expect(requests).toEqual([]);
+			expect(inputs).toEqual(["first direct"]);
+			expect(ui.harness.session.messages.map(getMessageText)).not.toContain("direct edited context");
+			preflight.resolve();
+			await vi.waitFor(() => expect(requests).toEqual(["first direct"]));
+			expect(ui.harness.session.getFollowUpMessages()).toEqual([]);
+			response.resolve();
+			await vi.waitFor(() => expect(requests).toEqual(["first direct", "second direct", "direct edited context"]));
+			ui.internal.fireDueScheduledMessages();
+			await setImmediate();
+			expect(ui.harness.session.isStreaming).toBe(true);
+			editResponse.resolve();
+			await ui.harness.session.waitForIdle();
+			expect(ui.harness.session.getLastAssistantText()).toBe("edited response");
+		} finally {
+			preflight.resolve();
+			response.resolve();
+			editResponse.resolve();
+			vi.useRealTimers();
+			await ui.cleanup();
+		}
+	},
+);
+
+it("keeps a due ordinary message as follow-up during a genuinely active run", async () => {
+	const ui = await createSchedulingMode();
+	const response = Promise.withResolvers<void>();
+	const requests: string[] = [];
+	ui.harness.setResponses([
+		async () => {
+			requests.push("active seed");
+			await response.promise;
+			return fauxAssistantMessage("seed completed");
+		},
+		(context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			return fauxAssistantMessage("ordinary follow-up completed");
+		},
+	]);
+	let running: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		running = ui.harness.session.prompt("active seed");
+		await vi.waitFor(() => expect(requests).toEqual(["active seed"]));
+		await ui.internal.handleScheduleCommand("1\nordinary due message");
+		ui.internal.countScheduledMessageEvent(fauxAssistantMessage("count trigger"));
+		await vi.waitFor(() => expect(ui.harness.session.getFollowUpMessages()).toEqual(["ordinary due message"]));
+		expect(ui.harness.session.getSteeringMessages()).toEqual([]);
+		expect(requests).toEqual(["active seed"]);
+		response.resolve();
+		await running;
+		expect(requests).toEqual(["active seed", "ordinary due message"]);
+		expect(ui.harness.session.getLastAssistantText()).toBe("ordinary follow-up completed");
+	} finally {
+		response.resolve();
+		await running?.catch(() => {});
 		await ui.cleanup();
 	}
 });

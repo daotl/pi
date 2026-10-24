@@ -6189,26 +6189,24 @@ export class InteractiveMode {
 	}
 
 	private deliverScheduledEntry(entry: ScheduledMessage): void {
-		if (entry.isContinue || entry.isEdit) {
-			this.deferOrRunScheduledAction(entry);
+		if (
+			!entry.isContinue &&
+			!entry.isEdit &&
+			(this.session.isStreaming || this.session.isCompacting) &&
+			!this.settledDeliveryPending &&
+			!this.compactionQueueDeliveryPending &&
+			!this.heartbeatStartPending
+		) {
+			this.deliverScheduledMessage(entry.text);
 			return;
 		}
-		this.deliverScheduledMessage(entry.text);
+		this.deferOrRunScheduledAction(entry);
 	}
 
-	/** Run a scheduled continue/edit+continue once the session is idle. */
+	/** Preserve a due delivery's creation ID while waiting for idle dispatch ownership. */
 	private deferOrRunScheduledAction(entry: ScheduledMessage): void {
-		if (
-			this.session.isStreaming ||
-			this.session.isCompacting ||
-			this.settledDeliveryPending ||
-			this.heartbeatStartPending ||
-			this.compactionQueueDeliveryPending
-		) {
-			this.deferredScheduledActions.push(entry);
-			return;
-		}
-		this.runScheduledAction(entry);
+		this.deferredScheduledActions.push(entry);
+		this.fireDueScheduledMessages();
 	}
 
 	/** Apply a scheduled <pi_edit> payload (if any) and run a continue. */
@@ -6346,7 +6344,8 @@ export class InteractiveMode {
 		};
 		if (deferred && (!due || deferred.id < due.id)) {
 			this.deferredScheduledActions.splice(deferredIndex, 1);
-			this.runScheduledAction(deferred, () => finish(false));
+			if (deferred.isContinue || deferred.isEdit) this.runScheduledAction(deferred, () => finish(false));
+			else this.deliverScheduledMessage(deferred.text, finish);
 			return;
 		}
 		if (this.pendingCompactionContinue) {
