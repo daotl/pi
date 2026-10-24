@@ -51,6 +51,10 @@ function createTreeUI() {
 		showStatus: vi.fn(),
 		showError: vi.fn(),
 		flushCompactionQueue: vi.fn(async () => {}),
+		fireDueScheduledMessages: vi.fn(),
+		wakeNavigationDeferredWork() {
+			Reflect.get(InteractiveMode.prototype, "wakeNavigationDeferredWork").call(this);
+		},
 	};
 	const showTreeSelector = Reflect.get(InteractiveMode.prototype, "showTreeSelector") as (this: typeof ui) => void;
 	showTreeSelector.call(ui);

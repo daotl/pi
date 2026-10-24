@@ -91,6 +91,8 @@ Time- and message-count-triggered delivery follows the same dispatch arbitration
 
 Compaction-queued delivery keeps an independent owner while its first prompt passes preflight and runs. Later queued input drains before settled schedules, including when the parent extension command has already returned. The rest of a batch is queued only after the first prompt is accepted or handled. If that first prompt is rejected, the original batch remains ahead of newer queued input for explicit retry, and settled schedules do not bypass it; existing steering/follow-up modes are preserved.
 
+Tree navigation through the selector or an extension command wakes queued input and due scheduled work after success, cancellation or failure. Selector navigation restores its Escape handler and clears its branch-summary indicator before dispatch resumes. Existing queue ownership and idle checks still decide when work may run, and navigation does not overwrite an unsent draft.
+
 Interval heartbeats track individual deadlines and dispatch at most one most-overdue beat per idle tick. A run started by an interval beat preserves the other beats' deadlines; ordinary activity resets interval countdowns. Typing during heartbeat preflight withdraws that cadence preservation without releasing its dispatch exclusion. Handled or rejected heartbeat input wakes eligible settled schedules; daily beats skip busy or owned-preflight occurrences and rearm for the next local wall-clock occurrence. Bare heartbeat continuation uses the existing synchronous Session run-ownership handoff.
 
 See [Compaction Reference](compaction.md) for thresholds, retained boundaries, branch-summary behavior, and extension hooks.

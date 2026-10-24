@@ -1,10 +1,11 @@
 import { setImmediate } from "node:timers/promises";
 import { type AssistantMessage, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { isPadLinesToWidth, isWrapLinesToWidth, setPadLinesToWidth, setWrapLinesToWidth } from "@earendil-works/pi-tui";
-import { expect, it, vi } from "vitest";
+import { expect, it, type MockInstance, vi } from "vitest";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
 import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
 import { type AgentSessionServices, createAgentSessionFromServices } from "../../src/core/agent-session-services.ts";
+import type { TreeSelectorComponent } from "../../src/modes/interactive/components/tree-selector.ts";
 import {
 	type HeartbeatEntry,
 	InteractiveMode,
@@ -75,6 +76,11 @@ async function createSchedulingMode(options: HarnessOptions = {}) {
 		compactionQueuedMessages: Array<{ text: string; mode: "steer" | "followUp" }>;
 		scheduledMessages: ScheduledMessage[];
 		deferredScheduledActions: ScheduledMessage[];
+		showTreeSelector(initialSelectedId?: string): void;
+		showExtensionSelector(): Promise<string | undefined>;
+		editorContainer: { children: unknown[] };
+		defaultEditor: { onEscape?: () => void; setText(text: string): void; getText(): string };
+		activeStatusIndicator?: { kind: string };
 	};
 	return {
 		harness,
@@ -1365,6 +1371,196 @@ it("keeps a due ordinary message as follow-up during a genuinely active run", as
 	} finally {
 		response.resolve();
 		await running?.catch(() => {});
+		await ui.cleanup();
+	}
+});
+
+it.each(
+	(["selector", "extension"] as const).flatMap((navigation) =>
+		(["success", "cancel", "failure"] as const).flatMap((outcome) =>
+			(["continue", "edit"] as const).map((action) => ({ navigation, outcome, action })),
+		),
+	),
+)("wakes due $action after $navigation navigation $outcome and UI cleanup", async ({ navigation, outcome, action }) => {
+	const summaryEntered = Promise.withResolvers<void>();
+	const summaryGate = Promise.withResolvers<void>();
+	const responseGate = Promise.withResolvers<void>();
+	const ui = await createSchedulingMode({
+		fauxApi: "openai-completions",
+		extensionFactories: [
+			(pi) => {
+				pi.registerCommand("visit", {
+					handler: async (target, context) => {
+						await context.navigateTree(target, { summarize: true });
+					},
+				});
+				pi.on("session_before_tree", async () => {
+					summaryEntered.resolve();
+					await summaryGate.promise;
+					if (outcome === "cancel") return { cancel: true };
+					if (outcome === "success") return { summary: { summary: "departed branch summary" } };
+				});
+			},
+		],
+	});
+	ui.harness.sessionManager.appendMessage(fauxAssistantMessage("root answer"));
+	const target = ui.harness.sessionManager.getLeafId()!;
+	ui.harness.sessionManager.appendMessage({ role: "user", content: "departed request", timestamp: 2 });
+	ui.harness.sessionManager.appendMessage(fauxAssistantMessage("departed partial", { stopReason: "length" }));
+	ui.harness.session.refreshContext();
+	expect(target).not.toBe(ui.harness.sessionManager.getLeafId());
+	const requests: string[][] = [];
+	const atDispatch: Array<{ escape?: () => void; indicator?: string }> = [];
+	let navigationRun: Promise<void> | undefined;
+	let summaryChoice: ReturnType<typeof vi.spyOn> | undefined;
+	let errors: MockInstance<(text: string) => void> | undefined;
+	let extensionErrors: MockInstance<(path: string, text: string) => void> | undefined;
+	try {
+		await ui.mode.init();
+		const originalEscape = ui.internal.defaultEditor.onEscape;
+		errors = vi.spyOn(ui.mode as unknown as { showError(text: string): void }, "showError");
+		extensionErrors = vi.spyOn(
+			ui.mode as unknown as { showExtensionError(path: string, text: string): void },
+			"showExtensionError",
+		);
+		summaryChoice = vi.spyOn(ui.internal, "showExtensionSelector").mockResolvedValue("Summarize");
+		ui.harness.setResponses([
+			...(outcome === "failure"
+				? [fauxAssistantMessage("", { stopReason: "error", errorMessage: "summary provider failed" })]
+				: []),
+			async (context) => {
+				requests.push(context.messages.filter((message) => message.role === "user").map(getMessageText));
+				atDispatch.push({
+					escape: ui.internal.defaultEditor.onEscape,
+					indicator: ui.internal.activeStatusIndicator?.kind,
+				});
+				await responseGate.promise;
+				return fauxAssistantMessage(
+					action === "continue" && outcome !== "success"
+						? "departed partial continued"
+						: "scheduled navigation response",
+				);
+			},
+		]);
+		if (navigation === "extension") navigationRun = ui.harness.session.prompt(`/visit ${target}`);
+		else {
+			ui.internal.showTreeSelector(target);
+			const selector = ui.internal.editorContainer.children.find(
+				(child) => typeof child === "object" && child !== null && "getTreeList" in child,
+			) as TreeSelectorComponent | undefined;
+			if (!selector) throw new Error("Expected mounted real tree selector");
+			navigationRun = Promise.resolve(selector.getTreeList().onSelect!(target));
+		}
+		await summaryEntered.promise;
+		expect(ui.harness.session.isCompacting).toBe(true);
+		await ui.internal.handleScheduleCommand(
+			`1\n${action === "edit" ? '<pi_edit id="-1" role="user">scheduled branch edit</pi_edit>' : ""}`,
+		);
+		ui.internal.countScheduledMessageEvent(fauxAssistantMessage("meaningful due contribution"));
+		ui.internal.defaultEditor.setText("unsent navigation draft");
+		expect(requests).toEqual([]);
+		summaryGate.resolve();
+		await navigationRun;
+		if (outcome === "success") {
+			expect(
+				ui.harness.sessionManager
+					.getBranch()
+					.some((entry) => entry.type === "branch_summary" && entry.summary === "departed branch summary"),
+			).toBe(true);
+		} else {
+			expect(ui.harness.session.messages.map(getMessageText)).toContain("departed request");
+			expect(ui.harness.sessionManager.getBranch().some((entry) => entry.type === "branch_summary")).toBe(false);
+			if (outcome === "failure") {
+				const diagnostics = [
+					...(errors?.mock.calls.map(([text]) => String(text)) ?? []),
+					...(extensionErrors?.mock.calls.map(([, text]) => String(text)) ?? []),
+				];
+				expect(diagnostics.join("\n")).toContain("summary provider failed");
+			}
+		}
+		await vi.waitFor(() => expect(requests).toHaveLength(1));
+		expect(atDispatch[0].escape).toBe(originalEscape);
+		expect(atDispatch[0].indicator).not.toBe("branchSummary");
+		if (action === "continue" && outcome === "success") {
+			expect(requests[0]).toContain("original context");
+			expect(requests[0].at(-1)).toContain("departed branch summary");
+			expect(requests[0]).not.toContain("scheduled branch edit");
+		} else expect(requests[0].at(-1)).toBe(action === "edit" ? "scheduled branch edit" : "departed request");
+		responseGate.resolve();
+		await ui.harness.session.waitForIdle();
+		expect(ui.internal.defaultEditor.getText()).toBe("unsent navigation draft");
+	} finally {
+		summaryGate.resolve();
+		responseGate.resolve();
+		await navigationRun?.catch(() => {});
+		summaryChoice?.mockRestore();
+		errors?.mockRestore();
+		extensionErrors?.mockRestore();
+		await ui.cleanup();
+	}
+});
+
+it("does not flush another navigation's queued input when a second extension navigation is rejected", async () => {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const inputs: string[] = [];
+	const ui = await createSchedulingMode({
+		extensionFactories: [
+			(pi) => {
+				pi.registerCommand("visit-busy", {
+					handler: async (target, context) => {
+						await context.navigateTree(target, { summarize: true });
+					},
+				});
+				pi.on("session_before_tree", async () => {
+					entered.resolve();
+					await release.promise;
+					return { cancel: true };
+				});
+				pi.on("input", (event) => {
+					inputs.push(event.text);
+				});
+			},
+		],
+	});
+	ui.harness.sessionManager.appendMessage(fauxAssistantMessage("earlier target"));
+	const target = ui.harness.sessionManager.getLeafId()!;
+	ui.harness.sessionManager.appendMessage({ role: "user", content: "later branch", timestamp: 2 });
+	ui.harness.session.refreshContext();
+	const requests: string[] = [];
+	ui.harness.setResponses([
+		(context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			return fauxAssistantMessage("queued navigation result");
+		},
+	]);
+	let first: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		first = ui.harness.session.prompt(`/visit-busy ${target}`);
+		await entered.promise;
+		ui.internal.queueCompactionMessage("queued under first navigation", "followUp");
+		await ui.harness.session.prompt(`/visit-busy ${target}`);
+		await setImmediate();
+		expect(ui.harness.session.isCompacting).toBe(true);
+		expect(inputs).toEqual([]);
+		expect(requests).toEqual([]);
+		expect(ui.internal.compactionQueuedMessages.map((entry) => entry.text)).toEqual([
+			"queued under first navigation",
+		]);
+		release.resolve();
+		await first;
+		await vi.waitFor(() => expect(requests).toEqual(["queued under first navigation"]));
+		await ui.harness.session.waitForIdle();
+		expect(inputs).toEqual(["queued under first navigation"]);
+	} finally {
+		release.resolve();
+		await first?.catch(() => {});
 		await ui.cleanup();
 	}
 });
