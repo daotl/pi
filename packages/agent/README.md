@@ -133,6 +133,8 @@ When you use the `Agent` class, assistant `message_end` processing is treated as
 
 Prefill continuations must reproduce the complete successful terminal echo before that message is published or any tool preflight runs, even if an earlier streamed partial matched. Raw-less tool calls must retain semantically equal JSON arguments (object key order is ignored; array order and nested values are not). Incomplete streamed arguments remain provisional. A mismatch aborts the active request and finishes through the normal error-event lifecycle; a rejected completed response keeps its usage and physical response metadata in a content-free failure message, while a streaming-only failure invents no completed charge. Restoring the original prefix remains the session owner's responsibility.
 
+Trailing whitespace in an explicit OpenAI Completions prefill is significant. Its text and supported raw reasoning fields retain that whitespace for echo verification; ordinary non-prefill replay still filters empty blocks. Do not trim the prefix before dispatch or compare only a normalized partial echo.
+
 ### Request preparation and turn finalization
 
 `prepareRequest` runs immediately before every conversational provider request, including the first. Use it to install canonical persisted context after pending input has been emitted:
@@ -582,6 +584,8 @@ for await (const event of agentLoopContinue(context, config, undefined, streamFn
 ```
 
 These low-level streams are observational. They preserve event order, but they do not wait for your async event handling to settle before later producer phases continue. If you need message processing to act as a barrier before tool preflight, use the `Agent` class instead of raw `agentLoop()` or `agentLoopContinue()`.
+
+Asynchronous preparation or provider failures settle these streams through an assistant error or aborted message, `turn_end`, and `agent_end`; they do not leave the event iterator open. Invalid initial continuation context still throws synchronously before a stream is returned. Handle that call-time validation separately from terminal events.
 
 ## License
 
