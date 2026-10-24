@@ -108,9 +108,8 @@ export class FooterComponent implements Component {
 	}
 
 	/**
-	 * Usage totals and context usage scan the whole session, and the footer renders on every frame.
-	 * Entries are append-only and every append moves the leaf. The cache also follows the
-	 * limits model and summary budget; completed asynchronous compaction counts invalidate it explicitly.
+	 * Cumulative usage scans the whole session and is cached by durable entry identity.
+	 * Context usage remains live: Session owns conversion-policy and exact-count validity.
 	 */
 	private getSessionStats(): SessionStats {
 		const sessionManager = this.session.sessionManager;
@@ -129,6 +128,7 @@ export class FooterComponent implements Component {
 			cached.limitsModel === limitsModel &&
 			cached.summaryBlockMaxTokens === summaryBlockMaxTokens
 		) {
+			cached.contextUsage = this.session.getContextUsage();
 			return cached;
 		}
 

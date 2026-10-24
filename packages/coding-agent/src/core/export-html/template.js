@@ -1087,7 +1087,7 @@
 
       /**
        * Download the session data as a JSONL file.
-       * Reconstructs the original format: header line + entry lines.
+       * Reconstructs the original format, including the exported session selection.
        */
       window.downloadSessionJson = function() {
         // Build JSONL content: header first, then all entries
@@ -1097,6 +1097,11 @@
         }
         for (const entry of entries) {
           lines.push(JSON.stringify(entry));
+        }
+        // Preserve the exported selection, not temporary navigation in the viewer.
+        // Legacy exports without selection metadata retain their last-entry fallback.
+        if (defaultLeafId !== undefined) {
+          lines.push(JSON.stringify({ type: 'leaf', leafId: defaultLeafId }));
         }
         const jsonlContent = lines.join('\n');
 

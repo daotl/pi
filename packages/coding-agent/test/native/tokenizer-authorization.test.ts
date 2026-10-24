@@ -3,7 +3,7 @@ import { fauxAssistantMessage, normalizeContext, toToolDeclaration } from "@eare
 import { streamSimple as streamNative } from "@earendil-works/pi-ai/api/openai-completions";
 import { afterEach, expect, it, vi } from "vitest";
 import type { CompactionEntry, SessionManager } from "../../src/core/session-manager.ts";
-import { createHarness, type HarnessOptions } from "./harness.ts";
+import { createHarness, type HarnessOptions } from "../suite/harness.ts";
 import { createNativeTokenizerFixture, privateMarker } from "./tokenizer-fixture.ts";
 
 const cleanups: Array<() => void> = [];
@@ -671,6 +671,56 @@ it.each(["block-images", "incoming-prefix"] as const)(
 				else expect(upload.body).toContain("NEW_LIVE_PREFIX");
 			}
 			expect(fixture.session.getContextUsage()?.tokens).not.toBe(100);
+		} finally {
+			release.resolve();
+			await outcome;
+		}
+	},
+);
+
+it.each(["preparation", "summary"] as const)(
+	"revokes same-function converter redaction during the %s recheck",
+	async (phase) => {
+		const fixture = await nativeFixture();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let redacted = false;
+		let matching = 0;
+		const convert = fixture.session.agent.convertToLlm;
+		fixture.session.agent.convertToLlm = (messages) =>
+			convert(redacted ? messages.filter((message) => !JSON.stringify(message).includes(privateMarker)) : messages);
+		const transform = fixture.session.agent.transformContext;
+		fixture.session.agent.transformContext = async (messages, signal) => {
+			const transformed = transform ? await transform(messages, signal) : messages;
+			const summary = messages.some((message) => message.role === "compactionSummary");
+			const committed = fixture.manager.getBranch().some((entry) => entry.type === "compaction");
+			if ((phase === "preparation" ? !summary : summary && !committed) && ++matching === 2) {
+				entered.resolve();
+				await release.promise;
+			}
+			return transformed;
+		};
+		const outcome = fixture.session
+			.compact(phase === "preparation" ? { keepRecentTokens: 1 } : { keepRecentMessages: 2 })
+			.then(
+				(result) => ({ result }),
+				(error: unknown) => ({ error }),
+			);
+		try {
+			await Promise.race([
+				entered.promise,
+				outcome.then(() => {
+					throw new Error("Stable converter gate did not start");
+				}),
+			]);
+			const accepted = fixture.uploads.length;
+			redacted = true;
+			release.resolve();
+			expect(await outcome).toMatchObject({ result: { summary: "safe checkpoint" } });
+			for (const upload of fixture.uploads.slice(accepted)) {
+				expect(upload.body).not.toContain(privateMarker);
+				if (phase === "summary") expect(upload.url).not.toMatch(/\/tokenize$/);
+			}
 		} finally {
 			release.resolve();
 			await outcome;

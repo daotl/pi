@@ -852,7 +852,14 @@ export async function generateSummaryWithUsage(
 					...(baseline ? [baseline] : []),
 					{
 						role: "user",
-						content: serializeConversation(transformMessages(llmMessages, model)),
+						content: transformMessages(llmMessages, model).flatMap((message) => {
+							const text = serializeConversation([message]);
+							// Keep each converted message's images alongside its bounded text.
+							const images = Array.isArray(message.content)
+								? message.content.filter((block) => block.type === "image")
+								: [];
+							return [...(text ? [{ type: "text" as const, text }] : []), ...images];
+						}),
 						timestamp: Date.now(),
 					},
 					instruction,

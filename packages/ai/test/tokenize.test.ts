@@ -192,6 +192,30 @@ describe("countTokens", () => {
 		await expect(promise).resolves.toBeUndefined();
 	});
 
+	it("cancels an unlimited retry during backoff without another request or unavailability", async () => {
+		vi.useFakeTimers();
+		try {
+			const controller = new AbortController();
+			const fetchFn = vi.fn<typeof globalThis.fetch>(async () => new Response("busy", { status: 503 }));
+			const onUnavailable = vi.fn();
+			const request = countTokensWithRetry(
+				model("http://host:8080"),
+				{ text: "history", fetch: fetchFn, signal: controller.signal },
+				{ enabled: true, maxRetries: Infinity, baseDelayMs: 1000, maxAgentDelayMs: 1000 },
+				onUnavailable,
+			);
+			await vi.advanceTimersByTimeAsync(1000);
+			expect(fetchFn).toHaveBeenCalledTimes(2);
+			controller.abort(new Error("cancel token count"));
+			await expect(request).resolves.toBeUndefined();
+			await vi.advanceTimersByTimeAsync(10_000);
+			expect(fetchFn).toHaveBeenCalledTimes(2);
+			expect(onUnavailable).not.toHaveBeenCalled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("returns undefined when the request is aborted", async () => {
 		const controller = new AbortController();
 		const fetchFn = (async () => {

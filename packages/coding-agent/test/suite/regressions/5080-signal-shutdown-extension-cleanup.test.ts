@@ -1,11 +1,22 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isPadLinesToWidth, isWrapLinesToWidth, setPadLinesToWidth, setWrapLinesToWidth } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { VirtualTerminal } from "../../../../tui/test/virtual-terminal.ts";
 import { APP_NAME } from "../../../src/config.ts";
+import { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.ts";
+import { type AgentSessionServices, createAgentSessionFromServices } from "../../../src/core/agent-session-services.ts";
 import type { SessionManager } from "../../../src/core/session-manager.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
+import {
+	isMessageBackground,
+	isMessageSeparator,
+	setMessageBackground,
+	setMessageSeparator,
+} from "../../../src/modes/interactive/theme/theme.ts";
+import { createHarness } from "../harness.ts";
 
 // Regression for https://github.com/earendil-works/pi/issues/5080
 //
@@ -139,6 +150,113 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 
 		expect(order).toEqual(["drainInput", "suspend", "dispose", "stop"]);
 	});
+
+	test.each(["regular", "fullscreen"] as const)(
+		"repaints %s after disposal rejects with shutdown UI updates pending, without keyboard input",
+		async (tuiMode) => {
+			const previous = {
+				pad: isPadLinesToWidth(),
+				wrap: isWrapLinesToWidth(),
+				background: isMessageBackground(),
+				separator: isMessageSeparator(),
+			};
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			let failFlush = false;
+			let commandCalls = 0;
+			const harness = await createHarness({
+				settings: { quietStartup: true, compaction: { enabled: false }, retry: { enabled: false } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_shutdown", async (_event, ctx) => {
+							ctx.ui.notify("shutdown cleanup notice");
+							entered.resolve();
+							await release.promise;
+						});
+						pi.registerCommand("still-registered", {
+							handler: async () => {
+								commandCalls++;
+							},
+						});
+					},
+				],
+			});
+			const services: AgentSessionServices = {
+				cwd: harness.sessionManager.getCwd(),
+				agentDir: harness.tempDir,
+				modelRuntime: harness.session.modelRuntime,
+				settingsManager: harness.settingsManager,
+				resourceLoader: harness.session.resourceLoader,
+				diagnostics: [],
+			};
+			const runtime = new AgentSessionRuntime(
+				harness.session,
+				services,
+				async ({ sessionManager, sessionStartEvent }) => ({
+					...(await createAgentSessionFromServices({
+						services,
+						sessionManager,
+						sessionStartEvent,
+						model: harness.getModel(),
+						noTools: "all",
+					})),
+					services,
+					diagnostics: [],
+				}),
+			);
+			const terminal = new VirtualTerminal(120, 40);
+			const mode = new InteractiveMode(runtime, { terminal, tuiMode });
+			const internal = mode as unknown as {
+				shutdown(): Promise<void>;
+				isShuttingDown: boolean;
+				defaultEditor: { setText(text: string): void };
+			};
+			const flushPendingUsage = harness.session.flushPendingUsage.bind(harness.session);
+			const flush = vi.spyOn(harness.session, "flushPendingUsage").mockImplementation(() => {
+				if (failFlush) {
+					failFlush = false;
+					throw new Error("shutdown receipt unavailable");
+				}
+				flushPendingUsage();
+			});
+			try {
+				await mode.init();
+				mode.showWarning("original session remains usable");
+				internal.defaultEditor.setText("unsent recovery draft");
+				await terminal.waitForRender();
+				expect(terminal.getViewport().join("\n")).toContain("original session remains usable");
+
+				const shutdown = internal.shutdown();
+				await entered.promise;
+				await terminal.waitForRender();
+				expect(internal.isShuttingDown).toBe(true);
+				expect(terminal.getViewport().join("\n")).not.toContain("shutdown cleanup notice");
+				failFlush = true;
+				release.resolve();
+				await shutdown;
+				await terminal.waitForRender();
+
+				const resumed = terminal.getViewport().join("\n");
+				expect(resumed).toContain("shutdown cleanup notice");
+				expect(resumed).toContain("Failed to shut down: shutdown receipt unavailable");
+				expect(resumed).toContain("original session remains usable");
+				expect(resumed).toContain("unsent recovery draft");
+				expect(internal.isShuttingDown).toBe(false);
+				await harness.session.prompt("/still-registered");
+				expect(commandCalls).toBe(1);
+			} finally {
+				release.resolve();
+				flush.mockRestore();
+				mode.stop();
+				await runtime.dispose();
+				harness.cleanup();
+				setPadLinesToWidth(previous.pad);
+				setWrapLinesToWidth(previous.wrap);
+				setMessageBackground(previous.background);
+				setMessageSeparator(previous.separator);
+			}
+		},
+	);
 
 	test("interactive quit appends the resume hint without erasing terminal history", async () => {
 		vi.spyOn(process, "exit").mockImplementation((() => {

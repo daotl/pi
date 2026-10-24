@@ -4,7 +4,7 @@ import { expect, vi } from "vitest";
 import type { AgentSession } from "../../src/core/agent-session.ts";
 import { createAgentSession } from "../../src/core/sdk.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
-import { createHarness, type Harness, type HarnessOptions } from "./harness.ts";
+import { createHarness, type Harness, type HarnessOptions } from "../suite/harness.ts";
 
 export const privateMarker = "PRIVATE_TOKENIZER_HISTORY";
 

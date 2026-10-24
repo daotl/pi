@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { createProvider, fauxAssistantMessage, normalizeContext } from "@earendil-works/pi-ai";
+import { createProvider, fauxAssistantMessage, type ImageContent, normalizeContext } from "@earendil-works/pi-ai";
 import { googleGenerativeAIApi } from "@earendil-works/pi-ai/api/google-generative-ai.lazy";
 import { estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
 import { afterEach, expect, it, vi } from "vitest";
@@ -124,6 +124,146 @@ it.each([100, 25000, 50000])(
 			expect(body).not.toContain('"role":"tool"');
 		}
 		for (const entry of before) expect(current.manager.getEntry(entry.id)).toEqual(entry);
+	},
+);
+
+it.each(["native", "faux"] as const)(
+	"preserves policy-visible images in bounded %s summary requests",
+	async (provider) => {
+		const current = await createNativeTokenizerFixture({
+			models: [{ id: "vision", input: ["text", "image"], contextWindow: 10000, maxTokens: 4096 }],
+			settings: { compaction: { enabled: false, reserveTokens: 4096 }, retry: { enabled: false } },
+		});
+		fixtures.push(current);
+		const session = provider === "native" ? current.session : current.owner.session;
+		const manager = provider === "native" ? current.manager : current.owner.sessionManager;
+		const selected = session.model;
+		if (!selected) throw new Error("Missing vision model");
+		await session.setModel({ ...selected, contextWindow: 10000, maxTokens: 4096 });
+		const userImage: ImageContent = { type: "image", mimeType: "image/png", data: "dXNlciBzY3JlZW5zaG90" };
+		const toolImage: ImageContent = { type: "image", mimeType: "image/png", data: "dG9vbCBzY3JlZW5zaG90" };
+		const privateImage: ImageContent = { type: "image", mimeType: "image/png", data: "cHJpdmF0ZSBpbWFnZQ==" };
+		manager.appendMessage({ role: "system", content: "PRIVATE_RAW_AUTHORITY", timestamp: 0 });
+		manager.appendMessage({ role: "user", content: [userImage, privateImage], timestamp: 1 });
+		manager.appendMessage({
+			...fauxAssistantMessage({ type: "toolCall", id: "vision-read", name: "read", arguments: {} }),
+			api: selected.api,
+			provider: selected.provider,
+			model: selected.id,
+			stopReason: "toolUse",
+		});
+		manager.appendMessage({
+			role: "toolResult",
+			toolCallId: "vision-read",
+			toolName: "read",
+			content: [{ type: "text", text: `VISIBLE_TOOL_START ${"x".repeat(50000)} PRIVATE_TOOL_TAIL` }, toolImage],
+			isError: false,
+			timestamp: 2,
+		});
+		manager.appendMessage({ role: "user", content: "retained input", timestamp: 3 });
+		session.refreshContext();
+		const convert = session.agent.convertToLlm;
+		session.agent.convertToLlm = async (messages) =>
+			(await convert(messages))
+				.filter((message) => message.role !== "system")
+				.map((message) =>
+					message.role === "user" && Array.isArray(message.content)
+						? {
+								...message,
+								content: message.content.filter(
+									(block) => block.type !== "image" || block.data !== privateImage.data,
+								),
+							}
+						: message,
+				);
+		const seenImages: ImageContent[][] = [];
+		current.owner.setResponses([
+			(context, options) => {
+				seenImages.push(
+					context.messages.flatMap((message) =>
+						Array.isArray(message.content) ? message.content.filter((block) => block.type === "image") : [],
+					),
+				);
+				expect(JSON.stringify(context.messages)).toContain("VISIBLE_TOOL_START");
+				expect(JSON.stringify(context.messages)).not.toContain("PRIVATE_TOOL_TAIL");
+				expect(JSON.stringify(context.messages)).not.toContain("PRIVATE_RAW_AUTHORITY");
+				expect(
+					context.messages.reduce((total, message) => total + estimateMessageTokens(message), 0) +
+						(options?.maxTokens ?? 0),
+				).toBeLessThanOrEqual(10000);
+				return fauxAssistantMessage("image-aware checkpoint");
+			},
+		]);
+		const before = structuredClone(manager.getEntries());
+		const result = await session.compact({ keepRecentMessages: 1 });
+		expect(result.summary).toContain(provider === "native" ? "safe checkpoint" : "image-aware checkpoint");
+		if (provider === "native") {
+			expect(current.summaries).toHaveLength(1);
+			const wire = JSON.parse(current.summaries[0].body) as {
+				messages: Array<{ content: string | Array<{ type: string; image_url?: { url: string } }> }>;
+			};
+			const images = wire.messages.flatMap((message) =>
+				Array.isArray(message.content)
+					? message.content.filter((block) => block.type === "image_url").map((block) => block.image_url?.url)
+					: [],
+			);
+			expect(images).toEqual([userImage, toolImage].map((image) => `data:${image.mimeType};base64,${image.data}`));
+			expect(current.summaries[0].body).toContain("VISIBLE_TOOL_START");
+			expect(current.summaries[0].body).not.toContain("PRIVATE_TOOL_TAIL");
+			expect(current.summaries[0].body).not.toContain("PRIVATE_RAW_AUTHORITY");
+		} else expect(seenImages).toEqual([[userImage, toolImage]]);
+		for (const entry of before) expect(manager.getEntry(entry.id)).toEqual(entry);
+	},
+);
+
+it.each(["native", "faux"] as const)(
+	"rejects unfit images before %s dispatch or checkpoint publication",
+	async (provider) => {
+		const current = await createNativeTokenizerFixture({
+			models: [{ id: "vision", input: ["text", "image"], contextWindow: 10000, maxTokens: 4096 }],
+			settings: { compaction: { enabled: false, reserveTokens: 4096 }, retry: { enabled: false } },
+		});
+		fixtures.push(current);
+		const session = provider === "native" ? current.session : current.owner.session;
+		const manager = provider === "native" ? current.manager : current.owner.sessionManager;
+		const selected = session.model;
+		if (!selected) throw new Error("Missing vision model");
+		await session.setModel({ ...selected, contextWindow: 10000, maxTokens: 4096 });
+		manager.appendMessage({
+			role: "user",
+			content: Array.from({ length: 9 }, (_, index) => ({
+				type: "image" as const,
+				mimeType: "image/png",
+				data: Buffer.from(`screenshot ${index}`).toString("base64"),
+			})),
+			timestamp: 1,
+		});
+		manager.appendMessage({
+			...fauxAssistantMessage({ type: "toolCall", id: "unfit-read", name: "read", arguments: {} }),
+			api: selected.api,
+			provider: selected.provider,
+			model: selected.id,
+			stopReason: "toolUse",
+		});
+		manager.appendMessage({
+			role: "toolResult",
+			toolCallId: "unfit-read",
+			toolName: "read",
+			content: [{ type: "text", text: "x".repeat(50000) }],
+			isError: false,
+			timestamp: 2,
+		});
+		manager.appendMessage({ role: "user", content: "retained input", timestamp: 3 });
+		session.refreshContext();
+		current.owner.setResponses([fauxAssistantMessage("must not publish")]);
+		const callsBefore = current.owner.faux.state.callCount;
+		const before = structuredClone(manager.getEntries());
+		const leaf = manager.getLeafId();
+		await expect(session.compact({ keepRecentMessages: 1 })).rejects.toThrow(/token budget/);
+		expect(current.summaries).toEqual([]);
+		expect(current.owner.faux.state.callCount).toBe(callsBefore);
+		expect(manager.getEntries()).toEqual(before);
+		expect(manager.getLeafId()).toBe(leaf);
 	},
 );
 

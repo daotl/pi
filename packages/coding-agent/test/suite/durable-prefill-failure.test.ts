@@ -807,3 +807,64 @@ it("restores a prompt-owned captured prefix after aborting its automatic retry m
 		harness.cleanup();
 	}
 });
+
+it.each(["delete", "delete-parent", "soft-delete", "shred", "replace"] as const)(
+	"does not replay failed prefix recovery after accepted %s",
+	async (mutation) => {
+		const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+		const harness = await createHarness({
+			cwd,
+			sessionManager: manager,
+			fauxApi: "openai-completions",
+			settings: { retry: { enabled: false }, compaction: { enabled: false } },
+		});
+		try {
+			harness.setResponses([fauxAssistantMessage("abandoned partial", { stopReason: "aborted" })]);
+			await harness.session.prompt("original question");
+			const prefix = manager
+				.getBranch()
+				.findLast((entry) => entry.type === "message" && entry.message.role === "assistant")!;
+			const parent = prefix.parentId!;
+			let armed = false;
+			const off = harness.session.subscribe((event) => {
+				if (event.type === "turn_end" && event.message.role === "assistant" && event.message.stopReason === "error")
+					armed = true;
+			});
+			const actual = await vi.importActual<typeof fs>("fs");
+			let failed = false;
+			vi.mocked(fs.writeFileSync).mockImplementation((...args) => {
+				if (armed && !failed) {
+					failed = true;
+					throw new Error("held recovery write failed");
+				}
+				return actual.writeFileSync(...args);
+			});
+			harness.setResponses([fauxAssistantMessage("wrong terminal")]);
+			await expect(harness.session.continue()).rejects.toBeInstanceOf(Error);
+			expect(failed).toBe(true);
+			off();
+			vi.mocked(fs.writeFileSync).mockImplementation(actual.writeFileSync);
+			if (mutation === "delete") harness.session.deleteLastMessages(1);
+			else if (mutation === "delete-parent") harness.session.deleteMessage(parent);
+			else if (mutation === "soft-delete") expect(harness.session.softDeleteMessage(prefix.id)).toBe(true);
+			else if (mutation === "shred") harness.session.shredLastMessages(1);
+			else harness.session.applyMessageEdits('<pi_edit id="1" role="user">accepted replacement</pi_edit>');
+			const accepted = harness.session.messages.filter((message) => message.role !== "system").map(getMessageText);
+			let requested: string[] = [];
+			harness.setResponses([
+				(context) => {
+					requested = context.messages.filter((message) => message.role !== "system").map(getMessageText);
+					return fauxAssistantMessage("next answer");
+				},
+			]);
+			await harness.session.prompt("next request");
+			expect(requested).toEqual([...accepted, "next request"]);
+			expect(SessionManager.open(manager.getSessionFile()!).buildSessionContext().messages).toEqual(
+				harness.session.messages,
+			);
+		} finally {
+			await harness.session.abort();
+			harness.cleanup();
+		}
+	},
+);

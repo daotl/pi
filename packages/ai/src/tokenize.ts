@@ -18,6 +18,7 @@ import type { Model, ProviderHeaders } from "./types.ts";
 import { providerHeadersToRecord } from "./utils/headers.ts";
 import { getPiUserAgent } from "./utils/pi-user-agent.ts";
 import { type RetryPolicy, retryDelayMs } from "./utils/retry.ts";
+import { sleep } from "./utils/sleep.ts";
 
 export interface CountTokensOptions {
 	text: string;
@@ -247,24 +248,6 @@ export async function countChatTokens(model: Model<any>, options: CountChatToken
 	}
 }
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) {
-			reject(new Error("Aborted"));
-			return;
-		}
-		const timeout = setTimeout(resolve, ms);
-		signal?.addEventListener(
-			"abort",
-			() => {
-				clearTimeout(timeout);
-				reject(new Error("Aborted"));
-			},
-			{ once: true },
-		);
-	});
-}
-
 /**
  * Count tokens via `/tokenize`, retrying transient failures with the same
  * exponential-backoff policy used by assistant calls.
@@ -300,7 +283,9 @@ export async function countTokensWithRetry(
 			if (attempt >= maxAttempts) return undefined;
 			attempt++;
 			try {
-				await sleep(retryDelayMs(policy!, attempt), options.signal);
+				const delay = retryDelayMs(policy!, attempt);
+				if (options.signal) await sleep(delay, options.signal);
+				else await new Promise<void>((resolve) => setTimeout(resolve, delay));
 			} catch (sleepError) {
 				// Abort during the backoff sleep is terminal: stop retrying.
 				if (options.signal?.aborted) return undefined;

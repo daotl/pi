@@ -154,8 +154,8 @@ it.each(["compact", "branch"] as const)(
 			return stream;
 		};
 		const retry = { enabled: true, maxRetries: 1, baseDelayMs: 0, maxDelayMs: 0 };
-		if (operation === "compact")
-			await generateSummaryWithUsage(
+		if (operation === "compact") {
+			const result = await generateSummaryWithUsage(
 				shared,
 				model,
 				1000,
@@ -172,8 +172,9 @@ it.each(["compact", "branch"] as const)(
 				undefined,
 				agent,
 			);
-		else
-			await generateBranchSummary(
+			expect(result.text).toBe("isolated summary");
+		} else {
+			const result = await generateBranchSummary(
 				[
 					{
 						type: "message",
@@ -185,6 +186,9 @@ it.each(["compact", "branch"] as const)(
 				],
 				{ model, agent, streamFn, retry, signal: new AbortController().signal },
 			);
+			expect(result.summary).toContain("isolated summary");
+		}
+		expect(snapshots).toHaveLength(2);
 		for (const snapshot of snapshots) {
 			expect(snapshot).toContain("SHARED CONVERTER HISTORY");
 			expect(snapshot).not.toContain("TRANSPORT MUTATION");

@@ -122,4 +122,48 @@ describe("deferred output persistence settlement", () => {
 			}
 		},
 	);
+
+	it("does not republish a committed custom record after its subscriber throws", async () => {
+		const cwd = fs.mkdtempSync(join(tmpdir(), "pi-custom-notification-"));
+		directories.push(cwd);
+		const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+		const harness = await createHarness({
+			cwd,
+			sessionManager: manager,
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+		});
+		harnesses.push(harness);
+		const failure = new Error("custom subscriber rejected after append");
+		let queued = false;
+		let failed = false;
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "agent_end" && !queued) {
+				queued = true;
+				void harness.session.sendCustomMessage(
+					{ customType: "one-publication", content: "accepted once", display: false },
+					{ triggerTurn: false },
+				);
+			}
+			if (event.type === "message_start" && event.message.role === "custom" && !failed) {
+				failed = true;
+				throw failure;
+			}
+		});
+		try {
+			harness.setResponses([fauxAssistantMessage("first answer")]);
+			await expect(harness.session.prompt("first request")).rejects.toBe(failure);
+			harness.setResponses([fauxAssistantMessage("next answer")]);
+			await harness.session.prompt("next request");
+			for (const current of [manager, SessionManager.open(manager.getSessionFile()!)]) {
+				expect(
+					current
+						.getEntries()
+						.filter((entry) => entry.type === "custom_message" && entry.customType === "one-publication")
+						.map(getMessageText),
+				).toEqual(["accepted once"]);
+			}
+		} finally {
+			unsubscribe();
+		}
+	});
 });

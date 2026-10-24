@@ -520,6 +520,11 @@ export class AgentSession {
 				contextEditId: string | undefined;
 				leafId: string | null;
 				model: Model<string>;
+				transform: Agent["transformContext"];
+				converter: Agent["convertToLlm"];
+				blockImages: boolean;
+				settingsPrefix: string | undefined;
+				incomingPrefix: string | undefined;
 		  }
 		| undefined;
 	private _latestContextEditId: string | undefined;
@@ -1945,6 +1950,7 @@ export class AgentSession {
 		this._assertHistoryMutationAllowed();
 		const removed = this.sessionManager.removeLastMessages(count);
 		if (removed > 0) {
+			if (this._prefillRestoreFailed) this._discardPrefillRecovery();
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
 			this._restoreBaseSystemPromptFromBranch();
@@ -2075,6 +2081,7 @@ export class AgentSession {
 			targets.map((unit) => ({ entryId: unit.entry.id, toolCallId: unit.toolCallId })),
 		);
 		if (marked > 0) {
+			if (this._prefillRestoreFailed) this._discardPrefillRecovery();
 			this._rebuildMessagesFromSession();
 		}
 		return targets.slice(0, marked);
@@ -2091,6 +2098,7 @@ export class AgentSession {
 		if (!this.sessionManager.getBranch().some((branchEntry) => branchEntry.id === entryId)) return false;
 		const marked = this.sessionManager.softDeleteUnits([{ entryId }]);
 		if (marked > 0) {
+			if (this._prefillRestoreFailed) this._discardPrefillRecovery();
 			this._rebuildMessagesFromSession();
 		}
 		return marked > 0;
@@ -2143,6 +2151,7 @@ export class AgentSession {
 			removed = this.sessionManager.removeEntries(otherEntryIds, toolCallRemovals);
 		}
 		if (removed > 0) {
+			if (this._prefillRestoreFailed) this._discardPrefillRecovery();
 			this._rebuildMessagesFromSession();
 		}
 		return expanded;
@@ -2517,6 +2526,7 @@ export class AgentSession {
 		this._assertHistoryMutationAllowed();
 		const removed = this.sessionManager.removeMessage(entryId);
 		if (removed) {
+			if (this._prefillRestoreFailed) this._discardPrefillRecovery();
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
 			this._emit({ type: "transcript_changed" });
@@ -2669,7 +2679,13 @@ export class AgentSession {
 				swiped++;
 			}
 		});
-		if (navigatedSwipe || versionBranchChanged) this._discardPrefillRecovery();
+		if (
+			navigatedSwipe ||
+			versionBranchChanged ||
+			(this._prefillRestoreFailed &&
+				(replacements.length > 0 || newMessages.length > 0 || versioned > 0 || swiped > 0))
+		)
+			this._discardPrefillRecovery();
 
 		const sessionContext = this.sessionManager.buildSessionContext();
 		this.agent.state.messages = sessionContext.messages;
@@ -4173,13 +4189,14 @@ export class AgentSession {
 		}
 	}
 
-	private _appendCustomMessage(appMessage: CustomMessage): void {
+	private _appendCustomMessage(appMessage: CustomMessage, pending = false): void {
 		this.sessionManager.appendCustomMessageEntry(
 			appMessage.customType,
 			appMessage.content,
 			appMessage.display,
 			appMessage.details,
 		);
+		if (pending) this._pendingCustomMessages.shift();
 		this._refreshFinalizedContext();
 		this._emit({ type: "message_start", message: appMessage });
 		this._emit({ type: "message_end", message: appMessage });
@@ -4193,8 +4210,7 @@ export class AgentSession {
 		if (this._pendingCustomMessages.length === 0) return;
 
 		while (this._pendingCustomMessages.length > 0) {
-			this._appendCustomMessage(this._pendingCustomMessages[0]);
-			this._pendingCustomMessages.shift();
+			this._appendCustomMessage(this._pendingCustomMessages[0], true);
 		}
 	}
 
@@ -4725,6 +4741,9 @@ export class AgentSession {
 					?.messages.find((message) => message.role === "compactionSummary");
 				const transform = this.agent.transformContext;
 				const converter = this.agent.convertToLlm;
+				const blockImages = this.settingsManager.getBlockImages();
+				const settingsPrefix = this.settingsManager.getIncomingMessagePrefix();
+				const incomingPrefix = this.agent.incomingMessagePrefix;
 				const input = structuredClone(this._getTokenizationContext(projection.messages));
 				const transformed = this.agent.transformContext ? await this.agent.transformContext(input, signal) : input;
 				const converted = await this.agent.convertForRequest(transformed);
@@ -4732,10 +4751,15 @@ export class AgentSession {
 				const rechecked = this.agent.transformContext
 					? await this.agent.transformContext(recheckedInput, signal)
 					: recheckedInput;
+				const recheckedMessages = await this.agent.convertForRequest(structuredClone(rechecked));
 				if (
 					summaryMessage &&
 					transform === this.agent.transformContext &&
 					converter === this.agent.convertToLlm &&
+					blockImages === this.settingsManager.getBlockImages() &&
+					settingsPrefix === this.settingsManager.getIncomingMessagePrefix() &&
+					incomingPrefix === this.agent.incomingMessagePrefix &&
+					isDeepStrictEqual(recheckedMessages, converted) &&
 					isDeepStrictEqual(rechecked, transformed) &&
 					transformed.some((message) => isDeepStrictEqual(message, summaryMessage)) &&
 					isDeepStrictEqual(
@@ -4781,15 +4805,15 @@ export class AgentSession {
 		const leafId = this.sessionManager.getLeafId();
 		const contextEditId = this._latestContextEditId;
 		const summaryBlockMaxTokens = this.settingsManager.getSummaryBlockMaxTokens();
+		const transform = this.agent.transformContext;
+		const converter = this.agent.convertToLlm;
+		const blockImages = this.settingsManager.getBlockImages();
+		const settingsPrefix = this.settingsManager.getIncomingMessagePrefix();
+		const incomingPrefix = this.agent.incomingMessagePrefix;
 
 		let contextTokens: number | undefined;
 		if (auth) {
 			try {
-				const transform = this.agent.transformContext;
-				const converter = this.agent.convertToLlm;
-				const blockImages = this.settingsManager.getBlockImages();
-				const settingsPrefix = this.settingsManager.getIncomingMessagePrefix();
-				const incomingPrefix = this.agent.incomingMessagePrefix;
 				const input = structuredClone(this._getTokenizationContext(sessionContext.messages));
 				const transformed = this.agent.transformContext ? await this.agent.transformContext(input, signal) : input;
 				const llmMessages = await this.agent.convertForRequest(transformed);
@@ -4838,9 +4862,27 @@ export class AgentSession {
 		this._postCompactionContextTokens =
 			contextTokens === undefined ||
 			!countedModel ||
-			summaryBlockMaxTokens !== this.settingsManager.getSummaryBlockMaxTokens()
+			!this._canUploadTokenizationText(countedModel) ||
+			signal?.aborted ||
+			summaryBlockMaxTokens !== this.settingsManager.getSummaryBlockMaxTokens() ||
+			transform !== this.agent.transformContext ||
+			converter !== this.agent.convertToLlm ||
+			blockImages !== this.settingsManager.getBlockImages() ||
+			settingsPrefix !== this.settingsManager.getIncomingMessagePrefix() ||
+			incomingPrefix !== this.agent.incomingMessagePrefix
 				? undefined
-				: { tokens: contextTokens, compactionId, contextEditId, leafId, model: countedModel };
+				: {
+						tokens: contextTokens,
+						compactionId,
+						contextEditId,
+						leafId,
+						model: countedModel,
+						transform,
+						converter,
+						blockImages,
+						settingsPrefix,
+						incomingPrefix,
+					};
 
 		return { newEntries, estimatedTokensAfter };
 	}
@@ -4898,6 +4940,9 @@ export class AgentSession {
 						auth = await this._getSummarizationRequestAuth(model, requestSignal);
 						const transform = this.agent.transformContext;
 						const converter = this.agent.convertToLlm;
+						const blockImages = this.settingsManager.getBlockImages();
+						const settingsPrefix = this.settingsManager.getIncomingMessagePrefix();
+						const incomingPrefix = this.agent.incomingMessagePrefix;
 						const input = structuredClone(contextMessages);
 						const transformed = this.agent.transformContext
 							? await this.agent.transformContext(input, requestSignal)
@@ -4910,9 +4955,14 @@ export class AgentSession {
 							? await this.agent.transformContext(recheckedInput, requestSignal)
 							: recheckedInput;
 						if (!isDeepStrictEqual(rechecked, contextMessages)) return false;
+						const recheckedMessages = await this.agent.convertForRequest(structuredClone(rechecked));
 						if (
 							transform !== this.agent.transformContext ||
 							converter !== this.agent.convertToLlm ||
+							blockImages !== this.settingsManager.getBlockImages() ||
+							settingsPrefix !== this.settingsManager.getIncomingMessagePrefix() ||
+							incomingPrefix !== this.agent.incomingMessagePrefix ||
+							!isDeepStrictEqual(recheckedMessages, converted) ||
 							requestSignal.aborted ||
 							unavailable ||
 							!this._canUploadTokenizationText(auth.model) ||
@@ -6773,7 +6823,13 @@ export class AgentSession {
 					counted?.compactionId === latestCompaction.id &&
 					counted.contextEditId === contextEditId &&
 					counted.leafId === this.sessionManager.getLeafId() &&
-					counted.model === model
+					counted.model === model &&
+					counted.transform === this.agent.transformContext &&
+					counted.converter === this.agent.convertToLlm &&
+					counted.blockImages === this.settingsManager.getBlockImages() &&
+					counted.settingsPrefix === this.settingsManager.getIncomingMessagePrefix() &&
+					counted.incomingPrefix === this.agent.incomingMessagePrefix &&
+					this._canUploadTokenizationText(counted.model)
 						? counted.tokens
 						: undefined;
 				return tokens !== undefined && tokens > 0

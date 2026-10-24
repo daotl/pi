@@ -243,3 +243,53 @@ it.each(["setter", "overrides"] as const)(
 		}
 	},
 );
+
+it.each(
+	(["agent-prefix", "sdk-prefix", "images", "converter", "transform", "payload", "stream"] as const).flatMap(
+		(policy) => (["during", "after"] as const).map((timing) => ({ policy, timing })),
+	),
+)(
+	"invalidates exact context and rendered footer after $policy changes $timing counting",
+	async ({ policy, timing }) => {
+		const current = await fixture();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		current.setTokenizer(async (url) => {
+			if (!url.endsWith("/chat/completions/input_tokens")) return Response.json({ tokens: [1] });
+			entered.resolve();
+			if (timing === "during") await release.promise;
+			return Response.json({ input_tokens: 100 });
+		});
+		const component = footer(current);
+		const outcome = current.session.compact({ keepRecentMessages: 2 });
+		try {
+			if (timing === "during") await entered.promise;
+			else {
+				await outcome;
+				expect(stripAnsi(component.render(120)[1])).toContain("100/");
+			}
+			if (policy === "agent-prefix") current.session.agent.incomingMessagePrefix = "new Agent prefix";
+			else if (policy === "sdk-prefix") current.owner.settingsManager.setIncomingMessagePrefix("new SDK prefix");
+			else if (policy === "images") current.owner.settingsManager.setBlockImages(true);
+			else if (policy === "payload") current.session.agent.onPayload = (payload) => payload;
+			else if (policy === "stream") {
+				const stream = current.session.agent.streamFunction;
+				current.session.agent.streamFunction = (...args) => stream(...args);
+			} else if (policy === "converter") {
+				const convert = current.session.agent.convertToLlm;
+				current.session.agent.convertToLlm = (messages) => convert(messages);
+			} else {
+				const transform = current.session.agent.transformContext;
+				current.session.agent.transformContext = async (messages, signal) =>
+					transform ? transform(messages, signal) : messages;
+			}
+			release.resolve();
+			await outcome;
+			expect(current.session.getContextUsage()?.tokens).toBeNull();
+			expect(stripAnsi(component.render(120)[1])).toContain("?/");
+		} finally {
+			release.resolve();
+			await outcome;
+		}
+	},
+);

@@ -4820,7 +4820,7 @@ export class InteractiveMode {
 			this.shutdownRequested = false;
 			this.ui.start();
 			this.themeController.applyFromSettings();
-			this.ui.requestRender();
+			this.ui.requestRender(true);
 			this.showError(`Failed to shut down: ${error instanceof Error ? error.message : String(error)}`);
 			void this.flushCompactionQueue().finally(() => this.fireDueScheduledMessages());
 			this.tickHeartbeats();
