@@ -8,7 +8,7 @@ import { DefaultResourceLoader } from "../../src/core/resource-loader.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
-import { createHarness, type Harness } from "./harness.ts";
+import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 it("keeps restored skill completion aligned with effective dispatch until explicit reload", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-effective-inventory-"));
@@ -94,6 +94,94 @@ it("keeps restored skill completion aligned with effective dispatch until explic
 		);
 	} finally {
 		harness?.cleanup();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+it("keeps a saved skill over a newly discovered same-name path while admitting another skill", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-skill-name-collision-"));
+	const cwd = join(root, "project");
+	const agentDir = join(root, "agent");
+	mkdirSync(cwd);
+	const savedDir = join(root, "saved-alpha");
+	const collisionDir = join(root, "discovered-alpha");
+	const betaDir = join(root, "discovered-beta");
+	for (const [directory, name, description, body] of [
+		[savedDir, "alpha", "SAVED ALPHA", "saved alpha instructions"],
+		[collisionDir, "alpha", "COLLIDING ALPHA", "wrong discovered alpha instructions"],
+		[betaDir, "beta", "DISCOVERED BETA", "new beta instructions"],
+	]) {
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(join(directory, "SKILL.md"), `---\nname: ${name}\ndescription: ${description}\n---\n${body}\n`);
+	}
+	const seedLoader = new DefaultResourceLoader({
+		cwd,
+		agentDir,
+		settingsManager: SettingsManager.inMemory(),
+		noExtensions: true,
+		noSkills: true,
+		additionalSkillPaths: [savedDir],
+		noThemes: true,
+		noPromptTemplates: true,
+		noContextFiles: true,
+	});
+	const loader = new DefaultResourceLoader({
+		cwd,
+		agentDir,
+		settingsManager: SettingsManager.inMemory(),
+		noSkills: true,
+		noThemes: true,
+		noPromptTemplates: true,
+		noContextFiles: true,
+		extensionFactories: [
+			(pi) => {
+				pi.on("resources_discover", () => ({ skillPaths: [collisionDir, betaDir] }));
+			},
+		],
+	});
+	let active: Harness | undefined;
+	try {
+		await seedLoader.reload();
+		await loader.reload();
+		const saved = seedLoader.getSkills().skills.find((skill) => skill.name === "alpha");
+		if (!saved) throw new Error("Missing saved alpha fixture");
+		expect(loader.getSkills().skills).toEqual([]);
+		const manager = SessionManager.create(cwd, join(root, "sessions"));
+		manager.appendSystemPrompt("saved policy", undefined, [saved]);
+		manager.appendMessage({ role: "user", content: "historical context", timestamp: 1 });
+		active = await createHarness({
+			cwd,
+			sessionManager: manager,
+			resourceLoader: loader,
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+		});
+		await active.session.bindExtensions({});
+		expect(loader.getSkills().skills.map((skill) => [skill.name, skill.filePath])).toEqual([
+			["alpha", join(collisionDir, "SKILL.md")],
+			["beta", join(betaDir, "SKILL.md")],
+		]);
+		expect(active.session.getEffectiveSkills().map((skill) => [skill.name, skill.filePath])).toEqual([
+			["alpha", join(savedDir, "SKILL.md")],
+			["beta", join(betaDir, "SKILL.md")],
+		]);
+		const requests: string[] = [];
+		active.setResponses(
+			Array.from({ length: 2 }, () => (context) => {
+				requests.push(getMessageText(context.messages.filter((message) => message.role === "user").at(-1)));
+				return fauxAssistantMessage("accepted skill");
+			}),
+		);
+		await active.session.prompt("/skill:alpha task");
+		await active.session.prompt("/skill:beta task");
+		expect(requests[0]).toContain(`location="${join(savedDir, "SKILL.md")}"`);
+		expect(requests[0]).toContain("saved alpha instructions");
+		expect(requests[0]).not.toContain("wrong discovered alpha instructions");
+		expect(requests[1]).toContain("new beta instructions");
+		expect(active.session.systemPrompt).toContain("SAVED ALPHA");
+		expect(active.session.systemPrompt).toContain("DISCOVERED BETA");
+		expect(active.session.systemPrompt).not.toContain("COLLIDING ALPHA");
+	} finally {
+		active?.cleanup();
 		rmSync(root, { recursive: true, force: true });
 	}
 });
