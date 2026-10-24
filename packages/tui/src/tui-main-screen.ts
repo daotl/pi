@@ -280,9 +280,12 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	protected override beforeTerminalStop(options: TuiStopOptions): void {
-		if (options.preserveScreen || this.previousLines.length === 0) return;
-		this.terminal.write(" ");
-		const targetRow = this.previousLayout?.totalRows ?? this.previousLines.length;
+		if (options.preserveScreen || (this.previousLines.length === 0 && this.overlaidRows.length === 0)) return;
+		this.terminal.write(this.overlaidRows.length > 0 ? "\r" : " ");
+		const transcriptEnd = this.previousLayout?.totalRows ?? this.previousLines.length;
+		const overlayEnd =
+			this.overlaidRows.length > 0 ? this.previousViewportTop + Math.max(...this.overlaidRows) + 1 : 0;
+		const targetRow = Math.max(transcriptEnd, overlayEnd);
 		const lineDiff = targetRow - this.hardwareCursorRow;
 		if (lineDiff > 0) this.terminal.write(`\x1b[${lineDiff}B`);
 		else if (lineDiff < 0) this.terminal.write(`\x1b[${-lineDiff}A`);

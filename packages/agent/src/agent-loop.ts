@@ -31,6 +31,11 @@ import type {
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
+type AgentLoopExecution = {
+	model: AgentLoopConfig["model"];
+	context?: AgentContext;
+};
+
 /**
  * A harness message is an assistant message with no meaningful content:
  * no non-empty thinking or text, no replay signatures, and no tool calls. The harness
@@ -149,7 +154,7 @@ async function runAgentLoopInternal(
 	emit: AgentEventSink,
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
-	execution?: { model: AgentLoopConfig["model"] },
+	execution?: AgentLoopExecution,
 ): Promise<AgentMessage[]> {
 	const initialMessages = declareToolChanges(context, prompts);
 	const newMessages: AgentMessage[] = [...initialMessages];
@@ -185,7 +190,7 @@ async function runAgentLoopContinueInternal(
 	emit: AgentEventSink,
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
-	execution?: { model: AgentLoopConfig["model"] },
+	execution?: AgentLoopExecution,
 ): Promise<AgentMessage[]> {
 	const effectiveMessages = stripTrailingHarnessMessages(context.messages);
 	if (effectiveMessages.length === 0) {
@@ -240,7 +245,7 @@ function createAgentStream(config: AgentLoopConfig, signal: AbortSignal | undefi
 	const completedMessages: AgentMessage[] = [];
 	let turnOpen = false;
 	let partialMessage: AssistantMessage | undefined;
-	const execution = { model: config.model };
+	const execution: AgentLoopExecution = { model: config.model };
 
 	const emit = (event: AgentEvent): void => {
 		switch (event.type) {
@@ -284,6 +289,14 @@ function createAgentStream(config: AgentLoopConfig, signal: AbortSignal | undefi
 				};
 		message.stopReason = signal?.aborted ? "aborted" : "error";
 		message.errorMessage = error instanceof Error ? error.message : String(error);
+		// Keep mutable request history consistent with the terminal events and result.
+		if (execution.context) {
+			if (partialMessage) {
+				execution.context.messages[execution.context.messages.length - 1] = message;
+			} else {
+				execution.context.messages.push(message);
+			}
+		}
 		// Preparation can fail between turns; an interrupted response already has a message_start.
 		if (!turnOpen) emit({ type: "turn_start" });
 		if (!partialMessage) emit({ type: "message_start", message });
@@ -306,9 +319,10 @@ async function runLoop(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFunction: StreamFn,
-	execution?: { model: AgentLoopConfig["model"] },
+	execution?: AgentLoopExecution,
 ): Promise<void> {
 	let currentContext = initialContext;
+	if (execution) execution.context = currentContext;
 	let config = initialConfig;
 	let lastCompletedTurn: PrepareNextTurnContext | undefined;
 	let explicitContinuation = false;
@@ -326,6 +340,7 @@ async function runLoop(
 				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
 				if (nextTurnSnapshot) {
 					currentContext = nextTurnSnapshot.context ?? currentContext;
+					if (execution) execution.context = currentContext;
 					preparedMessages = nextTurnSnapshot.messages ?? [];
 					config = {
 						...config,
@@ -374,6 +389,7 @@ async function runLoop(
 			);
 			if (requestUpdate) {
 				currentContext = requestUpdate.context ?? currentContext;
+				if (execution) execution.context = currentContext;
 				config = {
 					...config,
 					model: requestUpdate.model ?? config.model,

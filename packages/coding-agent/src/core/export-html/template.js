@@ -1902,8 +1902,10 @@
         } else {
           navigateTo(leafId, 'none');
         }
+      } else if (leafId === null) {
+        navigateTo(null, 'none');
       } else if (entries.length > 0) {
-        // Fallback: use last entry if no leafId
+        // Legacy exports without selection metadata fall back to the last entry.
         navigateTo(entries[entries.length - 1].id, 'none');
       }
     })();

@@ -12,6 +12,7 @@ import type {
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions.js";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
+import type { ChatTokenRequest } from "../tokenize.ts";
 import type {
 	AssistantMessage,
 	CacheRetention,
@@ -746,19 +747,51 @@ export const streamSimple: StreamFunction<"openai-completions", SimpleStreamOpti
 ): AssistantMessageEventStream => {
 	getClientApiKey(model.provider, options?.apiKey, options?.headers);
 
+	return stream(model, context, buildSimpleOptions(model, context, options));
+};
+
+function buildSimpleOptions(
+	model: Model<"openai-completions">,
+	context: TranscriptContext,
+	options?: SimpleStreamOptions,
+): OpenAICompletionsOptions {
 	const base = {
 		...buildBaseOptions(model, context, options, options?.apiKey),
 		toolChoice: options?.toolChoice,
 	} satisfies OpenAICompletionsOptions;
 	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
 	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
-
-	return stream(model, context, {
+	return {
 		...base,
 		reasoningEffort,
 		thinkingBudgets: options?.thinkingBudgets,
-	} satisfies OpenAICompletionsOptions);
-};
+	} satisfies OpenAICompletionsOptions;
+}
+
+/** Serialize native input for counting without generation controls or running payload hooks. */
+export function buildChatTokenRequest(
+	model: Model<"openai-completions">,
+	context: TranscriptContext,
+	options?: SimpleStreamOptions,
+): ChatTokenRequest {
+	const normalizedContext = resolveTranscript(context, getCompat(model).supportsMidConvoSystemMessages);
+	const request: ChatTokenRequest = {
+		...buildParams(model, normalizedContext, buildSimpleOptions(model, context, options)),
+	};
+	// Resolve template budgets against the inference ceiling before omitting generation-only fields.
+	for (const field of [
+		"stream",
+		"stream_options",
+		"max_tokens",
+		"max_completion_tokens",
+		"store",
+		"prompt_cache_key",
+		"prompt_cache_retention",
+	]) {
+		delete request[field];
+	}
+	return request;
+}
 
 function createClient(
 	model: Model<"openai-completions">,

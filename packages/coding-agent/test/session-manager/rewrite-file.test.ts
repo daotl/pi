@@ -119,6 +119,58 @@ describe("atomic session file rewrite", () => {
 		expect(SessionManager.open(file, dir, dir).getEntries()).toEqual(session.getEntries());
 	});
 
+	it.each(["write", "write-after", "close"] as const)(
+		"retries initial flush after exclusive creation and %s failure",
+		async (fault) => {
+			const actual = await vi.importActual<typeof fs>("fs");
+			const session = SessionManager.create(dir, dir);
+			session.appendSystemPrompt("original");
+			const entries = structuredClone(session.getEntries());
+			const leaf = session.getLeafId();
+			const file = session.getSessionFile()!;
+			const failure = new Error(`initial ${fault} failure`);
+			if (fault === "close")
+				vi.mocked(fs.closeSync).mockImplementationOnce((fd) => {
+					actual.closeSync(fd);
+					throw failure;
+				});
+			else
+				vi.mocked(fs.writeFileSync).mockImplementationOnce((...args) => {
+					if (fault === "write-after") actual.writeFileSync(...args);
+					throw failure;
+				});
+			expect(() => session.appendMessage(userMsg("accepted exactly once"))).toThrow(failure);
+			expect(session.getEntries()).toEqual(entries);
+			expect(session.getLeafId()).toBe(leaf);
+			expect(fs.existsSync(file)).toBe(false);
+			vi.mocked(fs.writeFileSync).mockImplementation(actual.writeFileSync);
+			vi.mocked(fs.closeSync).mockImplementation(actual.closeSync);
+			const accepted = session.appendMessage(userMsg("accepted exactly once"));
+			expect(session.getLeafId()).toBe(accepted);
+			const reopened = SessionManager.open(file, dir, dir);
+			expect(reopened.getEntries()).toEqual(session.getEntries());
+			expect(
+				reopened.getEntries().filter((entry) => entry.type === "message" && entry.message.role === "user"),
+			).toEqual([
+				expect.objectContaining({
+					id: accepted,
+					message: expect.objectContaining({ content: "accepted exactly once" }),
+				}),
+			]);
+		},
+	);
+
+	it("preserves another writer's file when initial exclusive creation collides", () => {
+		const session = SessionManager.create(dir, dir);
+		session.appendSystemPrompt("original");
+		const file = session.getSessionFile()!;
+		fs.writeFileSync(file, "foreign writer bytes");
+		const entries = structuredClone(session.getEntries());
+		expect(() => session.appendMessage(userMsg("must not publish"))).toThrow();
+		expect(fs.readFileSync(file, "utf8")).toBe("foreign writer bytes");
+		expect(session.getEntries()).toEqual(entries);
+	});
+
 	it("restores removed descendants, labels and a non-tail selected leaf after failed tail removal", () => {
 		const { session, user, file } = createSession();
 		const firstAnswer = session.getLeafId()!;

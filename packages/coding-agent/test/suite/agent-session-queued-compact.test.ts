@@ -282,6 +282,65 @@ describe("AgentSession queued /compact", () => {
 		},
 	);
 
+	it.each(["success", "failure", "cancel"] as const)(
+		"compacts before runnable settle continuation (%s)",
+		async (outcome) => {
+			let boundary = true;
+			const order: string[] = [];
+			const harness = await createHarness({
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 }, retry: { enabled: false } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("agent_before_settle", () => {
+							if (!boundary) return;
+							boundary = false;
+							harness.session.queueCompact();
+							return {
+								continue: true,
+								entries: [
+									{
+										type: "custom_message",
+										customType: "settle-input",
+										content: "accepted boundary work",
+										display: false,
+									},
+								],
+							};
+						});
+						pi.on("session_before_compact", (event) => {
+							order.push("compact");
+							if (outcome === "cancel") return { cancel: true };
+							if (outcome === "failure") throw new Error("summary failed");
+							return {
+								compaction: {
+									summary: SUMMARY_TEXT,
+									firstKeptEntryId: event.preparation.firstKeptEntryId,
+									tokensBefore: event.preparation.tokensBefore,
+								},
+							};
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.sessionManager.appendMessage({ role: "user", content: "older request", timestamp: 1 });
+			harness.sessionManager.appendMessage(fauxAssistantMessage("older answer", { timestamp: 2 }));
+			harness.session.refreshContext();
+			harness.setResponses([
+				fauxAssistantMessage("first answer"),
+				() => {
+					order.push("continue");
+					return fauxAssistantMessage("continued answer");
+				},
+			]);
+			await harness.session.prompt("current request");
+			expect(order).toEqual(outcome === "cancel" ? ["compact"] : ["compact", "continue"]);
+			expect(harness.eventsOfType("compaction_end")).toHaveLength(1);
+			expect(harness.session.hasQueuedCompact).toBe(false);
+			expect(harness.session.isIdle).toBe(true);
+		},
+	);
+
 	it.each(["none", "success", "failure"] as const)(
 		"does not reuse a cancelled retry grant after %s queued compaction",
 		async (compactOutcome) => {

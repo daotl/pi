@@ -147,7 +147,7 @@ Optional fields:
 
 ### ContextEditEntry
 
-Append-only edit of one earlier context-producing entry. It changes only future model context; the target entry and its metadata remain unchanged in raw history, UI, exports, and session accounting.
+Append-only edit of one earlier context-producing entry. It changes the projected model context without modifying the target entry or its metadata in raw history, exports, or session accounting. Interactive initial loading and transcript rebuilds display projected replacements and omissions; this does not imply immediate notification for every edit producer. See [conversation context](sessions.md#manage-conversation-context).
 
 ```json
 {"type":"context_edit","id":"g6h7i8j9","parentId":"f6g7h8i9","timestamp":"2024-12-03T14:11:00.000Z","targetId":"c3d4e5f6","replacement":null}

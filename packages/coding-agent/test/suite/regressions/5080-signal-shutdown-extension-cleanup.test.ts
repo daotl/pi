@@ -18,9 +18,13 @@ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode
 
 type ShutdownThis = {
 	isShuttingDown: boolean;
+	session: { abort: () => Promise<void>; flushPendingUsage: () => void };
 	unregisterSignalHandlers: () => void;
 	runtimeHost: { dispose: () => Promise<void> };
-	ui: { terminal: { drainInput: (ms: number) => Promise<void> } };
+	ui: {
+		stop: (options: { preserveScreen: boolean }) => void;
+		terminal: { drainInput: (ms: number) => Promise<void> };
+	};
 	themeController: { disableAutoSync: () => void };
 	stop: () => void;
 	sessionManager: SessionManager;
@@ -69,6 +73,7 @@ function restoreStdoutIsTTY(): void {
 function createContext(order: string[], sessionManager = createSessionManager()): ShutdownThis {
 	return {
 		isShuttingDown: false,
+		session: { abort: async () => {}, flushPendingUsage: () => {} },
 		unregisterSignalHandlers: vi.fn(),
 		runtimeHost: {
 			dispose: vi.fn(async () => {
@@ -76,6 +81,9 @@ function createContext(order: string[], sessionManager = createSessionManager())
 			}),
 		},
 		ui: {
+			stop: () => {
+				order.push("suspend");
+			},
 			terminal: {
 				drainInput: vi.fn(async () => {
 					order.push("drainInput");
@@ -129,7 +137,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 
 		await callShutdown(context);
 
-		expect(order).toEqual(["drainInput", "stop", "dispose"]);
+		expect(order).toEqual(["drainInput", "suspend", "dispose", "stop"]);
 	});
 
 	test("interactive quit appends the resume hint without erasing terminal history", async () => {
@@ -145,7 +153,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 
 		await callShutdown(context);
 
-		expect(order).toEqual(["drainInput", "stop", "dispose"]);
+		expect(order).toEqual(["drainInput", "suspend", "dispose", "stop"]);
 		const resumeCall = stdoutWrite.mock.calls.find((call) => String(call[0]).includes("To resume this session:"));
 		expect(resumeCall?.[0]).toBe(`${chalk.dim("To resume this session:")} ${APP_NAME} --session test-session\n`);
 	});

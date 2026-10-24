@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAssistantMessageEventStream, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, expect, it, vi } from "vitest";
+import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
 import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
 import { createAgentSession } from "../../src/core/sdk.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { getUsageCostBreakdown, getUsageTotals } from "../../src/core/usage-totals.ts";
+import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
 import { createHarness } from "./harness.ts";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -415,121 +417,212 @@ it.each(["checkpoint", "receipt"] as const)(
 	},
 );
 
-it.each(["new", "resume", "fork", "import", "same-resume", "same-import", "dispose"] as const)(
-	"persists pending summary charge to outgoing session before runtime %s",
-	async (operation) => {
-		const cwd = mkdtempSync(join(tmpdir(), "pi-summary-switch-"));
-		const manager = SessionManager.create(cwd, join(cwd, "sessions"));
-		const shutdownTotals: ReturnType<typeof getUsageTotals>[] = [];
-		const harness = await createHarness({
-			cwd,
-			sessionManager: manager,
-			settings: {
-				retry: { enabled: false },
-				compaction: { enabled: false, reserveTokens: 512, keepRecentTokens: 1 },
-			},
-			extensionFactories: [
-				(pi) => {
-					pi.on("session_shutdown", () => {
-						shutdownTotals.push(getUsageTotals(manager.getEntries()));
+it.each([
+	"new",
+	"resume",
+	"fork",
+	"import",
+	"same-resume",
+	"same-import",
+	"dispose",
+	"interactive",
+	"signal",
+	"late-interactive",
+] as const)("persists pending summary charge to outgoing session before runtime %s", async (operation) => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-summary-switch-"));
+	const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+	const shutdownTotals: ReturnType<typeof getUsageTotals>[] = [];
+	let lateReceiptCreated = false;
+	const terminalInputs: string[] = [];
+	const harness = await createHarness({
+		cwd,
+		sessionManager: manager,
+		settings: {
+			retry: { enabled: false },
+			compaction: { enabled: false, reserveTokens: 512, keepRecentTokens: 1 },
+		},
+		extensionFactories: [
+			(pi) => {
+				pi.on("session_start", (_event, context) => {
+					context.ui.onTerminalInput((data) => {
+						terminalInputs.push(data);
+						return undefined;
 					});
-				},
-			],
+				});
+				pi.on("session_shutdown", async () => {
+					shutdownTotals.push(getUsageTotals(manager.getEntries()));
+					if (operation === "late-interactive" && !lateReceiptCreated) {
+						lateReceiptCreated = true;
+						vi.mocked(fs.appendFileSync).mockImplementation(() => {
+							throw new Error("outgoing storage unavailable");
+						});
+						await expect(harness.session.compact({ keepRecentMessages: 1 })).rejects.toThrow(
+							"outgoing storage unavailable",
+						);
+					}
+				});
+			},
+		],
+	});
+	const actual = await vi.importActual<typeof fs>("fs");
+	let runtime: AgentSessionRuntime | undefined;
+	let interactive: InteractiveMode | undefined;
+	const terminal = new VirtualTerminal(120, 40);
+	const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+		throw new Error("test process exit");
+	});
+	try {
+		for (let index = 0; index < 3; index++) {
+			manager.appendMessage({ role: "user", content: `question ${index}`, timestamp: index * 2 });
+			manager.appendMessage(fauxAssistantMessage(`answer ${index}`));
+		}
+		harness.session.refreshContext();
+		const target = manager.getBranch().find((entry) => entry.type === "message" && entry.message.role === "user")!;
+		const usage = {
+			input: 100,
+			output: 10,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 110,
+			cost: { input: 0.1, output: 0.01, cacheRead: 0, cacheWrite: 0, total: 0.11 },
+		};
+		harness.session.agent.streamFunction = () => {
+			const stream = createAssistantMessageEventStream();
+			stream.push({ type: "done", reason: "stop", message: { ...fauxAssistantMessage("summary"), usage } });
+			return stream;
+		};
+		vi.stubGlobal("fetch", async () => new Response("unavailable", { status: 404 }));
+		vi.mocked(fs.appendFileSync).mockImplementation(() => {
+			throw new Error("outgoing storage unavailable");
 		});
-		const actual = await vi.importActual<typeof fs>("fs");
-		let runtime: AgentSessionRuntime | undefined;
-		try {
-			for (let index = 0; index < 3; index++) {
-				manager.appendMessage({ role: "user", content: `question ${index}`, timestamp: index * 2 });
-				manager.appendMessage(fauxAssistantMessage(`answer ${index}`));
-			}
-			harness.session.refreshContext();
-			const target = manager.getBranch().find((entry) => entry.type === "message" && entry.message.role === "user")!;
-			const usage = {
-				input: 100,
-				output: 10,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 110,
-				cost: { input: 0.1, output: 0.01, cacheRead: 0, cacheWrite: 0, total: 0.11 },
-			};
-			harness.session.agent.streamFunction = () => {
-				const stream = createAssistantMessageEventStream();
-				stream.push({ type: "done", reason: "stop", message: { ...fauxAssistantMessage("summary"), usage } });
-				return stream;
-			};
-			vi.stubGlobal("fetch", async () => new Response("unavailable", { status: 404 }));
-			vi.mocked(fs.appendFileSync).mockImplementation(() => {
-				throw new Error("outgoing storage unavailable");
-			});
-			await expect(harness.session.compact({ keepRecentMessages: 1 })).rejects.toThrow(
-				"outgoing storage unavailable",
-			);
-			const services = {
-				cwd,
-				agentDir: harness.tempDir,
-				modelRuntime: harness.session.modelRuntime,
-				settingsManager: harness.settingsManager,
-				resourceLoader: harness.session.resourceLoader,
+		await expect(harness.session.compact({ keepRecentMessages: 1 })).rejects.toThrow("outgoing storage unavailable");
+		const services = {
+			cwd,
+			agentDir: harness.tempDir,
+			modelRuntime: harness.session.modelRuntime,
+			settingsManager: harness.settingsManager,
+			resourceLoader: harness.session.resourceLoader,
+			diagnostics: [],
+		};
+		let replacements = 0;
+		runtime = new AgentSessionRuntime(harness.session, services, async ({ sessionManager }) => {
+			replacements++;
+			return {
+				...(await createAgentSession({
+					cwd,
+					agentDir: harness.tempDir,
+					model: harness.getModel(),
+					modelRuntime: services.modelRuntime,
+					settingsManager: services.settingsManager,
+					resourceLoader: services.resourceLoader,
+					sessionManager,
+					tools: [],
+				})),
+				services,
 				diagnostics: [],
 			};
-			let replacements = 0;
-			runtime = new AgentSessionRuntime(harness.session, services, async ({ sessionManager }) => {
-				replacements++;
-				return {
-					...(await createAgentSession({
-						cwd,
-						agentDir: harness.tempDir,
-						model: harness.getModel(),
-						modelRuntime: services.modelRuntime,
-						settingsManager: services.settingsManager,
-						resourceLoader: services.resourceLoader,
-						sessionManager,
-						tools: [],
-					})),
-					services,
-					diagnostics: [],
-				};
-			});
-			const outgoing = manager.getSessionFile()!;
-			const other = SessionManager.create(cwd, join(cwd, "other-sessions"));
-			other.appendMessage({ role: "user", content: "other", timestamp: 1 });
-			const replace = async () => {
-				if (operation === "new") await runtime!.newSession();
-				else if (operation === "resume") await runtime!.switchSession(other.getSessionFile()!);
-				else if (operation === "same-resume") await runtime!.switchSession(outgoing);
-				else if (operation === "fork") await runtime!.fork(target.id);
-				else if (operation === "import") await runtime!.importFromJsonl(other.getSessionFile()!);
-				else if (operation === "same-import") await runtime!.importFromJsonl(outgoing);
-				else await runtime!.dispose();
-			};
-			await expect(replace()).rejects.toThrow("outgoing storage unavailable");
-			expect(runtime.session).toBe(harness.session);
-			expect(replacements).toBe(0);
-			vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);
-			await replace();
-			expect(getUsageTotals(SessionManager.open(outgoing).getEntries())).toEqual({
+		});
+		if (operation === "interactive" || operation === "signal" || operation === "late-interactive") {
+			interactive = new InteractiveMode(runtime, { terminal });
+			await interactive.init();
+			terminal.sendInput("retryable draft");
+		}
+		const shutdownMode = interactive as unknown as {
+			shutdown(options?: { fromSignal?: boolean }): Promise<void>;
+			isShuttingDown: boolean;
+			isInitialized: boolean;
+			handleScheduleCommand(text: string): Promise<void>;
+			handleHeartbeatCommand(text: string): Promise<void>;
+			scheduledMessages: Array<{ id: number; text: string; when: unknown }>;
+			heartbeats: Array<{ id: number; text: string; nextFireAt: number | null }>;
+		};
+		const signalListeners = process.listeners("SIGTERM");
+		if (operation === "late-interactive") {
+			await shutdownMode.handleScheduleCommand("1h\nretained scheduled work");
+			await shutdownMode.handleHeartbeatCommand("1h\nretained heartbeat");
+		}
+		const schedulesBefore = interactive
+			? shutdownMode.scheduledMessages.map(({ id, text, when }) => ({ id, text, when }))
+			: [];
+		const heartbeatsBefore = interactive
+			? shutdownMode.heartbeats.map(({ id, text, nextFireAt }) => ({ id, text, nextFireAt }))
+			: [];
+		if (operation === "late-interactive") vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);
+		const outgoing = manager.getSessionFile()!;
+		const other = SessionManager.create(cwd, join(cwd, "other-sessions"));
+		other.appendMessage({ role: "user", content: "other", timestamp: 1 });
+		const replace = async () => {
+			if (operation === "new") await runtime!.newSession();
+			else if (operation === "resume") await runtime!.switchSession(other.getSessionFile()!);
+			else if (operation === "same-resume") await runtime!.switchSession(outgoing);
+			else if (operation === "fork") await runtime!.fork(target.id);
+			else if (operation === "import") await runtime!.importFromJsonl(other.getSessionFile()!);
+			else if (operation === "same-import") await runtime!.importFromJsonl(outgoing);
+			else if (interactive) await shutdownMode.shutdown({ fromSignal: operation === "signal" });
+			else await runtime!.dispose();
+		};
+		if (interactive) await replace();
+		else await expect(replace()).rejects.toThrow("outgoing storage unavailable");
+		expect(runtime.session).toBe(harness.session);
+		expect(replacements).toBe(0);
+		if (interactive) {
+			expect(shutdownMode.isInitialized).toBe(true);
+			expect(shutdownMode.isShuttingDown).toBe(false);
+			if (operation !== "late-interactive") expect(process.listeners("SIGTERM")).toEqual(signalListeners);
+			else expect(process.listeners("SIGTERM")).toHaveLength(signalListeners.length);
+			if (operation === "late-interactive") {
+				expect(shutdownMode.scheduledMessages.map(({ id, text, when }) => ({ id, text, when }))).toEqual(
+					schedulesBefore,
+				);
+				expect(shutdownMode.heartbeats.map(({ id, text, nextFireAt }) => ({ id, text, nextFireAt }))).toEqual(
+					heartbeatsBefore,
+				);
+			}
+			await vi.waitFor(async () =>
+				expect((await terminal.flushAndGetViewport()).join("\n")).toContain(
+					"Failed to shut down: outgoing storage unavailable",
+				),
+			);
+			const inputCount = terminalInputs.length;
+			terminal.sendInput(" remains usable");
+			await vi.waitFor(async () =>
+				expect((await terminal.flushAndGetViewport()).join("\n")).toContain("retryable draft remains usable"),
+			);
+			if (operation === "late-interactive") expect(terminalInputs.slice(inputCount)).toContain(" remains usable");
+		}
+		vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);
+		if (interactive) await expect(replace()).rejects.toThrow("test process exit");
+		else await replace();
+		expect(getUsageTotals(SessionManager.open(outgoing).getEntries())).toEqual({
+			input: operation === "late-interactive" ? 200 : 100,
+			output: operation === "late-interactive" ? 20 : 10,
+			cacheRead: 0,
+			cacheWrite: 0,
+			cost: operation === "late-interactive" ? 0.22 : 0.11,
+		});
+		if (operation === "same-resume" || operation === "same-import")
+			expect(getUsageTotals(runtime.session.sessionManager.getEntries())).toEqual({
 				input: 100,
 				output: 10,
 				cacheRead: 0,
 				cacheWrite: 0,
 				cost: 0.11,
 			});
-			if (operation === "same-resume" || operation === "same-import")
-				expect(getUsageTotals(runtime.session.sessionManager.getEntries())).toEqual({
-					input: 100,
-					output: 10,
-					cacheRead: 0,
-					cacheWrite: 0,
-					cost: 0.11,
-				});
-			expect(shutdownTotals).toEqual([{ input: 100, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0.11 }]);
-		} finally {
-			vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);
-			await runtime?.dispose();
-			await harness.session.abort();
-			harness.cleanup();
-			rmSync(cwd, { recursive: true, force: true });
-		}
-	},
-);
+		expect(shutdownTotals).toEqual(
+			operation === "late-interactive"
+				? [
+						{ input: 100, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0.11 },
+						{ input: 200, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.22 },
+					]
+				: [{ input: 100, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0.11 }],
+		);
+	} finally {
+		vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);
+		interactive?.stop();
+		exit.mockRestore();
+		await runtime?.dispose();
+		await harness.session.abort();
+		harness.cleanup();
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});

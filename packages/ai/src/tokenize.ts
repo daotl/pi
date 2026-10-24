@@ -9,6 +9,11 @@
  * caller can fall back to an estimate.
  */
 
+import type {
+	ChatCompletionMessageParam,
+	ChatCompletionTool,
+	ChatCompletionToolChoiceOption,
+} from "openai/resources/chat/completions.js";
 import type { Model, ProviderHeaders } from "./types.ts";
 import { providerHeadersToRecord } from "./utils/headers.ts";
 import { getPiUserAgent } from "./utils/pi-user-agent.ts";
@@ -27,10 +32,17 @@ export interface CountTokensOptions {
 	timeoutMs?: number;
 }
 
-/** Options for {@link countChatTokens}. Messages are the full chat request content. */
-export interface CountChatTokensOptions {
-	/** The chat messages exactly as they would be sent to /v1/chat/completions. */
-	messages: unknown[];
+/** Chat-template input serialized by the native Chat Completions adapter. */
+export interface ChatTokenRequest {
+	model: string;
+	messages: ChatCompletionMessageParam[];
+	tools?: ChatCompletionTool[];
+	tool_choice?: ChatCompletionToolChoiceOption;
+	[key: string]: unknown;
+}
+
+/** Options for {@link countChatTokens}. Supply serialized wire content, not transcript messages. */
+export type CountChatTokensOptions = {
 	apiKey?: string;
 	headers?: ProviderHeaders;
 	env?: Record<string, string>;
@@ -40,7 +52,7 @@ export interface CountChatTokensOptions {
 	signal?: AbortSignal;
 	/** Request timeout in milliseconds. Default 30000. */
 	timeoutMs?: number;
-}
+} & ({ request: ChatTokenRequest; messages?: never } | { messages: unknown[]; request?: never });
 
 function usableTokenizerBaseUrl(baseUrl: string): boolean {
 	if (!baseUrl || /[{}\s]/.test(baseUrl)) return false;
@@ -174,7 +186,8 @@ export async function countTokens(model: Model<any>, options: CountTokensOptions
  */
 export async function countChatTokens(model: Model<any>, options: CountChatTokensOptions): Promise<number | undefined> {
 	const url = chatTokenizeEndpointUrl(model.baseUrl);
-	if (!url || options.messages.length === 0) return undefined;
+	const request = options.request ?? { messages: options.messages, model: model.id };
+	if (!url || request.messages.length === 0) return undefined;
 
 	const headers = providerHeadersToRecord(
 		{
@@ -198,7 +211,7 @@ export async function countChatTokens(model: Model<any>, options: CountChatToken
 		const res = await fetchFn(url, {
 			method: "POST",
 			headers,
-			body: JSON.stringify({ messages: options.messages, model: model.id }),
+			body: JSON.stringify(request),
 			signal: controller.signal,
 		});
 

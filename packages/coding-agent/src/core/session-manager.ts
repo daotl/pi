@@ -1465,13 +1465,27 @@ export class SessionManager {
 
 		if (!this.flushed) {
 			if (!this._hasConversation(entries)) return;
-			const fd = openSync(this.sessionFile, "wx");
+			let fd: number | undefined = openSync(this.sessionFile, "wx");
 			try {
 				for (const e of entries) {
 					writeFileSync(fd, `${JSON.stringify(e)}\n`);
 				}
-			} finally {
 				closeSync(fd);
+				fd = undefined;
+			} catch (error) {
+				if (fd !== undefined) {
+					try {
+						closeSync(fd);
+					} catch {
+						/* Preserve the first write or close failure. */
+					}
+				}
+				try {
+					unlinkSync(this.sessionFile);
+				} catch {
+					/* Only this successful exclusive open owns the initial file. */
+				}
+				throw error;
 			}
 			this.flushed = true;
 		} else {

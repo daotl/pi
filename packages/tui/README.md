@@ -248,7 +248,11 @@ tui.hasOverlay();
 
 `TuiMainScreen` composes overlays on physical viewport rows, including native-autowrapped continuations, separately from transcript history and layout. Previous overlay cells are restored before transcript updates can scroll them into history. Repainting is relative to the tracked hardware cursor rather than an assumed row-zero screen origin, preserving preceding shell output through open/update/hide.
 
+Carriage-return overwrites are materialized into final row cells before overlay composition: `abc\rZ` backs an overlay with `Zbc`, not the original write sequence. Existing supported styling and OSC 8 links stay attached to surviving cells; row-local cursor-forward movement preserves cells it skips.
+
 An overlay below a short transcript reserves addressable rows with line feeds; shell output may enter scrollback but is not overwritten. Overlay padding does not inflate transcript shrink accounting or add exported renderer state. Repeated open/hide/reopen, empty frames and renderer handoff preserve the working origin; resize retains the existing full-redraw policy.
+
+Regular `stop()` leaves the shell cursor below retained transcript and overlay output, including bottom overlays below short or empty transcripts. `stop({ preserveScreen: true })` leaves the screen and cursor in place for renderer handoff.
 
 Overlay components render in a synchronous local wrapped scope before height/position measurement. Built-in Text and Markdown wrap within a narrow overlay without changing transcript preferences.
 

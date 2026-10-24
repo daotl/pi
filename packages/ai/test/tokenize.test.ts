@@ -1,13 +1,18 @@
+import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
+import { buildChatTokenRequest, streamSimple } from "../src/api/openai-completions.ts";
+import { fauxAssistantMessage } from "../src/providers/faux.ts";
 import {
 	type CountTokensOptions,
+	countChatTokens,
 	countTokens,
 	countTokensWithRetry,
 	TokenizeTransientError,
 	tokenizeEndpointUrl,
 } from "../src/tokenize.ts";
-import type { Model } from "../src/types.ts";
+import type { Model, SimpleStreamOptions } from "../src/types.ts";
 import type { RetryPolicy } from "../src/utils/retry.ts";
+import { normalizeContext } from "../src/utils/transcript.ts";
 
 const retryPolicy: RetryPolicy = {
 	enabled: true,
@@ -362,6 +367,94 @@ describe("countTokens", () => {
 			);
 			expect(endpointUnavailable).toBe(kind === "unavailable");
 			expect(count).toBe(kind === "success" ? 2 : undefined);
+		},
+	);
+});
+
+describe("native chat token request", () => {
+	it.each(["chat-template", "qwen-chat-template", "baseten"] as const)(
+		"matches inference messages, tools and %s options without generation controls",
+		async (thinkingFormat) => {
+			const selected: Model<"openai-completions"> = {
+				...model("https://tokenizer.invalid/v1"),
+				reasoning: true,
+				input: ["text", "image"],
+				compat: {
+					thinkingFormat,
+					chatTemplateKwargs: {
+						enable_thinking: { $var: "thinking.enabled" },
+						thinking_budget: { $var: "thinking.budget" },
+					},
+					chatTemplateArgs: { thinking_budget: { $var: "thinking.budget" } },
+				},
+				samplingParams: { chat_template: "custom-template", top_k: 20 },
+			};
+			const context = normalizeContext({
+				systemPrompt: "Inspect the image",
+				tools: [{ name: "read", description: "Read image", parameters: Type.Object({ path: Type.String() }) }],
+				messages: [
+					{ role: "user", content: "read image.png", timestamp: 1 },
+					{
+						...fauxAssistantMessage({
+							type: "toolCall",
+							id: "call-read",
+							name: "read",
+							arguments: { path: "image.png" },
+						}),
+						api: selected.api,
+						provider: selected.provider,
+						model: selected.id,
+						stopReason: "toolUse",
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call-read",
+						toolName: "read",
+						content: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
+						isError: false,
+						timestamp: 2,
+					},
+				],
+			});
+			const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+			const fetch = mockFetch(async (url, init) => {
+				requests.push({ url, body: JSON.parse(String(init.body)) });
+				if (url.endsWith("/input_tokens")) return Response.json({ input_tokens: 123 });
+				return new Response(
+					'data: {"id":"wire","choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+					{ headers: { "content-type": "text/event-stream" } },
+				);
+			});
+			const options: SimpleStreamOptions = {
+				apiKey: "offline",
+				fetch,
+				reasoning: "high",
+				maxTokens: 4096,
+				thinkingBudgets: { high: 8192 },
+				toolChoice: "auto",
+				samplingParams: { top_k: 40 },
+			};
+			const result = await streamSimple(selected, context, options).result();
+			expect(result.stopReason).toBe("stop");
+			const request = buildChatTokenRequest(selected, context, options);
+			expect(await countChatTokens(selected, { request, fetch })).toBe(123);
+			const inference = requests.find((entry) => entry.url.endsWith("/chat/completions"))!.body;
+			const counted = requests.find((entry) => entry.url.endsWith("/input_tokens"))!.body;
+			expect(counted.messages).toEqual(inference.messages);
+			expect(counted.tools).toEqual(inference.tools);
+			expect(counted.tool_choice).toBe(inference.tool_choice);
+			expect(counted.chat_template_kwargs).toEqual(inference.chat_template_kwargs);
+			expect(counted.chat_template_args).toEqual(inference.chat_template_args);
+			expect(counted.chat_template).toBe("custom-template");
+			expect(counted.top_k).toBe(40);
+			expect(counted).not.toHaveProperty("stream");
+			expect(counted).not.toHaveProperty("stream_options");
+			expect(counted).not.toHaveProperty("max_completion_tokens");
+			expect(counted).not.toHaveProperty("max_tokens");
+			if (thinkingFormat === "chat-template") {
+				expect(counted.chat_template_kwargs).toEqual({ enable_thinking: true, thinking_budget: 3072 });
+			}
+			if (thinkingFormat === "baseten") expect(counted.chat_template_args).toEqual({ thinking_budget: 3072 });
 		},
 	);
 });

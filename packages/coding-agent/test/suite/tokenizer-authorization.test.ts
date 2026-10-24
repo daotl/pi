@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, toToolDeclaration } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, normalizeContext, toToolDeclaration } from "@earendil-works/pi-ai";
+import { streamSimple as streamNative } from "@earendil-works/pi-ai/api/openai-completions";
 import { afterEach, expect, it, vi } from "vitest";
 import type { CompactionEntry, SessionManager } from "../../src/core/session-manager.ts";
 import { createHarness, type HarnessOptions } from "./harness.ts";
@@ -308,16 +309,46 @@ it("keeps policy removal of system and tools authoritative for chat counting", a
 	const full = fixture.uploads.find((request) => request.url.endsWith("/chat/completions/input_tokens"));
 	expect(full).toBeDefined();
 	const body = JSON.parse(full!.body);
+	expect(body.tools).toBeUndefined();
+	expect(fixture.session.agent.state.tools.map((tool) => tool.name)).toContain("read");
 	expect(body.messages.some((message: { role: string }) => message.role === "system")).toBe(false);
 	expect(full!.body).not.toContain("toolsAdded");
 });
 
 it("retains multimodal content and effective tools in chat-template counting", async () => {
 	const fixture = await nativeFixture({ initialActiveToolNames: ["read"] });
+	const selected = fixture.session.model;
+	if (!selected || selected.api !== "openai-completions") throw new Error("Missing native model");
+	const model = {
+		...selected,
+		api: "openai-completions" as const,
+		samplingParams: { chat_template_kwargs: { enable_thinking: false, custom_prompt: "wire-format" } },
+	};
+	await fixture.session.setModel(model);
 	fixture.manager.appendMessage({
 		role: "system",
 		content: "",
 		toolsAdded: fixture.session.agent.state.tools.map(toToolDeclaration),
+		timestamp: 29,
+	});
+	fixture.manager.appendMessage({
+		...fauxAssistantMessage({
+			type: "toolCall",
+			id: "retained-read",
+			name: "read",
+			arguments: { path: "image.png" },
+		}),
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		stopReason: "toolUse",
+	});
+	fixture.manager.appendMessage({
+		role: "toolResult",
+		toolCallId: "retained-read",
+		toolName: "read",
+		content: [{ type: "text", text: "retained tool output" }],
+		isError: false,
 		timestamp: 29,
 	});
 	fixture.manager.appendMessage({
@@ -329,12 +360,49 @@ it("retains multimodal content and effective tools in chat-template counting", a
 		timestamp: 30,
 	});
 	fixture.session.refreshContext();
-	await fixture.session.compact({ keepRecentMessages: 2 });
+	await fixture.session.compact({ keepRecentMessages: 4 });
 	const full = fixture.uploads.find((request) => request.url.endsWith("/chat/completions/input_tokens"));
 	expect(full).toBeDefined();
-	expect(full!.body).toContain('"type":"image"');
-	expect(full!.body).toContain('"toolsAdded"');
-	expect(full!.body).toContain('"name":"read"');
+	const counted = JSON.parse(full!.body);
+	expect(counted.messages).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({ role: "tool", tool_call_id: "retained-read", content: "retained tool output" }),
+			expect.objectContaining({
+				role: "assistant",
+				tool_calls: [
+					expect.objectContaining({
+						type: "function",
+						function: { name: "read", arguments: '{"path":"image.png"}' },
+					}),
+				],
+			}),
+			expect.objectContaining({
+				role: "user",
+				content: [
+					{ type: "text", text: "retained image" },
+					{ type: "image_url", image_url: { url: "data:image/png;base64,aW1hZ2U=" } },
+				],
+			}),
+		]),
+	);
+	expect(counted.tools).toEqual([
+		expect.objectContaining({
+			type: "function",
+			function: expect.objectContaining({ name: "read", parameters: expect.objectContaining({ type: "object" }) }),
+		}),
+	]);
+	expect(counted.chat_template_kwargs).toEqual(model.samplingParams.chat_template_kwargs);
+	const messages = await fixture.session.agent.convertForRequest(
+		structuredClone(fixture.session.agent.state.messages),
+	);
+	const result = await streamNative(model, normalizeContext({ messages }), {
+		apiKey: "offline-tokenizer-key",
+	}).result();
+	expect(result.stopReason).toBe("stop");
+	const inference = JSON.parse(fixture.summaries.at(-1)!.body);
+	expect(counted.messages).toEqual(inference.messages);
+	expect(counted.tools).toEqual(inference.tools);
+	expect(counted.chat_template_kwargs).toEqual(inference.chat_template_kwargs);
 	expect(fixture.session.getContextUsage()?.tokens).toBe(100);
 });
 

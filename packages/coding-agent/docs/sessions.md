@@ -113,6 +113,8 @@ Use `--session` when you already know the session path or ID. Use `--fork` to cr
 
 If persisting deferred bash output or context-only extension messages fails, the active prompt or continuation reports the storage error and releases its run ownership. Successfully appended records are not replayed; records not yet written remain pending for the next accepted prompt. This recovery state is in memory and does not survive a process crash before it is written.
 
+If the first conversation write fails after exclusively creating its session file, Pi removes that failed attempt's file and leaves the entry unpublished, so the next append can retry. An exclusive-open collision never removes another writer's file. This is recoverable write/close error handling, not a guarantee against process crashes or independent concurrent writers.
+
 Edits, surgical deletions and failed-prefill restoration can create context-only copies of earlier entries. Session stats, footer, cost breakdowns and HTML export count each recorded charge identity once, including abandoned history. Independent equal-valued provider calls, including regenerated swipe responses, remain separate charges; equal amounts alone never identify a replay. Existing histories without replay identities are not retroactively deduplicated.
 
 ## Export or share a session

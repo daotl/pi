@@ -1,5 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
+import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import { Text } from "../src/components/text.ts";
 import { type Component, CURSOR_MARKER, type TUI } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
@@ -26,6 +27,128 @@ class SimpleOverlay implements Component {
 }
 
 describe("TUI overlay with short content", () => {
+	for (const { line, base, covered } of [
+		{ line: "abc\rZ", base: "Zbc", covered: "Xbc" },
+		{ line: "abc\r\x1b[CZ", base: "aZc", covered: "XZc" },
+		{ line: "a界c\rZ", base: "Z界c", covered: "X界c" },
+		{ line: "界bc\rZ", base: "Z bc", covered: "X bc" },
+		{ line: "ábc\rZ", base: "Zbc", covered: "Xbc" },
+	]) {
+		it(`composes and restores column-zero overlays over ${JSON.stringify(line)}`, async () => {
+			const terminal = new VirtualTerminal(20, 7);
+			const tui = new TuiMainScreen(terminal);
+			tui.addChild(new SimpleContent([line]));
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				assert.strictEqual(terminal.getViewport()[0], base);
+				const content = new Text("X", 0, 0);
+				const overlay = tui.showOverlay(content, { width: 1, row: 0, col: 0, nonCapturing: true });
+				await terminal.waitForRender();
+				assert.strictEqual(terminal.getViewport()[0].trimEnd(), covered);
+				content.setText("Y");
+				tui.requestRender();
+				await terminal.waitForRender();
+				assert.strictEqual(terminal.getViewport()[0].trimEnd(), `Y${base.slice(1)}`);
+				overlay.hide();
+				await terminal.waitForRender();
+				assert.strictEqual(terminal.getViewport()[0], base);
+			} finally {
+				tui.stop();
+			}
+		});
+	}
+
+	it("retains overwritten and untouched cell styles through overlay updates and restoration", async () => {
+		const terminal = new VirtualTerminal(20, 7);
+		const tui = new TuiMainScreen(terminal);
+		tui.addChild(new SimpleContent(["\x1b[31mabc\r\x1b[32mZ"]));
+		// The existing terminal harness keeps its real xterm instance private.
+		const terminalWithXterm = terminal as unknown as { xterm: XtermTerminalType };
+		const xterm = terminalWithXterm.xterm;
+		const colorAt = (column: number) => {
+			const cell = xterm.buffer.active.getLine(xterm.buffer.active.viewportY)?.getCell(column);
+			assert.ok(cell);
+			return { mode: cell.getFgColorMode(), color: cell.getFgColor() };
+		};
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			const overwrittenColor = colorAt(0);
+			const retainedColor = colorAt(1);
+			assert.notDeepStrictEqual(overwrittenColor, retainedColor);
+			const content = new Text("X", 0, 0);
+			const overlay = tui.showOverlay(content, { width: 1, row: 0, col: 0, nonCapturing: true });
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[0].trimEnd(), "Xbc");
+			assert.deepStrictEqual(colorAt(1), retainedColor);
+			content.setText("Y");
+			tui.requestRender();
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[0].trimEnd(), "Ybc");
+			assert.deepStrictEqual(colorAt(1), retainedColor);
+			overlay.hide();
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[0], "Zbc");
+			assert.deepStrictEqual(colorAt(0), overwrittenColor);
+			assert.deepStrictEqual(colorAt(1), retainedColor);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	for (const lines of [["base", "ready"], []]) {
+		it(`places shell output below an open bottom overlay with ${lines.length} transcript rows`, async () => {
+			const terminal = new VirtualTerminal(20, 7);
+			terminal.write("shell\r\nprevious\r\n");
+			await terminal.flush();
+			const tui = new TuiMainScreen(terminal);
+			tui.addChild(new SimpleContent(lines));
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				tui.showOverlay(new Text("TOP\nBOTTOM", 0, 0), {
+					width: 8,
+					anchor: "bottom-left",
+					nonCapturing: true,
+				});
+				await terminal.waitForRender();
+				const retained = ["shell", "previous", ...lines, ...Array(5 - lines.length).fill(""), "TOP", "BOTTOM"];
+				assert.deepStrictEqual(
+					terminal.getScrollBuffer().map((line) => line.trimEnd()),
+					retained,
+				);
+				tui.stop();
+				terminal.write("shell $ ");
+				await terminal.flush();
+				assert.deepStrictEqual(
+					terminal.getScrollBuffer().map((line) => line.trimEnd()),
+					[...retained, "shell $"],
+				);
+				assert.deepStrictEqual(terminal.getCursorPosition(), { x: 8, y: 6 });
+			} finally {
+				tui.stop();
+			}
+		});
+	}
+
+	it("preserves the cursor and open bottom overlay on preserveScreen shutdown", async () => {
+		const terminal = new VirtualTerminal(20, 7);
+		const tui = new TuiMainScreen(terminal);
+		tui.addChild(new SimpleContent([`ready${CURSOR_MARKER}`]));
+		tui.setShowHardwareCursor(true);
+		tui.start();
+		await terminal.waitForRender();
+		tui.showOverlay(new Text("TOP\nBOTTOM", 0, 0), { width: 8, anchor: "bottom-left", nonCapturing: true });
+		await terminal.waitForRender();
+		const retained = terminal.getScrollBuffer();
+		const cursor = terminal.getCursorPosition();
+		tui.stop({ preserveScreen: true });
+		await terminal.flush();
+		assert.deepStrictEqual(terminal.getScrollBuffer(), retained);
+		assert.deepStrictEqual(terminal.getCursorPosition(), cursor);
+	});
+
 	it("reserves bottom overlay rows below shell output without clamping or losing history", async () => {
 		const terminal = new VirtualTerminal(20, 7);
 		terminal.write("shell $ pwd\r\n/tmp/project\r\n");

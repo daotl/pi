@@ -46,11 +46,13 @@ import {
 	createInitialSystemMessage,
 	getCurrentSystemMessage,
 	getSystemMessageText,
+	normalizeContext,
 	type RetryPolicy,
 	retryDelayMs,
 	toToolDeclaration,
 	uuidv7,
 } from "@earendil-works/pi-ai";
+import { buildChatTokenRequest } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { isContextClampingApi } from "@earendil-works/pi-ai/api/simple-options";
 import type {
 	Api,
@@ -1383,7 +1385,7 @@ export class AgentSession {
 			await this._emitExtensionEvent(event);
 			this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 		} catch (error) {
-			if (verifiedPrefill && event.type === "message_end" && event.message.role === "assistant") {
+			if (event.type === "message_end" && event.message.role === "assistant") {
 				throw new TerminalResponseError(error instanceof Error ? error.message : String(error), event.message, {
 					cause: error,
 				});
@@ -2210,6 +2212,7 @@ export class AgentSession {
 	goToSwipeVersion(group: SwipeGroup, index: number): boolean {
 		const changed = this._selectSwipeVersion(this.sessionManager, group, index);
 		if (changed) {
+			this._discardPrefillRecovery();
 			this._refreshFinalizedContext();
 			this._restoreBaseSystemPromptFromBranch();
 		}
@@ -2261,6 +2264,7 @@ export class AgentSession {
 			throw new Error("User messages cannot be regenerated.");
 		}
 		this.sessionManager.branch(group.anchorEntryId);
+		this._discardPrefillRecovery();
 		this._refreshFinalizedContext();
 		this._restoreBaseSystemPromptFromBranch(false);
 	}
@@ -2644,8 +2648,10 @@ export class AgentSession {
 		let versioned = 0;
 		let swiped = 0;
 		let navigatedSwipe = false;
+		let versionBranchChanged = false;
 		this.sessionManager.editMessages((draft) => {
 			for (const { block, target } of versionTargets) {
+				versionBranchChanged ||= draft.getEntry(target.entryId)?.parentId != null;
 				this._appendEditAsNewSwipeVersion(draft, block, target);
 				versioned++;
 			}
@@ -2657,6 +2663,7 @@ export class AgentSession {
 				swiped++;
 			}
 		});
+		if (navigatedSwipe || versionBranchChanged) this._discardPrefillRecovery();
 
 		const sessionContext = this.sessionManager.buildSessionContext();
 		this.agent.state.messages = sessionContext.messages;
@@ -3656,10 +3663,11 @@ export class AgentSession {
 	/** Consume a compact accepted after the final turn boundary before publishing settlement. */
 	private async _continuePastSettleBoundary(): Promise<boolean> {
 		if (this._agentRunAbortRequested) return false;
-		if (await this._runBeforeSettleBoundary()) return !this._agentRunAbortRequested;
+		const boundaryContinuation = await this._runBeforeSettleBoundary();
 		if (this._agentRunAbortRequested) return false;
-		const queuedCompactResume = await this._runQueuedCompact();
-		if (queuedCompactResume === undefined || this._agentRunAbortRequested) return false;
+		const queuedCompactResume = await this._runQueuedCompact(boundaryContinuation);
+		if (this._agentRunAbortRequested) return false;
+		if (queuedCompactResume === undefined) return boundaryContinuation;
 		return queuedCompactResume || this.agent.hasQueuedMessages();
 	}
 
@@ -4773,6 +4781,17 @@ export class AgentSession {
 				const input = structuredClone(this._getTokenizationContext(sessionContext.messages));
 				const transformed = this.agent.transformContext ? await this.agent.transformContext(input, signal) : input;
 				const llmMessages = await this.agent.convertForRequest(transformed);
+				if (auth.model.api !== "openai-completions") throw new Error("Unsupported native chat tokenizer");
+				const request = await buildChatTokenRequest(
+					{ ...auth.model, api: "openai-completions" },
+					normalizeContext({ messages: llmMessages }),
+					{
+						reasoning: this.thinkingLevel === "off" ? undefined : this.thinkingLevel,
+						thinkingBudgets: this.agent.thinkingBudgets,
+						sessionId: this.agent.sessionId,
+						env: auth.env,
+					},
+				);
 				const recheckedInput = structuredClone(this._getTokenizationContext(sessionContext.messages));
 				const rechecked = this.agent.transformContext
 					? await this.agent.transformContext(recheckedInput, signal)
@@ -4787,7 +4806,7 @@ export class AgentSession {
 				if (!this._canUploadTokenizationText(auth.model) || signal?.aborted)
 					throw new Error("Tokenizer request policy changed");
 				const count = await countChatTokens(auth.model, {
-					messages: llmMessages,
+					request,
 					apiKey: auth.apiKey,
 					headers: auth.headers,
 					env: auth.env,
@@ -6178,6 +6197,16 @@ export class AgentSession {
 		return last;
 	}
 
+	/** Accepted branch selection supersedes recovery owned by the abandoned prefix. */
+	private _discardPrefillRecovery(): void {
+		this._prefillRestoreFailed = false;
+		this._pendingPrefill = undefined;
+		this._prefillEntryId = undefined;
+		this._prefillRestorePoint = undefined;
+		this._prefillTrailingEntries = [];
+		this._prefillContinuationBranch = [];
+	}
+
 	/** Capture only the live projection; the original stays selected and durable. */
 	private _capturePrefill(message: AssistantMessage): void {
 		const branch = this.sessionManager.getBranch();
@@ -6567,13 +6596,7 @@ export class AgentSession {
 			// Update finalized context from the canonical session projection.
 			this._refreshFinalizedContext();
 			this._restoreBaseSystemPromptFromBranch();
-			// Accepted navigation supersedes recoverable work on the abandoned branch.
-			this._prefillRestoreFailed = false;
-			this._pendingPrefill = undefined;
-			this._prefillEntryId = undefined;
-			this._prefillRestorePoint = undefined;
-			this._prefillTrailingEntries = [];
-			this._prefillContinuationBranch = [];
+			this._discardPrefillRecovery();
 
 			// Emit session_tree event
 			await this._extensionRunner.emit({

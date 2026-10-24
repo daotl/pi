@@ -105,6 +105,56 @@ async function createSchedulingMode(options: HarnessOptions = {}) {
 	};
 }
 
+it("holds due work through shutdown abort settlement and resumes once after rejection", async () => {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const shutdownError = new Error("retained receipt unavailable");
+	const ui = await createSchedulingMode();
+	const requests: string[] = [];
+	ui.harness.setResponses([
+		async () => {
+			entered.resolve();
+			await release.promise;
+			return fauxAssistantMessage("initial answer", { stopReason: "aborted" });
+		},
+		(context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			return fauxAssistantMessage("scheduled answer");
+		},
+	]);
+	const shutdownMode = ui.mode as unknown as { shutdown(): Promise<void>; isShuttingDown: boolean };
+	const flush = vi.spyOn(ui.harness.session, "flushPendingUsage").mockImplementationOnce(() => {
+		throw shutdownError;
+	});
+	let running: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		running = ui.harness.session.prompt("initial request");
+		await entered.promise;
+		await ui.internal.handleScheduleCommand("\nretained after abort");
+		const shutdown = shutdownMode.shutdown();
+		await setImmediate();
+		expect(shutdownMode.isShuttingDown).toBe(true);
+		expect(requests).toEqual([]);
+		release.resolve();
+		await running;
+		await shutdown;
+		await vi.waitFor(() => expect(requests).toEqual(["retained after abort"]));
+		await ui.harness.session.waitForIdle();
+		expect(ui.internal.scheduledMessages).toEqual([]);
+	} finally {
+		release.resolve();
+		flush.mockRestore();
+		await running?.catch(() => {});
+		await ui.cleanup();
+	}
+});
+
 it.each(["handled input", "/handled", "rejected edit", "no-op deferred edit"] as const)(
 	"advances no-run %s once and never consumes settled work during an active run",
 	async (kind) => {
@@ -969,6 +1019,98 @@ it.each(
 			preflight.resolve();
 			response.resolve();
 			auth?.mockRestore();
+			await ui.cleanup();
+		}
+	},
+);
+
+it.each(["started", "handled", "rejected"] as const)(
+	"retains heartbeat exclusion while foreign-run fallback is held then %s",
+	async (outcome) => {
+		const entered = Promise.withResolvers<void>();
+		const preflight = Promise.withResolvers<void>();
+		const fallback = Promise.withResolvers<void>();
+		const fallbackRelease = Promise.withResolvers<void>();
+		const foreign = Promise.withResolvers<void>();
+		const requests: string[] = [];
+		const ui = await createSchedulingMode({
+			withConfiguredAuth: outcome !== "rejected",
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async (event) => {
+						if (event.prompt === "reserved heartbeat") {
+							entered.resolve();
+							await preflight.promise;
+						}
+					});
+					pi.on("input", async (event) => {
+						if (event.text === "reserved heartbeat" && event.streamingBehavior === "followUp") {
+							fallback.resolve();
+							await fallbackRelease.promise;
+							if (outcome === "handled") return { action: "handled" };
+						}
+					});
+				},
+			],
+		});
+		ui.harness.setResponses([
+			async () => {
+				requests.push("foreign user");
+				await foreign.promise;
+				return fauxAssistantMessage("foreign response");
+			},
+			(context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				return fauxAssistantMessage("heartbeat response");
+			},
+			(context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				return fauxAssistantMessage("scheduled response");
+			},
+		]);
+		let running: Promise<void> | undefined;
+		const auth = vi.spyOn(ui.harness.session.modelRuntime, "checkAuth").mockResolvedValue({ type: "api_key" });
+		try {
+			await ui.mode.init();
+			await ui.internal.handleHeartbeatCommand("12:01\nreserved heartbeat");
+			ui.internal.fireHeartbeat(ui.internal.heartbeats[0].id);
+			await entered.promise;
+			running = ui.harness.session.prompt("foreign user");
+			await vi.waitFor(() => expect(requests).toEqual(["foreign user"]));
+			preflight.resolve();
+			await fallback.promise;
+			await ui.internal.handleScheduleCommand('\n<pi_edit id="-1" role="user">after reserved heartbeat</pi_edit>');
+			foreign.resolve();
+			await running;
+			await setImmediate();
+			expect(requests).toEqual(["foreign user"]);
+			expect(ui.harness.session.messages.map(getMessageText)).not.toContain("after reserved heartbeat");
+			if (outcome === "rejected") auth.mockRejectedValueOnce(new Error("fallback authentication rejected"));
+			fallbackRelease.resolve();
+			await vi.waitFor(() =>
+				expect(requests).toEqual(
+					outcome !== "started"
+						? ["foreign user", "after reserved heartbeat"]
+						: ["foreign user", "reserved heartbeat", "after reserved heartbeat"],
+				),
+			);
+			await ui.harness.session.waitForIdle();
+		} finally {
+			preflight.resolve();
+			fallbackRelease.resolve();
+			foreign.resolve();
+			await running?.catch(() => {});
+			auth.mockRestore();
 			await ui.cleanup();
 		}
 	},

@@ -1,6 +1,6 @@
 import { type AssistantMessage, createProvider, fauxAssistantMessage, type Provider } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
-import { vi } from "vitest";
+import { expect, vi } from "vitest";
 import type { AgentSession } from "../../src/core/agent-session.ts";
 import { createAgentSession } from "../../src/core/sdk.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
@@ -90,6 +90,17 @@ export async function createNativeTokenizerFixture(options: HarnessOptions = {})
 			const authorization = new Headers(init?.headers).get("authorization");
 			if (url.endsWith("/tokenize") || url.endsWith("/chat/completions/input_tokens")) {
 				uploads.push({ url, body, authorization });
+				if (url.endsWith("/chat/completions/input_tokens")) {
+					const request = JSON.parse(body) as { messages: Array<Record<string, unknown>> };
+					for (const message of request.messages) {
+						expect(["system", "developer", "user", "assistant", "tool"]).toContain(message.role);
+						expect(message).not.toHaveProperty("toolsAdded");
+						expect(message).not.toHaveProperty("toolsRemoved");
+						if (Array.isArray(message.content)) {
+							for (const part of message.content) expect(["text", "image_url"]).toContain(part.type);
+						}
+					}
+				}
 				return tokenize(url, init);
 			}
 			if (url !== "https://tokenizer.invalid/v1/chat/completions") throw new Error(`Unexpected origin: ${url}`);

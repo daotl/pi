@@ -210,6 +210,78 @@ it.each([
 	},
 );
 
+it("retains an ordinary completed response charge after a prepublication listener rejects it", async () => {
+	const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+	const harness = await createHarness({
+		cwd,
+		sessionManager: manager,
+		settings: { retry: { enabled: false }, compaction: { enabled: false } },
+	});
+	try {
+		const model = harness.getModel();
+		const terminal: AssistantMessage = {
+			...fauxAssistantMessage("unpublished ordinary answer"),
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			responseId: "ordinary-listener-charge",
+			responseModel: "physical-deployment",
+			diagnostics: [{ type: "provider-recovery", timestamp: 1, details: { attempt: 1 } }],
+			usage: {
+				input: 100,
+				output: 10,
+				cacheRead: 5,
+				cacheWrite: 3,
+				totalTokens: 118,
+				cost: { input: 0.1, output: 0.01, cacheRead: 0.005, cacheWrite: 0.003, total: 0.118 },
+			},
+		};
+		harness.session.agent.streamFunction = () => {
+			const stream = createAssistantMessageEventStream();
+			stream.push({ type: "done", reason: "stop", message: structuredClone(terminal) });
+			return stream;
+		};
+		let rejected = false;
+		harness.session.subscribe((event) => {
+			if (!rejected && event.type === "message_end" && event.message.role === "assistant") {
+				rejected = true;
+				throw new Error("ordinary publication rejected");
+			}
+		});
+		await harness.session.prompt("ordinary request");
+		expect(rejected).toBe(true);
+		for (const current of [manager, SessionManager.open(manager.getSessionFile()!)]) {
+			const assistants = current
+				.getEntries()
+				.filter((entry) => entry.type === "message" && entry.message.role === "assistant");
+			expect(assistants).toEqual([
+				expect.objectContaining({
+					message: expect.objectContaining({
+						content: [{ type: "text", text: "" }],
+						stopReason: "error",
+						responseId: terminal.responseId,
+						responseModel: terminal.responseModel,
+						diagnostics: terminal.diagnostics,
+						usage: terminal.usage,
+					}),
+				}),
+			]);
+			expect(current.buildSessionContext().messages.map(getMessageText)).not.toContain(
+				"unpublished ordinary answer",
+			);
+			expect(getUsageTotals(current.getEntries())).toEqual({
+				input: 100,
+				output: 10,
+				cacheRead: 5,
+				cacheWrite: 3,
+				cost: expect.closeTo(0.118),
+			});
+		}
+	} finally {
+		harness.cleanup();
+	}
+});
+
 it("keeps an accepted branch navigation instead of replaying failed recovery from its abandoned branch", async () => {
 	const manager = SessionManager.create(cwd, join(cwd, "sessions"));
 	const harness = await createHarness({
@@ -263,6 +335,98 @@ it("keeps an accepted branch navigation instead of replaying failed recovery fro
 		harness.cleanup();
 	}
 });
+
+it.each(["select", "regenerate", "edit-version", "edit-swipe"] as const)(
+	"discards failed prefix recovery after accepted swipe %s",
+	async (action) => {
+		const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+		const harness = await createHarness({
+			cwd,
+			sessionManager: manager,
+			fauxApi: "openai-completions",
+			settings: { retry: { enabled: false }, compaction: { enabled: false } },
+		});
+		try {
+			harness.setResponses([
+				fauxAssistantMessage("selected answer"),
+				fauxAssistantMessage("abandoned partial", { stopReason: "aborted" }),
+			]);
+			await harness.session.prompt("same question");
+			const selected = harness.session.getSwipeGroup()!.versions[0];
+			await harness.session.regenerateSwipe(harness.session.getSwipeGroup()!);
+			let restoration = false;
+			harness.session.subscribe((event) => {
+				if (event.type === "turn_end" && event.message.role === "assistant" && event.message.stopReason === "error")
+					restoration = true;
+			});
+			const actual = await vi.importActual<typeof fs>("fs");
+			let failed = false;
+			vi.mocked(fs.writeFileSync).mockImplementation((...args) => {
+				if (restoration && !failed) {
+					failed = true;
+					throw new Error("injected failed prefix restoration");
+				}
+				return actual.writeFileSync(...args);
+			});
+			harness.setResponses([fauxAssistantMessage("wrong terminal")]);
+			await expect(harness.session.continue()).rejects.toBeInstanceOf(Error);
+			expect(failed).toBe(true);
+			vi.mocked(fs.writeFileSync).mockImplementation(actual.writeFileSync);
+			const beforeLeaf = manager.getLeafId();
+			const anchorId = harness.session.getSwipeGroup()!.anchorEntryId;
+			if (action === "select")
+				expect(harness.session.goToSwipeVersion(harness.session.getSwipeGroup()!, 0)).toBe(true);
+			else if (action === "regenerate") harness.session.prepareSwipeRegeneration(harness.session.getSwipeGroup()!);
+			else if (action === "edit-version")
+				harness.session.applyMessageEdits(
+					'<pi_edit id="0" role="assistant"><pi_content>edited version</pi_content></pi_edit>',
+				);
+			else
+				harness.session.applyMessageEdits(
+					`<pi_swipe timestamp="${selected.timestamp}" role="assistant"><pi_content>edited selected</pi_content></pi_swipe>`,
+				);
+			const selectedTexts = manager
+				.buildSessionContext()
+				.messages.filter((message) => message.role !== "system")
+				.map(getMessageText);
+			const expectedSelected = {
+				select: ["same question", "selected answer"],
+				regenerate: ["same question"],
+				"edit-version": ["same question", "edited version"],
+				"edit-swipe": ["same question", "edited selected"],
+			}[action];
+			expect(selectedTexts).toEqual(expectedSelected);
+			expect(manager.getLeafId()).not.toBe(beforeLeaf);
+			if (action === "select") expect(manager.getLeafId()).toBe(selected.id);
+			else if (action === "regenerate") expect(manager.getLeafId()).toBe(anchorId);
+			else if (action === "edit-version") {
+				const version = manager.getEntry(manager.getLeafId()!);
+				expect(version).toMatchObject({
+					type: "message",
+					parentId: anchorId,
+					message: { role: "assistant", content: [{ type: "text", text: "edited version" }] },
+				});
+				expect(manager.getBranch().map((entry) => entry.id)).not.toContain(selected.id);
+			}
+			let requested: string[] = [];
+			harness.setResponses([
+				(context) => {
+					requested = context.messages.filter((message) => message.role !== "system").map(getMessageText);
+					return fauxAssistantMessage("accepted next answer");
+				},
+			]);
+			await harness.session.prompt("next instruction");
+			expect(requested).toEqual([...expectedSelected, "next instruction"]);
+			expect(requested).not.toContain("abandoned partial");
+			expect(SessionManager.open(manager.getSessionFile()!).buildSessionContext().messages).toEqual(
+				harness.session.messages,
+			);
+		} finally {
+			await harness.session.abort();
+			harness.cleanup();
+		}
+	},
+);
 
 it("preserves failed restoration after aborting an approved active prefix retry", async () => {
 	const manager = SessionManager.create(cwd, join(cwd, "sessions"));

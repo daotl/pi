@@ -576,6 +576,72 @@ export function terminalLineRows(
 	return position.rows;
 }
 
+/** Materialize row-local overwrites before the compositor slices by visible columns. */
+function materializeCarriageReturnRow(text: string, columns: number, tracker: AnsiCodeTracker): string {
+	interface Cell {
+		text: string;
+		style: string;
+		start: number;
+		width: number;
+	}
+	const cells: (Cell | undefined)[] = [];
+	let style = tracker.getActiveCodes();
+	let column = 0;
+	let i = 0;
+	while (i < text.length) {
+		const ansi = extractAnsiCode(text, i);
+		if (ansi) {
+			if ((ansi.code.startsWith("\x1b[") && ansi.code.endsWith("m")) || ansi.code.startsWith("\x1b]8;")) {
+				tracker.process(ansi.code);
+				style = tracker.getActiveCodes();
+			} else {
+				const forward = /^\x1b\[(\d*)C$/.exec(ansi.code);
+				if (forward) column = Math.min(columns - 1, column + Math.max(1, Number(forward[1] || 1)));
+			}
+			i += ansi.length;
+			continue;
+		}
+		let end = i + 1;
+		while (end < text.length && !extractAnsiCode(text, end)) end++;
+		for (const { segment } of graphemeSegmenter.segment(text.slice(i, end))) {
+			if (segment === "\r") {
+				column = 0;
+				continue;
+			}
+			const width = graphemeWidth(segment);
+			if (width === 0) {
+				const previous = cells[column - 1];
+				if (previous) previous.text += segment;
+				continue;
+			}
+			// Overwriting either half of a wide grapheme removes its whole placement.
+			for (let col = column; col < column + width; col++) {
+				const old = cells[col];
+				if (old) {
+					for (let covered = old.start; covered < old.start + old.width; covered++) cells[covered] = undefined;
+				}
+			}
+			const cell = { text: segment, style, start: column, width };
+			for (let col = column; col < column + width; col++) cells[col] = cell;
+			column += width;
+		}
+		i = end;
+	}
+	let visible = "";
+	let previousStyle: string | undefined;
+	for (let col = 0; col < cells.length; ) {
+		const cell = cells[col];
+		const cellStyle = cell?.style ?? "";
+		if (cellStyle !== previousStyle) {
+			visible += `\x1b[0m\x1b]8;;\x1b\\${cellStyle}`;
+			previousStyle = cellStyle;
+		}
+		visible += cell?.text ?? " ";
+		col += cell?.width ?? 1;
+	}
+	return visible;
+}
+
 /** Slice native-reflow rows without changing word boundaries or replaying semantic escapes. */
 export function terminalLinePhysicalRows(str: string, columns: number, startRow = 0, endRow = Infinity): string[] {
 	const normalized = normalizeTerminalOutput(str);
@@ -587,6 +653,11 @@ export function terminalLinePhysicalRows(str: string, columns: number, startRow 
 	for (let row = 0; row < boundaries.length - 1; row++) {
 		const text = normalized.slice(boundaries[row], boundaries[row + 1]).replace(/\r?\n$/, "");
 		if (row >= startRow && row < endRow) {
+			if (text.includes("\r")) {
+				rows.push(materializeCarriageReturnRow(text, columns, tracker));
+				if (row + 1 >= endRow) break;
+				continue;
+			}
 			const prefix = tracker.getActiveCodes();
 			// Only styles and cursor markers are safe to repaint; prompt zones and other
 			// semantic controls were already emitted by the transcript renderer.

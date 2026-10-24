@@ -4773,11 +4773,34 @@ export class InteractiveMode {
 			// terminal. If the terminal is gone, the restore writes below emit EIO,
 			// which the stdout/stderr error handler turns into emergencyTerminalExit;
 			// the render loop is already idle, so this cannot hot-spin (see #4144).
-			await this.runtimeHost.dispose();
+			try {
+				await this.runtimeHost.dispose();
+			} catch (error: unknown) {
+				this.isShuttingDown = false;
+				this.shutdownRequested = false;
+				this.showError(`Failed to shut down: ${error instanceof Error ? error.message : String(error)}`);
+				void this.flushCompactionQueue().finally(() => this.fireDueScheduledMessages());
+				this.tickHeartbeats();
+				return;
+			}
 			this.themeController.disableAutoSync();
 			await this.ui.terminal.drainInput(1000);
 			this.stop();
 			process.exit(0);
+		}
+
+		// Persist retained receipts before stop() disposes the UI and its subscriptions.
+		// Aborting first also collects any charge from the run being shut down.
+		try {
+			await this.session.abort();
+			this.session.flushPendingUsage();
+		} catch (error: unknown) {
+			this.isShuttingDown = false;
+			this.shutdownRequested = false;
+			this.showError(`Failed to shut down: ${error instanceof Error ? error.message : String(error)}`);
+			void this.flushCompactionQueue().finally(() => this.fireDueScheduledMessages());
+			this.tickHeartbeats();
+			return;
 		}
 
 		// Interactive quit (Ctrl+D, Ctrl+C, /quit, extension shutdown()). Stop the
@@ -4788,8 +4811,22 @@ export class InteractiveMode {
 		this.themeController.disableAutoSync();
 		await this.ui.terminal.drainInput(1000);
 
+		this.ui.stop({ preserveScreen: true });
+		try {
+			await this.runtimeHost.dispose();
+		} catch (error: unknown) {
+			// Disposal rejected before invalidation; resume the same host registrations.
+			this.isShuttingDown = false;
+			this.shutdownRequested = false;
+			this.ui.start();
+			this.themeController.applyFromSettings();
+			this.ui.requestRender();
+			this.showError(`Failed to shut down: ${error instanceof Error ? error.message : String(error)}`);
+			void this.flushCompactionQueue().finally(() => this.fireDueScheduledMessages());
+			this.tickHeartbeats();
+			return;
+		}
 		this.stop();
-		await this.runtimeHost.dispose();
 
 		const resumeCommand = formatResumeCommand(this.sessionManager);
 		if (resumeCommand) {
@@ -5245,7 +5282,7 @@ export class InteractiveMode {
 	}
 
 	private async flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
-		if (this.compactionQueueDeliveryPending || this.compactionQueuedMessages.length === 0) {
+		if (this.isShuttingDown || this.compactionQueueDeliveryPending || this.compactionQueuedMessages.length === 0) {
 			return;
 		}
 
@@ -6210,6 +6247,7 @@ export class InteractiveMode {
 
 	private deliverScheduledEntry(entry: ScheduledMessage): void {
 		if (
+			!this.isShuttingDown &&
 			!entry.isContinue &&
 			!entry.isEdit &&
 			(this.session.isStreaming || this.session.isCompacting) &&
@@ -6283,24 +6321,28 @@ export class InteractiveMode {
 				},
 			})
 			.catch((error: unknown) => {
-				reportOutcome(false);
 				// Preserve ordinary messages if another run won asynchronous preflight.
 				if (error instanceof Error && error.message.includes("already processing")) {
 					void this.session
 						.prompt(text, {
 							streamingBehavior: "followUp",
-							preflightResult: (disposition) => onDispatch?.(disposition !== "handled"),
+							preflightResult: (disposition) => {
+								reportOutcome(disposition === "started");
+								onDispatch?.(disposition !== "handled");
+							},
 							onDeferredError: () => {
 								reportOutcome(false);
 								onDispatch?.(false);
 							},
 						})
 						.catch((inner: unknown) => {
+							reportOutcome(false);
 							this.showError(inner instanceof Error ? inner.message : String(inner));
 							onDispatch?.(false);
 						});
 					return;
 				}
+				reportOutcome(false);
 				this.showError(error instanceof Error ? error.message : String(error));
 				onDispatch?.(false);
 			});
@@ -6327,6 +6369,7 @@ export class InteractiveMode {
 	/** Drain eligible settled work in creation order while one dispatch owns preflight. */
 	private fireDueScheduledMessages(): void {
 		if (
+			this.isShuttingDown ||
 			!this.session.isIdle ||
 			this.settledDeliveryPending ||
 			this.heartbeatStartPending ||
@@ -6660,6 +6703,7 @@ export class InteractiveMode {
 
 	/** Deliver one most-overdue interval beat per idle tick, preserving other deadlines for heartbeat-owned runs. */
 	private tickHeartbeats(): void {
+		if (this.isShuttingDown) return;
 		const now = Date.now();
 		if (this.session.isStreaming || this.session.isCompacting) {
 			if (this.heartbeatRunActive) return;
@@ -6778,6 +6822,7 @@ export class InteractiveMode {
 
 		// Daily occurrences are skipped, not deferred, while another delivery owns preflight.
 		if (
+			this.isShuttingDown ||
 			this.session.isStreaming ||
 			this.session.isCompacting ||
 			this.heartbeatStartPending ||

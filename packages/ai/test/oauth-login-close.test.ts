@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type * as CallbackServerModule from "../src/auth/oauth/callback-server.ts";
 import type { OAuthCallbackServerOptions } from "../src/auth/oauth/callback-server.ts";
 import { openaiCodexOAuth } from "../src/auth/oauth/openai-codex.ts";
 import { openRouterOAuth } from "../src/auth/oauth/openrouter.ts";
@@ -12,7 +13,7 @@ const control = vi.hoisted(() => ({
 }));
 
 vi.mock("../src/auth/oauth/callback-server.ts", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("../src/auth/oauth/callback-server.ts")>();
+	const actual = await importOriginal<typeof CallbackServerModule>();
 	return {
 		...actual,
 		startOAuthCallbackServer: async (options: OAuthCallbackServerOptions<unknown>) => {
