@@ -45,3 +45,39 @@ Fresh repair-only `ce-code-review` ran ten native personas against the 26 change
 ### Verdict
 
 Ready locally within the stated scope. All original retained product findings are fixed, with the #11 coverage gap promoted only after real RED proof. No live tokenizer-server numerical, arbitrary ANSI, process-crash durability or dead-terminal cleanup guarantee is made. Original HTML browser automation is not a permanent test suite. Machine-local proof and review artifacts: `/Users/nex/.local/state/pi-review-repair-2026-10-25/` and `/tmp/compound-engineering-501/ce-code-review/20261025-review-repairs/`. No push or PR.
+
+## Full merge review loop: round 1
+
+Scope: fixed `839dc79197595a4285d711e37d02fb623e5b6b7b` -> `cee6de06220369eea3c2d06296abfafb333a1143`, all 416 changed tracked paths. The immutable snapshot digest is `2f0de79fdeba7f81aecddfa27b0c8a26b6df8da7e4ee8e67c0e97e74ec55fc2b`. This is a fresh complete merge diff, not the previous 26-path repair diff. Eighteen independent native workers completed: eight correctness domains plus ten justified cross-cutting lenses. Exact domain inventories partition all 416 paths without omissions or duplicates. Complete assigned-diff traversal is reported; deep whole-file clearance of every path is not claimed. Historical receipt lines and external/dynamic callers retain explicit evidence limits.
+
+### Confirmed findings and repairs
+
+- R1-#1 (P1; security + adversarial): a stable SDK converter reads live Block images and incoming-prefix settings. A held final-context transform allowed previously converted image bytes to upload after blocking was enabled. Both image and prefix regressions failed before repair. Finalization now reconverts the isolated rechecked context, compares the converted result, and checks built-in live policy values and callback/transport identities after awaited work. Stale counts are declined; complete multimodal/tool/template counting remains. Native authorization owner: 37 passed.
+- R1-#3 (P2): a public `agent_settled` subscriber throw bypassed deferred completion rejection and idle-wait resolution. Actual regression failed with unresolved completion. Notification failure now discards not-started deferred actions with the same error and resolves idle waiters after clearing the emission flag. Successful deferred execution retains its prior idle boundary. Actual UI queue test restores the original batch before newer input and retries successfully. Scheduler owner: 55 passed. A separate actual-source runtime smoke observed original-error propagation, deferred rejection, idle resolution and a successful subsequent prompt.
+- R1-#5 (P2): native pi-messages EOF/read rejection/abort synthesized an empty terminal assistant despite emitted raw tokens. Four regressions failed before repair. Terminal failure now retains the emitted partial, including raw arguments, content, metadata and diagnostics; pre-start setup failures remain empty. AI owner: 16 passed. Actual localhost HTTP SSE EOF smoke retained the raw prefix in the authoritative result.
+- R1-#6 (P2): failed SYSTEM.md/APPEND_SYSTEM.md publication restored Session fields but left rejected loader caches eligible for later tool-loadout rebuild. Two extended regressions failed after toggling active tools. Rollback now pins accepted static sections/baseline/context inputs; the next actual provider request remains on accepted construction until an explicit update succeeds. Prompt transaction owner: 22 passed.
+- R1-#7 (P2): prefill capture set Session streaming before the low-level run began, preserving a historical unresolved tool component as live. The real VirtualTerminal regression failed during held continuation. Preservation now depends on low-level Agent streaming ownership; the subsequent streamed/executing tool has one component and retains its identity.
+- R1-#8 (P2): atomic heartbeat save renamed over a symlink rather than updating its target. A real-filesystem regression failed before repair. Save now resolves the existing destination before creating its sibling temporary file; alias, target bytes and permissions survive. Four held-save replacement/stop success/error cases also cover the previously reported test gap without changing accepted-snapshot semantics.
+- R1-#10 (P2): physical row discovery ignored cursor-forward movement, then materialization inserted the gap too late. Two terminal regressions failed before repair. Supported CUF now participates in last-column clamping/pending-wrap decisions before row splitting; materialization reuses the overwrite-cell path. Actual VirtualTerminal overlay open/hide preserves both continuation rows and following Footer content. TUI owners: 75 passed.
+
+### Validation, verification and exceptions
+
+Ten raw candidates -> one semantic privacy duplicate merged, one pure heartbeat coverage gap demoted, eight candidates independently validated in one normal-sized batch. Seven retained. R1-#4 id0 usage identity was rejected as pre-existing: the fixed base already copied usage into a new unlinked version and counted it again. No unrelated billing change was made.
+
+Post-format integration runs: coding-agent 215 passed / 7 files; AI 16 passed / 1 file; TUI 75 passed / 4 files. Full `npm run check` first passed after formatting three owned files, then passed with **1770 files / No fixes applied, 156.20s**. Actual source lifecycle smoke required a temporary source-export resolver because unbuilt dist imports were unavailable; that resolver and smoke script were removed.
+
+Root aggregate history remains explicit: first run timed out at 240.27s without a total (`artifact://5678`); second ended **8821 passed / 1 failed / 915 skipped, 285.33s** (`artifact://5681`), failing the unchanged experimental remote-worker immediate PID-exit assertion. Its baseline provenance is `65ec9453bc` (2026-08-16). Coordinator disconnect removes the worker mapping before OS process exit; the original isolated case passed three times. Two diagnostic polling edits were exactly reverted; no experimental runtime/test change enters this repair. Final unchanged-source isolated `./test.sh`: **8822 passed / 0 failed / 915 skipped, 236.88s** (`artifact://5689`). No green claim is based on the modified diagnostic run.
+
+The strict loop preflight returned `clean:false` because of the original 749 protected untracked files. They are preserved; manual full-review waves are used, not strict loop-protocol convergence. Graph initialization remains unavailable (WeakMap error). No external peer was sent: serving-family independence could not be attested. The canonical receipt helper rejected custom correctness-domain identities; this round retains all raw reports, exact coverage audit and independent validation, but does not claim a canonical helper-complete receipt. Next full wave must use canonical persona identities. Artifacts: `/tmp/compound-engineering-501/ce-code-review/20261025-full-wave1-0de930fe/`.
+
+### Actionable Findings
+
+All seven confirmed round-1 defects are repaired and behaviorally verified in the current uncommitted product tree. Commit and a fresh fixed-base -> latest-HEAD full review are still required; this round does not establish convergence.
+
+### Coverage
+
+No live tokenizer numerical, arbitrary ANSI, crash durability, dead-terminal, complete external caller or permanent HTML DOM automation guarantee. Detailed cross-cutting coverage is bounded and recorded per path. Agent-native focused counts were corrected by the mechanical coverage audit to 11 detailed / 405 insufficient paths; complete domain correctness assignments remain separate. Recovery protection is checked against the available recovery snapshot, not the lost original manifest.
+
+### Verdict
+
+Round-1 repairs verified locally; review loop continues after the repair commit. No push, PR, dependency, released changelog or upstream replay.

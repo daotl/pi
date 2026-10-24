@@ -1310,11 +1310,17 @@ export class AgentSession {
 		this._cacheWarmer?.onAgentSettled();
 		this._isAgentRunActive = false;
 		this._isEmittingAgentSettled = true;
+		let notificationFailed = false;
 		try {
 			await this._extensionRunner.emit({ type: "agent_settled" });
 			this._emit({ type: "agent_settled" });
+		} catch (error) {
+			notificationFailed = true;
+			for (const action of this._deferredSettledActions.splice(0)) action.discard?.(error);
+			throw error;
 		} finally {
 			this._isEmittingAgentSettled = false;
+			if (notificationFailed) this._resolveIdleWaitIfIdle();
 		}
 
 		const deferred = this._deferredSettledActions.splice(0);
@@ -3291,6 +3297,8 @@ export class AgentSession {
 			deferUntrustedSnapshot: this._deferUntrustedSnapshot,
 			fileSources: this._promptFileSources,
 		};
+		const acceptedSections = this._buildEffectivePromptSections(previous.options);
+		const acceptedBaseline = buildSystemPromptSections(previous.options);
 		try {
 			if (options.systemPrompt) {
 				this._resourceLoader.reloadSystemPrompt();
@@ -3323,9 +3331,10 @@ export class AgentSession {
 			this._effectiveSkills = previous.skills;
 			this._restoreSystemPrompt = previous.restoreSystemPrompt;
 			this._lastPersistedSystemPrompt = previous.lastPersistedSystemPrompt;
-			this._restoredSystemPromptSections = previous.sections;
-			this._restoredPromptBaseline = previous.baseline;
-			this._effectiveContextFiles = previous.contextFiles;
+			// Loader caches may already contain rejected files; rebuild from accepted static sections.
+			this._restoredSystemPromptSections = previous.sections ?? acceptedSections;
+			this._restoredPromptBaseline = previous.baseline ?? acceptedBaseline;
+			this._effectiveContextFiles = previous.contextFiles ?? previous.options.contextFiles;
 			this._untrustedSkillOrder = previous.untrustedSkillOrder;
 			this._deferUntrustedSnapshot = previous.deferUntrustedSnapshot;
 			this._promptFileSources = previous.fileSources;
@@ -4778,6 +4787,9 @@ export class AgentSession {
 			try {
 				const transform = this.agent.transformContext;
 				const converter = this.agent.convertToLlm;
+				const blockImages = this.settingsManager.getBlockImages();
+				const settingsPrefix = this.settingsManager.getIncomingMessagePrefix();
+				const incomingPrefix = this.agent.incomingMessagePrefix;
 				const input = structuredClone(this._getTokenizationContext(sessionContext.messages));
 				const transformed = this.agent.transformContext ? await this.agent.transformContext(input, signal) : input;
 				const llmMessages = await this.agent.convertForRequest(transformed);
@@ -4796,10 +4808,15 @@ export class AgentSession {
 				const rechecked = this.agent.transformContext
 					? await this.agent.transformContext(recheckedInput, signal)
 					: recheckedInput;
+				const recheckedMessages = await this.agent.convertForRequest(structuredClone(rechecked));
 				if (
 					transform !== this.agent.transformContext ||
 					converter !== this.agent.convertToLlm ||
-					!isDeepStrictEqual(rechecked, transformed)
+					!isDeepStrictEqual(rechecked, transformed) ||
+					!isDeepStrictEqual(recheckedMessages, llmMessages) ||
+					blockImages !== this.settingsManager.getBlockImages() ||
+					settingsPrefix !== this.settingsManager.getIncomingMessagePrefix() ||
+					incomingPrefix !== this.agent.incomingMessagePrefix
 				)
 					throw new Error("Tokenizer context policy changed");
 				// Respect policy removal of system/tools; never reinsert raw authority after conversion.

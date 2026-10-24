@@ -325,9 +325,14 @@ function parsePiMessagesEvent(raw: string): PiMessagesEvent | undefined {
 	return data && data !== "[DONE]" ? (JSON.parse(data) as PiMessagesEvent) : undefined;
 }
 
-function createErrorEvent(model: Model<"pi-messages">, error: unknown, aborted: boolean): AssistantMessageEvent {
+function createErrorEvent(
+	model: Model<"pi-messages">,
+	error: unknown,
+	aborted: boolean,
+	partial?: AssistantMessage,
+): AssistantMessageEvent {
 	const reason = aborted ? "aborted" : "error";
-	const assistantMessage: AssistantMessage = {
+	const assistantMessage: AssistantMessage = partial ?? {
 		role: "assistant",
 		content: [],
 		api: model.api,
@@ -335,9 +340,10 @@ function createErrorEvent(model: Model<"pi-messages">, error: unknown, aborted: 
 		model: model.id,
 		usage: createEmptyUsage(),
 		stopReason: reason,
-		errorMessage: error instanceof Error ? error.message : String(error),
 		timestamp: Date.now(),
 	};
+	assistantMessage.stopReason = reason;
+	assistantMessage.errorMessage = error instanceof Error ? error.message : String(error);
 
 	if (!aborted && error instanceof PiMessagesResponseError) {
 		appendAssistantMessageDiagnostic(
@@ -364,6 +370,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 ): AssistantMessageEventStream => {
 	const eventStream = new AssistantMessageEventStream();
 	const convertEvent = createEventConverter(model);
+	let partial: AssistantMessage | undefined;
 
 	void (async () => {
 		try {
@@ -419,6 +426,9 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 			for await (const piEvent of readPiMessagesEvents(response.body)) {
 				await options?.onProviderStreamEvent?.(piEvent, model);
 				const event = convertEvent(piEvent);
+				if ("partial" in event) {
+					partial = event.partial;
+				}
 				eventStream.push(event);
 				if (event.type === "done" || event.type === "error") {
 					return;
@@ -427,7 +437,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 
 			throw new Error(`${model.provider} stream ended without a terminal event`);
 		} catch (error) {
-			eventStream.push(createErrorEvent(model, error, options?.signal?.aborted ?? false));
+			eventStream.push(createErrorEvent(model, error, options?.signal?.aborted ?? false, partial));
 		}
 	})();
 

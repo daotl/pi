@@ -619,3 +619,61 @@ it.each(["sdk-compact", "sdk-branch", "sdk-bug-report", "wrapped-sdk-compact"] a
 		}
 	},
 );
+
+it.each(["block-images", "incoming-prefix"] as const)(
+	"revokes stale chat counting when live SDK %s changes during the final transform",
+	async (policy) => {
+		const fixture = await nativeFixture();
+		const image = "UFJJVkFURV9MSVZFX1BPTElDWV9JTUFHRQ==";
+		fixture.manager.appendMessage({
+			role: "user",
+			content: [
+				{ type: "text", text: "retained live policy" },
+				{ type: "image", data: image, mimeType: "image/png" },
+			],
+			timestamp: 30,
+		});
+		fixture.session.refreshContext();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const transform = fixture.session.agent.transformContext;
+		let matching = 0;
+		fixture.session.agent.transformContext = async (messages, signal) => {
+			const transformed = transform ? await transform(messages, signal) : messages;
+			if (
+				fixture.manager.getBranch().some((entry) => entry.type === "compaction") &&
+				messages.some((message) => message.role === "compactionSummary") &&
+				++matching === 2
+			) {
+				entered.resolve();
+				await release.promise;
+			}
+			return transformed;
+		};
+		const outcome = fixture.session.compact({ keepRecentMessages: 2 }).then(
+			(result) => ({ result }),
+			(error: unknown) => ({ error }),
+		);
+		try {
+			await Promise.race([
+				entered.promise,
+				outcome.then(() => {
+					throw new Error("Live policy transform gate did not start");
+				}),
+			]);
+			const accepted = fixture.uploads.length;
+			if (policy === "block-images") fixture.owner.settingsManager.setBlockImages(true);
+			else fixture.owner.settingsManager.setIncomingMessagePrefix("NEW_LIVE_PREFIX");
+			release.resolve();
+			expect(await outcome).toMatchObject({ result: { summary: "safe checkpoint" } });
+			for (const upload of fixture.uploads.slice(accepted)) {
+				if (policy === "block-images") expect(upload.body).not.toContain(image);
+				else expect(upload.body).toContain("NEW_LIVE_PREFIX");
+			}
+			expect(fixture.session.getContextUsage()?.tokens).not.toBe(100);
+		} finally {
+			release.resolve();
+			await outcome;
+		}
+	},
+);

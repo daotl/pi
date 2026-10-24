@@ -36,8 +36,10 @@ it.each(
 		fs.mkdirSync(cwd, { recursive: true });
 		fs.mkdirSync(skillDir, { recursive: true });
 		const system = join(agentDir, "SYSTEM.md");
+		const addendum = join(agentDir, "APPEND_SYSTEM.md");
 		const skill = join(skillDir, "SKILL.md");
 		fs.writeFileSync(system, "ORIGINAL PREAMBLE");
+		fs.writeFileSync(addendum, "ORIGINAL ADDENDUM");
 		fs.writeFileSync(skill, "---\nname: alpha\ndescription: ORIGINAL SKILL\n---\nbody");
 		const loader = new DefaultResourceLoader({
 			cwd,
@@ -81,6 +83,7 @@ it.each(
 			const entries = structuredClone(manager.getEntries());
 			const bytes = fs.readFileSync(manager.getSessionFile()!);
 			fs.writeFileSync(system, "UNCOMMITTED PREAMBLE");
+			fs.writeFileSync(addendum, "UNCOMMITTED ADDENDUM");
 			fs.writeFileSync(skill, "---\nname: alpha\ndescription: UNCOMMITTED SKILL\n---\nbody");
 			const update = () => {
 				if (operation === "set") harness.session.setCustomSystemPrompt("UNCOMMITTED CUSTOM");
@@ -97,6 +100,10 @@ it.each(
 			expect(manager.getSavedSystemPrompt()).toEqual(snapshot);
 			expect(manager.getEntries()).toEqual(entries);
 			expect(fs.readFileSync(manager.getSessionFile()!)).toEqual(bytes);
+			harness.session.setActiveToolsByName([]);
+			harness.session.setActiveToolsByName(["read", "bash", "edit", "write"]);
+			expect(harness.session.systemPrompt).not.toContain("UNCOMMITTED");
+			expect(harness.session.systemPrompt).toContain("ORIGINAL ADDENDUM");
 			let request = "";
 			harness.setResponses([
 				(context) => {

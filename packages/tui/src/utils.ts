@@ -484,7 +484,7 @@ export function extractAnsiCode(str: string, pos: number): { code: string; lengt
  * Width of a string made of printable ASCII, tabs, and ANSI escape sequences, or -1 if it contains
  * anything else. Matches `visibleWidth` for those strings without allocating.
  */
-function asciiVisibleWidth(str: string, endIndex = str.length): number {
+function asciiVisibleWidth(str: string, endIndex = str.length, rejectCursorForward = false): number {
 	let width = 0;
 	let i = 0;
 	while (i < endIndex) {
@@ -498,6 +498,7 @@ function asciiVisibleWidth(str: string, endIndex = str.length): number {
 		} else if (code === 0x1b) {
 			const length = ansiCodeLength(str, i);
 			if (length === 0) return -1;
+			if (rejectCursorForward && str[i + length - 1] === "C") return -1;
 			i += length;
 		} else {
 			return -1;
@@ -513,7 +514,7 @@ export function terminalLineRows(
 	cursor?: { index: number; row: number; col: number },
 	rowBreak?: (index: number) => void,
 ): number {
-	const asciiWidth = asciiVisibleWidth(str);
+	const asciiWidth = asciiVisibleWidth(str, str.length, true);
 	if (asciiWidth !== -1 && !rowBreak) {
 		if (cursor) {
 			const prefixWidth = asciiVisibleWidth(str, cursor.index);
@@ -538,6 +539,13 @@ export function terminalLineRows(
 		const ansiLength = ansiCodeLength(str, i);
 		if (ansiLength > 0) {
 			if (cursor && i === cursor.index) position.cursorPending = true;
+			// CUF is row-local: clamp at the final cell, cancelling a pending wrap.
+			if (str[i + ansiLength - 1] === "C") {
+				const forward = /^\x1b\[(\d*)C$/.exec(str.slice(i, i + ansiLength));
+				if (forward) {
+					position.column = Math.min(columns - 1, position.column + Math.max(1, Number(forward[1] || 1)));
+				}
+			}
 			i += ansiLength;
 			continue;
 		}
@@ -576,8 +584,8 @@ export function terminalLineRows(
 	return position.rows;
 }
 
-/** Materialize row-local overwrites before the compositor slices by visible columns. */
-function materializeCarriageReturnRow(text: string, columns: number, tracker: AnsiCodeTracker): string {
+/** Materialize row-local overwrites and cursor gaps before slicing by visible columns. */
+function materializeCursorRow(text: string, columns: number, tracker: AnsiCodeTracker): string {
 	interface Cell {
 		text: string;
 		style: string;
@@ -653,8 +661,8 @@ export function terminalLinePhysicalRows(str: string, columns: number, startRow 
 	for (let row = 0; row < boundaries.length - 1; row++) {
 		const text = normalized.slice(boundaries[row], boundaries[row + 1]).replace(/\r?\n$/, "");
 		if (row >= startRow && row < endRow) {
-			if (text.includes("\r")) {
-				rows.push(materializeCarriageReturnRow(text, columns, tracker));
+			if (text.includes("\r") || /\x1b\[\d*C/.test(text)) {
+				rows.push(materializeCursorRow(text, columns, tracker));
 				if (row + 1 >= endRow) break;
 				continue;
 			}
@@ -668,13 +676,6 @@ export function terminalLinePhysicalRows(str: string, columns: number, startRow 
 				if (ansi) {
 					if ((ansi.code.startsWith("\x1b[") && ansi.code.endsWith("m")) || ansi.code.startsWith("\x1b]8;")) {
 						visible += ansi.code;
-					} else {
-						const forward = /^\x1b\[(\d*)C$/.exec(ansi.code);
-						if (forward) {
-							const column = Math.min(columns - 1, visibleWidth(visible));
-							const distance = Math.max(1, Number(forward[1] || 1));
-							visible += " ".repeat(Math.min(distance, Math.max(0, columns - 1 - column)));
-						}
 					}
 					i += ansi.length;
 				} else {

@@ -2031,3 +2031,87 @@ it("restores a deferred queue batch when an earlier deferred prompt aborts settl
 		await ui.cleanup();
 	}
 });
+
+it("discards settlement-deferred ownership when a public subscriber throws", async () => {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	let held = false;
+	const ui = await createSchedulingMode({
+		extensionFactories: [
+			(pi) => {
+				pi.on("agent_settled", async () => {
+					if (held) return;
+					held = true;
+					entered.resolve();
+					await release.promise;
+				});
+			},
+		],
+	});
+	const original = new Error("public settlement subscriber failed");
+	let fail = true;
+	const unsubscribe = ui.harness.session.subscribe((event) => {
+		if (event.type === "agent_settled" && fail) {
+			fail = false;
+			throw original;
+		}
+	});
+	const errors = vi.spyOn(ui.mode as unknown as { showError(text: string): void }, "showError");
+	let running: Promise<void> | undefined;
+	let completion: Promise<void> | undefined;
+	let idleResolved = false;
+	let completionError: unknown;
+	ui.harness.setResponses([fauxAssistantMessage("seed response")]);
+	try {
+		await ui.mode.init();
+		running = ui.harness.session.prompt("seed input");
+		const outcome = running.catch((error: unknown) => error);
+		await entered.promise;
+		const idle = ui.harness.session.waitForIdle().then(() => {
+			idleResolved = true;
+		});
+		await ui.harness.session.prompt("discarded direct prompt", {
+			onDeferred: (promise) => {
+				completion = promise;
+				void promise.catch((error: unknown) => {
+					completionError = error;
+				});
+			},
+		});
+		expect(completion).toBeDefined();
+		ui.internal.queueCompactionMessage("discarded queued first", "followUp");
+		ui.internal.queueCompactionMessage("discarded queued rest", "followUp");
+		await ui.internal.flushCompactionQueue();
+		ui.internal.queueCompactionMessage("newer queued input", "followUp");
+		release.resolve();
+		expect(await outcome).toBe(original);
+		await setImmediate();
+		expect(completionError).toBe(original);
+		expect(idleResolved).toBe(true);
+		await idle;
+		expect(ui.internal.compactionQueuedMessages.map((entry) => entry.text)).toEqual([
+			"discarded queued first",
+			"discarded queued rest",
+			"newer queued input",
+		]);
+		expect(ui.harness.session.messages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
+			"original context",
+			"seed input",
+		]);
+		ui.harness.setResponses([
+			fauxAssistantMessage("first retried"),
+			fauxAssistantMessage("rest retried"),
+			fauxAssistantMessage("newer retried"),
+		]);
+		await ui.internal.flushCompactionQueue();
+		await ui.harness.session.waitForIdle();
+		expect(ui.internal.compactionQueuedMessages).toEqual([]);
+		expect(ui.harness.session.getLastAssistantText()).toBe("newer retried");
+	} finally {
+		release.resolve();
+		unsubscribe();
+		errors.mockRestore();
+		await running?.catch(() => {});
+		await ui.cleanup();
+	}
+});

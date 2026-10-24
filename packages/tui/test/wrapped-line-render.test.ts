@@ -20,6 +20,55 @@ describe("TUI wrapped-line differential rendering (wrapping disabled)", () => {
 		assert.strictEqual(terminalLineRows(source, 10), 1);
 		assert.deepStrictEqual(terminalLinePhysicalRows(source, 10).map(stripTerminalSequences), ["a  b"]);
 	});
+	it("matches terminal rows when cursor-forward movement reaches the wrap boundary", async () => {
+		for (const [source, expected] of [
+			["abcdefgh\x1b[2CXY", ["abcdefgh X", "Y"]],
+			["abcdefghij\x1b[2CXY", ["abcdefghiX", "Y"]],
+			["abcdefgh\x1b[0CXY", ["abcdefgh X", "Y"]],
+			["abcdefgh\x1b[C界Z", ["abcdefgh", "界Z"]],
+			["abcdefgh\x1b[2CX\rZ", ["Zbcdefgh X"]],
+			["\x1b[31m\x1b]8;;https://example.com\x1b\\abcdefg a\u0301\x1b[2CXY", ["abcdefg áX", "Y"]],
+		] as const) {
+			const terminal = new VirtualTerminal(10, 4);
+			terminal.write(source);
+			await terminal.flush();
+			assert.deepStrictEqual(terminal.getViewport().slice(0, expected.length), expected);
+			assert.strictEqual(terminalLineRows(source, 10), expected.length);
+			const rows = terminalLinePhysicalRows(source, 10);
+			assert.deepStrictEqual(rows.map(stripTerminalSequences), expected);
+			for (const row of rows) assert.ok(visibleWidth(row) <= 10);
+			const replay = new VirtualTerminal(10, 4);
+			replay.write(rows.join("\x1b[0m\x1b]8;;\x1b\\\r\n"));
+			await replay.flush();
+			assert.deepStrictEqual(replay.getViewport().slice(0, expected.length), expected);
+			assert.deepStrictEqual(terminalLinePhysicalRows(source, 10, 1).map(stripTerminalSequences), expected.slice(1));
+		}
+	});
+
+	it("preserves cursor-forward continuation and following content through overlay open and hide", async () => {
+		const terminal = new VirtualTerminal(10, 6);
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		component.lines = ["Header", "abcdefgh\x1b[2CXY", "Footer"];
+		tui.addChild(component);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			const expected = ["Header", "abcdefgh X", "Y", "Footer", "", ""];
+			assert.deepStrictEqual(terminal.getViewport(), expected);
+			const content = new TestComponent();
+			content.lines = ["Q"];
+			const overlay = tui.showOverlay(content, { width: 1, row: 1, col: 0, nonCapturing: true });
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), ["Header", "Qbcdefgh X", "Y", "Footer", "", ""]);
+			overlay.hide();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), expected);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("wraps independently rendered Indic constituents without pushing the footer cursor down", async () => {
 		const terminal = new VirtualTerminal(79, 6);
 		const tui = new TuiMainScreen(terminal, true);

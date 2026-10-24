@@ -4718,7 +4718,7 @@ export class InteractiveMode {
 	}
 
 	private rebuildChatFromMessages(): void {
-		const liveTools = this.session.isStreaming ? new Map(this.pendingTools) : undefined;
+		const liveTools = this.session.agent.state.isStreaming ? new Map(this.pendingTools) : undefined;
 		this.chatContainer.clear();
 		this.renderSessionEntries(this.session.getSessionProjection().entries);
 		if (this.streamingComponent) this.chatContainer.addChild(this.streamingComponent);
@@ -6855,13 +6855,15 @@ export class InteractiveMode {
 		const display = getCwdRelativePath(target, cwd) ?? target;
 		try {
 			await fs.promises.mkdir(path.dirname(target), { recursive: true });
+			let destination = target;
 			let mode: number | undefined;
 			try {
-				mode = (await fs.promises.stat(target)).mode & 0o7777;
+				destination = await fs.promises.realpath(target);
+				mode = (await fs.promises.stat(destination)).mode & 0o7777;
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			}
-			const temporaryFile = `${target}.${crypto.randomUUID()}.tmp`;
+			const temporaryFile = `${destination}.${crypto.randomUUID()}.tmp`;
 			// A failed exclusive open owns no file and must not clean up another writer.
 			const file = await fs.promises.open(temporaryFile, "wx", mode);
 			let closed = false;
@@ -6870,7 +6872,7 @@ export class InteractiveMode {
 				await file.writeFile(content, "utf8");
 				await file.close();
 				closed = true;
-				await fs.promises.rename(temporaryFile, target);
+				await fs.promises.rename(temporaryFile, destination);
 			} catch (error) {
 				if (!closed) {
 					try {

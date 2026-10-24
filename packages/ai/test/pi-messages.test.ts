@@ -268,6 +268,7 @@ describe("pi-messages", () => {
 
 		expect(message.stopReason).toBe("error");
 		expect(message.errorMessage).toContain("stream ended without a terminal event");
+		expect(message.content).toEqual([{ type: "text", text: "partial" }]);
 	});
 
 	it("preserves raw-only tool increments before an interrupted native message stream ends", async () => {
@@ -286,6 +287,66 @@ describe("pi-messages", () => {
 			{ type: "toolCall", id: "call", name: "read", arguments: { path: "/tmp" }, raw: "<prefix><tail>" },
 		]);
 	});
+
+	it.each(["eof", "rejected read", "abort"] as const)(
+		"retains the authoritative partial tool call after %s",
+		async (interruption) => {
+			const controller = new AbortController();
+			const failure = new Error(interruption === "abort" ? "cancelled by caller" : "body read failed");
+			const wireEvents = [
+				{ type: "start" },
+				{ type: "toolcall_start", contentIndex: 0, id: "call", toolName: "read" },
+				{ type: "toolcall_delta", contentIndex: 0, delta: '{"path":"/tmp', rawDelta: "<prefix>" },
+				{ type: "toolcall_delta", contentIndex: 0, delta: "", rawDelta: "<tail>" },
+			];
+			let fetch: PiMessagesOptions["fetch"];
+			let baseUrl: string;
+			if (interruption === "eof") {
+				({ baseUrl } = await startServer({ events: wireEvents }));
+			} else {
+				baseUrl = "http://offline.invalid/v1";
+				let sent = false;
+				fetch = async () =>
+					new Response(
+						new ReadableStream<Uint8Array>({
+							pull(body) {
+								if (!sent) {
+									sent = true;
+									const sse = wireEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+									body.enqueue(new TextEncoder().encode(sse));
+									return;
+								}
+								if (interruption === "abort") controller.abort(failure);
+								body.error(failure);
+							},
+						}),
+					);
+			}
+			const response = stream(createModel(baseUrl), normalizeContext(context), {
+				apiKey: "offline",
+				fetch,
+				signal: controller.signal,
+			});
+			let partial: Extract<AssistantMessageEvent, { type: "start" }>["partial"] | undefined;
+			const diagnostic = { type: "consumer_diagnostic", timestamp: 123, details: { source: "progress" } };
+			for await (const event of response) {
+				if (event.type === "start") {
+					partial = event.partial;
+					partial.diagnostics = [diagnostic];
+				}
+			}
+			const message = await response.result();
+			expect(message.content).toEqual([
+				{ type: "toolCall", id: "call", name: "read", arguments: { path: "/tmp" }, raw: "<prefix><tail>" },
+			]);
+			expect(message).toBe(partial);
+			expect(message.diagnostics).toEqual([diagnostic]);
+			expect(message.stopReason).toBe(interruption === "abort" ? "aborted" : "error");
+			expect(message.errorMessage).toBe(
+				interruption === "eof" ? "radius stream ended without a terminal event" : failure.message,
+			);
+		},
+	);
 
 	it.each([undefined, "", "<final>"])("uses authoritative native message tool end raw %j", async (raw) => {
 		const final = {

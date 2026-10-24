@@ -709,6 +709,70 @@ describe("InteractiveMode heartbeat firing", () => {
 });
 
 describe("InteractiveMode heartbeat persistence", () => {
+	it.skipIf(process.platform === "win32")(
+		"saves through an existing symlink without replacing its alias",
+		async () => {
+			await withTempDir(async (dir) => {
+				const target = path.join(dir, "shared.md");
+				const alias = path.join(dir, "HEARTBEAT.md");
+				fs.writeFileSync(target, "previous");
+				fs.chmodSync(target, 0o640);
+				fs.symlinkSync("shared.md", alias);
+				const context = makeContext({
+					sessionManager: { getCwd: () => dir },
+					heartbeats: [mkEntry(1, "5m", "accepted instruction")],
+				});
+				await context.saveHeartbeatsFromArg("save");
+				expect(fs.lstatSync(alias).isSymbolicLink()).toBe(true);
+				expect(fs.readlinkSync(alias)).toBe("shared.md");
+				expect(fs.readFileSync(target, "utf8")).toBe("/heartbeat 5m\naccepted instruction\n");
+				expect(fs.statSync(target).mode & 0o7777).toBe(0o640);
+				expect(context.showStatus).toHaveBeenCalledWith("Saved 1 heartbeat to HEARTBEAT.md");
+			});
+		},
+	);
+
+	it.each([
+		["replacement", "success"],
+		["replacement", "error"],
+		["stop", "success"],
+		["stop", "error"],
+	] as const)("suppresses held save %s status after %s", async (transition, outcome) => {
+		await withTempDir(async (dir) => {
+			const context = makeContext({
+				sessionManager: { getCwd: () => dir },
+				heartbeats: [mkEntry(1, "5m", "accepted instruction")],
+			});
+			const entered = Promise.withResolvers<void>();
+			const gate = Promise.withResolvers<void>();
+			const mkdir = fs.promises.mkdir.bind(fs.promises);
+			const held = vi.spyOn(fs.promises, "mkdir").mockImplementationOnce(async (...args) => {
+				entered.resolve();
+				await gate.promise;
+				if (outcome === "error") throw new Error("held save failure");
+				return mkdir(...args);
+			});
+			const save = context.saveHeartbeatsFromArg("save");
+			try {
+				await entered.promise;
+				if (transition === "replacement") context.session = { isStreaming: false, isCompacting: false };
+				else context.clearHeartbeats();
+				context.heartbeats = [mkEntry(2, "3h", "new schedule")];
+				gate.resolve();
+				await save;
+				expect(context.showStatus).not.toHaveBeenCalled();
+				const target = path.join(dir, "HEARTBEAT.md");
+				if (outcome === "success")
+					expect(fs.readFileSync(target, "utf8")).toBe("/heartbeat 5m\naccepted instruction\n");
+				else expect(fs.existsSync(target)).toBe(false);
+			} finally {
+				gate.resolve();
+				await save;
+				held.mockRestore();
+			}
+		});
+	});
+
 	it.each(["clear", "replacement"] as const)("discards a stale pending load after %s", async (transition) => {
 		await withTempDir(async (dir) => {
 			const context = makeContext({ sessionManager: { getCwd: () => dir } });

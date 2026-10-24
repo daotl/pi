@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import {
 	type Container,
 	isPadLinesToWidth,
@@ -11,12 +11,14 @@ import {
 	setWrapLinesToWidth,
 	Text,
 } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { expect, it, vi } from "vitest";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
 import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
 import { type AgentSessionServices, createAgentSessionFromServices } from "../../src/core/agent-session-services.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { AssistantMessageComponent } from "../../src/modes/interactive/components/assistant-message.ts";
+import { ToolExecutionComponent } from "../../src/modes/interactive/components/tool-execution.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
 import {
 	isMessageBackground,
@@ -123,6 +125,82 @@ it("renders edited and omitted contributions while retaining source cache-miss b
 		await ui.terminal.waitForRender();
 		expect(ui.terminal.getViewport().join("\n")).toContain("edited billed answer");
 	} finally {
+		await ui.stop();
+		harness.cleanup();
+	}
+});
+
+it("removes historical unresolved tools during prefill capture before the new stream and execution", async () => {
+	const toolStarted = Promise.withResolvers<void>();
+	const releaseTool = Promise.withResolvers<void>();
+	const harness = await createHarness({
+		fauxApi: "openai-completions",
+		settings: { quietStartup: true, retry: { enabled: false }, compaction: { enabled: false } },
+		tools: [
+			{
+				name: "continued_tool",
+				label: "Continued tool",
+				description: "Held continuation tool",
+				parameters: Type.Object({}),
+				execute: async () => {
+					toolStarted.resolve();
+					await releaseTool.promise;
+					return { content: [{ type: "text", text: "continued tool result" }], details: {} };
+				},
+			},
+		],
+	});
+	harness.sessionManager.appendMessage({ role: "user", content: "historical request", timestamp: 1 });
+	const selected = harness.sessionManager.appendMessage(
+		fauxAssistantMessage([fauxToolCall("continued_tool", {}, { id: "continued-call" })], { stopReason: "toolUse" }),
+	);
+	harness.sessionManager.appendMessage(fauxAssistantMessage("later branch"));
+	await harness.session.navigateTree(selected);
+	const streams = [createAssistantMessageEventStream(), createAssistantMessageEventStream()];
+	let requests = 0;
+	harness.session.agent.streamFunction = () => streams[requests++];
+	const ui = await createTranscriptMode(harness);
+	const tools = () => ui.internal.chatContainer.children.filter((child) => child instanceof ToolExecutionComponent);
+	let running: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		expect(tools()).toHaveLength(1);
+		const historical = tools()[0];
+		running = Promise.resolve(ui.internal.defaultEditor.onSubmit!("/continue"));
+		await vi.waitFor(() => expect(requests).toBe(1));
+		expect(tools()).toEqual([]);
+		await ui.terminal.waitForRender();
+		expect(ui.terminal.getViewport().join("\n")).not.toContain("continued_tool");
+		const partial = fauxAssistantMessage([fauxToolCall("continued_tool", {}, { id: "continued-call" })], {
+			stopReason: "toolUse",
+		});
+		streams[0].push({ type: "start", partial });
+		streams[0].push({ type: "toolcall_start", contentIndex: 0, partial });
+		await vi.waitFor(() => expect(tools()).toHaveLength(1));
+		expect(tools()[0]).not.toBe(historical);
+		const live = tools()[0];
+		streams[0].push({ type: "done", reason: "toolUse", message: partial });
+		await toolStarted.promise;
+		expect(tools()).toEqual([live]);
+		ui.internal.rebuildChatFromMessages();
+		expect(tools()).toEqual([live]);
+		await ui.terminal.waitForRender();
+		expect(
+			ui.terminal
+				.getViewport()
+				.join("\n")
+				.match(/continued_tool/g),
+		).toHaveLength(1);
+		releaseTool.resolve();
+		await vi.waitFor(() => expect(requests).toBe(2));
+		streams[1].push({ type: "done", reason: "stop", message: fauxAssistantMessage("continuation finished") });
+		await running;
+		expect(ui.output()).toContain("continued tool result");
+	} finally {
+		releaseTool.resolve();
+		for (const stream of streams) stream.end(fauxAssistantMessage("cleanup"));
+		await harness.session.abort();
+		await running?.catch(() => {});
 		await ui.stop();
 		harness.cleanup();
 	}
