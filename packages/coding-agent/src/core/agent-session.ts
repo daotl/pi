@@ -373,6 +373,13 @@ export interface PromptOptions {
 	preflightResult?: (disposition: PromptDisposition) => void;
 	/** @internal Observe settlement-deferred execution failure after the original prompt returned. Settlement still propagates the original error, even if this observer throws. */
 	onDeferredError?: (error: unknown) => void;
+	/** @internal Called synchronously when prompt execution is deferred. Do not await completion from a settlement handler. */
+	onDeferred?: (completion: Promise<void>) => void;
+}
+
+interface DeferredSettledAction {
+	execute: () => Promise<void>;
+	discard?: (error: unknown) => void;
 }
 
 /** Options for model/thinking mutations. */
@@ -565,7 +572,7 @@ export class AgentSession {
 	private _isBeforeSettle = false;
 	private _abortDuringBeforeSettle = false;
 	private _isEmittingAgentSettled = false;
-	private readonly _deferredSettledActions: Array<() => Promise<void>> = [];
+	private readonly _deferredSettledActions: DeferredSettledAction[] = [];
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
@@ -1311,7 +1318,14 @@ export class AgentSession {
 		const deferred = this._deferredSettledActions.splice(0);
 		if (deferred.length > 0) {
 			try {
-				for (const action of deferred) await action();
+				for (let i = 0; i < deferred.length; i++) {
+					try {
+						await deferred[i].execute();
+					} catch (error) {
+						for (let j = i + 1; j < deferred.length; j++) deferred[j].discard?.(error);
+						throw error;
+					}
+				}
 			} finally {
 				this._resolveIdleWaitIfIdle();
 			}
@@ -3726,18 +3740,34 @@ export class AgentSession {
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		if (this._isEmittingAgentSettled) {
-			this._deferredSettledActions.push(async () => {
+			const completion = options?.onDeferred ? Promise.withResolvers<void>() : undefined;
+			// Deferred failures still propagate through settlement when nobody observes completion.
+			void completion?.promise.catch(() => {});
+			const reject = (error: unknown) => {
+				completion?.reject(error);
 				try {
-					await this.prompt(text, options);
-				} catch (error) {
-					try {
-						options?.onDeferredError?.(error);
-					} catch {
-						// An observer must not replace the deferred execution failure.
-					}
-					throw error;
+					options?.onDeferredError?.(error);
+				} catch {
+					// An observer must not replace the deferred execution failure.
 				}
+			};
+			this._deferredSettledActions.push({
+				execute: async () => {
+					try {
+						await this.prompt(text, options);
+						completion?.resolve();
+					} catch (error) {
+						reject(error);
+						throw error;
+					}
+				},
+				discard: reject,
 			});
+			try {
+				if (completion) options?.onDeferred?.(completion.promise);
+			} catch {
+				// Execution is already queued; an observer must not reject its submission.
+			}
 			return;
 		}
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
@@ -4111,7 +4141,7 @@ export class AgentSession {
 			}
 		} else if (options?.triggerTurn) {
 			if (this._isEmittingAgentSettled) {
-				this._deferredSettledActions.push(async () => await this._runAgentPrompt(appMessage));
+				this._deferredSettledActions.push({ execute: async () => await this._runAgentPrompt(appMessage) });
 				return;
 			}
 			await this._runAgentPrompt(appMessage);

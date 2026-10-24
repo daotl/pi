@@ -1564,3 +1564,328 @@ it("does not flush another navigation's queued input when a second extension nav
 		await ui.cleanup();
 	}
 });
+
+it.each(["external", "settlement handler"] as const)(
+	"keeps queue delivery owned when %s defers its first prompt",
+	async (origin) => {
+		const settlementEntered = Promise.withResolvers<void>();
+		const handlerEntered = Promise.withResolvers<void>();
+		let flushReturned = false;
+		const settlementRelease = Promise.withResolvers<void>();
+		const preflightEntered = Promise.withResolvers<void>();
+		const preflightRelease = Promise.withResolvers<void>();
+		const response = Promise.withResolvers<void>();
+		let settlementHeld = false;
+		let flushFromHandler: (() => Promise<void>) | undefined;
+		const ui = await createSchedulingMode({
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_settled", async () => {
+						if (settlementHeld) return;
+						settlementHeld = true;
+						handlerEntered.resolve();
+						if (origin === "settlement handler") await flushFromHandler!();
+						settlementEntered.resolve();
+						await settlementRelease.promise;
+					});
+					pi.on("before_agent_start", async (event) => {
+						if (event.prompt === "settlement queued input") {
+							preflightEntered.resolve();
+							await preflightRelease.promise;
+						}
+					});
+				},
+			],
+		});
+		const requests: string[] = [];
+		ui.harness.setResponses([
+			() => {
+				requests.push("seed");
+				return fauxAssistantMessage("seed response");
+			},
+			async (context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				await response.promise;
+				return fauxAssistantMessage("queued response");
+			},
+			(context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				return fauxAssistantMessage("rest response");
+			},
+			(context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				return fauxAssistantMessage("scheduled response");
+			},
+		]);
+		let running: Promise<void> | undefined;
+		let delivery: Promise<void> | undefined;
+		try {
+			await ui.mode.init();
+			flushFromHandler = async () => {
+				ui.internal.queueCompactionMessage("settlement queued input", "followUp");
+				ui.internal.queueCompactionMessage("settlement batch rest", "followUp");
+				delivery = ui.internal.flushCompactionQueue();
+				await delivery;
+				flushReturned = true;
+			};
+			running = ui.harness.session.prompt("seed");
+			await handlerEntered.promise;
+			if (origin === "settlement handler") await vi.waitFor(() => expect(flushReturned).toBe(true));
+			await settlementEntered.promise;
+			if (origin === "external") await flushFromHandler();
+			await setImmediate();
+			await ui.internal.handleScheduleCommand('\n<pi_edit id="-1" role="user">after settlement queue</pi_edit>');
+			await setImmediate();
+			expect(ui.harness.session.messages.map(getMessageText)).not.toContain("after settlement queue");
+			settlementRelease.resolve();
+			await preflightEntered.promise;
+			ui.internal.fireDueScheduledMessages();
+			await setImmediate();
+			expect(requests).toEqual(["seed"]);
+			expect(ui.harness.session.messages.map(getMessageText)).not.toContain("after settlement queue");
+			expect(ui.harness.session.getFollowUpMessages()).toEqual([]);
+			preflightRelease.resolve();
+			await vi.waitFor(() => expect(requests).toEqual(["seed", "settlement queued input"]));
+			await vi.waitFor(() => expect(ui.harness.session.getFollowUpMessages()).toEqual(["settlement batch rest"]));
+			expect(requests).toEqual(["seed", "settlement queued input"]);
+			response.resolve();
+			await running;
+			await delivery;
+			await vi.waitFor(() =>
+				expect(requests).toEqual([
+					"seed",
+					"settlement queued input",
+					"settlement batch rest",
+					"after settlement queue",
+				]),
+			);
+			await ui.harness.session.waitForIdle();
+		} finally {
+			settlementRelease.resolve();
+			preflightRelease.resolve();
+			response.resolve();
+			await running?.catch(() => {});
+			await delivery?.catch(() => {});
+			await ui.cleanup();
+		}
+	},
+);
+
+it("retains queue ownership through actual nested compaction and drains newer input before schedules", async () => {
+	const compactEntered = Promise.withResolvers<void>();
+	const compactRelease = Promise.withResolvers<void>();
+	const response = Promise.withResolvers<void>();
+	let compact: (() => Promise<void>) | undefined;
+	const ui = await createSchedulingMode({
+		extensionFactories: [
+			(pi) => {
+				pi.on("before_agent_start", async (event) => {
+					if (event.prompt === "nested first input") await compact!();
+				});
+				pi.on("session_before_compact", async () => {
+					compactEntered.resolve();
+					await compactRelease.promise;
+					return { cancel: true };
+				});
+			},
+		],
+	});
+	let delivery: Promise<void> | undefined;
+	const requests: string[] = [];
+	try {
+		await ui.mode.init();
+		ui.harness.setResponses([fauxAssistantMessage("seed completed")]);
+		await ui.harness.session.prompt("seed input");
+		compact = async () => {
+			await ui.harness.session.compact({ keepRecentMessages: 1 }).catch((error: unknown) => {
+				if (!(error instanceof Error) || error.message !== "Compaction cancelled") throw error;
+			});
+		};
+		ui.harness.setResponses([
+			async (context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				await response.promise;
+				return fauxAssistantMessage("first completed");
+			},
+			(context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				return fauxAssistantMessage("second completed");
+			},
+			(context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				return fauxAssistantMessage("scheduled completed");
+			},
+		]);
+		ui.internal.queueCompactionMessage("nested first input", "followUp");
+		delivery = ui.internal.flushCompactionQueue();
+		await compactEntered.promise;
+		expect(ui.harness.session.isCompacting).toBe(true);
+		ui.internal.queueCompactionMessage("nested second input", "followUp");
+		await ui.internal.handleScheduleCommand('\n<pi_edit id="-1" role="user">after nested compaction</pi_edit>');
+		compactRelease.resolve();
+		await vi.waitFor(() => expect(requests).toEqual(["nested first input"]));
+		expect(ui.harness.session.messages.map(getMessageText)).not.toContain("after nested compaction");
+		response.resolve();
+		await delivery;
+		await vi.waitFor(() =>
+			expect(requests).toEqual(["nested first input", "nested second input", "after nested compaction"]),
+		);
+		await ui.harness.session.waitForIdle();
+		expect(ui.harness.eventsOfType("compaction_end").at(-1)?.aborted).toBe(true);
+	} finally {
+		compactRelease.resolve();
+		response.resolve();
+		await delivery?.catch(() => {});
+		await ui.cleanup();
+	}
+});
+
+it("restores a settlement-deferred rejected batch ahead of newer input", async () => {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	let held = false;
+	const inputs: string[] = [];
+	const ui = await createSchedulingMode({
+		withConfiguredAuth: false,
+		extensionFactories: [
+			(pi) => {
+				pi.on("agent_settled", async () => {
+					if (!held) {
+						held = true;
+						entered.resolve();
+						await release.promise;
+					}
+				});
+				pi.on("input", (event) => {
+					inputs.push(event.text);
+				});
+			},
+		],
+	});
+	const auth = vi.spyOn(ui.harness.session.modelRuntime, "checkAuth").mockResolvedValue({ type: "api_key" });
+	const errors = vi.spyOn(ui.mode as unknown as { showError(text: string): void }, "showError");
+	ui.harness.setResponses([fauxAssistantMessage("seed response")]);
+	let running: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		running = ui.harness.session.prompt("seed input");
+		const outcome = running.then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		await entered.promise;
+		ui.internal.queueCompactionMessage("deferred rejected input", "followUp");
+		ui.internal.queueCompactionMessage("original deferred rest", "followUp");
+		await ui.internal.flushCompactionQueue();
+		ui.internal.queueCompactionMessage("newer deferred input", "followUp");
+		auth.mockRejectedValueOnce(new Error("deferred queue auth failed"));
+		release.resolve();
+		expect(await outcome).toBeInstanceOf(Error);
+		await vi.waitFor(() =>
+			expect(ui.internal.compactionQueuedMessages.map((entry) => entry.text)).toEqual([
+				"deferred rejected input",
+				"original deferred rest",
+				"newer deferred input",
+			]),
+		);
+		expect(inputs).toEqual(["seed input", "deferred rejected input"]);
+		expect(errors.mock.calls.map(([text]) => text)).toEqual([
+			"Failed to send queued messages: deferred queue auth failed",
+		]);
+		expect(ui.harness.session.isIdle).toBe(true);
+	} finally {
+		release.resolve();
+		await running?.catch(() => {});
+		auth.mockRestore();
+		errors.mockRestore();
+		await ui.cleanup();
+	}
+});
+
+it("restores a deferred queue batch when an earlier deferred prompt aborts settlement", async () => {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	let held = false;
+	const ui = await createSchedulingMode({
+		withConfiguredAuth: false,
+		extensionFactories: [
+			(pi) => {
+				pi.on("agent_settled", async () => {
+					if (!held) {
+						held = true;
+						entered.resolve();
+						await release.promise;
+					}
+				});
+			},
+		],
+	});
+	const auth = vi.spyOn(ui.harness.session.modelRuntime, "checkAuth").mockResolvedValue({ type: "api_key" });
+	const errors = vi.spyOn(ui.mode as unknown as { showError(text: string): void }, "showError");
+	ui.harness.setResponses([fauxAssistantMessage("seed response")]);
+	let running: Promise<void> | undefined;
+	const original = new Error("earlier deferred auth failed");
+	try {
+		await ui.mode.init();
+		running = ui.harness.session.prompt("seed input");
+		const outcome = running.then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		await entered.promise;
+		await ui.harness.session.prompt("earlier rejected deferred input");
+		ui.internal.queueCompactionMessage("discarded deferred queue input", "followUp");
+		await ui.internal.flushCompactionQueue();
+		auth.mockRejectedValueOnce(original);
+		release.resolve();
+		expect(await outcome).toBe(original);
+		await vi.waitFor(() =>
+			expect(ui.internal.compactionQueuedMessages.map((entry) => entry.text)).toEqual([
+				"discarded deferred queue input",
+			]),
+		);
+		expect(errors.mock.calls.map(([text]) => text)).toEqual([
+			"Failed to send queued message: earlier deferred auth failed",
+		]);
+		expect(ui.harness.session.messages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
+			"original context",
+			"seed input",
+		]);
+	} finally {
+		release.resolve();
+		await running?.catch(() => {});
+		auth.mockRestore();
+		errors.mockRestore();
+		await ui.cleanup();
+	}
+});

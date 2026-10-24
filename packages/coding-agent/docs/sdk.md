@@ -123,6 +123,10 @@ Use `agent_settled` when the host needs to know that Pi will not continue automa
 
 Prompts submitted from an `agent_settled` handler are deferred until those handlers finish and return immediately, so awaiting the original call does not await the deferred run. The internal `PromptOptions.onDeferredError` observer receives later deferred-execution failures; the original failure still propagates through the enclosing settlement path. Accepted dispatch reporting remains separate and does not report rejections.
 
+The internal `PromptOptions.onDeferred` hook receives a separate execution-completion promise synchronously when submission is deferred. It leaves the original `prompt()` call's immediate-return behavior unchanged. A settlement handler must not await that completion promise itself; internal delivery owners can observe it outside the handler to retain exclusion until execution finishes. Exceptions from the notification hook do not reject work that is already queued.
+
+If an earlier deferred action fails, later actions are not executed; their completion handoffs reject with that same error and their internal error observers are notified, so delivery owners can release or restore pending input.
+
 ## Configuring a session
 
 Without overrides, the factory creates a `ModelRuntime`, file-backed `SettingsManager`, persistent `SessionManager`, `DefaultResourceLoader`, and the configured default tools.

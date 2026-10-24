@@ -75,6 +75,7 @@ import {
 	type AgentSession,
 	type AgentSessionEvent,
 	type DeletableUnit,
+	type PromptOptions,
 	parseSkillBlock,
 	type SwipeGroup,
 } from "../../core/agent-session.ts";
@@ -5268,14 +5269,81 @@ export class InteractiveMode {
 				}`,
 			);
 		};
+		const deferred = Promise.withResolvers<void>();
+		const promptQueued = (text: string, promptOptions?: PromptOptions): Promise<void> => {
+			let completion: Promise<void> | undefined;
+			const submitted = session.prompt(text, {
+				...promptOptions,
+				onDeferred: (pending) => {
+					completion = pending;
+					deferred.resolve();
+				},
+			});
+			return completion ?? submitted;
+		};
+		const deliver = async () => {
+			try {
+				if (options?.willRetry) {
+					// When retry is pending, queue messages for the retry turn
+					for (const message of queuedMessages) {
+						if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
+						if (this.isExtensionCommand(message.text)) {
+							await promptQueued(message.text);
+						} else if (message.mode === "followUp") {
+							await this.session.followUp(message.text);
+						} else {
+							await this.session.steer(message.text);
+						}
+						if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
+					}
+					this.updatePendingMessagesDisplay();
+					return;
+				}
 
-		try {
-			if (options?.willRetry) {
-				// When retry is pending, queue messages for the retry turn
-				for (const message of queuedMessages) {
+				// Find first non-extension-command message to use as prompt
+				const firstPromptIndex = queuedMessages.findIndex((message) => !this.isExtensionCommand(message.text));
+				if (firstPromptIndex === -1) {
+					// All extension commands - execute them all
+					for (const message of queuedMessages) {
+						await promptQueued(message.text);
+						if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
+					}
+					return;
+				}
+
+				// Execute any extension commands before the first prompt
+				const preCommands = queuedMessages.slice(0, firstPromptIndex);
+				const firstPrompt = queuedMessages[firstPromptIndex];
+				const rest = queuedMessages.slice(firstPromptIndex + 1);
+
+				for (const message of preCommands) {
+					await promptQueued(message.text);
+					if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
+				}
+
+				// Start a prompt when idle, or queue it into a run still finishing compaction.
+				const dispatched = Promise.withResolvers<void>();
+				let dispatchFailure: { error: unknown } | undefined;
+				const promptPromise = promptQueued(firstPrompt.text, {
+					streamingBehavior: firstPrompt.mode,
+					preflightResult: () => dispatched.resolve(),
+				});
+				void promptPromise.then(
+					() => dispatched.resolve(),
+					(error: unknown) => {
+						dispatchFailure = { error };
+						dispatched.resolve();
+					},
+				);
+				await dispatched.promise;
+				if (dispatchFailure) throw dispatchFailure.error;
+				if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
+
+				// Queue remaining messages
+				for (const message of rest) {
 					if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 					if (this.isExtensionCommand(message.text)) {
-						await this.session.prompt(message.text);
+						await promptQueued(message.text);
 					} else if (message.mode === "followUp") {
 						await this.session.followUp(message.text);
 					} else {
@@ -5284,74 +5352,23 @@ export class InteractiveMode {
 					if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 				}
 				this.updatePendingMessagesDisplay();
-				return;
-			}
-
-			// Find first non-extension-command message to use as prompt
-			const firstPromptIndex = queuedMessages.findIndex((message) => !this.isExtensionCommand(message.text));
-			if (firstPromptIndex === -1) {
-				// All extension commands - execute them all
-				for (const message of queuedMessages) {
-					await this.session.prompt(message.text);
-					if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
-				}
-				return;
-			}
-
-			// Execute any extension commands before the first prompt
-			const preCommands = queuedMessages.slice(0, firstPromptIndex);
-			const firstPrompt = queuedMessages[firstPromptIndex];
-			const rest = queuedMessages.slice(firstPromptIndex + 1);
-
-			for (const message of preCommands) {
-				await this.session.prompt(message.text);
-				if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
-			}
-
-			// Start a prompt when idle, or queue it into a run still finishing compaction.
-			const dispatched = Promise.withResolvers<void>();
-			let dispatchFailure: { error: unknown } | undefined;
-			const promptPromise = session.prompt(firstPrompt.text, {
-				streamingBehavior: firstPrompt.mode,
-				preflightResult: () => dispatched.resolve(),
-			});
-			void promptPromise.then(
-				() => dispatched.resolve(),
-				(error: unknown) => {
-					dispatchFailure = { error };
-					dispatched.resolve();
-				},
-			);
-			await dispatched.promise;
-			if (dispatchFailure) throw dispatchFailure.error;
-			if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
-
-			// Queue remaining messages
-			for (const message of rest) {
-				if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
-				if (this.isExtensionCommand(message.text)) {
-					await this.session.prompt(message.text);
-				} else if (message.mode === "followUp") {
-					await this.session.followUp(message.text);
-				} else {
-					await this.session.steer(message.text);
-				}
-				if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
-			}
-			this.updatePendingMessagesDisplay();
-			await promptPromise;
-		} catch (error) {
-			restoreQueue(error);
-		} finally {
-			if (this.compactionQueueDeliveryPending === delivery && this.session === session) {
-				this.compactionQueueDeliveryPending = undefined;
-				if (!queueRestored && !session.isCompacting && this.compactionQueuedMessages.length > 0) {
-					void this.flushCompactionQueue({ willRetry: options?.willRetry });
-				} else if (session.isIdle) {
-					this.fireDueScheduledMessages();
+				await promptPromise;
+			} catch (error) {
+				restoreQueue(error);
+			} finally {
+				if (this.compactionQueueDeliveryPending === delivery && this.session === session) {
+					this.compactionQueueDeliveryPending = undefined;
+					if (!queueRestored && !session.isCompacting && this.compactionQueuedMessages.length > 0) {
+						void this.flushCompactionQueue({ willRetry: options?.willRetry });
+					} else if (session.isIdle) {
+						this.fireDueScheduledMessages();
+					}
 				}
 			}
-		}
+		};
+		// A settlement handler may await this flush. Return after deferral, not after its own future run;
+		// deliver keeps the queue token until the separate execution completion settles.
+		await Promise.race([deliver(), deferred.promise]);
 	}
 
 	/** Move pending bash components from pending area to chat */

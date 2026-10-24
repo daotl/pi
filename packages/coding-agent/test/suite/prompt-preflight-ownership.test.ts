@@ -232,3 +232,51 @@ it("preserves a settlement-deferred prompt error when its observer also throws",
 		await harness.session.abort();
 	}
 });
+
+it("keeps deferred execution queued when the synchronous handoff observer throws", async () => {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	let held = false;
+	const harness = await createHarness({
+		settings: { compaction: { enabled: false }, retry: { enabled: false } },
+		extensionFactories: [
+			(pi) => {
+				pi.on("agent_settled", async () => {
+					if (!held) {
+						held = true;
+						entered.resolve();
+						await release.promise;
+					}
+				});
+			},
+		],
+	});
+	harnesses.push(harness);
+	harness.setResponses([fauxAssistantMessage("seed"), fauxAssistantMessage("deferred completed")]);
+	let completion: Promise<void> | undefined;
+	const running = harness.session.prompt("seed input");
+	try {
+		await entered.promise;
+		await expect(
+			harness.session.prompt("deferred input", {
+				onDeferred: (pending) => {
+					completion = pending;
+					throw new Error("handoff observer failed");
+				},
+			}),
+		).resolves.toBeUndefined();
+		expect(completion).toBeDefined();
+		release.resolve();
+		await running;
+		await completion;
+		expect(harness.session.getLastAssistantText()).toBe("deferred completed");
+		expect(harness.session.messages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
+			"seed input",
+			"deferred input",
+		]);
+	} finally {
+		release.resolve();
+		await running.catch(() => {});
+		await harness.session.abort();
+	}
+});
