@@ -1,4 +1,5 @@
 import type { Api, Model, Provider } from "@earendil-works/pi-ai";
+import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../../../src/core/auth-storage.ts";
 import { defaultModelPerProvider } from "../../../src/core/model-resolver.ts";
@@ -216,4 +217,74 @@ describe("post-login model discovery", () => {
 		expect(login.showError).toHaveBeenCalledWith(expect.stringContaining("no models are available"));
 		expect(login.setModel).not.toHaveBeenCalled();
 	});
+
+	it.each(["azure-openai-responses", "github-copilot"] as const)(
+		"selects and persists the catalog default after first authentication with %s",
+		async (providerId) => {
+			harness = await createHarness();
+			const session = harness.session;
+			const id = defaultModelPerProvider[providerId];
+			if (!id) throw new Error("Missing provider default");
+			const selected = getBuiltinModels(providerId).find((model) => model.id === id);
+			if (!selected) throw new Error("Missing catalog default model");
+			const unknown = { ...harness.getModel(), id: "unknown", provider: "unknown", api: "unknown" };
+			session.agent.state.model = unknown;
+			session.modelRuntime.registerNativeProvider({
+				id: providerId,
+				name: providerId,
+				auth: {
+					apiKey: {
+						name: "Offline credential fixture",
+						check: async ({ credential }) => (credential?.key ? { type: "api_key" } : undefined),
+						resolve: async ({ credential }) => ({ auth: { apiKey: credential?.key }, source: "fixture" }),
+					},
+				},
+				getModels: () => [selected],
+				stream: () => {
+					throw new Error("Unexpected provider dispatch");
+				},
+				streamSimple: () => {
+					throw new Error("Unexpected provider dispatch");
+				},
+			});
+			await harness.authStorage.modify(providerId, async () => ({ type: "api_key", key: "offline-first-login" }));
+			await session.modelRuntime.getAvailable(providerId);
+			expect(session.modelRuntime.getAvailableSnapshot().filter((model) => model.provider === providerId)).toEqual([
+				selected,
+			]);
+			vi.spyOn(session.modelRuntime, "refresh").mockResolvedValue({ aborted: false, errors: new Map() });
+			const errors: string[] = [];
+			const statuses: string[] = [];
+			const context = {
+				session,
+				updateAvailableProviderCount: async () => {},
+				footer: { invalidate: () => {} },
+				updateEditorBorderColor: () => {},
+				showStatus: (text: string) => {
+					statuses.push(text);
+				},
+				showError: (text: string) => {
+					errors.push(text);
+				},
+				showWarning: (text: string) => {
+					errors.push(text);
+				},
+				maybeWarnAboutAnthropicSubscriptionAuth: async () => {},
+				checkDaxnutsEasterEgg: () => {},
+				ui: { requestRender: () => {} },
+			};
+			await complete.call(context, providerId, providerId, "api_key", unknown);
+			expect(session.model).toEqual(selected);
+			expect(harness.settingsManager.getDefaultProvider()).toBe(providerId);
+			expect(harness.settingsManager.getDefaultModel()).toBe(id);
+			expect(
+				harness.sessionManager
+					.getBranch()
+					.filter((entry) => entry.type === "model_change")
+					.at(-1),
+			).toMatchObject({ provider: providerId, modelId: id });
+			expect(statuses.join("\n")).toContain(`Selected ${id}`);
+			expect(errors).toEqual([]);
+		},
+	);
 });
