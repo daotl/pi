@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	type CountTokensOptions,
 	countTokens,
@@ -198,12 +198,13 @@ describe("countTokens", () => {
 		// Already-aborted signal short-circuits without fetching.
 		const aborted = new AbortController();
 		aborted.abort();
-		const neverFetched = (async () => {
+		const neverFetched = vi.fn<typeof globalThis.fetch>(async () => {
 			throw new Error("should not be called");
-		}) as unknown as typeof globalThis.fetch;
+		});
 		expect(
 			await countTokens(model("http://host:8080"), { text: "x", fetch: neverFetched, signal: aborted.signal }),
 		).toBeUndefined();
+		expect(neverFetched).not.toHaveBeenCalled();
 	});
 
 	it("awaits authorization before sending text or credentials", async () => {

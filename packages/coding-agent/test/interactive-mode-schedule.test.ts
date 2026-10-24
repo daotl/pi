@@ -89,7 +89,12 @@ describe("parseScheduleWhen", () => {
 		expect(parseScheduleWhen("2300-02-29 10:00")).toBeUndefined();
 	});
 
-	test("date-less time in the future today schedules for today", () => {
+	test("date-less time in the future today schedules for today", ({ onTestFinished }) => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		onTestFinished(() => {
+			vi.useRealTimers();
+		});
+		vi.setSystemTime(new Date(2026, 9, 24, 12, 0, 15));
 		const now = new Date();
 		const future = new Date(now.getTime() + 60_000);
 		const spec = `${String(future.getHours()).padStart(2, "0")}:${String(future.getMinutes()).padStart(2, "0")}`;
@@ -105,7 +110,12 @@ describe("parseScheduleWhen", () => {
 		}
 	});
 
-	test("date-less time already passed today schedules for the next day", () => {
+	test("date-less time already passed today schedules for the next day", ({ onTestFinished }) => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		onTestFinished(() => {
+			vi.useRealTimers();
+		});
+		vi.setSystemTime(new Date(2026, 9, 24, 12, 0, 15));
 		const now = new Date();
 		// Use a time two minutes in the past.
 		const past = new Date(now.getTime() - 120_000);
@@ -140,7 +150,12 @@ describe("parseScheduleWhen", () => {
 		}
 	});
 
-	test("date-less time with seconds schedules a time", () => {
+	test("date-less time with seconds schedules a time", ({ onTestFinished }) => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		onTestFinished(() => {
+			vi.useRealTimers();
+		});
+		vi.setSystemTime(new Date(2026, 9, 24, 12, 0, 15));
 		const now = new Date();
 		const future = new Date(now.getTime() + 120_000);
 		const spec = `${String(future.getHours()).padStart(2, "0")}:${String(future.getMinutes()).padStart(2, "0")}:${String(future.getSeconds()).padStart(2, "0")}`;
