@@ -252,6 +252,8 @@ Configure delivery in [settings](docs/settings.md): `steeringMode` and `followUp
 
 Assistant blocks support `pi_reasoning_content`, `pi_content`, and `pi_tool_call` sections; user blocks support plain text and `pi_image`. Deleting all sections of a block deletes the message.
 
+Tool-call arguments in edited `pi_tool_call` sections must be JSON objects. Arrays, `null` and scalar JSON values are rejected.
+
 Edit formatting refuses messages whose content or provider replay metadata cannot survive an unchanged XML round trip. A substring or swipe selection is refused as a whole if any selected message is unsafe; the existing draft stays intact. Multi-message copy keeps such messages as plain content rather than dropping them. Ordinary comparisons, HTML-like text, and literal entities remain body text.
 
 ### Swipes
@@ -670,7 +672,7 @@ Combine `--no-*` with explicit flags to load exactly what you need, ignoring set
 | `--verbose` | Force verbose startup |
 | `-a`, `--approve` | Trust project-local files for this run |
 | `-na`, `--no-approve` | Ignore project-local files for this run |
-| `--heartbeat <spec>` | Preset a recurring wake-up heartbeat at startup (repeatable; e.g. 3h or 15:23) |
+| `--heartbeat <spec>` | Preset a recurring interactive-only wake-up heartbeat at startup (repeatable; e.g. 3h or 15:23) |
 | `--` | Stop option parsing; remaining arguments are prompts or `@file` inputs |
 | `-h`, `--help` | Show help |
 | `-v`, `--version` | Show version |
