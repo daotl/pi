@@ -3454,6 +3454,7 @@ export class AgentSession {
 		messages: AgentMessage | AgentMessage[],
 		preflightResult?: PromptOptions["preflightResult"],
 		nextTurnMessageCount = 0,
+		admit?: () => void,
 	): Promise<void> {
 		if (this._isAgentRunActive || this.agent.signal) {
 			throw new Error(
@@ -3465,8 +3466,11 @@ export class AgentSession {
 		this._failedResponse = undefined;
 		this._recordSelection();
 		this._isAgentRunActive = true;
+		let admitted = false;
 		try {
 			this._flushPendingUsage();
+			admit?.();
+			admitted = true;
 			// Consume only this prompt's batch after receipt admission, before callbacks can queue more.
 			if (nextTurnMessageCount > 0) this._pendingNextTurnMessages.splice(0, nextTurnMessageCount);
 			preflightResult?.("started");
@@ -3502,7 +3506,7 @@ export class AgentSession {
 				this._refreshFinalizedContext();
 				this._flushPendingBashMessages();
 				this._flushPendingCustomMessages();
-				if (this._acceptedPromptSections) this._acceptedPromptLeafId = this.sessionManager.getLeafId();
+				if (admitted && this._acceptedPromptSections) this._acceptedPromptLeafId = this.sessionManager.getLeafId();
 			} finally {
 				await this._emitAgentSettled();
 			}
@@ -4046,17 +4050,19 @@ export class AgentSession {
 				timestamp: Date.now(),
 			});
 		}
-		this._acceptedPromptSections = Object.fromEntries(
+		const acceptedSections = Object.fromEntries(
 			Object.entries(buildSystemPromptSections(result.systemPromptOptions)).filter(
 				([name]) =>
 					!["preamble", "tools", "rules", "docs", "addendum", "project_context", "skills", "cwd"].includes(name),
 			),
 		);
-		const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
-		this._runSystemPromptOptions = result.systemPromptOptions;
-		if (updateMessage) messages.unshift(updateMessage);
-
-		await this._runAgentPrompt(messages, preflightResult, nextTurnMessageCount);
+		await this._runAgentPrompt(messages, preflightResult, nextTurnMessageCount, () => {
+			const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
+			this._acceptedPromptSections = acceptedSections;
+			this._acceptedPromptLeafId = this.sessionManager.getLeafId();
+			this._runSystemPromptOptions = result.systemPromptOptions;
+			if (updateMessage) messages.unshift(updateMessage);
+		});
 	}
 
 	/**
@@ -4675,8 +4681,42 @@ export class AgentSession {
 	): Promise<CompactionResult & { usageModel: Model<Api> }> {
 		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
 		const request = await this._getSummarizationRequestAuth(model, signal);
+		// Reconcile policy only in the summary request, before context/converter hooks.
+		// Saved snapshots may be newer than the conversational system messages on reopen.
+		const messages = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
+		const current = getCurrentSystemMessage(messages) ?? getCurrentSystemMessage(this.agent.state.messages);
+		const customSections = this.settingsManager.isProjectTrusted()
+			? Object.fromEntries(
+					Object.entries(current?.sections ?? {}).filter(
+						(entry): entry is [string, string] =>
+							entry[1] !== null &&
+							!["preamble", "tools", "rules", "docs", "addendum", "project_context", "skills", "cwd"].includes(
+								entry[0],
+							),
+					),
+				)
+			: this._acceptedPromptSections;
+		const sections = diffSystemPromptSections(current?.sections ?? {}, {
+			...customSections,
+			...this._buildEffectivePromptSections(this._runSystemPromptOptions ?? this._baseSystemPromptOptions),
+		});
+		const policyPatch: SystemMessage[] = sections
+			? [{ role: "system", content: "", sections, timestamp: Date.now() }]
+			: [];
+		const baseline = preparation.messagesToSummarize[0]?.role !== "system" && current ? [current] : [];
+		const requestPreparation = {
+			...preparation,
+			messagesToSummarize: [
+				...baseline,
+				...preparation.messagesToSummarize,
+				...(preparation.isSplitTurn ? [] : policyPatch),
+			],
+			turnPrefixMessages: preparation.isSplitTurn
+				? [...preparation.turnPrefixMessages, ...policyPatch]
+				: preparation.turnPrefixMessages,
+		};
 		const result = await compact(
-			preparation,
+			requestPreparation,
 			request.model,
 			request.apiKey,
 			request.headers,

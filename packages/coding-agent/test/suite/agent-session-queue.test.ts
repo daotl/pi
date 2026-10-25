@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, getCurrentSystemMessage, getCurrentTools } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, InputEvent } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -537,6 +537,90 @@ describe("AgentSession queue characterization", () => {
 				"queued during admission",
 				"hook: later prompt",
 			]);
+		} finally {
+			vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);
+			harness.cleanup();
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves accepted discovery and tools after a receipt-rejected prompt before untrusted continuation", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-policy-receipt-"));
+		const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+		const harness = await createHarness({
+			cwd,
+			sessionManager: manager,
+			fauxApi: "openai-completions",
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", (event) => {
+						const rejected = event.prompt === "rejected candidate";
+						event.systemPromptOptions.selectedTools = rejected ? [] : ["read"];
+						event.systemPromptOptions.sections.mcp_servers = rejected
+							? "REJECTED DISCOVERY"
+							: "ACCEPTED DISCOVERY";
+					});
+				},
+			],
+		});
+		const actual = await vi.importActual<typeof fs>("fs");
+		let writable = false;
+		const dispositions: string[] = [];
+		try {
+			harness.settingsManager.setProjectTrusted(false);
+			harness.setResponses([
+				fauxAssistantMessage("earlier answer"),
+				fauxAssistantMessage("accepted prefix", { stopReason: "aborted" }),
+				fauxAssistantMessage("completed summary"),
+			]);
+			await harness.session.prompt("earlier question");
+			await harness.session.prompt("accepted question");
+			const acceptedLeaf = manager.getLeafId();
+			const beforeRejected = structuredClone(manager.getEntries());
+			const starts = harness.eventsOfType("agent_start").length;
+			vi.mocked(fs.appendFileSync).mockImplementation((...args) => {
+				const record = JSON.parse(String(args[1])) as { type: string; kind?: string };
+				if (!writable && record.type === "compaction") throw new Error("checkpoint storage unavailable");
+				if (!writable && record.type === "usage" && record.kind === "compaction") {
+					throw new Error("summary receipt storage unavailable");
+				}
+				return actual.appendFileSync(...args);
+			});
+			await expect(harness.session.compact({ keepRecentMessages: 1 })).rejects.toThrow(
+				"checkpoint storage unavailable",
+			);
+			expect(harness.faux.state.callCount).toBe(3);
+			await expect(
+				harness.session.prompt("rejected candidate", { preflightResult: (value) => dispositions.push(value) }),
+			).rejects.toThrow("summary receipt storage unavailable");
+			expect(harness.faux.state.callCount).toBe(3);
+			expect(harness.eventsOfType("agent_start")).toHaveLength(starts);
+			expect(dispositions).toEqual([]);
+			expect(manager.getLeafId()).toBe(acceptedLeaf);
+			expect(manager.getEntries()).toEqual(beforeRejected);
+			writable = true;
+			let discovery: string | null | undefined;
+			let tools: string[] = [];
+			harness.setResponses([
+				(context) => {
+					discovery = getCurrentSystemMessage(context.messages)?.sections?.mcp_servers;
+					tools = getCurrentTools(context.messages).map((tool) => tool.name);
+					return fauxAssistantMessage("accepted prefix completed");
+				},
+			]);
+			await harness.session.continue();
+			expect(discovery).toBe("<mcp_servers>\nACCEPTED DISCOVERY\n</mcp_servers>");
+			expect(tools).toEqual(["read"]);
+			for (const current of [manager, SessionManager.open(manager.getSessionFile()!)]) {
+				const messages = current.buildSessionContext().messages;
+				expect(getCurrentSystemMessage(messages)?.sections?.mcp_servers).toBe(discovery);
+				expect(getCurrentTools(messages).map((tool) => tool.name)).toEqual(["read"]);
+				expect(messages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
+					"earlier question",
+					"accepted question",
+				]);
+			}
 		} finally {
 			vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);
 			harness.cleanup();

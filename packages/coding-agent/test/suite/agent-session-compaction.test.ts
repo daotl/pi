@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
@@ -14,6 +17,7 @@ import {
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { estimateTokens } from "../../src/core/compaction/index.ts";
+import { SessionManager } from "../../src/core/session-manager.ts";
 import { createHarness, getUserTexts, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
@@ -335,6 +339,59 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.faux.state.callCount).toBe(1);
 	});
 
+	it("uses the newer trusted saved policy for immediate compaction without rewriting history", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-compact-saved-policy-"));
+		const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+		let harness: Harness | undefined;
+		try {
+			harness = await createHarness({
+				cwd,
+				sessionManager: manager,
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 }, retry: { enabled: false } },
+			});
+			harness.session.setCustomSystemPrompt("OLD CONVERSATIONAL POLICY");
+			harness.setResponses([fauxAssistantMessage("old answer")]);
+			await harness.session.prompt("original question");
+			harness.session.setCustomSystemPrompt("NEW SAVED SUMMARY POLICY");
+			manager.appendMessage({ role: "user", content: "retained pending question", timestamp: Date.now() });
+			const file = manager.getSessionFile()!;
+			harness.cleanup();
+			harness = undefined;
+			const reopened = SessionManager.open(file);
+			const originalEntries = structuredClone(reopened.getEntries());
+			const hookPolicies: string[] = [];
+			harness = await createHarness({
+				cwd,
+				sessionManager: reopened,
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 }, retry: { enabled: false } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("context_with_system", (event) => {
+							hookPolicies.push(getCurrentSystemPrompt(event.messages));
+							expect(reopened.getEntries()).toEqual(originalEntries);
+						});
+					},
+				],
+			});
+			let requestPolicy = "";
+			harness.setResponses([
+				(context) => {
+					requestPolicy = getCurrentSystemPrompt(context.messages);
+					return fauxAssistantMessage("summary under saved policy");
+				},
+			]);
+			await harness.session.compact({ keepRecentMessages: 1 });
+			expect(requestPolicy).toContain("NEW SAVED SUMMARY POLICY");
+			expect(requestPolicy).not.toContain("OLD CONVERSATIONAL POLICY");
+			expect(hookPolicies).toEqual([requestPolicy]);
+			expect(reopened.getEntries().slice(0, originalEntries.length)).toEqual(originalEntries);
+			expect(SessionManager.open(file).getEntries().slice(0, originalEntries.length)).toEqual(originalEntries);
+		} finally {
+			harness?.cleanup();
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it("reuses the agent context pipeline so the summarization request stays cache-compatible", async () => {
 		const harness = await createHarness({ settings: { compaction: { keepRecentTokens: 1 } } });
 		harnesses.push(harness);
@@ -354,11 +411,8 @@ describe("AgentSession compaction characterization", () => {
 
 		await harness.session.compact();
 
-		// Cache-valid summarization reuses the agent's transformContext, system
-		// prompt, and tools so the request byte-matches a normal chat turn (the
-		// summarization only appends its instruction at the end).
+		// Summary requests use the same context pipeline and current tool declarations as chat.
 		expect(transformContext).toHaveBeenCalled();
-		expect(getCurrentSystemPrompt(requestContext?.messages ?? [])).toBe(harness.session.agent.state.systemPrompt);
 		expect(getCurrentTools(requestContext?.messages ?? [])).toEqual(
 			harness.session.agent.state.tools.map(toToolDeclaration),
 		);
@@ -368,24 +422,6 @@ describe("AgentSession compaction characterization", () => {
 		expect(requestOptions).toMatchObject({ cacheRetention: "none" });
 		expect(requestOptions?.sessionId).not.toBe("active-routing-session");
 		expect(requestOptions?.transport).toBe(harness.session.agent.transport);
-	});
-
-	it("sends the prepared system checkpoint once to the summary stream", async () => {
-		const harness = await createHarness({ settings: { compaction: { keepRecentTokens: 1 } } });
-		harnesses.push(harness);
-		harness.sessionManager.appendMessage({ role: "system", content: "CHECKPOINT-ONCE", timestamp: 1 });
-		seedCompactableSession(harness);
-		let captured: TranscriptContext | undefined;
-		useSummaryStreamFn(harness, "checkpoint summary", (context) => {
-			captured = context;
-		});
-		await harness.session.compact();
-		expect(captured?.messages.filter((message) => message.role === "system")).toEqual([
-			expect.objectContaining({ role: "system", content: "CHECKPOINT-ONCE" }),
-		]);
-		expect(getCurrentTools(captured?.messages ?? [])).toEqual(
-			harness.session.agent.state.tools.map(toToolDeclaration),
-		);
 	});
 
 	it("persists usage from pi-generated manual compaction", async () => {

@@ -372,3 +372,30 @@ Canonical receipt, independent validator, exact coverage audit, RED/GREEN and te
 ### Verdict
 
 Round-12 repair verified locally; continue full merge review after local commit. No push, PR, dependency metadata, upstream replay or released changelog change.
+
+## Full merge review loop: round 13
+
+Round-12 repair commit: `8cd4b5b6ef84083b012b59bbf1c928a765e8280c`; normal hook No fixes applied and tested product/guide blobs match. Thirteenth fresh fixed-base -> HEAD review covers all 421 paths, 72 runtime source paths and 60,146 diff lines; digest `d31efcb843eaff3a0e84f0190b7895ab59bc1060b229ff1c74a462af2094c0eb`. Eleven canonical personas completed. Three candidates semantically deduplicated to two root causes; both independently validated true. Canonical receipt passed before mutation (`artifact://8005`). Exact adversarial partition: 112 investigated / 309 insufficient detailed paths; complete inventory is not whole-change deep clearance.
+
+### Confirmed findings and repairs
+
+- R13-#1 (P2): trusted reopen restores a newer effective saved prompt without installing it into historical Agent messages. Immediate direct compact therefore summarized under the older conversational policy. Built-in Session compaction now adds a request-local structured policy patch before context/converter hooks, retaining conversational ordering and accepted custom sections without rewriting durable history. Hooks remain authoritative, including system removal. Independent RED observes the old policy at the actual summary provider; GREEN observes newer saved policy at both context_with_system and provider, including reopen.
+- R13-#2 (P2): prompt published candidate accepted sections and side-effecting loadout before receipt admission. Rejection left candidate discovery/tools/hidden declarations installed and marked the unchanged leaf accepted. Candidate sections/options remain local until the run-owned mandatory drain succeeds; an admission closure then publishes before started/Agent dispatch. Rejected admission does not advance accepted-leaf authority; no rollback race. Independent RED contaminates recovered untrusted continuation with rejected discovery; owner RED changes accepted echo loadout to mask,echo. Recovery now retains accepted discovery and tools and excludes rejected policy from actual request and reopened projection.
+
+### Verification
+
+Actual consumer REDs: direct summary **1**, continuation authority **1**, owning prompt loadout **1**. Final post-format combined owners: **155 passed / 12 files, 12.24s**, including native summary/tokenizer, policy retry, untrusted summary, prefill and RPC controls. Final full `npm run check`: **1770 / No fixes applied, 11.10s**. First check formatted one file and exposed TS2345 nullable section values; an explicit tuple type predicate fixes narrowing without changing behavior, followed by final green check/tests. Original isolated root `./test.sh`: **8935 passed / 0 failed / 915 skipped, 90.56s**, `artifact://8022`.
+
+Temporary actual-source/faux smoke separately proves started callback sees admitted policy/loadout and summary hooks can remove reconciled authority; removed after execution. Incidental sole-system-checkpoint shape and empty Agent-prompt assertions were deleted rather than re-pinned; semantic policy/routing/tool assertions retained. Worker receipts preserve intermediate fixture failures. Existing SDK and compaction guides updated.
+
+### Actionable Findings
+
+Both confirmed root causes repaired and verified; commit and another fresh entire fixed-base -> latest committed HEAD review remain required. No convergence claim.
+
+### Coverage
+
+Canonical receipt, semantic deduplication, two-item validator, exact coverage audit, RED/GREEN and tested source identity: `/tmp/compound-engineering-501/ce-code-review/20261025-full-wave13-61a5b871/`. Existing manual protected-worktree exception, graph/external-family, source/caller/runtime and process-crash limits remain. Native non-OpenAI/Google final-wire coverage and HTML viewer actions remain disclosed testing boundaries, not confirmed product failures or new scope.
+
+### Verdict
+
+Round-13 repairs verified locally; continue full merge review after local commit. No push, PR, dependency metadata, upstream replay or released changelog change.

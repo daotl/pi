@@ -28,6 +28,8 @@ Historical assistant usage is cleared only on request-local summary copies, incl
 
 Compaction preserves fitting structured history. If converted tool results exceed the physical input window or leave only the verified native adapter's one-token emergency floor, it serializes already-converted, replay-eligible history with bounded tool-result text. It preserves the policy-visible system/tool state and selected kept boundary, then checks the complete bounded request again. A request that still cannot fit fails before dispatch. Arbitrary custom streams retain their physical-window budget rather than inheriting native safety allowances.
 
+Session-owned direct compaction reconciles its request-local structured system policy with the current effective Session policy before context/converter hooks. This includes a newer saved prompt restored on trusted reopen even when no ordinary prompt or continuation has run yet. Historical conversation order and accepted custom sections remain available; this reconciliation does not rewrite durable history, and downstream hooks can still remove system/tool authority before dispatch.
+
 ## Compaction
 
 ### When It Triggers

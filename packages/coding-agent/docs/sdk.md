@@ -99,6 +99,8 @@ If both original terminal publication and its fallback content-free receipt appe
 
 Accepted custom messages with `deliverAs: "nextTurn"` remain Session-owned if required receipt admission rejects before Agent dispatch. Recovery retries deliver that batch in original order alongside the user message, before before-agent-start hook messages. Consumption happens after successful receipt admission and before the started callback; custom messages newly queued by that callback belong to the following prompt. An already dispatched batch is not queued again after a later run failure.
 
+Candidate prompt sections and tool-loadout changes publish only after that same successful run-owned receipt admission. A receipt-rejected prompt does not replace accepted discovery authority, advance its selected leaf, or install its candidate tools/hidden declarations; later continuation retains the previously accepted policy.
+
 `abort()` stops the active operation and waits for the session to become idle. `waitForIdle()` waits without aborting it.
 
 Hosts replacing or disposing a Session directly can call `flushPendingPersistence()` after aborting/settling it to publish retained deferred bash/custom output and usage receipts without outgoing subscriber notifications. Runtime replacement and interactive shutdown use this drain before invalidation. Records are consumed after successful storage, even if later projection refresh fails, so retry does not append them twice. `flushPendingUsage()` remains the narrower usage-only operation.

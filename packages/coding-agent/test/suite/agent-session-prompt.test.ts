@@ -2,7 +2,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, getCurrentSystemMessage, type Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, InputEvent } from "../../src/core/extensions/index.ts";
@@ -39,6 +39,72 @@ describe("AgentSession prompt characterization", () => {
 				rmSync(tempDir, { recursive: true, force: true });
 			}
 		}
+	});
+
+	it("preserves admitted hook policy and hidden declarations when a later receipt admission rejects", async () => {
+		let rejected = false;
+		const echo: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo",
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text", text: "echo" }], details: {} }),
+		};
+		const harness = await createHarness({
+			tools: [echo],
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+			extensionFactories: [
+				(pi) => {
+					pi.registerTool({
+						name: "mask",
+						label: "Mask",
+						description: "Mask",
+						parameters: Type.Object({}),
+						defaultActive: false,
+						prepareLoadout: () => ({ hiddenDeclarations: ["echo"] }),
+						execute: async () => ({ content: [], details: {} }),
+					});
+					pi.on("before_agent_start", (event) => {
+						event.systemPromptOptions.sections.discovery = rejected ? "REJECTED DISCOVERY" : "ACCEPTED DISCOVERY";
+						event.systemPromptOptions.selectedTools = rejected ? ["mask", "echo"] : ["echo"];
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		vi.spyOn(harness.settingsManager, "isProjectTrusted").mockReturnValue(false);
+		harness.setResponses([
+			fauxAssistantMessage("first"),
+			fauxAssistantMessage("second"),
+			fauxAssistantMessage("summary"),
+			(context) => {
+				const system = getCurrentSystemMessage(context.messages);
+				expect(system?.sections?.discovery).toBe("ACCEPTED DISCOVERY");
+				expect(system?.toolsAdded?.map((tool) => tool.name)).toEqual(["echo"]);
+				return fauxAssistantMessage("continued");
+			},
+		]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		const checkpoint = vi.spyOn(harness.sessionManager, "appendCompaction").mockImplementation(() => {
+			throw new Error("checkpoint unavailable");
+		});
+		const receipt = vi.spyOn(harness.sessionManager, "appendUsage").mockImplementation(() => {
+			throw new Error("receipt unavailable");
+		});
+		try {
+			await expect(harness.session.compact({ keepRecentMessages: 1 })).rejects.toThrow("checkpoint unavailable");
+			rejected = true;
+			await expect(harness.session.prompt("never admitted")).rejects.toThrow("receipt unavailable");
+			expect(harness.session.getActiveToolNames()).toEqual(["echo"]);
+		} finally {
+			checkpoint.mockRestore();
+			receipt.mockRestore();
+		}
+		// Continue from a pending user without another before_agent_start acceptance.
+		harness.sessionManager.appendMessage({ role: "user", content: "pending", timestamp: Date.now() });
+		harness.session.refreshContext();
+		await harness.session.continue();
 	});
 
 	it("prompts while idle and records a single text response", async () => {
