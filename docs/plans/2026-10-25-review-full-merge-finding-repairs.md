@@ -428,3 +428,28 @@ Canonical receipt, semantic deduplication, four-item validator, coverage audit, 
 ### Verdict
 
 Round-14 repairs verified locally; continue full merge review after local commit. No push, PR, dependency metadata, upstream replay or released changelog change.
+
+## Full merge review loop: round 15
+
+Round-14 repair commit: `f374c3e92a59d162a98ea07dee9aba620548dcba`; normal hook No fixes applied and tested product/guide blobs match. Fifteenth fresh fixed-base -> HEAD review covers all 423 paths, 73 runtime source paths and 61,461 diff lines; digest `b586ad8fc3333a240f0b3ed48f97a4142bd09e56e135496c926c9537b2283958`. Eleven canonical personas completed; two distinct findings independently validated true. Canonical receipt passed before mutation (`artifact://8332`). Exact adversarial partition: 110 investigated / 313 insufficient detailed paths; complete inventory is not full deep semantic clearance.
+
+### Confirmed findings and repairs
+
+- R15-#1 (P2): branch selection treated a contribution containing toolResult plus its Session reconciliation patch as independent budget material. A result-only budget could retain that tail while dropping its owning assistant, producing an orphan native role:tool. Mixed result/system contributions now defer atomically to the matching call, preserving patch chronology and existing user/custom/assistant boundaries, including reused IDs. Public tree navigation RED dispatched/published an orphan; four explicit-projection/boundary REDs failed too. Real loopback/native Completions smoke rejects a tight budget before HTTP dispatch; ample budget emits complete matching calls/results with restored docs/rules and returns a summary.
+- R15-#2 (P2): a successful canonical continuation remains before its durable policy suffix even though the provider request already counted that suffix. Estimation added the policy again. Existing `usageContextEntryId` now marks the final retained counted tail, including state-only entries, with legacy checkpoint/edit anchors still supported. Projection estimation counts only later contributions; clones remap the boundary, copied usage stays rejected, later invalidating boundaries still invalidate. Canonical order and billing are unchanged. Actual RED: faux context 2498 vs billed 1677; real native offline HTTP usage context 833 vs billed 12, both double-adding 821 policy tokens. SDK/footer/reopen, later-policy and copy/checkpoint controls pass.
+
+### Verification
+
+Post-format combined owners: **255 passed / 2 skipped, 12 files, 8.23s**. Final full `npm run check`: **1770 / No fixes applied, 11.82s**; first check formatted three owned files. Original isolated root `./test.sh`: **8956 passed / 0 failed / 915 skipped, 96.09s**, `artifact://8350`. Actual source SDK/faux/footer smoke reports billed/context 2510 and `2.5k/125k (2.0%)`; not claimed as native numerical proof. Native HTTP fixture supplies scripted usage to the real adapter and proves ownership, not tokenizer accuracy. Runtime smokes removed. Session-format and compaction guides document counted-tail semantics and mixed result/policy grouping. Parent LSP references obtained before exported metadata semantics changed.
+
+### Actionable Findings
+
+Both findings repaired and verified; commit and another fresh entire fixed-base -> latest committed HEAD review remain required. No convergence claim.
+
+### Coverage
+
+Canonical receipt, two-item validator, exact coverage audit, RED/GREEN and tested source identity: `/tmp/compound-engineering-501/ce-code-review/20261025-full-wave15-4f9b2925/`. Existing protected-worktree/manual-loop, graph/stale-LSP/external-family, source/caller/runtime and process-crash limitations remain.
+
+### Verdict
+
+Round-15 repairs verified locally; continue full merge review after local commit. No push, PR, dependency metadata, upstream replay or released changelog change.

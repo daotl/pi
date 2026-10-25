@@ -7,7 +7,15 @@ import {
 	getCurrentSystemMessage,
 } from "@earendil-works/pi-ai";
 import { expect, it, vi } from "vitest";
+import { estimateProjectedContextTokens, estimateTokens } from "../../src/core/compaction/compaction.ts";
+import { FooterDataProvider } from "../../src/core/footer-data-provider.ts";
+import { createAgentSession } from "../../src/core/sdk.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
+import { getUsageTotals } from "../../src/core/usage-totals.ts";
+import { FooterComponent, formatTokens } from "../../src/modes/interactive/components/footer.ts";
+import { initTheme } from "../../src/modes/interactive/theme/theme.ts";
+import { stripAnsi } from "../../src/utils/ansi.ts";
+import { createNativeTokenizerFixture } from "../native/tokenizer-fixture.ts";
 import { createHarness, getMessageText } from "./harness.ts";
 
 it.each((["success", "mismatch"] as const).flatMap((outcome) => [false, true].map((clone) => ({ outcome, clone }))))(
@@ -323,5 +331,116 @@ it("keeps accepted discovery while a rejected competing prompt awaits preflight"
 		await continuation;
 		await harness.session.abort();
 		harness.cleanup();
+	}
+});
+
+it.each(["faux", "native"] as const)("counts a continued policy suffix only once (%s)", async (runtime) => {
+	initTheme(undefined, false);
+	const cwd = mkdtempSync(join(tmpdir(), "pi-policy-usage-"));
+	const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+	const native = runtime === "native" ? await createNativeTokenizerFixture() : undefined;
+	const harness = native?.owner ?? (await createHarness({ fauxApi: "openai-completions" }));
+	const model = native?.session.model ?? harness.getModel();
+	if (!model) throw new Error("Expected model");
+	manager.appendMessage({ role: "system", content: "baseline", timestamp: 0 });
+	const user = manager.appendMessage({ role: "user", content: "question", timestamp: 1 });
+	manager.appendMessage({
+		...fauxAssistantMessage("partial", { stopReason: "aborted" }),
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+	});
+	let { session } = await createAgentSession({
+		cwd,
+		agentDir: cwd,
+		model,
+		modelRuntime: harness.session.modelRuntime,
+		settingsManager: harness.settingsManager,
+		resourceLoader: harness.session.resourceLoader,
+		sessionManager: manager,
+		tools: [],
+	});
+	const footerData = new FooterDataProvider(cwd);
+	try {
+		session.setCustomSystemPrompt("accepted policy ".repeat(200));
+		if (native) native.setResponses([fauxAssistantMessage("partial completed")]);
+		else harness.setResponses([fauxAssistantMessage("partial completed")]);
+		await session.continue();
+		const response = manager
+			.getBranch()
+			.find((entry) => entry.type === "message" && entry.message.role === "assistant");
+		if (response?.type !== "message" || response.message.role !== "assistant")
+			throw new Error("Expected continued response");
+		const billed = response.message.usage.totalTokens;
+		if (native) {
+			expect(billed).toBe(12);
+			expect(native.summaries[0]?.body).toContain("accepted policy");
+			const request = JSON.parse(native.summaries[0]!.body) as {
+				messages: Array<{ role: string; content: string }>;
+			};
+			expect(request.messages.at(-1)).toMatchObject({ role: "assistant", content: "partial" });
+		}
+		const totals = getUsageTotals(manager.getEntries());
+		const continuedIndex = manager.getBranch().findIndex((entry) => entry.id === response.id);
+		expect(
+			manager
+				.getBranch()
+				.slice(continuedIndex + 1)
+				.some((entry) => entry.type === "message" && entry.message.role === "system"),
+		).toBe(true);
+		const file = manager.getSessionFile()!;
+		for (const reopen of [false, true]) {
+			if (reopen) {
+				session.dispose();
+				({ session } = await createAgentSession({
+					cwd,
+					agentDir: cwd,
+					model,
+					modelRuntime: harness.session.modelRuntime,
+					settingsManager: harness.settingsManager,
+					resourceLoader: harness.session.resourceLoader,
+					sessionManager: SessionManager.open(file),
+					tools: [],
+				}));
+			}
+			expect(session.getContextUsage()?.tokens).toBe(billed);
+			expect(session.getSessionStats().contextUsage?.tokens).toBe(billed);
+			expect(stripAnsi(new FooterComponent(session, footerData).render(160).join("\n"))).toContain(
+				`${formatTokens(billed)}/${formatTokens(model.contextWindow)} (${((billed / model.contextWindow) * 100).toFixed(1)}%)`,
+			);
+		}
+		const current = session.sessionManager;
+		const later = { role: "system" as const, content: "new policy not counted", timestamp: 5 };
+		current.appendMessage(later);
+		session.refreshContext();
+		expect(session.getContextUsage()?.tokens).toBe(billed + estimateTokens(later));
+		for (const selected of [current, SessionManager.open(file)]) {
+			expect(estimateProjectedContextTokens(selected.buildSessionProjection(), selected.getBranch()).tokens).toBe(
+				billed + estimateTokens(later),
+			);
+		}
+		current.replaceMessages([{ entryId: user, message: { role: "user", content: "changed", timestamp: 6 } }]);
+		session.refreshContext();
+		for (const copy of [current, SessionManager.open(file)]) {
+			expect(estimateProjectedContextTokens(copy.buildSessionProjection(), copy.getBranch()).usageTokens).toBe(0);
+			expect(getUsageTotals(copy.getEntries())).toEqual(totals);
+			const copied = copy
+				.getBranch()
+				.find((entry) => entry.type === "message" && entry.message.role === "assistant");
+			if (copied?.type !== "message") throw new Error("Expected copied assistant");
+			expect(copy.getBranch().some((entry) => entry.id === copied.usageContextEntryId)).toBe(true);
+		}
+		const copiedUser = current
+			.getBranch()
+			.find((entry) => entry.type === "message" && entry.message.role === "user")!;
+		current.appendCompaction("new uncounted checkpoint", copiedUser.id, billed);
+		session.refreshContext();
+		expect(session.getContextUsage()?.tokens).toBeNull();
+	} finally {
+		session.dispose();
+		footerData.dispose();
+		if (native) native.cleanup();
+		else harness.cleanup();
+		rmSync(cwd, { recursive: true, force: true });
 	}
 });

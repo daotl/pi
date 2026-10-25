@@ -246,7 +246,12 @@ function selectBranchEntries(
 	for (let i = projected.length - 1; i >= 0; i--) {
 		const { sourceEntry: entry, messages: contribution } = projected[i];
 		if (contribution.length === 0) continue;
-		if (contribution.every((message) => message.role === "toolResult")) {
+		// Request-local policy reconciliation can share a contribution with its result.
+		// Defer the entire ordered contribution so the patch cannot split call/result ownership.
+		if (
+			contribution.some((message) => message.role === "toolResult") &&
+			contribution.every((message) => message.role === "toolResult" || message.role === "system")
+		) {
 			pendingContributions.push(contribution);
 			continue;
 		}

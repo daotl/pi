@@ -253,13 +253,30 @@ export function estimateProjectedContextTokens(
 				break;
 			}
 		}
+		const countedBoundaryIndex =
+			usageEntry?.type === "message" && usageEntry.usageContextEntryId !== undefined
+				? branchEntries.findIndex((entry) => entry.id === usageEntry.usageContextEntryId)
+				: -1;
 		if (
-			usageEntryIndex > latestInvalidatingEntryIndex ||
-			(usageEntry?.type === "message" &&
-				usageEntry.usageContextEntryId !== undefined &&
-				usageEntry.usageContextEntryId === branchEntries[latestInvalidatingEntryIndex]?.id)
-		)
-			return estimate;
+			usageEntryIndex >= 0 &&
+			(usageEntryIndex > latestInvalidatingEntryIndex || countedBoundaryIndex >= latestInvalidatingEntryIndex)
+		) {
+			if (countedBoundaryIndex <= usageEntryIndex) return estimate;
+			const countedSuffixIds = new Set(
+				branchEntries.slice(usageEntryIndex + 1, countedBoundaryIndex + 1).map((entry) => entry.id),
+			);
+			let trailingTokens = 0;
+			let messageIndex = 0;
+			for (const entry of projection.entries) {
+				for (const message of entry.messages) {
+					if (messageIndex > estimate.lastUsageIndex && !countedSuffixIds.has(entry.sourceEntry.id)) {
+						trailingTokens += estimateTokens(message);
+					}
+					messageIndex++;
+				}
+			}
+			return { ...estimate, tokens: estimate.usageTokens + trailingTokens, trailingTokens };
+		}
 	}
 
 	const currentSystem = getCurrentSystemMessage(projection.messages);

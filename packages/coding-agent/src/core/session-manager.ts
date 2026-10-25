@@ -88,7 +88,7 @@ export interface SessionEntryBase {
 export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
 	message: AgentMessage;
-	/** Latest edit/checkpoint included in a freshly billed canonical continuation request. */
+	/** Last retained entry included in a freshly billed canonical continuation request (legacy: latest edit/checkpoint). */
 	usageContextEntryId?: string;
 	/**
 	 * Tool call blocks soft-deleted from this assistant message: toolCallId →
@@ -1571,8 +1571,7 @@ export class SessionManager {
 				delete clone.usageSourceId;
 				delete clone.deletedToolCalls;
 				delete clone.usageContextEntryId;
-				const boundary = tail.findLast((entry) => entry.type === "compaction" || entry.type === "context_edit");
-				if (boundary) clone.usageContextEntryId = idMap.get(boundary.id)!;
+				clone.usageContextEntryId = idMap.get(tail.at(-1)!.id)!;
 				clone.timestamp = new Date().toISOString();
 			}
 			entries.push(clone);
@@ -2592,6 +2591,9 @@ export class SessionManager {
 		// Only new clones belong to this edit; historical branches keep their references.
 		for (const id of idMap.values()) {
 			const entry = this.byId.get(id)!;
+			if (entry.type === "message" && entry.usageContextEntryId !== undefined) {
+				entry.usageContextEntryId = idMap.get(entry.usageContextEntryId) ?? entry.usageContextEntryId;
+			}
 			if (entry.type === "compaction") {
 				entry.firstKeptEntryId =
 					idMap.get(entry.firstKeptEntryId) ?? boundaryIds.get(entry.firstKeptEntryId) ?? entry.firstKeptEntryId;
@@ -2764,6 +2766,9 @@ export class SessionManager {
 
 		// Only new clones belong to this removal; historical branches keep their references.
 		for (const entry of clones) {
+			if (entry.type === "message" && entry.usageContextEntryId !== undefined) {
+				entry.usageContextEntryId = idMap.get(entry.usageContextEntryId) ?? entry.usageContextEntryId;
+			}
 			if (entry.type === "compaction" && entry.firstKeptEntryId) {
 				if (idMap.has(entry.firstKeptEntryId)) {
 					entry.firstKeptEntryId = idMap.get(entry.firstKeptEntryId)!;

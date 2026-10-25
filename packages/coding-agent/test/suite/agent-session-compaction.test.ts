@@ -5,8 +5,10 @@ import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
+	createProvider,
 	fauxAssistantMessage,
 	fauxToolCall,
+	getCurrentSystemMessage,
 	getCurrentSystemPrompt,
 	getCurrentTools,
 	type Model,
@@ -14,6 +16,7 @@ import {
 	type TranscriptContext,
 	toToolDeclaration,
 } from "@earendil-works/pi-ai";
+import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { estimateTokens } from "../../src/core/compaction/index.ts";
@@ -462,6 +465,118 @@ describe("AgentSession compaction characterization", () => {
 			harness?.cleanup();
 			rmSync(cwd, { recursive: true, force: true });
 		}
+	});
+
+	it("keeps policy-patched terminating tool groups atomic through public tree navigation and native dispatch", async () => {
+		let turn = 0;
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 30000, maxTokens: 1024 }],
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+			tools: [
+				{
+					name: "finish_branch",
+					label: "Finish branch",
+					description: "Finish the current branch",
+					parameters: Type.Object({ payload: Type.String() }),
+					execute: async () => ({
+						content: [{ type: "text", text: "TERMINAL_BRANCH_RESULT" }],
+						details: {},
+						terminate: true,
+					}),
+				},
+			],
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", (event) => {
+						if (++turn === 2) {
+							event.systemPromptOptions.sections.docs = "";
+							event.systemPromptOptions.sections.rules = "";
+						}
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("shared answer"),
+			fauxAssistantMessage(fauxToolCall("finish_branch", { payload: "x".repeat(8000) }), { stopReason: "toolUse" }),
+		]);
+		await harness.session.prompt("shared question");
+		const target = harness.sessionManager.getLeafId()!;
+		const originalPolicy = getCurrentSystemMessage(harness.session.messages)!;
+		await harness.session.prompt("finish the abandoned branch");
+		expect(harness.session.messages.at(-1)?.role).toBe("toolResult");
+		expect(getCurrentSystemMessage(harness.session.messages)?.sections).not.toHaveProperty("docs");
+		expect(getCurrentSystemMessage(harness.session.messages)?.sections).not.toHaveProperty("rules");
+		const provider = createProvider({
+			id: "branch-grouping-native",
+			auth: { apiKey: { name: "offline", resolve: async () => ({ auth: { apiKey: "offline-key" } }) } },
+			models: [
+				{
+					...harness.getModel(),
+					id: "local",
+					provider: "branch-grouping-native",
+					api: "openai-completions",
+					baseUrl: "https://branch-grouping.invalid/v1",
+				},
+			],
+			api: openAICompletionsApi(),
+		});
+		harness.session.modelRuntime.registerNativeProvider(provider);
+		await harness.session.setModel(provider.getModels()[0]!);
+		const requests: Array<{
+			messages: Array<{
+				role: string;
+				content?: unknown;
+				tool_calls?: Array<{ id: string }>;
+				tool_call_id?: string;
+			}>;
+		}> = [];
+		vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+			expect(String(input)).toBe("https://branch-grouping.invalid/v1/chat/completions");
+			requests.push(JSON.parse(String(init?.body)));
+			const chunk = {
+				id: "branch-summary",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: "local",
+				choices: [
+					{ index: 0, delta: { role: "assistant", content: "complete branch summary" }, finish_reason: "stop" },
+				],
+			};
+			return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, {
+				headers: { "content-type": "text/event-stream" },
+			});
+		});
+		const resultMessage = harness.session.messages.at(-1)!;
+		const callMessage = harness.session.messages.findLast((message) => message.role === "assistant")!;
+		const budget = estimateTokens(resultMessage) + 100;
+		expect(estimateTokens(callMessage) + estimateTokens(resultMessage)).toBeGreaterThan(budget);
+		harness.settingsManager.applyOverrides({ branchSummary: { reserveTokens: 30000 - budget } });
+		const before = structuredClone(harness.sessionManager.getEntries());
+		const leaf = harness.sessionManager.getLeafId();
+		const callsBefore = harness.faux.state.callCount;
+		harness.setResponses([fauxAssistantMessage("must not summarize an orphan")]);
+		await expect(harness.session.navigateTree(target, { summarize: true })).rejects.toThrow(/token budget/);
+		expect(harness.faux.state.callCount).toBe(callsBefore);
+		expect(harness.sessionManager.getLeafId()).toBe(leaf);
+		expect(harness.sessionManager.getEntries()).toEqual(before);
+		expect(requests).toEqual([]);
+		harness.settingsManager.applyOverrides({ branchSummary: { reserveTokens: 1024 } });
+		const navigation = await harness.session.navigateTree(target, { summarize: true });
+		expect(navigation.summaryEntry?.summary).toContain("complete branch summary");
+		expect(requests).toHaveLength(1);
+		const wire = requests[0].messages;
+		const toolIndex = wire.findIndex((message) => message.role === "tool");
+		expect(wire[toolIndex]).toMatchObject({ content: "TERMINAL_BRANCH_RESULT" });
+		expect(wire[toolIndex - 1]).toMatchObject({
+			role: "assistant",
+			tool_calls: [{ id: wire[toolIndex].tool_call_id }],
+		});
+		expect(JSON.stringify(wire)).toContain("x".repeat(8000));
+		expect(wire[0].content).toEqual(expect.stringContaining(originalPolicy.sections!.docs!));
+		expect(wire[0].content).toEqual(expect.stringContaining(originalPolicy.sections!.rules!));
+		for (const entry of before) expect(harness.sessionManager.getEntry(entry.id)).toEqual(entry);
 	});
 
 	it.each([false, true])("keeps legacy mid-history policy once and ordered in split=%s compaction", async (split) => {

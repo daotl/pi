@@ -9,7 +9,7 @@ import {
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
-import { generateBranchSummary } from "../src/core/compaction/index.ts";
+import { estimateTokens, generateBranchSummary, prepareBranchEntries } from "../src/core/compaction/index.ts";
 import { type SessionEntry, SessionManager } from "../src/core/session-manager.ts";
 
 const model: Model<"anthropic-messages"> = {
@@ -240,6 +240,72 @@ describe("branch summarization", () => {
 		expect(result).toMatchObject({ error: expect.any(String) });
 		expect(result.summary).toBeUndefined();
 	});
+
+	it("budgets projected tool results and their policy patches with the owning call in source order", () => {
+		const manager = SessionManager.inMemory();
+		manager.appendMessage({
+			...response([{ type: "toolCall", id: "mixed-result", name: "read", arguments: { path: "x".repeat(1000) } }]),
+			stopReason: "toolUse",
+		});
+		manager.appendMessage({ role: "system", content: "BEFORE_RESULT", timestamp: 1 });
+		manager.appendMessage({
+			role: "toolResult",
+			toolCallId: "mixed-result",
+			toolName: "read",
+			content: [{ type: "text", text: "OWNED_RESULT" }],
+			isError: false,
+			timestamp: 2,
+		});
+		const projection = manager.buildSessionProjection();
+		const patch = { role: "system" as const, content: "AFTER_RESULT", timestamp: 3 };
+		projection.entries.at(-1)!.messages.push(patch);
+		projection.messages.push(patch);
+		const before = structuredClone(projection);
+		const unlimited = prepareBranchEntries(manager.getBranch(), 0, projection);
+		expect(unlimited.messages.map((message) => message.role)).toEqual([
+			"assistant",
+			"system",
+			"toolResult",
+			"system",
+		]);
+		expect(unlimited.messages).toEqual(projection.messages);
+		const budget = projection.entries
+			.at(-1)!
+			.messages.reduce((tokens, message) => tokens + estimateTokens(message), 0);
+		const bounded = prepareBranchEntries(manager.getBranch(), budget, projection);
+		expect(bounded).toMatchObject({ messages: [], budgetExceeded: true });
+		expect(projection).toEqual(before);
+	});
+
+	it.each(["user", "custom", "assistant"] as const)(
+		"does not attach a mixed result/policy contribution across a %s boundary with reused call IDs",
+		(boundary) => {
+			const manager = SessionManager.inMemory();
+			manager.appendMessage({
+				...response([{ type: "toolCall", id: "reused", name: "read", arguments: {} }]),
+				stopReason: "toolUse",
+			});
+			if (boundary === "custom") manager.appendCustomMessageEntry("notice", "BOUNDARY", true);
+			else if (boundary === "user") manager.appendMessage({ role: "user", content: "BOUNDARY", timestamp: 1 });
+			else manager.appendMessage(response([{ type: "text", text: "BOUNDARY" }]));
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: "reused",
+				toolName: "read",
+				content: [{ type: "text", text: "UNRELATED_RESULT" }],
+				isError: false,
+				timestamp: 2,
+			});
+			const projection = manager.buildSessionProjection();
+			const patch = { role: "system" as const, content: "PRESERVED_POLICY", timestamp: 3 };
+			projection.entries.at(-1)!.messages.push(patch);
+			projection.messages.push(patch);
+			const selected = prepareBranchEntries(manager.getBranch(), 0, projection);
+			expect(JSON.stringify(selected.messages)).toContain("BOUNDARY");
+			expect(JSON.stringify(selected.messages)).not.toContain("UNRELATED_RESULT");
+			expect(selected.messages.at(-1)).toEqual(patch);
+		},
+	);
 
 	it("uses the live Agent request prefix for branch history only", async () => {
 		const agent = new Agent({
