@@ -504,7 +504,7 @@ export async function findCutPoint(
 		const batchSize = tokenCounter ? 4 : 1;
 		let nextIndex = endIndex - 1;
 		// Never speculate beyond the stricter known message-count boundary.
-		while (nextIndex >= countCut && !exceededBudget) {
+		while (keepRecentTokens !== 0 && nextIndex >= countCut && !exceededBudget) {
 			const batch: { index: number; messages: AgentMessage[] }[] = [];
 			while (nextIndex >= countCut && batch.length < batchSize) {
 				const index = nextIndex--;
@@ -1020,7 +1020,7 @@ async function findProjectedCutPoint(
 		let tokenCut = keepRecentTokens === 0 ? cutPoints[cutPoints.length - 1] : keepAllIndex;
 		const batchSize = tokenCounter ? 4 : 1;
 		let nextIndex = endIndex - 1;
-		while (nextIndex >= countCut && !exceededBudget) {
+		while (keepRecentTokens !== 0 && nextIndex >= countCut && !exceededBudget) {
 			const batch: { index: number; messages: AgentMessage[] }[] = [];
 			while (nextIndex >= countCut && batch.length < batchSize) {
 				const index = nextIndex--;

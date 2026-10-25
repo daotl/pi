@@ -877,7 +877,7 @@ export class InteractiveMode {
 
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
-	private compactionQueueDeliveryPending?: object;
+	private compactionQueueDeliveryPending?: { messages: CompactionQueuedMessage[] };
 	// A /continue issued while compaction is running, deferred until the session
 	// is idle (compaction complete and any queued compaction messages drained).
 	private pendingCompactionContinue = false;
@@ -5195,10 +5195,16 @@ export class InteractiveMode {
 		return {
 			steering: [
 				...this.session.getSteeringMessages(),
+				...(this.compactionQueueDeliveryPending?.messages ?? [])
+					.filter((msg) => msg.mode === "steer")
+					.map((msg) => msg.text),
 				...this.compactionQueuedMessages.filter((msg) => msg.mode === "steer").map((msg) => msg.text),
 			],
 			followUp: [
 				...this.session.getFollowUpMessages(),
+				...(this.compactionQueueDeliveryPending?.messages ?? [])
+					.filter((msg) => msg.mode === "followUp")
+					.map((msg) => msg.text),
 				...this.compactionQueuedMessages.filter((msg) => msg.mode === "followUp").map((msg) => msg.text),
 			],
 		};
@@ -5210,6 +5216,10 @@ export class InteractiveMode {
 	 */
 	private clearAllQueues(): { steering: string[]; followUp: string[] } {
 		const { steering, followUp } = this.session.clearQueue();
+		const reserved = this.compactionQueueDeliveryPending?.messages ?? [];
+		steering.push(...reserved.filter((msg) => msg.mode === "steer").map((msg) => msg.text));
+		followUp.push(...reserved.filter((msg) => msg.mode === "followUp").map((msg) => msg.text));
+		reserved.length = 0;
 		const compactionSteering = this.compactionQueuedMessages
 			.filter((msg) => msg.mode === "steer")
 			.map((msg) => msg.text);
@@ -5286,31 +5296,39 @@ export class InteractiveMode {
 			return;
 		}
 
-		const delivery = {};
+		const delivery = { messages: this.compactionQueuedMessages };
 		this.compactionQueueDeliveryPending = delivery;
 		const session = this.session;
-		const queuedMessages = [...this.compactionQueuedMessages];
 		this.compactionQueuedMessages = [];
 		this.updatePendingMessagesDisplay();
 		let queueRestored = false;
+		let submitting: CompactionQueuedMessage | undefined;
 
 		const restoreQueue = (error: unknown) => {
 			if (queueRestored || this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 			queueRestored = true;
-			this.session.clearQueue();
-			this.compactionQueuedMessages = [...queuedMessages, ...this.compactionQueuedMessages];
+			const unsent = submitting ? [submitting, ...delivery.messages] : delivery.messages;
+			const unsentCount = unsent.length;
+			this.compactionQueuedMessages = [...unsent, ...this.compactionQueuedMessages];
+			delivery.messages.length = 0;
 			this.updatePendingMessagesDisplay();
 			this.showError(
-				`Failed to send queued message${queuedMessages.length > 1 ? "s" : ""}: ${
+				`Failed to send queued message${unsentCount > 1 ? "s" : ""}: ${
 					error instanceof Error ? error.message : String(error)
 				}`,
 			);
 		};
 		const deferred = Promise.withResolvers<void>();
-		const promptQueued = (text: string, promptOptions?: PromptOptions): Promise<void> => {
+		const promptQueued = (message: CompactionQueuedMessage, promptOptions?: PromptOptions): Promise<void> => {
+			submitting = message;
+			this.updatePendingMessagesDisplay();
 			let completion: Promise<void> | undefined;
-			const submitted = session.prompt(text, {
+			const submitted = session.prompt(message.text, {
 				...promptOptions,
+				preflightResult: (disposition) => {
+					if (submitting === message) submitting = undefined;
+					promptOptions?.preflightResult?.(disposition);
+				},
 				onDeferred: (pending) => {
 					completion = pending;
 					deferred.resolve();
@@ -5322,15 +5340,18 @@ export class InteractiveMode {
 			try {
 				if (options?.willRetry) {
 					// When retry is pending, queue messages for the retry turn
-					for (const message of queuedMessages) {
+					while (delivery.messages.length > 0) {
+						const message = delivery.messages.shift()!;
+						submitting = message;
 						if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 						if (this.isExtensionCommand(message.text)) {
-							await promptQueued(message.text);
+							await promptQueued(message);
 						} else if (message.mode === "followUp") {
-							await this.session.followUp(message.text);
+							await session.followUp(message.text);
 						} else {
-							await this.session.steer(message.text);
+							await session.steer(message.text);
 						}
+						submitting = undefined;
 						if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 					}
 					this.updatePendingMessagesDisplay();
@@ -5338,30 +5359,29 @@ export class InteractiveMode {
 				}
 
 				// Find first non-extension-command message to use as prompt
-				const firstPromptIndex = queuedMessages.findIndex((message) => !this.isExtensionCommand(message.text));
+				const firstPromptIndex = delivery.messages.findIndex((message) => !this.isExtensionCommand(message.text));
 				if (firstPromptIndex === -1) {
 					// All extension commands - execute them all
-					for (const message of queuedMessages) {
-						await promptQueued(message.text);
+					while (delivery.messages.length > 0) {
+						await promptQueued(delivery.messages.shift()!);
 						if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 					}
 					return;
 				}
 
-				// Execute any extension commands before the first prompt
-				const preCommands = queuedMessages.slice(0, firstPromptIndex);
-				const firstPrompt = queuedMessages[firstPromptIndex];
-				const rest = queuedMessages.slice(firstPromptIndex + 1);
-
-				for (const message of preCommands) {
-					await promptQueued(message.text);
+				// Execute any extension commands before the first prompt.
+				for (let i = 0; i < firstPromptIndex && delivery.messages.length > 0; i++) {
+					await promptQueued(delivery.messages.shift()!);
 					if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 				}
+				const firstPrompt = delivery.messages.shift();
+				if (!firstPrompt) return;
+				this.updatePendingMessagesDisplay();
 
 				// Start a prompt when idle, or queue it into a run still finishing compaction.
 				const dispatched = Promise.withResolvers<void>();
 				let dispatchFailure: { error: unknown } | undefined;
-				const promptPromise = promptQueued(firstPrompt.text, {
+				const promptPromise = promptQueued(firstPrompt, {
 					streamingBehavior: firstPrompt.mode,
 					preflightResult: () => dispatched.resolve(),
 				});
@@ -5376,16 +5396,11 @@ export class InteractiveMode {
 				if (dispatchFailure) throw dispatchFailure.error;
 				if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 
-				// Queue remaining messages
-				for (const message of rest) {
+				// Recheck run ownership after each message's asynchronous input processing.
+				while (delivery.messages.length > 0) {
 					if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
-					if (this.isExtensionCommand(message.text)) {
-						await promptQueued(message.text);
-					} else if (message.mode === "followUp") {
-						await this.session.followUp(message.text);
-					} else {
-						await this.session.steer(message.text);
-					}
+					const message = delivery.messages.shift()!;
+					await promptQueued(message, { streamingBehavior: message.mode });
 					if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 				}
 				this.updatePendingMessagesDisplay();

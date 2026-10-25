@@ -15,6 +15,51 @@ describe("compaction tokenization", () => {
 		while (fixtures.length > 0) fixtures.pop()?.cleanup();
 	});
 
+	it("starts zero-retention summary despite transient preparation tokenizer unavailability", async () => {
+		const fixture = await createNativeTokenizerFixture({ settings: { retry: { enabled: true } } });
+		fixtures.push(fixture);
+		let preparationCalls = 0;
+		let summaryCounts = 0;
+		let contextCounts = 0;
+		fixture.setTokenizer(async (url, init) => {
+			if (fixture.summaries.length === 0) {
+				preparationCalls++;
+				return new Response("temporarily unavailable", { status: 503 });
+			}
+			if (url.endsWith("/chat/completions/input_tokens")) {
+				contextCounts++;
+				return Response.json({ input_tokens: 100 });
+			}
+			expect(JSON.parse(String(init?.body)).content).toBe("safe checkpoint");
+			summaryCounts++;
+			return Response.json({ tokens: Array(42).fill(0) });
+		});
+		const newestEntryId = fixture.manager
+			.getBranch()
+			.findLast((entry) => entry.type === "message" && entry.message.role === "assistant")?.id;
+		const outcome = fixture.session.compact({ keepRecentTokens: 0 }).then(
+			(result) => ({ result }),
+			(error: unknown) => ({ error }),
+		);
+		try {
+			await vi.waitFor(() => expect(fixture.summaries).toHaveLength(1));
+			expect(await outcome).toMatchObject({
+				result: { summary: "safe checkpoint", firstKeptEntryId: newestEntryId },
+			});
+			expect(preparationCalls).toBe(0);
+			expect(summaryCounts).toBe(1);
+			expect(contextCounts).toBe(1);
+			expect(fixture.manager.getEntries().find((entry) => entry.type === "compaction")).toMatchObject({
+				summaryTokens: 42,
+			});
+			expect(fixture.session.getContextUsage()?.tokens).toBe(100);
+			expect(fixture.session.isCompacting).toBe(false);
+		} finally {
+			fixture.session.abortCompaction();
+			await outcome;
+		}
+	});
+
 	it("aborts unused native preparation requests without cancelling the compaction", async () => {
 		const fixture = await createNativeTokenizerFixture();
 		fixtures.push(fixture);

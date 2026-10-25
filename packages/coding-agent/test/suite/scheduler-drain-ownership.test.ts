@@ -1,5 +1,5 @@
 import { setImmediate } from "node:timers/promises";
-import { type AssistantMessage, fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { type AssistantMessage, fauxAssistantMessage, type TranscriptContext } from "@earendil-works/pi-ai";
 import { isPadLinesToWidth, isWrapLinesToWidth, setPadLinesToWidth, setWrapLinesToWidth } from "@earendil-works/pi-tui";
 import { expect, it, type MockInstance, vi } from "vitest";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
@@ -2111,6 +2111,306 @@ it("discards settlement-deferred ownership when a public subscriber throws", asy
 		release.resolve();
 		unsubscribe();
 		errors.mockRestore();
+		await running?.catch(() => {});
+		await ui.cleanup();
+	}
+});
+
+it("dequeues reserved batch rest through Alt+Up without cancelling its submitted first prompt", async () => {
+	const compactEntered = Promise.withResolvers<void>();
+	const compactRelease = Promise.withResolvers<void>();
+	const preflightEntered = Promise.withResolvers<void>();
+	const preflightRelease = Promise.withResolvers<void>();
+	const response = Promise.withResolvers<void>();
+	const ui = await createSchedulingMode({
+		extensionFactories: [
+			(pi) => {
+				pi.on("session_before_compact", async () => {
+					compactEntered.resolve();
+					await compactRelease.promise;
+					return { cancel: true };
+				});
+				pi.on("before_agent_start", async (event) => {
+					if (event.prompt === "submitted first") {
+						preflightEntered.resolve();
+						await preflightRelease.promise;
+					}
+				});
+			},
+		],
+	});
+	const requests: string[] = [];
+	let compaction: Promise<unknown> | undefined;
+	try {
+		await ui.mode.init();
+		ui.harness.setResponses([fauxAssistantMessage("seed response")]);
+		await ui.harness.session.prompt("seed");
+		ui.harness.setResponses([
+			async (context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				await response.promise;
+				return fauxAssistantMessage("first completed");
+			},
+		]);
+		compaction = ui.harness.session.compact({ keepRecentMessages: 1 }).catch((error: unknown) => error);
+		await compactEntered.promise;
+		ui.terminal.sendInput("submitted first");
+		ui.terminal.sendInput("\r");
+		ui.terminal.sendInput("reserved second");
+		ui.terminal.sendInput("\x1b[13;3u");
+		compactRelease.resolve();
+		await compaction;
+		await vi.waitFor(() => expect(ui.internal.compactionQueuedMessages).toEqual([]));
+		await preflightEntered.promise;
+		await ui.terminal.waitForRender();
+		expect(ui.terminal.getViewport().join("\n")).toContain("Follow-up: reserved second");
+		ui.terminal.sendInput("\x1b[1;3A");
+		await ui.terminal.waitForRender();
+		expect(ui.internal.editor.getText()).toBe("reserved second");
+		expect(ui.terminal.getViewport().join("\n")).toContain("Restored 1 queued message to editor");
+		expect(ui.terminal.getViewport().join("\n")).not.toContain("Follow-up: reserved second");
+		preflightRelease.resolve();
+		await vi.waitFor(() => expect(requests).toEqual(["submitted first"]));
+		expect(ui.harness.session.isStreaming).toBe(true);
+		response.resolve();
+		await ui.harness.session.waitForIdle();
+		expect(requests).toEqual(["submitted first"]);
+		expect(ui.harness.session.messages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
+			"original context",
+			"seed",
+			"submitted first",
+		]);
+		expect(ui.internal.editor.getText()).toBe("reserved second");
+	} finally {
+		compactRelease.resolve();
+		preflightRelease.resolve();
+		response.resolve();
+		await compaction;
+		await ui.cleanup();
+	}
+});
+
+it.each(["steer", "followUp"] as const)(
+	"starts held batch %s input once after its first run settles and excludes schedules through completion",
+	async (mode) => {
+		const inputEntered = Promise.withResolvers<void>();
+		const inputRelease = Promise.withResolvers<void>();
+		const firstResponse = Promise.withResolvers<void>();
+		const secondResponse = Promise.withResolvers<void>();
+		const ui = await createSchedulingMode({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async (event) => {
+						if (event.text === "slow second") {
+							inputEntered.resolve();
+							await inputRelease.promise;
+						}
+					});
+				},
+			],
+		});
+		const requests: string[] = [];
+		ui.harness.setResponses([
+			async (context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				await firstResponse.promise;
+				return fauxAssistantMessage("first answer");
+			},
+			async (context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				await secondResponse.promise;
+				return fauxAssistantMessage("second answer");
+			},
+			(context) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				return fauxAssistantMessage("scheduled answer");
+			},
+		]);
+		let delivery: Promise<void> | undefined;
+		try {
+			await ui.mode.init();
+			ui.internal.queueCompactionMessage("short first", "followUp");
+			ui.internal.queueCompactionMessage("slow second", mode);
+			delivery = ui.internal.flushCompactionQueue();
+			await inputEntered.promise;
+			await vi.waitFor(() => expect(requests).toEqual(["short first"]));
+			firstResponse.resolve();
+			await ui.harness.session.waitForIdle();
+			await ui.internal.handleScheduleCommand('\n<pi_edit id="-1" role="user">after slow batch</pi_edit>');
+			ui.internal.fireDueScheduledMessages();
+			await setImmediate();
+			expect(requests).toEqual(["short first"]);
+			inputRelease.resolve();
+			await vi.waitFor(() => expect(requests).toEqual(["short first", "slow second"]));
+			ui.internal.fireDueScheduledMessages();
+			await setImmediate();
+			expect(ui.harness.session.messages.map(getMessageText)).not.toContain("after slow batch");
+			expect(ui.harness.session.getSteeringMessages()).toEqual([]);
+			expect(ui.harness.session.getFollowUpMessages()).toEqual([]);
+			await ui.terminal.waitForRender();
+			expect(ui.terminal.getViewport().join("\n")).toContain("slow second");
+			secondResponse.resolve();
+			await delivery;
+			await vi.waitFor(() => expect(requests).toEqual(["short first", "slow second", "after slow batch"]));
+			await ui.harness.session.waitForIdle();
+			expect(ui.harness.session.getLastAssistantText()).toBe("scheduled answer");
+		} finally {
+			firstResponse.resolve();
+			inputRelease.resolve();
+			secondResponse.resolve();
+			await delivery?.catch(() => {});
+			await ui.cleanup();
+		}
+	},
+);
+
+it("restores only a later rejected input and reserved rest without replaying its accepted first prompt", async () => {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const firstResponse = Promise.withResolvers<void>();
+	const ui = await createSchedulingMode({
+		withConfiguredAuth: false,
+		extensionFactories: [
+			(pi) => {
+				pi.on("input", async (event) => {
+					if (event.text === "reject second") {
+						entered.resolve();
+						await release.promise;
+					}
+				});
+			},
+		],
+	});
+	const auth = vi.spyOn(ui.harness.session.modelRuntime, "checkAuth").mockResolvedValue({ type: "api_key" });
+	const requests: string[] = [];
+	ui.harness.setResponses([
+		async (context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			await firstResponse.promise;
+			return fauxAssistantMessage("first accepted");
+		},
+		...Array.from({ length: 3 }, () => (context: TranscriptContext) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			return fauxAssistantMessage("retry completed");
+		}),
+	]);
+	let delivery: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		ui.internal.queueCompactionMessage("accept first", "followUp");
+		ui.internal.queueCompactionMessage("reject second", "steer");
+		ui.internal.queueCompactionMessage("reserved third", "followUp");
+		delivery = ui.internal.flushCompactionQueue();
+		await entered.promise;
+		firstResponse.resolve();
+		await ui.harness.session.waitForIdle();
+		ui.internal.queueCompactionMessage("newer fourth", "followUp");
+		auth.mockRejectedValueOnce(new Error("later authentication failed"));
+		release.resolve();
+		await delivery;
+		expect(requests).toEqual(["accept first"]);
+		expect(ui.internal.compactionQueuedMessages).toEqual([
+			{ text: "reject second", mode: "steer" },
+			{ text: "reserved third", mode: "followUp" },
+			{ text: "newer fourth", mode: "followUp" },
+		]);
+		await ui.internal.flushCompactionQueue();
+		await ui.harness.session.waitForIdle();
+		expect(requests).toEqual(["accept first", "reject second", "reserved third", "newer fourth"]);
+		expect(ui.harness.session.messages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
+			"original context",
+			"accept first",
+			"reject second",
+			"reserved third",
+			"newer fourth",
+		]);
+	} finally {
+		firstResponse.resolve();
+		release.resolve();
+		await delivery?.catch(() => {});
+		auth.mockRestore();
+		await ui.cleanup();
+	}
+});
+
+it("keeps retry batch commands immediate and preserves steering before follow-up delivery", async () => {
+	const response = Promise.withResolvers<void>();
+	const commands: string[] = [];
+	const ui = await createSchedulingMode({
+		extensionFactories: [
+			(pi) => {
+				pi.registerCommand("retry-command", {
+					handler: async () => {
+						commands.push("retry-command");
+					},
+				});
+			},
+		],
+	});
+	const requests: string[] = [];
+	ui.harness.setResponses([
+		async () => {
+			requests.push("retrying run");
+			await response.promise;
+			return fauxAssistantMessage("retry response");
+		},
+		...Array.from({ length: 2 }, () => (context: TranscriptContext) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			return fauxAssistantMessage("queued retry response");
+		}),
+	]);
+	let running: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		running = ui.harness.session.prompt("retrying run");
+		await vi.waitFor(() => expect(requests).toEqual(["retrying run"]));
+		ui.internal.queueCompactionMessage("retry follow-up", "followUp");
+		ui.internal.queueCompactionMessage("/retry-command", "steer");
+		ui.internal.queueCompactionMessage("retry steering", "steer");
+		await ui.internal.flushCompactionQueue({ willRetry: true });
+		expect(commands).toEqual(["retry-command"]);
+		expect(ui.harness.session.getSteeringMessages()).toEqual(["retry steering"]);
+		expect(ui.harness.session.getFollowUpMessages()).toEqual(["retry follow-up"]);
+		response.resolve();
+		await running;
+		expect(requests).toEqual(["retrying run", "retry steering", "retry follow-up"]);
+	} finally {
+		response.resolve();
 		await running?.catch(() => {});
 		await ui.cleanup();
 	}

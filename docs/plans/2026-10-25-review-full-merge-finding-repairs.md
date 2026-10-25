@@ -115,3 +115,29 @@ Run artifacts and canonical receipt: `/tmp/compound-engineering-501/ce-code-revi
 ### Verdict
 
 Round-2 repairs verified locally; continue the full merge review loop after committing. No push, PR, upstream replay, dependency or released changelog change.
+
+## Full merge review loop: round 3
+
+Round-2 repair commit: `8daceb2998221a8465630320ee8c76353b68c720`; normal hook passed with No fixes applied. Committed tested source bytes match the captured final tree. Round 3 reviewed fixed `839dc79197595a4285d711e37d02fb623e5b6b7b` -> that HEAD, all 417 paths, including native-test relocation. Snapshot digest: `f00324cdccb09afbcd46cc07a79351be2bd282e643c90fd358cfa4caeb86d14d`. Eleven canonical personas completed; three candidates survived one independent three-item validator batch. Canonical receipt passed before mutation. All runtime source changed hunks received detailed correctness/API/maintenance/reliability review; complete inventory is not exhaustive whole-file or external-caller clearance. The adversarial exact ledger is 25 detailed / 392 diff-only paths and explicitly retains tool-output omission limits.
+
+### Confirmed findings and repairs
+
+- R3-#1 (P2): zero retained-token budget already selected the latest valid atomic cutoff, but both raw/projected selectors still awaited native preparation counts. With transient 503 plus unlimited retry, summary generation never started. Seven actual REDs cover six forbidden-counter invocations and native liveness. Both selectors now bypass counting loops for zero, retaining candidate initialization, message-budget combination, metadata backtracking and split-turn reconciliation. Native summary/final-context exact counts remain 42/100; positive-budget behavior is unchanged.
+- R3-#2 (P2): the delivery-local reserved batch disappeared from pending display and Alt+Up while the first prompt awaited preflight. The real VirtualTerminal regression failed on the missing reserved row. The existing delivery token now owns unsubmitted messages; pending display and queue clearing include them. Actual Alt+Up restores/removes only the reserved second message while the accepted first request completes once.
+- R3-#3 (P2): remaining batch messages used unconditional followUp/steer after an async input handler. If the first run settled during that handler, the message was stranded in idle Agent queues and scheduled work could overtake it. Actual steer/followUp REDs reproduce both outcomes. Captured `session.prompt` with original streaming behavior and the existing deferred-completion handoff now rechecks run ownership. Delivery exclusion lasts through a newly started run. Later rejection restores only rejected/unsubmitted entries, not the accepted first request. Actual Enter/Alt+Enter/Alt+Up, pending/editor rendering, request order and final transcript are exercised through InteractiveMode, runtime and xterm-backed VirtualTerminal. Retry commands and steering-before-follow-up ordering remain covered.
+
+### Verification
+
+Initial integration check formatted one owned file and found four implicit callback parameter types in two newly generated fixture callbacks; explicit `TranscriptContext` annotations resolved them without runtime changes. Final `npm run check`: **1770 files / No fixes applied, 12.07s**. Post-format focused owners: **156 passed / 2 skipped / 6 files, 18.99s**. Isolated root `./test.sh`: **8863 passed / 0 failed / 915 skipped, 123.01s**, `artifact://6294`. No experimental worker fixture was changed. Five non-report source/test files form the tested repair scope; a later commit is not retroactively named as the executed tree.
+
+### Actionable Findings
+
+All three confirmed round-3 defects are repaired and verified. Another fresh fixed-base -> latest committed HEAD review is required after this repair commit; the loop has not yet converged.
+
+### Coverage
+
+Canonical review and repair evidence: `/tmp/compound-engineering-501/ce-code-review/20261025-full-wave3-a1b432f7/`. Same protected-worktree/manual-loop, unattested external-family, graph, browser automation and runtime limits apply. Performance observations about long-history footer/count preprocessing remain unmeasured residuals, not newly confirmed defects.
+
+### Verdict
+
+Round-3 repairs verified locally; continue full merge review after local commit. No push, PR, dependency, upstream replay or released changelog change.

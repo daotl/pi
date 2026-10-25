@@ -522,9 +522,15 @@ describe("findCutPoint", () => {
 	});
 
 	it.each([
-		{ tokens: 0, messages: undefined },
-		{ tokens: undefined, messages: 0 },
-	])("retains the newest atomic tool group for zero budgets: $tokens/$messages", async ({ tokens, messages }) => {
+		{ mode: "raw", tokens: 0, messages: undefined },
+		{ mode: "projected", tokens: 0, messages: undefined },
+		{ mode: "raw", tokens: 0, messages: 3 },
+		{ mode: "projected", tokens: 0, messages: 3 },
+		{ mode: "raw", tokens: 0, messages: 0 },
+		{ mode: "projected", tokens: 0, messages: 0 },
+		{ mode: "raw", tokens: undefined, messages: 0 },
+		{ mode: "projected", tokens: undefined, messages: 0 },
+	])("keeps newest atomic group without counting: $mode/$tokens/$messages", async ({ mode, tokens, messages }) => {
 		const old = createMessageEntry(createUserMessage("old"));
 		const user = createMessageEntry(createUserMessage("current"));
 		const call = createMessageEntry({
@@ -541,18 +547,26 @@ describe("findCutPoint", () => {
 			timestamp: 1,
 		});
 		const entries = [old, user, call, result];
-		expect(await findCutPoint(entries, 0, entries.length, tokens, messages)).toEqual({
-			firstKeptEntryIndex: 2,
-			turnStartIndex: 1,
-			isSplitTurn: true,
-		});
-		const preparation = await prepareCompaction(entries, DEFAULT_COMPACTION_SETTINGS, {
-			keepRecentTokens: tokens,
-			keepRecentMessages: messages,
-		});
-		expect(preparation?.firstKeptEntryId).toBe(call.id);
-		expect(preparation?.messagesToSummarize).toEqual([old.message]);
-		expect(preparation?.turnPrefixMessages).toEqual([user.message]);
+		const counter: TokenCounter = async () => {
+			throw new Error("Zero retention must not count preparation tokens");
+		};
+		if (mode === "raw") {
+			expect(await findCutPoint(entries, 0, entries.length, tokens, messages, counter)).toEqual({
+				firstKeptEntryIndex: 2,
+				turnStartIndex: 1,
+				isSplitTurn: true,
+			});
+		} else {
+			const preparation = await prepareCompaction(
+				entries,
+				DEFAULT_COMPACTION_SETTINGS,
+				{ keepRecentTokens: tokens, keepRecentMessages: messages },
+				counter,
+			);
+			expect(preparation?.firstKeptEntryId).toBe(call.id);
+			expect(preparation?.messagesToSummarize).toEqual([old.message]);
+			expect(preparation?.turnPrefixMessages).toEqual([user.message]);
+		}
 	});
 
 	it("counts empty conversation contributions, not prompt deltas, in message budgets", async () => {
