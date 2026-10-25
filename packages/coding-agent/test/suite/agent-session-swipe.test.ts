@@ -1,5 +1,9 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { SessionManager } from "../../src/core/session-manager.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 function visibleTexts(harness: Harness): string[] {
@@ -418,4 +422,28 @@ describe("AgentSession swipe deletion", () => {
 		expect(remaining.versions).toHaveLength(1);
 		expect(visibleTexts(harness)).toEqual(["question", "v1", "contents"]);
 	});
+});
+
+it("durably selects the surviving swipe when shredding the current version", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-swipe-selected-shred-"));
+	const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+	const harness = await createHarness({ cwd, sessionManager: manager });
+	try {
+		harness.setResponses([fauxAssistantMessage("surviving answer"), fauxAssistantMessage("shredded answer")]);
+		await harness.session.prompt("question");
+		await harness.session.regenerateSwipe(harness.session.getSwipeGroup()!);
+		harness.session.shredSwipeVersions([2]);
+		expect(visibleTexts(harness)).toEqual(["question", "surviving answer"]);
+		const reopened = SessionManager.open(manager.getSessionFile()!);
+		expect(reopened.getLeafId()).toBe(manager.getLeafId());
+		expect(
+			reopened
+				.buildSessionContext()
+				.messages.filter((message) => message.role !== "system")
+				.map(getMessageText),
+		).toEqual(["question", "surviving answer"]);
+	} finally {
+		harness.cleanup();
+		rmSync(cwd, { recursive: true, force: true });
+	}
 });

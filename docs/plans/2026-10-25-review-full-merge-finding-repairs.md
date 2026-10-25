@@ -141,3 +141,29 @@ Canonical review and repair evidence: `/tmp/compound-engineering-501/ce-code-rev
 ### Verdict
 
 Round-3 repairs verified locally; continue full merge review after local commit. No push, PR, dependency, upstream replay or released changelog change.
+
+## Full merge review loop: round 4
+
+Round-3 repair commit: `510b7d3031edc3421f74541b053b80ba3edce467`; normal hook No fixes applied, tested source blobs match. Fresh fixed-base -> HEAD full review again covers all 417 paths, snapshot digest `7f58e9b8055f68934ed3f4750e4813f20ea70c9ab4bf716ccc54b3074a07f026`. All eleven canonical personas completed. Four candidates independently validated in one batch: three true; repeated Footer projection performance candidate rejected because user-observable impact remains unmeasured. Canonical receipt passed before mutation. Per-path coverage audit retains 10 detailed / 407 insufficient correctness and 29 detailed / 388 insufficient adversarial accounting; other lenses provide attributed runtime-hunk coverage, not whole-tree deep clearance.
+
+### Confirmed findings and repairs
+
+- R4-#1 (P2): upfront continuation refresh removed prompt-only MCP discovery sections. Actual first-start-only section injection RED loses mcp_servers on continuation. Session now retains accepted normalized custom-section values directly, combines them with current explicit base sections on continuation, and clears the snapshot on branch reconciliation. No rendered-tag reverse parsing. Repeated continuation preserves discovery; a fresh prompt without reinjection removes it and the next continuation keeps it absent. Current custom preamble still applies.
+- R4-#2 (P2): swipe-specific removal missed failed-prefix recovery invalidation, including zero surviving versions. Actual sole-version shred RED resurrected abandoned partial on the next request. Successful swipe delete/shred now discard failed recovery before rebuilding; failure/no-op paths retain it. Separate soft-delete control exposed only an empty-error projection difference before repair, not claimed as independent resurrection proof.
+- R4-#3 (P2): shredding the selected swipe persisted an ancestor leaf, then chose a survivor only in memory. Actual file-backed two-version RED displays the survivor but reopens on another leaf. Shred now stages subtree removal and the same clamped survivor selection in one existing editMessages draft transaction. Finalized context and runtime-only branch policy restore follow the durable commit. Immediate reopen retains the displayed surviving answer without another append.
+
+### Verification
+
+Focused post-format Session/swipe/discovery/MCP/restoration owners: **92 passed / 5 files, 6.66s**. Final full `npm run check`: **1770 / No fixes applied, 21.68s**. Earlier check formatted three files and found a nullable section fixture type, corrected without production behavior changes; repeat-scenario formatting later changed one file. Initial root aggregate **8851 passed / 16 failed / 915 skipped, 197.45s**, `artifact://6521`: tracked packages/durable env-node WSL-platform fixture timed out, then subsequent shell cases observed its temporary Windows platform. Exact owning file isolated **48 passed / 1 skipped, 1.37s**. This was not an untracked packages/env test; no unrelated production/test/environment files were changed or excluded. Final original isolated root `./test.sh`: **8867 passed / 0 failed / 915 skipped, 181.23s**, `artifact://6529`.
+
+### Actionable Findings
+
+All three confirmed defects repaired and verified in the current tree. Commit and a fresh full fixed-base -> latest HEAD review still required; no convergence claim yet.
+
+### Coverage
+
+Canonical review, validator, exact coverage audit and tested content identity: `/tmp/compound-engineering-501/ce-code-review/20261025-full-wave4-8b549cfb/`. Existing manual protected-worktree exception and runtime/source limits remain. No live MCP server or physical terminal/network-provider proof is claimed; actual faux request construction and file reopen prove the repaired paths.
+
+### Verdict
+
+Round-4 repairs verified locally; continue full merge review after local commit. No push, PR, upstream replay, dependency or released changelog change.

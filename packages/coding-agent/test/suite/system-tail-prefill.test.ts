@@ -1,7 +1,11 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAssistantMessageEventStream, fauxAssistantMessage } from "@earendil-works/pi-ai";
+import {
+	createAssistantMessageEventStream,
+	fauxAssistantMessage,
+	getCurrentSystemMessage,
+} from "@earendil-works/pi-ai";
 import { expect, it } from "vitest";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { createHarness, getMessageText } from "./harness.ts";
@@ -101,3 +105,63 @@ it.each((["success", "mismatch"] as const).flatMap((outcome) => [false, true].ma
 		}
 	},
 );
+
+it("preserves accepted dynamic discovery sections on continuation while refreshing base policy", async () => {
+	let injected = false;
+	const harness = await createHarness({
+		fauxApi: "openai-completions",
+		settings: { compaction: { enabled: false }, retry: { enabled: false } },
+		extensionFactories: [
+			(pi) => {
+				pi.on("before_agent_start", (event) => {
+					if (injected) return;
+					injected = true;
+					event.systemPromptOptions.sections.mcp_servers = "indirect server namespace: docs";
+				});
+			},
+		],
+	});
+	try {
+		harness.setResponses([fauxAssistantMessage("partial", { stopReason: "aborted" })]);
+		await harness.session.prompt("start discovery");
+		expect(getCurrentSystemMessage(harness.session.messages)?.sections?.mcp_servers).toContain("docs");
+		harness.session.setCustomSystemPrompt("new accepted preamble");
+		let sections: Record<string, string | null> | undefined;
+		harness.setResponses([
+			(context) => {
+				sections = getCurrentSystemMessage(context.messages)?.sections;
+				return fauxAssistantMessage("partial continued", { stopReason: "aborted" });
+			},
+		]);
+		await harness.session.continue();
+		expect(sections?.mcp_servers).toBe("<mcp_servers>\nindirect server namespace: docs\n</mcp_servers>");
+		expect(sections?.preamble).toBe("new accepted preamble");
+		harness.setResponses([
+			(context) => {
+				sections = getCurrentSystemMessage(context.messages)?.sections;
+				return fauxAssistantMessage("partial continued twice", { stopReason: "aborted" });
+			},
+		]);
+		await harness.session.continue();
+		expect(sections?.mcp_servers).toContain("indirect server namespace: docs");
+		harness.setResponses([
+			(context) => {
+				sections = getCurrentSystemMessage(context.messages)?.sections;
+				return fauxAssistantMessage("fresh prefix", { stopReason: "aborted" });
+			},
+		]);
+		await harness.session.prompt("new start without discovery injection");
+		expect(sections?.mcp_servers).toBeUndefined();
+		harness.setResponses([
+			(context) => {
+				sections = getCurrentSystemMessage(context.messages)?.sections;
+				return fauxAssistantMessage("fresh prefix completed");
+			},
+		]);
+		await harness.session.continue();
+		expect(sections?.mcp_servers).toBeUndefined();
+	} finally {
+		await harness.session.abort();
+		harness.cleanup();
+	}
+});

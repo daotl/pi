@@ -808,7 +808,7 @@ it("restores a prompt-owned captured prefix after aborting its automatic retry m
 	}
 });
 
-it.each(["delete", "delete-parent", "soft-delete", "shred", "replace"] as const)(
+it.each(["delete", "delete-parent", "soft-delete", "shred", "replace", "swipe-delete", "swipe-shred"] as const)(
 	"does not replay failed prefix recovery after accepted %s",
 	async (mutation) => {
 		const manager = SessionManager.create(cwd, join(cwd, "sessions"));
@@ -848,6 +848,8 @@ it.each(["delete", "delete-parent", "soft-delete", "shred", "replace"] as const)
 			else if (mutation === "delete-parent") harness.session.deleteMessage(parent);
 			else if (mutation === "soft-delete") expect(harness.session.softDeleteMessage(prefix.id)).toBe(true);
 			else if (mutation === "shred") harness.session.shredLastMessages(1);
+			else if (mutation === "swipe-delete") harness.session.deleteSwipeVersions([1]);
+			else if (mutation === "swipe-shred") harness.session.shredSwipeVersions([1]);
 			else harness.session.applyMessageEdits('<pi_edit id="1" role="user">accepted replacement</pi_edit>');
 			const accepted = harness.session.messages.filter((message) => message.role !== "system").map(getMessageText);
 			let requested: string[] = [];

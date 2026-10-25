@@ -634,6 +634,7 @@ export class AgentSession {
 	private _promptFileSources: { systemPrompt?: string; addendum: string[] } = { addendum: [] };
 	/** Prompt options after before_agent_start mutations for the active run. */
 	private _runSystemPromptOptions?: NormalizedBuildSystemPromptOptions;
+	private _acceptedRunSections: Record<string, string> = {};
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -2335,6 +2336,7 @@ export class AgentSession {
 
 		const marked = this.sessionManager.softDeleteUnits(targets);
 		if (marked > 0) {
+			if (this._prefillRestoreFailed) this._discardPrefillRecovery();
 			this._navigateAfterVersionRemoval(group, selected.includes(currentVersion));
 		}
 		return selected.map((entry) => ({ entry }));
@@ -2356,9 +2358,28 @@ export class AgentSession {
 		}
 		if (selected.length === 0) return [];
 		const removedCurrent = selected.includes(group.versions[group.currentIndex]);
-		const removed = this.sessionManager.removeEntriesWithDescendants(selected.map((entry) => entry.id));
+		let removed = 0;
+		this.sessionManager.editMessages((draft) => {
+			removed = draft.removeEntriesWithDescendants(selected.map((entry) => entry.id));
+			if (removed > 0 && removedCurrent) {
+				const remaining = this._visibleVersionsOf(group, draft);
+				if (remaining.length > 0)
+					this._selectSwipeVersion(
+						draft,
+						{
+							anchorEntryId: group.anchorEntryId,
+							versions: remaining,
+							currentIndex: -1,
+							role: group.role,
+						},
+						Math.min(group.currentIndex, remaining.length - 1),
+					);
+			}
+		});
 		if (removed > 0) {
-			this._navigateAfterVersionRemoval(group, removedCurrent);
+			if (this._prefillRestoreFailed) this._discardPrefillRecovery();
+			this._refreshFinalizedContext();
+			this._restoreBaseSystemPromptFromBranch(false);
 		}
 		return selected.map((entry) => ({ entry }));
 	}
@@ -2390,11 +2411,10 @@ export class AgentSession {
 	}
 
 	/** Visible (non-deleted, non-superseded) versions of a group's anchor. */
-	private _visibleVersionsOf(group: SwipeGroup): SessionMessageEntry[] {
+	private _visibleVersionsOf(group: SwipeGroup, manager = this.sessionManager): SessionMessageEntry[] {
 		const remaining: SessionMessageEntry[] = [];
-		for (const entry of this.sessionManager.getEntries()) {
-			if (entry.type !== "message" || this._swipeAnchor(this.sessionManager, entry) !== group.anchorEntryId)
-				continue;
+		for (const entry of manager.getEntries()) {
+			if (entry.type !== "message" || this._swipeAnchor(manager, entry) !== group.anchorEntryId) continue;
 			if (entry.message.role !== group.role) continue;
 			if (entry.deletedAt !== undefined || entry.supersededBy !== undefined) continue;
 			remaining.push(entry);
@@ -3278,6 +3298,7 @@ export class AgentSession {
 		this._lastPersistedSystemPrompt = undefined;
 		this._restoreSystemPrompt = true;
 		this._runSystemPromptOptions = undefined;
+		this._acceptedRunSections = {};
 		// Tool restoration is runtime-only: do not publish an intermediate abandoned-policy snapshot.
 		this._restoreToolsFromTranscript(false);
 		this._commitBaseSystemPrompt(this._rebuildSystemPrompt(this.getActiveToolNames()));
@@ -3483,6 +3504,7 @@ export class AgentSession {
 			this._flushPendingCompactionUsage();
 			const options = normalizeBuildSystemPromptOptions({
 				...this._baseSystemPromptOptions,
+				sections: { ...this._acceptedRunSections, ...this._baseSystemPromptOptions.sections },
 				selectedTools: this.getActiveToolNames(),
 			});
 			const updateMessage = this._preparePromptAndToolLoadout(options);
@@ -3965,6 +3987,7 @@ export class AgentSession {
 		}
 		const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
 		this._runSystemPromptOptions = result.systemPromptOptions;
+		this._acceptedRunSections = { ...result.systemPromptOptions.sections };
 		if (updateMessage) messages.unshift(updateMessage);
 
 		preflightResult?.("started");
