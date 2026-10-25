@@ -317,7 +317,7 @@ describe("RPC prompt response semantics", () => {
 		}
 	});
 
-	it("rejects RPC acceptance during a pending summary receipt outage and accepts recovery once", async () => {
+	it("retains nextTurn context through repeated RPC receipt failures and dispatches it once after recovery", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "pi-rpc-receipt-outage-"));
 		const manager = SessionManager.create(cwd, join(cwd, "sessions"));
 		const harness = await createHarness({
@@ -330,7 +330,14 @@ describe("RPC prompt response semantics", () => {
 		let writable = false;
 		let receiptFailures = 0;
 		let cleanup = async () => {};
-		const requests: string[] = [];
+		const requests: string[][] = [];
+		const contexts = ["first accepted RPC context", "later accepted RPC context", "latest accepted RPC context"];
+		const queueContext = async (index: number) => {
+			await harness.session.sendCustomMessage(
+				{ customType: "rpc-next-turn", content: contexts[index], display: true, details: { index } },
+				{ deliverAs: "nextTurn" },
+			);
+		};
 		try {
 			for (let index = 0; index < 3; index++) {
 				manager.appendMessage({ role: "user", content: `question ${index}`, timestamp: index * 2 });
@@ -340,12 +347,7 @@ describe("RPC prompt response semantics", () => {
 			harness.setResponses([
 				fauxAssistantMessage("completed retained summary"),
 				(context) => {
-					requests.push(
-						context.messages
-							.filter((message) => message.role === "user")
-							.map(getMessageText)
-							.at(-1)!,
-					);
+					requests.push(context.messages.filter((message) => message.role === "user").map(getMessageText));
 					expect(
 						manager.getEntries().filter((entry) => entry.type === "usage" && entry.kind === "compaction"),
 					).toHaveLength(1);
@@ -353,6 +355,10 @@ describe("RPC prompt response semantics", () => {
 						{ success: true, data: { disposition: "started" } },
 					]);
 					return fauxAssistantMessage("RPC recovery completed");
+				},
+				(context) => {
+					requests.push(context.messages.filter((message) => message.role === "user").map(getMessageText));
+					return fauxAssistantMessage("subsequent RPC completed");
 				},
 			]);
 			vi.mocked(fs.appendFileSync).mockImplementation((...args) => {
@@ -368,28 +374,34 @@ describe("RPC prompt response semantics", () => {
 				"checkpoint storage unavailable",
 			);
 			expect(receiptFailures).toBe(1);
+			const callsAfterSummary = harness.faux.state.callCount;
 			const rpc = await startRpcMode({ withAuth: false, responseDelayMs: 0, session: harness.session });
 			cleanup = rpc.cleanup;
-			rpc.lineHandler(
-				JSON.stringify({ id: "receipt-blocked", type: "prompt", message: "retry retained RPC input" }),
-			);
-			await vi.waitFor(() => {
-				expect(getPromptResponses(rpcIo.outputLines, "receipt-blocked")).toEqual([
-					{
-						id: "receipt-blocked",
-						type: "response",
-						command: "prompt",
-						success: false,
-						error: "summary receipt storage unavailable",
-					},
-				]);
-			});
-			await harness.session.waitForIdle();
-			expect(requests).toEqual([]);
-			expect(
-				harness.session.messages.filter((message) => message.role === "user").map(getMessageText),
-			).not.toContain("retry retained RPC input");
-			expect(parseOutputLines(rpcIo.outputLines).filter((line) => line.type === "agent_start")).toEqual([]);
+			for (const [index, id] of ["receipt-blocked", "receipt-blocked-again"].entries()) {
+				await queueContext(index);
+				rpc.lineHandler(JSON.stringify({ id, type: "prompt", message: "retry retained RPC input" }));
+				await vi.waitFor(() => {
+					expect(getPromptResponses(rpcIo.outputLines, id)).toEqual([
+						{
+							id,
+							type: "response",
+							command: "prompt",
+							success: false,
+							error: "summary receipt storage unavailable",
+						},
+					]);
+				});
+				await harness.session.waitForIdle();
+				expect(requests).toEqual([]);
+				expect(harness.faux.state.callCount).toBe(callsAfterSummary);
+				expect(
+					harness.session.messages.filter((message) => message.role === "user").map(getMessageText),
+				).not.toContain("retry retained RPC input");
+				expect(harness.session.messages.filter((message) => message.role === "custom")).toEqual([]);
+				expect(parseOutputLines(rpcIo.outputLines).filter((line) => line.type === "agent_start")).toEqual([]);
+			}
+			expect(receiptFailures).toBeGreaterThanOrEqual(3);
+			await queueContext(2);
 			writable = true;
 			rpc.lineHandler(
 				JSON.stringify({ id: "receipt-recovered", type: "prompt", message: "retry retained RPC input" }),
@@ -406,20 +418,54 @@ describe("RPC prompt response semantics", () => {
 				]);
 			});
 			await harness.session.waitForIdle();
-			expect(getPromptResponses(rpcIo.outputLines, "receipt-blocked")).toMatchObject([{ success: false }]);
-			expect(requests).toEqual(["retry retained RPC input"]);
-			expect(
-				harness.session.messages
-					.filter((message) => message.role === "user")
-					.map(getMessageText)
-					.filter((text) => text === "retry retained RPC input"),
-			).toEqual(["retry retained RPC input"]);
-			expect(
-				SessionManager.open(manager.getSessionFile()!)
-					.getEntries()
-					.filter((entry) => entry.type === "usage" && entry.kind === "compaction"),
-			).toHaveLength(1);
-			expect(parseOutputLines(rpcIo.outputLines).filter((line) => line.type === "agent_start")).toHaveLength(1);
+			const expectedRequest = ["question 0", "question 1", "question 2", "retry retained RPC input", ...contexts];
+			expect(requests).toEqual([expectedRequest]);
+			expect(harness.faux.state.callCount).toBe(callsAfterSummary + 1);
+			const expectedCustomMessages = contexts.map((content, index) => ({
+				customType: "rpc-next-turn",
+				content,
+				display: true,
+				details: { index },
+			}));
+			const expectRetainedHistory = () => {
+				const reopened = SessionManager.open(manager.getSessionFile()!);
+				expect(
+					reopened.getEntries().filter((entry) => entry.type === "usage" && entry.kind === "compaction"),
+				).toHaveLength(1);
+				expect(reopened.getEntries().filter((entry) => entry.type === "custom_message")).toMatchObject(
+					expectedCustomMessages,
+				);
+				for (const messages of [harness.session.messages, reopened.buildSessionContext().messages]) {
+					expect(messages.filter((message) => message.role === "custom")).toMatchObject(expectedCustomMessages);
+					expect(
+						messages
+							.filter((message) => message.role === "user")
+							.map(getMessageText)
+							.filter((text) => text === "retry retained RPC input"),
+					).toEqual(["retry retained RPC input"]);
+				}
+			};
+			expectRetainedHistory();
+			rpc.lineHandler(JSON.stringify({ id: "receipt-subsequent", type: "prompt", message: "subsequent RPC input" }));
+			await vi.waitFor(() => {
+				expect(getPromptResponses(rpcIo.outputLines, "receipt-subsequent")).toEqual([
+					{
+						id: "receipt-subsequent",
+						type: "response",
+						command: "prompt",
+						success: true,
+						data: { disposition: "started" },
+					},
+				]);
+			});
+			await harness.session.waitForIdle();
+			expect(requests).toEqual([expectedRequest, [...expectedRequest, "subsequent RPC input"]]);
+			expect(harness.faux.state.callCount).toBe(callsAfterSummary + 2);
+			expectRetainedHistory();
+			for (const id of ["receipt-blocked", "receipt-blocked-again"]) {
+				expect(getPromptResponses(rpcIo.outputLines, id)).toMatchObject([{ success: false }]);
+			}
+			expect(parseOutputLines(rpcIo.outputLines).filter((line) => line.type === "agent_start")).toHaveLength(2);
 		} finally {
 			writable = true;
 			vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);

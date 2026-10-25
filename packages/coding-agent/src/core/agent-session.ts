@@ -3453,6 +3453,7 @@ export class AgentSession {
 	private async _runAgentPrompt(
 		messages: AgentMessage | AgentMessage[],
 		preflightResult?: PromptOptions["preflightResult"],
+		nextTurnMessageCount = 0,
 	): Promise<void> {
 		if (this._isAgentRunActive || this.agent.signal) {
 			throw new Error(
@@ -3466,6 +3467,8 @@ export class AgentSession {
 		this._isAgentRunActive = true;
 		try {
 			this._flushPendingUsage();
+			// Consume only this prompt's batch after receipt admission, before callbacks can queue more.
+			if (nextTurnMessageCount > 0) this._pendingNextTurnMessages.splice(0, nextTurnMessageCount);
 			preflightResult?.("started");
 			await this.agent.prompt(messages);
 			// Always restore a captured prefix before honoring cancellation after a retry.
@@ -4027,10 +4030,10 @@ export class AgentSession {
 		});
 
 		// Inject any pending "nextTurn" messages as context alongside the user message
+		const nextTurnMessageCount = this._pendingNextTurnMessages.length;
 		for (const msg of this._pendingNextTurnMessages) {
 			messages.push(msg);
 		}
-		this._pendingNextTurnMessages = [];
 
 		for (const msg of result.messages) {
 			messages.push({
@@ -4053,7 +4056,7 @@ export class AgentSession {
 		this._runSystemPromptOptions = result.systemPromptOptions;
 		if (updateMessage) messages.unshift(updateMessage);
 
-		await this._runAgentPrompt(messages, preflightResult);
+		await this._runAgentPrompt(messages, preflightResult, nextTurnMessageCount);
 	}
 
 	/**

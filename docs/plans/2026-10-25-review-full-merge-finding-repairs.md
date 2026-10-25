@@ -348,3 +348,27 @@ Canonical receipt, independent validator, exact coverage audit, RED/GREEN, tool 
 ### Verdict
 
 Round-11 repair verified locally; continue full merge review after local commit. No push, PR, dependency metadata, upstream replay or released changelog change.
+
+## Full merge review loop: round 12
+
+Round-11 repair commit: `7d04e443ef07446721db3b1c130688c7af98fb2c`; normal hook No fixes applied and tested product/guide blobs match. Twelfth fresh fixed-base -> HEAD review covers all 420 paths, 72 runtime source paths and 59,858 diff lines; digest `6008b0ad397d9cb323a074c5f1c3323e49e29f7bef9f30012a6c8dd5baaf778f`. Eleven canonical personas completed; one distinct reliability candidate independently validated true. Canonical receipt passed before mutation (`artifact://7740`). Exact adversarial partition: 124 investigated / 296 insufficient detailed paths, disjoint/exhaustive inventory; not whole-tree or exhaustive caller clearance.
+
+### Confirmed finding and repair
+
+- R12-#1 (P2): prompt copied and cleared accepted nextTurn context before mandatory receipt admission. A still-unwritable pending-summary receipt then rejected before Agent dispatch, leaving no owner for that context. The captured batch remains Session-owned until run-owned receipt drain succeeds. Only its captured prefix is consumed before admission callbacks; user/custom/hook ordering, callback additions for the following prompt, run exclusion and no replay after dispatched failure remain intact.
+
+### Verification
+
+Actual owning-queue and independent JSONL RPC REDs demonstrate context lost after two receipt-outage rejections; recovery must retain original and later accepted context in order. Final integrated owners: **172 passed / 5 files, 25.16s**. Full `npm run check`: **1770 / No fixes applied, 12.53s**. Original isolated root `./test.sh`: **8933 passed / 0 failed / 915 skipped, 112.26s**, `artifact://7753`. Actual-source real filesystem ENOTDIR smoke uses SessionManager/faux summary, repeated rejection, recovered request and reopened history exactly once; temporary scenario and directories removed. RPC proves no false started/provider dispatch while blocked, exact recovery context ordering and no subsequent replay. SDK documents the ownership boundary.
+
+### Actionable Findings
+
+Confirmed finding repaired and verified; commit and another fresh entire fixed-base -> latest committed HEAD review remain required. No convergence claim.
+
+### Coverage
+
+Canonical receipt, independent validator, exact coverage audit, RED/GREEN and tested source identity: `/tmp/compound-engineering-501/ce-code-review/20261025-full-wave12-4d84f342/`. Prior protected-worktree/manual-loop, graph/external-family, bounded source/caller/runtime and process-crash limitations remain.
+
+### Verdict
+
+Round-12 repair verified locally; continue full merge review after local commit. No push, PR, dependency metadata, upstream replay or released changelog change.

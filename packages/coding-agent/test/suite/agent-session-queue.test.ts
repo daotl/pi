@@ -1,9 +1,19 @@
+import * as fs from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, InputEvent } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { SessionManager } from "../../src/core/session-manager.ts";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.ts";
+
+vi.mock("fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof fs>();
+	return { ...actual, appendFileSync: vi.fn(actual.appendFileSync) };
+});
 
 async function createWaitingHarness(
 	options: {
@@ -404,6 +414,156 @@ describe("AgentSession queue characterization", () => {
 			"custom",
 			"assistant",
 		]);
+	});
+
+	it("retains nextTurn context across rejected receipt admissions without consuming later callback messages", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-next-turn-receipt-"));
+		const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+		const harness = await createHarness({
+			cwd,
+			sessionManager: manager,
+			fauxApi: "openai-completions",
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", (event) => ({
+						message: { customType: "hook", content: `hook: ${event.prompt}`, display: false },
+					}));
+				},
+			],
+		});
+		const actual = await vi.importActual<typeof fs>("fs");
+		let writable = false;
+		let receiptFailures = 0;
+		const requests: string[][] = [];
+		const dispositions: string[] = [];
+		const reentrantAttempts: Promise<void>[] = [];
+		const queue = (content: string) =>
+			harness.session.sendCustomMessage(
+				{ customType: "next-turn", content, display: true, details: { content } },
+				{ deliverAs: "nextTurn" },
+			);
+		try {
+			for (let index = 0; index < 3; index++) {
+				manager.appendMessage({ role: "user", content: `question ${index}`, timestamp: index * 2 });
+				manager.appendMessage(fauxAssistantMessage(`answer ${index}`));
+			}
+			harness.session.refreshContext();
+			harness.setResponses([
+				fauxAssistantMessage("completed retained summary"),
+				(context) => {
+					requests.push(context.messages.filter((message) => message.role === "user").map(getMessageText));
+					return fauxAssistantMessage("recovered answer");
+				},
+				(context) => {
+					requests.push(context.messages.filter((message) => message.role === "user").map(getMessageText));
+					return fauxAssistantMessage("later answer");
+				},
+			]);
+			vi.mocked(fs.appendFileSync).mockImplementation((...args) => {
+				const record = JSON.parse(String(args[1])) as { type: string; kind?: string };
+				if (record.type === "compaction") throw new Error("checkpoint storage unavailable");
+				if (record.type === "usage" && record.kind === "compaction" && !writable) {
+					receiptFailures++;
+					throw new Error("summary receipt storage unavailable");
+				}
+				return actual.appendFileSync(...args);
+			});
+			await expect(harness.session.compact({ keepRecentMessages: 1 })).rejects.toThrow(
+				"checkpoint storage unavailable",
+			);
+			expect(receiptFailures).toBe(1);
+			await queue("accepted first");
+			for (const text of ["rejected first", "rejected second"]) {
+				await expect(
+					harness.session.prompt(text, { preflightResult: (value) => dispositions.push(value) }),
+				).rejects.toThrow("summary receipt storage unavailable");
+				if (text === "rejected first") await queue("accepted second");
+			}
+			expect(receiptFailures).toBe(3);
+			expect(dispositions).toEqual([]);
+			expect(requests).toEqual([]);
+			expect(harness.eventsOfType("agent_start")).toEqual([]);
+			expect(getUserTexts(harness)).toEqual(["question 0", "question 1", "question 2"]);
+			harness.session.subscribe((event) => {
+				if (event.type === "entry_appended" && event.entry.type === "usage") {
+					expect(harness.session.isStreaming).toBe(true);
+					reentrantAttempts.push(
+						expect(harness.session.prompt("reentrant receipt prompt")).rejects.toThrow(
+							"Agent is already processing.",
+						),
+					);
+					void queue("queued during receipt");
+				}
+			});
+			writable = true;
+			await harness.session.prompt("recovered prompt", {
+				preflightResult: (value) => {
+					dispositions.push(value);
+					reentrantAttempts.push(
+						expect(harness.session.prompt("reentrant admission prompt")).rejects.toThrow(
+							"Agent is already processing.",
+						),
+					);
+					void queue("queued during admission");
+				},
+			});
+			await Promise.all(reentrantAttempts);
+			expect(requests[0].slice(-4)).toEqual([
+				"recovered prompt",
+				"accepted first",
+				"accepted second",
+				"hook: recovered prompt",
+			]);
+			expect(dispositions).toEqual(["started"]);
+			await harness.session.prompt("later prompt");
+			expect(requests[1].slice(-4)).toEqual([
+				"later prompt",
+				"queued during receipt",
+				"queued during admission",
+				"hook: later prompt",
+			]);
+			const reopened = SessionManager.open(manager.getSessionFile()!);
+			expect(
+				reopened.getEntries().filter((entry) => entry.type === "usage" && entry.kind === "compaction"),
+			).toHaveLength(1);
+			expect(
+				reopened.getEntries().flatMap((entry) => (entry.type === "custom_message" ? [entry.content] : [])),
+			).toEqual([
+				"accepted first",
+				"accepted second",
+				"hook: recovered prompt",
+				"queued during receipt",
+				"queued during admission",
+				"hook: later prompt",
+			]);
+		} finally {
+			vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);
+			harness.cleanup();
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("does not replay dispatched nextTurn context after a run rejects", async () => {
+		const harness = await createHarness({ settings: { compaction: { enabled: false } } });
+		harnesses.push(harness);
+		await harness.session.sendCustomMessage(
+			{ customType: "next-turn", content: "already dispatched", display: true, details: {} },
+			{ deliverAs: "nextTurn" },
+		);
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "agent_end") throw new Error("run completion listener failed");
+		});
+		harness.setResponses([fauxAssistantMessage("first answer"), fauxAssistantMessage("second answer")]);
+		await expect(harness.session.prompt("first prompt")).rejects.toThrow("run completion listener failed");
+		unsubscribe();
+		await harness.session.prompt("second prompt");
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.flatMap((entry) => (entry.type === "custom_message" ? [entry.content] : [])),
+		).toEqual(["already dispatched"]);
+		expect(getUserTexts(harness)).toEqual(["first prompt", "second prompt"]);
 	});
 
 	it("updates pendingMessageCount and removes queued text before message_start is emitted", async () => {
