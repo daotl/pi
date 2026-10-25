@@ -3515,11 +3515,13 @@ export class AgentSession {
 		this._isAgentRunActive = true;
 		try {
 			this._flushPendingCompactionUsage();
-			this._continuationSections = Object.fromEntries(
-				Object.entries(getCurrentSystemMessage(this._buildLiveProjection().messages)?.sections ?? {}).filter(
-					(entry): entry is [string, string] => entry[1] !== null,
-				),
-			);
+			this._continuationSections = this.settingsManager.isProjectTrusted()
+				? Object.fromEntries(
+						Object.entries(getCurrentSystemMessage(this._buildLiveProjection().messages)?.sections ?? {}).filter(
+							(entry): entry is [string, string] => entry[1] !== null,
+						),
+					)
+				: undefined;
 			const options = normalizeBuildSystemPromptOptions({
 				...this._baseSystemPromptOptions,
 				selectedTools: this.getActiveToolNames(),

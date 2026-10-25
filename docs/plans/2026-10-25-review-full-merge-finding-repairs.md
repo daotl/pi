@@ -6,6 +6,8 @@ Parent tree `5732877aada8298caf98c7c4c616b2dd17a24f13`. Source review: `2026-10-
 
 No upstream replay, branch/worktree/push/PR/ticket, released changelog, dependency or generated-model change. Existing swipe/soft-delete/restore/shred/id0 behavior, direct-upload authorization and full chat-template counting remain required. Existing 749 untracked environment-target files are excluded. The source review was degraded because one validator batch exceeded its normal size; its source conclusions are not used as runtime proof here.
 
+Round sections retain their pre-commit status as historical snapshots, not current open work. Their successor headers record the completed repair commits: round 1 `fe50e664f82286dc460c6adc5653addc5bf55901`; round 2 `8daceb2998221a8465630320ee8c76353b68c720`; round 3 `510b7d3031edc3421f74541b053b80ba3edce467`; round 4 `50a522d52e016cd47fea5bc355da84f72b9e9f8f`; round 5 `8d9c6473a9e5fb342222f98fffef9228934612b3`; round 6 `90a97b2ea16655a3c790f7085472e02bcca463d1`. Only the latest section determines current loop status. Round-7 three-reviewer provenance is grounded in the actual agent-native-reviewer.json finding at lines 3-24 as well as security/correctness reports; all are same-family reviews, not cross-model independence.
+
 ## Implemented behavior and observed proof
 
 - #5: Any assistant terminal rejected before publication carries its completed physical identity/diagnostics/usage through `TerminalResponseError`. Actual ordinary listener RED lost all metadata and charged zero; fixed ordinary/prefill owners **13 passed / 2 files, 4.62s**. No postpublication duplicate receipt is introduced.
@@ -218,3 +220,27 @@ Canonical receipt, validator, exact path audit and tested content identity: `/tm
 ### Verdict
 
 Round-6 repair verified locally; continue full merge review after local commit. No push, PR, dependency, upstream replay or released changelog change.
+
+## Full merge review loop: round 7
+
+Round-6 repair commit: `90a97b2ea16655a3c790f7085472e02bcca463d1`; normal hook No fixes applied, tested source blobs match. Seventh fresh fixed-base -> HEAD review covers all 418 paths, snapshot digest `d74fd19a93f4b579997e4fa1432b6edbe58ad3c410f35b06ea3d862f1de9b992`. Eleven canonical personas completed. Three independent same-family findings (security, correctness, agent-native) describe one trust-boundary defect and were semantically merged; one independent validator confirmed it. Exact adversarial coverage ledger: 87 investigated / 331 insufficient detailed paths. No whole-merge deep-clearance claim. Canonical receipt first rejected mismatched first_evidence after merging; matching it to evidence[0] passed before mutation.
+
+### Confirmed finding and repair
+
+R7-#1 (P2): unconditional canonical section preservation let an untrusted reopened session import historical custom system instructions into the effective prompt. That effective prompt was then used by the new sanitizer, so context hooks and outgoing requests saw the rejected historical section. Actual SDK/faux direct-continuation RED observed HISTORICAL HOSTILE SECTION in context_with_system input (`artifact://7042`). Durable historical dynamic-section capture is now allowed only when project trust is true. Untrusted continuation uses accepted current base construction; current context-hook augmentation remains allowed. Trusted regenerate/reopen discovery controls remain intact. This fixes an interaction with the newly established sanitizer contract, not a claim that project trust is an OS sandbox.
+
+### Verification
+
+Post-format untrusted direct continuation/summary, trusted discovery continuation and prompt restoration owners: **31 passed / 3 files, 4.23s**. Final `npm run check`: **1770 / No fixes applied, 19.77s**; first check formatted one file. Isolated root `./test.sh`: **8874 passed / 0 failed / 915 skipped, 132.26s**, `artifact://7047`. Actual request/hook contents, not only intermediate Session state, establish rejection of historical preamble/custom/tail and retention of current policy/hook additions.
+
+### Actionable Findings
+
+The single confirmed defect is repaired and verified. Another fresh complete fixed-base -> latest committed HEAD review remains required; no convergence claim yet.
+
+### Coverage
+
+Canonical receipt, independent validation, exact path audit and tested source identity: `/tmp/compound-engineering-501/ce-code-review/20261025-full-wave7-aadbb0ed/`. Existing manual protected-worktree exception, graph/external-family/source/caller limits remain. All reviewer execution claims remain static-only; runtime proof above belongs to integration.
+
+### Verdict
+
+Round-7 repair verified locally; continue full merge review after local commit. No push, PR, dependency, upstream replay or released changelog change.

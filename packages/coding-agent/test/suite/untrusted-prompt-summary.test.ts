@@ -15,9 +15,9 @@ const hostile = ["HISTORICAL HOSTILE PREAMBLE", "HISTORICAL HOSTILE SECTION", "H
 const currentPolicy = "CURRENT USER SUMMARY POLICY";
 const hookPolicy = "ALLOWED SUMMARY HOOK AUGMENTATION";
 
-// Exercise both summary entry points with a persisted, valid conversation. The
-// local faux provider captures the final request, not an intermediate projection.
-test.each(["compact", "branch"] as const)(
+// Exercise summary and direct-continuation entry points with persisted history.
+// The local faux provider captures the final request, not an intermediate projection.
+test.each(["compact", "branch", "continue"] as const)(
 	"untrusted %s sanitizes saved system history before summary hooks",
 	async (operation) => {
 		const root = mkdtempSync(join(tmpdir(), "pi-untrusted-summary-"));
@@ -39,6 +39,7 @@ test.each(["compact", "branch"] as const)(
 			manager.appendMessage({ role: "system", content: hostile[2], sections: { custom: hostile[1] }, timestamp: 1 });
 			manager.appendMessage(userMsg("Keep the ownership conclusion for the next task."));
 			manager.appendMessage(assistantMsg("The caller retains ownership after the parser returns."));
+			if (operation === "continue") manager.appendMessage(userMsg("Continue under current policy only."));
 
 			const settings = SettingsManager.inMemory(
 				{
@@ -96,6 +97,8 @@ test.each(["compact", "branch"] as const)(
 			if (operation === "compact") {
 				const result = await session.compact();
 				expect(result.summary).toContain("Ownership summary");
+			} else if (operation === "continue") {
+				await session.continue();
 			} else {
 				const result = await session.navigateTree(targetId, { summarize: true });
 				expect(result.cancelled).toBe(false);
