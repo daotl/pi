@@ -4671,20 +4671,9 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
-	/** Generate Pi's built-in compaction summary for manual and automatic compaction. */
-	private async _runDefaultCompaction(
-		preparation: CompactionPreparation,
-		model: Model<any>,
-		customInstructions: string | undefined,
-		signal: AbortSignal,
-		reason: "manual" | "threshold" | "overflow",
-	): Promise<CompactionResult & { usageModel: Model<Api> }> {
-		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
-		const request = await this._getSummarizationRequestAuth(model, signal);
-		// Reconcile policy only in the summary request, before context/converter hooks.
-		// Saved snapshots may be newer than the conversational system messages on reopen.
-		const messages = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
-		const current = getCurrentSystemMessage(messages) ?? getCurrentSystemMessage(this.agent.state.messages);
+	/** Reconcile saved effective sections without changing selected conversational contributions. */
+	private _getSummaryPolicyPatch(messages: AgentMessage[]): SystemMessage | undefined {
+		const current = getCurrentSystemMessage(messages);
 		const customSections = this.settingsManager.isProjectTrusted()
 			? Object.fromEntries(
 					Object.entries(current?.sections ?? {}).filter(
@@ -4700,10 +4689,32 @@ export class AgentSession {
 			...customSections,
 			...this._buildEffectivePromptSections(this._runSystemPromptOptions ?? this._baseSystemPromptOptions),
 		});
-		const policyPatch: SystemMessage[] = sections
-			? [{ role: "system", content: "", sections, timestamp: Date.now() }]
-			: [];
-		const baseline = preparation.messagesToSummarize[0]?.role !== "system" && current ? [current] : [];
+		return sections ? { role: "system", content: "", sections, timestamp: Date.now() } : undefined;
+	}
+
+	/** Generate Pi's built-in compaction summary for manual and automatic compaction. */
+	private async _runDefaultCompaction(
+		preparation: CompactionPreparation,
+		model: Model<any>,
+		customInstructions: string | undefined,
+		signal: AbortSignal,
+		reason: "manual" | "threshold" | "overflow",
+	): Promise<CompactionResult & { usageModel: Model<Api> }> {
+		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
+		const request = await this._getSummarizationRequestAuth(model, signal);
+		// Reconcile policy only in the summary request, before context/converter hooks.
+		// Saved snapshots may be newer than the conversational system messages on reopen.
+		const messages = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
+		const projected = this.sessionManager.buildSessionProjection().messages;
+		const firstIndex = projected.findIndex((message) => isDeepStrictEqual(message, messages[0]));
+		// Fold only preceding policy: selected mid-history raw system bodies must remain once, in order.
+		const preceding =
+			messages[0]?.role !== "system"
+				? getCurrentSystemMessage(projected.slice(0, Math.max(0, firstIndex)))
+				: undefined;
+		const baseline = preceding ? [preceding] : [];
+		const patch = this._getSummaryPolicyPatch([...baseline, ...messages]);
+		const policyPatch = patch ? [patch] : [];
 		const requestPreparation = {
 			...preparation,
 			messagesToSummarize: [
@@ -6731,6 +6742,14 @@ export class AgentSession {
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
 				const signal = this._branchSummaryAbortController.signal;
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
+				const projection = this.sessionManager.buildSessionProjection();
+				const patch = this._getSummaryPolicyPatch(projection.messages);
+				// Keep durable owners and selected history intact; only this request receives the idle policy update.
+				const projectedEntries = projection.entries.map((entry, index) =>
+					patch && index === projection.entries.length - 1
+						? { ...entry, messages: [...entry.messages, patch] }
+						: entry,
+				);
 				const result = await generateBranchSummary(entriesToSummarize, {
 					...(await this._getSummarizationRequestAuth(this.model!, signal)),
 					signal,
@@ -6743,7 +6762,11 @@ export class AgentSession {
 					agent: this.agent,
 					requestHistoryPolicy: (model) => this._requestHistoryPolicy(model),
 					usesAdapterOutputClamp: (model) => this._usesAdapterOutputClamp(model),
-					contextProjection: this.sessionManager.buildSessionProjection(),
+					contextProjection: {
+						...projection,
+						entries: projectedEntries,
+						messages: projectedEntries.flatMap((entry) => entry.messages),
+					},
 				});
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };

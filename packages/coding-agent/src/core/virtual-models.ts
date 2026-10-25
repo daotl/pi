@@ -40,6 +40,31 @@ export interface VirtualModelStateData<TState = unknown> {
 
 const THINKING_LEVELS: readonly ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
+const virtualProviderDispatch = new WeakMap<
+	Provider,
+	{
+		provider: Provider;
+		stream: Provider["stream"];
+		streamSimple: Provider["streamSimple"];
+		physicalStream: Provider["stream"];
+		physicalStreamSimple: Provider["streamSimple"];
+	}
+>();
+
+/** @internal Preserve physical capabilities only while both repository-owned dispatch pairs are intact. */
+export function unwrapVirtualModelProvider(provider: Provider): Provider | undefined {
+	const original = virtualProviderDispatch.get(provider);
+	if (!original) return provider;
+	if (
+		provider.stream !== original.stream ||
+		provider.streamSimple !== original.streamSimple ||
+		original.provider.stream !== original.physicalStream ||
+		original.provider.streamSimple !== original.physicalStreamSimple
+	)
+		return undefined;
+	return original.provider;
+}
+
 /**
  * Why a request is being routed.
  * - `user`: first request after a message the user wrote (prompt, steering, or follow-up)
@@ -219,7 +244,7 @@ export function withVirtualModels(
 	const virtual = <TModel extends AnyModel>(models: readonly TModel[]) =>
 		models.filter((model) => isVirtualModel(model));
 	const { filterModels, filterAllModels } = provider;
-	return {
+	const wrapped: Provider = {
 		...provider,
 		getModels: () => [...physical(provider.getModels()), ...virtualModels],
 		getAllModels: () => [...physical(provider.getAllModels?.() ?? provider.getModels()), ...virtualModels],
@@ -235,4 +260,12 @@ export function withVirtualModels(
 		streamSimple: (model, context, options) =>
 			isVirtualModel(model) ? unroutedStream(model) : provider.streamSimple(model, context, options),
 	};
+	virtualProviderDispatch.set(wrapped, {
+		provider,
+		stream: wrapped.stream,
+		streamSimple: wrapped.streamSimple,
+		physicalStream: provider.stream,
+		physicalStreamSimple: provider.streamSimple,
+	});
+	return wrapped;
 }

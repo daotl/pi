@@ -426,6 +426,181 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		},
 	);
 
+	test.each([
+		{ fromSignal: false, retryKey: "/quit", tuiMode: "fullscreen" as const },
+		{ fromSignal: true, retryKey: "Ctrl+D", tuiMode: "regular" as const },
+	])(
+		"restricts work and retries $retryKey after failed reactivation (signal: $fromSignal)",
+		async ({ fromSignal, retryKey, tuiMode }) => {
+			const previous = {
+				pad: isPadLinesToWidth(),
+				wrap: isWrapLinesToWidth(),
+				background: isMessageBackground(),
+				separator: isMessageSeparator(),
+			};
+			const actions: string[] = [];
+			let starts = 0;
+			let closed = false;
+			let failFlush = false;
+			const retryEntered = Promise.withResolvers<void>();
+			const releaseRetry = Promise.withResolvers<void>();
+			const harness = await createHarness({
+				settings: { quietStartup: true, compaction: { enabled: false }, retry: { enabled: false } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_start", () => {
+							starts++;
+							closed = false;
+						});
+						pi.on("session_shutdown", () => {
+							closed = true;
+							failFlush = true;
+						});
+						pi.on("user_bash", () => {
+							actions.push("bash");
+						});
+						pi.registerCommand("use-resource", {
+							handler: async () => {
+								actions.push(`command:${closed}`);
+							},
+						});
+						pi.registerShortcut("ctrl+x", {
+							handler: async () => {
+								actions.push(`shortcut:${closed}`);
+							},
+						});
+						pi.registerTool({
+							name: "resource",
+							label: "Resource",
+							description: "Use resource",
+							parameters: Type.Object({}),
+							execute: async () => {
+								actions.push(`tool:${closed}`);
+								return { content: [], details: {} };
+							},
+						});
+					},
+				],
+			});
+			const runtime = new AgentSessionRuntime(
+				harness.session,
+				{
+					cwd: harness.sessionManager.getCwd(),
+					agentDir: harness.tempDir,
+					modelRuntime: harness.session.modelRuntime,
+					settingsManager: harness.settingsManager,
+					resourceLoader: harness.session.resourceLoader,
+					diagnostics: [],
+				},
+				async () => {
+					throw new Error("Unexpected replacement");
+				},
+			);
+			const terminal = new VirtualTerminal(120, 40);
+			const mode = new InteractiveMode(runtime, { terminal, tuiMode });
+			const internal = mode as unknown as {
+				shutdown(options?: { fromSignal?: boolean }): Promise<void>;
+				defaultEditor: { onSubmit(text: string): Promise<void> };
+				onInputCallback?: (text: string) => void;
+				pendingUserInputs: string[];
+				switchTuiMode(mode: "regular" | "fullscreen"): boolean;
+			};
+			const bind = harness.session.bindExtensions.bind(harness.session);
+			const bindSpy = vi.spyOn(harness.session, "bindExtensions").mockImplementation(async (bindings) => {
+				await bind(bindings);
+				if (starts > 1) throw new Error("resource reactivation failed");
+			});
+			const flushOriginal = harness.session.flushPendingPersistence.bind(harness.session);
+			const flush = vi.spyOn(harness.session, "flushPendingPersistence").mockImplementation(() => {
+				if (failFlush) {
+					failFlush = false;
+					throw new Error("receipt unavailable");
+				}
+				flushOriginal();
+			});
+			const dispose = runtime.dispose.bind(runtime);
+			const disposal = vi.spyOn(runtime, "dispose");
+			const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as unknown as typeof process.exit);
+			const prompt = vi.spyOn(harness.session, "prompt");
+			const continuation = vi.spyOn(harness.session, "continue");
+			const bash = vi.spyOn(harness.session, "executeBash");
+			const input = mode.getUserInput.bind(mode);
+			const loopStopped = new Error("prompt loop stopped");
+			const getInput = vi.spyOn(mode, "getUserInput").mockImplementationOnce(input).mockRejectedValue(loopStopped);
+			let loop: Promise<unknown> | undefined;
+			vi.stubEnv("PI_OFFLINE", "1");
+			try {
+				await mode.init();
+				expect(internal.switchTuiMode(tuiMode === "fullscreen" ? "regular" : "fullscreen")).toBe(true);
+				loop = mode.run().catch((error: unknown) => error);
+				await vi.waitFor(() => expect(internal.onInputCallback).toBeDefined());
+				await internal.shutdown({ fromSignal });
+				expect(runtime.shutdownPending).toBe(true);
+				expect(closed).toBe(true);
+				await terminal.waitForRender();
+				expect(terminal.getViewport().join("\n")).toContain("resource reactivation failed");
+				const submitKeyboard = async (text: string) => {
+					terminal.sendInput(`\x1b[200~${text}\x1b[201~`);
+					terminal.sendInput("\r");
+					await terminal.waitForRender();
+				};
+				for (const text of ["ordinary prompt", "/continue", "!echo forbidden", "/use-resource"]) {
+					await submitKeyboard(text);
+				}
+				terminal.sendInput("\x18");
+				await terminal.waitForRender();
+				expect(prompt).not.toHaveBeenCalled();
+				expect(continuation).not.toHaveBeenCalled();
+				expect(bash).not.toHaveBeenCalled();
+				expect(actions).toEqual([]);
+				expect(internal.pendingUserInputs).toEqual([]);
+				// Work captured before shutdown must also be rejected at the prompt-loop boundary.
+				internal.onInputCallback?.("captured prompt");
+				expect(await loop).toBe(loopStopped);
+				expect(prompt).not.toHaveBeenCalled();
+				// An already captured editor callback must not bypass the terminal recovery gate.
+				await internal.defaultEditor.onSubmit("/use-resource");
+				expect(prompt).not.toHaveBeenCalled();
+				expect(actions).toEqual([]);
+				bindSpy.mockRestore();
+				flush.mockRestore();
+				disposal.mockImplementation(async (options) => {
+					retryEntered.resolve();
+					await releaseRetry.promise;
+					await dispose(options);
+				});
+				if (retryKey === "/quit") await submitKeyboard("/quit");
+				else terminal.sendInput("\x04");
+				await vi.waitFor(() => expect(disposal).toHaveBeenCalledTimes(2));
+				await retryEntered.promise;
+				terminal.sendInput("\x04");
+				await terminal.waitForRender();
+				expect(disposal).toHaveBeenCalledTimes(2);
+				expect(exit).not.toHaveBeenCalled();
+				releaseRetry.resolve();
+				await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+				expect(actions).toEqual([]);
+				expect(starts).toBe(2);
+			} finally {
+				releaseRetry.resolve();
+				bindSpy.mockRestore();
+				flush.mockRestore();
+				disposal.mockRestore();
+				mode.stop();
+				internal.onInputCallback?.("stop prompt loop");
+				await loop;
+				getInput.mockRestore();
+				vi.unstubAllEnvs();
+				await runtime.dispose();
+				harness.cleanup();
+				setPadLinesToWidth(previous.pad);
+				setWrapLinesToWidth(previous.wrap);
+				setMessageBackground(previous.background);
+				setMessageSeparator(previous.separator);
+			}
+		},
+	);
+
 	test.each(["regular", "fullscreen"] as const)(
 		"repaints %s after disposal rejects with shutdown UI updates pending, without keyboard input",
 		async (tuiMode) => {

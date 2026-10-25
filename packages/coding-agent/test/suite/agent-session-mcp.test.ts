@@ -2,8 +2,10 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import type { Model, SystemMessage, ToolResultMessage, Usage } from "@earendil-works/pi-ai/compat";
 import { type JsonRpcRequest, LATEST_PROTOCOL_VERSION } from "@earendil-works/pi-mcp";
 import { createInMemoryTransportPair } from "@earendil-works/pi-mcp/testing";
+import { isPadLinesToWidth, isWrapLinesToWidth, setPadLinesToWidth, setWrapLinesToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
 import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
 import type { ExtensionAPI, ExtensionFactory } from "../../src/core/extensions/types.ts";
 import { getUsageTotals } from "../../src/core/usage-totals.ts";
@@ -13,6 +15,13 @@ import { createMcpExtension, MCP_SERVERS_SECTION } from "../../src/extensions/mc
 import { createMcpToolName } from "../../src/extensions/mcp/tools.ts";
 import { createToolSearchExtension } from "../../src/extensions/tool-search/index.ts";
 import { TOOL_SEARCH_DESCRIPTION } from "../../src/extensions/tool-search/tool.ts";
+import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
+import {
+	isMessageBackground,
+	isMessageSeparator,
+	setMessageBackground,
+	setMessageSeparator,
+} from "../../src/modes/interactive/theme/theme.ts";
 import {
 	createHarness,
 	createTestUiContext,
@@ -413,6 +422,102 @@ describe("AgentSession MCP integration", () => {
 			}
 		},
 	);
+
+	it("keeps real MCP transports closed while keyboard shutdown recovery is pending", async () => {
+		const previous = {
+			pad: isPadLinesToWidth(),
+			wrap: isWrapLinesToWidth(),
+			background: isMessageBackground(),
+			separator: isMessageSeparator(),
+		};
+		const { harness, calls, servers } = await setup("direct");
+		const runtime = new AgentSessionRuntime(
+			harness.session,
+			{
+				cwd: harness.sessionManager.getCwd(),
+				agentDir: harness.tempDir,
+				modelRuntime: harness.session.modelRuntime,
+				settingsManager: harness.settingsManager,
+				resourceLoader: harness.session.resourceLoader,
+				diagnostics: [],
+			},
+			async () => {
+				throw new Error("Unexpected replacement");
+			},
+		);
+		const terminal = new VirtualTerminal(120, 40);
+		const mode = new InteractiveMode(runtime, { terminal });
+		const internal = mode as unknown as {
+			shutdown(options: { fromSignal: boolean }): Promise<void>;
+			onInputCallback?: (text: string) => void;
+		};
+		let bind: { mockRestore(): void } | undefined;
+		const flush = vi.spyOn(harness.session, "flushPendingPersistence");
+		const input = mode.getUserInput.bind(mode);
+		const loopStopped = new Error("MCP prompt loop stopped");
+		const getInput = vi.spyOn(mode, "getUserInput").mockImplementationOnce(input).mockRejectedValue(loopStopped);
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as unknown as typeof process.exit);
+		let loop: Promise<unknown> | undefined;
+		vi.stubEnv("PI_OFFLINE", "1");
+		try {
+			await mode.init();
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("mcp__docs__search", { query: "live" }), { stopReason: "toolUse" }),
+				fauxAssistantMessage("done"),
+			]);
+			await harness.session.prompt("prove MCP resource is live");
+			expect(calls).toEqual(['search:{"query":"live"}']);
+			loop = mode.run().catch((error: unknown) => error);
+			await vi.waitFor(() => expect(internal.onInputCallback).toBeDefined());
+			const activeClosed = vi.spyOn(servers.at(-1)!, "close");
+			const bindOriginal = harness.session.bindExtensions.bind(harness.session);
+			bind = vi.spyOn(harness.session, "bindExtensions").mockImplementation(async (bindings) => {
+				await bindOriginal(bindings);
+				throw new Error("MCP reactivation failed");
+			});
+			flush.mockImplementationOnce(() => {
+				throw new Error("receipt unavailable");
+			});
+			await internal.shutdown({ fromSignal: true });
+			expect(activeClosed).toHaveBeenCalledTimes(1);
+			expect(runtime.shutdownPending).toBe(true);
+			const transportCount = servers.length;
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("mcp__docs__search", { query: "forbidden" }), { stopReason: "toolUse" }),
+				fauxAssistantMessage("done"),
+			]);
+			for (const text of ["use MCP again", "/continue", "!echo forbidden"]) {
+				terminal.sendInput(`\x1b[200~${text}\x1b[201~`);
+				terminal.sendInput("\r");
+				await terminal.waitForRender();
+			}
+			expect(harness.getPendingResponseCount()).toBe(2);
+			expect(calls).toEqual(['search:{"query":"live"}']);
+			expect(servers).toHaveLength(transportCount);
+			internal.onInputCallback?.("stop prompt loop");
+			expect(await loop).toBe(loopStopped);
+			bind.mockRestore();
+			flush.mockRestore();
+			terminal.sendInput("\x04");
+			await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+			expect(servers).toHaveLength(transportCount);
+			expect(calls).toEqual(['search:{"query":"live"}']);
+		} finally {
+			bind?.mockRestore();
+			flush.mockRestore();
+			mode.stop();
+			internal.onInputCallback?.("stop prompt loop");
+			await loop;
+			getInput.mockRestore();
+			vi.unstubAllEnvs();
+			await runtime.dispose();
+			vi.restoreAllMocks();
+			setPadLinesToWidth(previous.pad);
+			setWrapLinesToWidth(previous.wrap);
+			setMessageBackground(previous.background);
+			setMessageSeparator(previous.separator);
+		}
+	});
 
 	it.each(["direct", "codemode"] as const)(
 		"withdraws and restores %s MCP tools the server changes",

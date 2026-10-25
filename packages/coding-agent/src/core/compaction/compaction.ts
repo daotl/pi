@@ -5,6 +5,7 @@
  * and after compaction the session is reloaded.
  */
 
+import { isDeepStrictEqual } from "node:util";
 import type { Agent, AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
 	contentText,
@@ -637,10 +638,23 @@ async function buildAgentSummarizationContext(
 	signal: AbortSignal | undefined,
 	fallbackSystemPrompt: string | undefined,
 ): Promise<Message[]> {
-	const baseline = agent && messages[0]?.role !== "system" ? getCurrentSystemMessage(agent.state.messages) : undefined;
+	const firstIndex = agent?.state.messages.findIndex((message) => isDeepStrictEqual(message, messages[0])) ?? -1;
+	const preceding =
+		firstIndex >= 0
+			? agent?.state.messages.slice(0, firstIndex)
+			: messages.some((message) => message.role === "system")
+				? []
+				: agent?.state.messages;
+	const baseline = messages[0]?.role !== "system" && preceding ? getCurrentSystemMessage(preceding) : undefined;
 	const source = structuredClone(baseline ? [baseline, ...messages] : messages);
 	if (source[0]?.role !== "system") {
-		source.unshift({ role: "system", content: fallbackSystemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT, timestamp: 0 });
+		source.unshift({
+			role: "system",
+			content: source.some((message) => message.role === "system")
+				? ""
+				: (fallbackSystemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT),
+			timestamp: 0,
+		});
 	}
 	if (agent && source[0]?.role === "system" && source[0].toolsAdded === undefined) {
 		source[0] = { ...source[0], toolsAdded: agent.state.tools.map(toToolDeclaration) };

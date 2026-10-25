@@ -39,42 +39,125 @@ it("retains native summary and full chat-template counting", async () => {
 	expect(fixture.summaries).toHaveLength(1);
 });
 
-it.each(["payload", "headers", "host", "stream", "provider"] as const)(
-	"does not bypass %s policy for any tokenizer upload",
-	async (policy) => {
+it.each([100, 25000])(
+	"preserves physical tokenizer counts, files, and output headroom beside a virtual sibling with %i-character results",
+	async (characters) => {
 		const fixture = await nativeFixture({
-			extensionFactories: [
-				(pi) => {
-					if (policy === "payload")
-						pi.on("before_provider_request", (event) =>
-							JSON.parse(JSON.stringify(event.payload).replaceAll(privateMarker, "REDACTED")),
-						);
-					if (policy === "headers")
-						pi.on("before_provider_headers", (event) => {
-							event.headers.Authorization = null;
-						});
-				},
-			],
+			settings: { compaction: { enabled: false, reserveTokens: 4096 }, retry: { enabled: false } },
 		});
-		if (policy === "host")
-			fixture.session.agent.onPayload = (payload) =>
-				JSON.parse(JSON.stringify(payload).replaceAll(privateMarker, "REDACTED"));
-		if (policy === "stream") {
-			const stream = fixture.session.agent.streamFunction;
-			fixture.session.agent.streamFunction = (...args) => stream(...args);
+		const runtime = fixture.session.modelRuntime;
+		const selected = fixture.session.model!;
+		await fixture.session.setModel({ ...selected, contextWindow: 10000 });
+		runtime.registerVirtualModel({
+			provider: selected.provider,
+			id: "virtual-sibling",
+			name: "Virtual sibling",
+			route: () => ({ model: selected, thinkingLevel: "off" }),
+		});
+		await runtime.refresh({ allowNetwork: false });
+		fixture.manager.appendMessage({ role: "user", content: "inspect work", timestamp: 30 });
+		fixture.manager.appendMessage({
+			...fauxAssistantMessage([
+				{ type: "toolCall", id: "physical-read", name: "read", arguments: { path: "/project/read.ts" } },
+				{ type: "toolCall", id: "physical-edit", name: "edit", arguments: { path: "/project/edited.ts" } },
+			]),
+			api: selected.api,
+			provider: selected.provider,
+			model: selected.id,
+			stopReason: "toolUse",
+		});
+		for (const [id, name] of [
+			["physical-read", "read"],
+			["physical-edit", "edit"],
+		]) {
+			fixture.manager.appendMessage({
+				role: "toolResult",
+				toolCallId: id,
+				toolName: name,
+				content: [{ type: "text", text: `VISIBLE_PHYSICAL_RESULT ${"x".repeat(characters)}` }],
+				isError: false,
+				timestamp: 31,
+			});
 		}
-		if (policy === "provider") {
-			const stream = fixture.provider.streamSimple;
-			fixture.provider.streamSimple = (...args) => stream(...args);
-		}
-		await fixture.session.compact({ keepRecentTokens: 1 });
-		expect(fixture.summaries).toHaveLength(1);
-		if (policy === "headers") expect(fixture.summaries[0].authorization).toBeNull();
-		if (policy === "payload" || policy === "host") expect(fixture.summaries[0].body).not.toContain(privateMarker);
-		expect(fixture.uploads).toEqual([]);
-		expect(checkpoint(fixture.manager).summaryTokens).toBeUndefined();
+		fixture.manager.appendMessage({ role: "user", content: "retained input", timestamp: 32 });
+		fixture.session.refreshContext();
+		const result = await fixture.session.compact({ keepRecentMessages: 1 });
+		expect(checkpoint(fixture.manager).summaryTokens).toBe(42);
+		expect(fixture.session.getContextUsage()?.tokens).toBe(100);
+		expect(result.summary).toContain("<read-files>\n/project/read.ts\n</read-files>");
+		expect(result.summary).toContain("<modified-files>\n/project/edited.ts\n</modified-files>");
+		const wire = JSON.parse(fixture.summaries[0].body);
+		expect(wire.max_completion_tokens ?? wire.max_tokens).toBeGreaterThan(1);
+		expect(fixture.summaries[0].body).toContain("VISIBLE_PHYSICAL_RESULT");
+		if (characters === 25000) expect(fixture.summaries[0].body).toContain("[Tool result]");
+		const full = fixture.uploads.find((request) => request.url.endsWith("/chat/completions/input_tokens"));
+		expect(full?.authorization).toBe("Bearer offline-tokenizer-key");
+		expect(JSON.parse(full!.body).model).toBe(selected.id);
 	},
 );
+
+it.each([
+	"payload",
+	"headers",
+	"host",
+	"stream",
+	"provider",
+	"virtual-stream",
+	"virtual-simple",
+	"virtual-native-stream",
+	"virtual-native-simple",
+] as const)("does not bypass %s policy for any tokenizer upload", async (policy) => {
+	const fixture = await nativeFixture({
+		extensionFactories: [
+			(pi) => {
+				if (policy === "payload")
+					pi.on("before_provider_request", (event) =>
+						JSON.parse(JSON.stringify(event.payload).replaceAll(privateMarker, "REDACTED")),
+					);
+				if (policy === "headers")
+					pi.on("before_provider_headers", (event) => {
+						event.headers.Authorization = null;
+					});
+			},
+		],
+	});
+	if (policy === "host")
+		fixture.session.agent.onPayload = (payload) =>
+			JSON.parse(JSON.stringify(payload).replaceAll(privateMarker, "REDACTED"));
+	if (policy === "stream") {
+		const stream = fixture.session.agent.streamFunction;
+		fixture.session.agent.streamFunction = (...args) => stream(...args);
+	}
+	if (policy === "provider") {
+		const stream = fixture.provider.streamSimple;
+		fixture.provider.streamSimple = (...args) => stream(...args);
+	}
+	if (policy.startsWith("virtual-")) {
+		const runtime = fixture.session.modelRuntime;
+		const model = fixture.session.model!;
+		runtime.registerVirtualModel({
+			provider: model.provider,
+			id: "virtual-sibling",
+			name: "Virtual sibling",
+			route: () => ({ model, thinkingLevel: "off" }),
+		});
+		await runtime.refresh({ allowNetwork: false });
+		const provider = policy.startsWith("virtual-native-") ? fixture.provider : runtime.getProvider(model.provider)!;
+		if (policy.endsWith("-stream")) {
+			const stream = provider.stream;
+			provider.stream = (...args) => stream(...args);
+		} else {
+			const stream = provider.streamSimple;
+			provider.streamSimple = (...args) => stream(...args);
+		}
+	}
+	await fixture.session.compact({ keepRecentTokens: 1 });
+	expect(fixture.summaries).toHaveLength(1);
+	if (policy === "headers") expect(fixture.summaries[0].authorization).toBeNull();
+	if (policy === "payload" || policy === "host") expect(fixture.summaries[0].body).not.toContain(privateMarker);
+	expect(fixture.uploads).toEqual([]);
+	expect(checkpoint(fixture.manager).summaryTokens).toBeUndefined();
+});
 
 it.each(["transform", "converter"] as const)(
 	"proves complete history before fragment counting under %s redaction",

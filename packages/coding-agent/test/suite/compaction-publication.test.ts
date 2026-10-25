@@ -890,9 +890,20 @@ it.each(
 					expect(mode.isShuttingDown).toBe(false);
 					expect(process.listeners("SIGTERM")).toEqual(listeners);
 					expect(mode.scheduledMessages.map(({ id, text, when }) => ({ id, text, when }))).toEqual(scheduled);
-					expect(mode.heartbeats.map(({ id, text, nextFireAt }) => ({ id, text, nextFireAt }))).toEqual(
-						heartbeats,
+					expect(mode.heartbeats.map(({ id, text }) => ({ id, text }))).toEqual(
+						heartbeats.map(({ id, text }) => ({ id, text })),
 					);
+					for (const [index, heartbeat] of mode.heartbeats.entries()) {
+						const previous = heartbeats[index].nextFireAt;
+						if (operation === "interactive") {
+							// Clearing the submitted /quit is editor activity and resets interval cadence.
+							expect(previous).not.toBeNull();
+							expect(heartbeat.nextFireAt).not.toBeNull();
+							expect(heartbeat.nextFireAt!).toBeGreaterThanOrEqual(previous!);
+						} else {
+							expect(heartbeat.nextFireAt).toBe(previous);
+						}
+					}
 					// /quit consumes its command text before attempting shutdown.
 					if (operation === "interactive") terminal.sendInput("retryable draft");
 					terminal.sendInput(" remains usable");

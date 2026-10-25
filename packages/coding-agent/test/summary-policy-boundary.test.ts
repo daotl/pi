@@ -107,6 +107,66 @@ function snapshot(context: TranscriptContext): SummaryRequestSnapshot {
 	};
 }
 
+it("restores only the policy preceding selected standalone compaction history", async () => {
+	const selected: AgentMessage[] = [
+		{ role: "user", content: "before selected legacy policy", timestamp: 1 },
+		{ role: "system", content: "SELECTED RAW POLICY", sections: { custom: "SELECTED CUSTOM SECTION" }, timestamp: 2 },
+		{ role: "user", content: "after selected legacy policy", timestamp: 3 },
+	];
+	const original = structuredClone(selected);
+	const hooks: AgentMessage[][] = [];
+	const agent = new Agent({
+		streamFn: () => {
+			throw new Error("Unexpected normal request");
+		},
+		initialState: {
+			messages: [
+				{ role: "system", content: "PRECEDING RAW POLICY", timestamp: 0 },
+				...selected,
+				{ role: "system", content: "UNSELECTED SUFFIX POLICY", timestamp: 4 },
+			],
+		},
+		transformContext: async (messages) => {
+			hooks.push(structuredClone(messages));
+			return messages;
+		},
+	});
+	let sent: TranscriptContext | undefined;
+	const streamFn: AgentStream = (_model, context) => {
+		sent = context;
+		const stream = createAssistantMessageEventStream();
+		stream.end(fauxAssistantMessage("ordered standalone summary"));
+		return stream;
+	};
+	await generateSummaryWithUsage(
+		selected,
+		model,
+		1000,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		streamFn,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		agent,
+	);
+	expect(hooks).toHaveLength(1);
+	for (const messages of [hooks[0], sent!.messages]) {
+		const policy = getCurrentSystemPrompt(messages);
+		expect(policy.match(/PRECEDING RAW POLICY/g)).toHaveLength(1);
+		expect(policy.match(/SELECTED RAW POLICY/g)).toHaveLength(1);
+		expect(policy).toContain("SELECTED CUSTOM SECTION");
+		expect(policy).not.toContain("UNSELECTED SUFFIX POLICY");
+		expect(messages.slice(0, 4).map((message) => message.role)).toEqual(["system", "user", "system", "user"]);
+	}
+	expect(selected).toEqual(original);
+});
+
 describe.each(["compact", "branch"] as const)("%s summary policy boundaries", (operation) => {
 	it.each([
 		["transform", "baseline", false],

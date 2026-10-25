@@ -1,4 +1,4 @@
-import { createProvider, type Model, type ProviderStreams } from "@earendil-works/pi-ai";
+import { createProvider, type Model, type Provider, type ProviderStreams } from "@earendil-works/pi-ai";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { azureOpenAIResponsesApi } from "@earendil-works/pi-ai/api/azure-openai-responses.lazy";
 import { bedrockConverseStreamApi } from "@earendil-works/pi-ai/api/bedrock-converse-stream.lazy";
@@ -42,20 +42,62 @@ it.each([
 	const model = native.getModels()[0] as Model<string>;
 	expect(runtime.canAttributeRequestHistory(model)).toBe(true);
 	expect(runtime.canAttributeRequestHistory(model, true)).toBe(direct);
+	runtime.registerVirtualModel({
+		provider: native.id,
+		id: "virtual-sibling",
+		name: "Virtual sibling",
+		route: () => ({ model, thinkingLevel: "off" }),
+	});
+	await runtime.refresh({ allowNetwork: false });
+	const virtual = runtime.getModel(native.id, "virtual-sibling")!;
+	expect(runtime.canAttributeRequestHistory(virtual)).toBe(false);
+	expect(runtime.canAttributeRequestHistory(virtual, true)).toBe(false);
+	expect(runtime.usesAdapterOutputClamp(virtual)).toBe(false);
+	expect(runtime.canAttributeRequestHistory(model)).toBe(true);
+	expect(runtime.canAttributeRequestHistory(model, true)).toBe(direct);
+	expect(runtime.usesAdapterOutputClamp(model)).toBe(true);
+	const wrapped = runtime.getProvider(native.id)!;
+	const wrappedStream = wrapped.stream;
+	const wrappedSimple = wrapped.streamSimple;
+	wrapped.stream = (...args) => wrappedStream(...args);
+	expect(runtime.canAttributeRequestHistory(model)).toBe(false);
+	expect(runtime.canAttributeRequestHistory(model, true)).toBe(false);
+	expect(runtime.usesAdapterOutputClamp(model)).toBe(false);
+	wrapped.stream = wrappedStream;
+	wrapped.streamSimple = (...args) => wrappedSimple(...args);
+	expect(runtime.canAttributeRequestHistory(model)).toBe(false);
+	expect(runtime.canAttributeRequestHistory(model, true)).toBe(false);
+	expect(runtime.usesAdapterOutputClamp(model)).toBe(false);
+	wrapped.streamSimple = wrappedSimple;
+	expect(runtime.canAttributeRequestHistory(model)).toBe(true);
+	expect(runtime.usesAdapterOutputClamp(model)).toBe(true);
 	const originalStream = native.stream;
 	native.stream = (...args) => originalStream(...args);
 	expect(runtime.canAttributeRequestHistory(model)).toBe(false);
 	expect(runtime.canAttributeRequestHistory(model, true)).toBe(false);
+	expect(runtime.usesAdapterOutputClamp(model)).toBe(false);
 	native.stream = originalStream;
 	expect(runtime.canAttributeRequestHistory(model)).toBe(true);
 	const saved = native.streamSimple;
 	native.streamSimple = (...args) => saved(...args);
 	expect(runtime.canAttributeRequestHistory(model)).toBe(false);
+	expect(runtime.canAttributeRequestHistory(model, true)).toBe(false);
+	expect(runtime.usesAdapterOutputClamp(model)).toBe(false);
 	native.streamSimple = saved;
 	expect(runtime.canAttributeRequestHistory(model)).toBe(true);
+	expect(runtime.usesAdapterOutputClamp(model)).toBe(true);
+	const replacement = provider(api, factory());
+	native.stream = replacement.stream;
+	native.streamSimple = replacement.streamSimple;
+	expect(runtime.canAttributeRequestHistory(model)).toBe(false);
+	expect(runtime.canAttributeRequestHistory(model, true)).toBe(false);
+	expect(runtime.usesAdapterOutputClamp(model)).toBe(false);
+	native.stream = originalStream;
+	native.streamSimple = saved;
 	runtime.registerProvider(native.id, { api, streamSimple: (...args) => saved(...args), apiKey: "offline" });
 	expect(runtime.canAttributeRequestHistory(model)).toBe(false);
 	expect(runtime.canAttributeRequestHistory(model, true)).toBe(false);
+	expect(runtime.usesAdapterOutputClamp(model)).toBe(false);
 });
 
 it("denies direct uploads to an OpenAI-labelled faux registration and observes live registry replacement", async () => {
@@ -69,6 +111,13 @@ it("denies direct uploads to an OpenAI-labelled faux registration and observes l
 			models: [definition],
 		});
 		const model = runtime.getModel("custom-test", "model")!;
+		runtime.registerVirtualModel({
+			provider: model.provider,
+			id: "virtual-sibling",
+			name: "Virtual sibling",
+			route: () => ({ model, thinkingLevel: "off" }),
+		});
+		await runtime.refresh({ allowNetwork: false });
 		expect(runtime.canAttributeRequestHistory(model)).toBe(true);
 		expect(runtime.canAttributeRequestHistory(model, true)).toBe(false);
 		const streams = openAICompletionsApi();
@@ -92,6 +141,13 @@ it("revokes composed dispatch evidence when either entry point is replaced", asy
 		models: [definition],
 	});
 	const model = runtime.getModel("composed-test", "model")!;
+	runtime.registerVirtualModel({
+		provider: model.provider,
+		id: "virtual-sibling",
+		name: "Virtual sibling",
+		route: () => ({ model, thinkingLevel: "off" }),
+	});
+	await runtime.refresh({ allowNetwork: false });
 	const composed = runtime.getProvider("composed-test")!;
 	const original = { stream: composed.stream, streamSimple: composed.streamSimple };
 	expect(runtime.canAttributeRequestHistory(model, true)).toBe(true);
@@ -104,6 +160,29 @@ it("revokes composed dispatch evidence when either entry point is replaced", asy
 	expect(runtime.canAttributeRequestHistory(model)).toBe(false);
 	composed.streamSimple = original.streamSimple;
 	expect(runtime.canAttributeRequestHistory(model, true)).toBe(true);
+	expect(runtime.usesAdapterOutputClamp(model)).toBe(true);
+});
+
+it("does not grant physical capabilities to manually matching API transports with virtual siblings", async () => {
+	const runtime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false });
+	const native = provider("openai-completions", openAICompletionsApi());
+	const manual: Provider = {
+		...native,
+		stream: (...args) => native.stream(...args),
+		streamSimple: (...args) => native.streamSimple(...args),
+	};
+	runtime.registerNativeProvider(manual);
+	const model = manual.getModels()[0];
+	runtime.registerVirtualModel({
+		provider: manual.id,
+		id: "virtual-sibling",
+		name: "Virtual sibling",
+		route: () => ({ model, thinkingLevel: "off" }),
+	});
+	await runtime.refresh({ allowNetwork: false });
+	expect(runtime.canAttributeRequestHistory(model)).toBe(false);
+	expect(runtime.canAttributeRequestHistory(model, true)).toBe(false);
+	expect(runtime.usesAdapterOutputClamp(model)).toBe(false);
 });
 
 it.each([
@@ -124,6 +203,13 @@ it.each([
 		const native = provider(api, streams);
 		runtime.registerNativeProvider(native);
 		const model = native.getModels()[0];
+		runtime.registerVirtualModel({
+			provider: model.provider,
+			id: "virtual-sibling",
+			name: "Virtual sibling",
+			route: () => ({ model, thinkingLevel: "off" }),
+		});
+		await runtime.refresh({ allowNetwork: false });
 		expect(runtime.usesAdapterOutputClamp(model)).toBe(true);
 		const simple = streams.streamSimple;
 		streams.streamSimple = (...args) => simple(...args);

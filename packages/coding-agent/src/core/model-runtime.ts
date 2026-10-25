@@ -89,6 +89,7 @@ import {
 	isVirtualModel,
 	type ModelRoute,
 	type ModelRouteReason,
+	unwrapVirtualModelProvider,
 	type VirtualModelDefinition,
 	withVirtualModels,
 } from "./virtual-models.ts";
@@ -528,14 +529,16 @@ export class ModelRuntime implements Models {
 	/** @internal Re-evaluated against the live provider, never inferred from its API label. */
 	canAttributeRequestHistory(model: Model<Api>, direct = false): boolean {
 		if (isVirtualModel(model)) return false;
-		const provider = this.models.getProvider(model.provider);
+		const liveProvider = this.models.getProvider(model.provider);
+		const provider = liveProvider && unwrapVirtualModelProvider(liveProvider);
 		return provider !== undefined && canAttributeProviderHistory(provider, model, direct);
 	}
 
 	/** @internal Rechecks the live native dispatch pair without granting history/upload authority. */
 	usesAdapterOutputClamp(model: Model<Api>): boolean {
 		if (isVirtualModel(model)) return false;
-		const provider = this.models.getProvider(model.provider);
+		const liveProvider = this.models.getProvider(model.provider);
+		const provider = liveProvider && unwrapVirtualModelProvider(liveProvider);
 		return provider !== undefined && usesProviderOutputClamp(provider, model);
 	}
 

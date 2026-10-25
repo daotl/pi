@@ -392,6 +392,133 @@ describe("AgentSession compaction characterization", () => {
 		}
 	});
 
+	it("uses the newer trusted saved policy for immediate tree summarization without rewriting history", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-tree-saved-policy-"));
+		const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+		let harness: Harness | undefined;
+		try {
+			harness = await createHarness({ cwd, sessionManager: manager, settings: { compaction: { enabled: false } } });
+			harness.session.setCustomSystemPrompt("OLD TREE POLICY");
+			harness.setResponses([fauxAssistantMessage("shared answer"), fauxAssistantMessage("abandoned answer")]);
+			await harness.session.prompt("shared question");
+			const target = manager.getLeafId()!;
+			await harness.session.prompt("abandoned question");
+			manager.appendMessage({
+				role: "system",
+				content: "",
+				sections: { accepted: "CUSTOM TREE SECTION" },
+				timestamp: 3,
+			});
+			harness.session.setCustomSystemPrompt("NEW SAVED TREE POLICY");
+			const file = manager.getSessionFile()!;
+			harness.cleanup();
+			harness = undefined;
+			const reopened = SessionManager.open(file);
+			const original = structuredClone(reopened.getEntries());
+			const policies: string[] = [];
+			harness = await createHarness({
+				cwd,
+				sessionManager: reopened,
+				settings: { compaction: { enabled: false } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("context_with_system", (event) => {
+							policies.push(getCurrentSystemPrompt(event.messages));
+							expect(reopened.getEntries()).toEqual(original);
+						});
+					},
+				],
+			});
+			let sent: TranscriptContext | undefined;
+			const convertedPolicies: string[] = [];
+			const convert = harness.session.agent.convertToLlm;
+			harness.session.agent.convertToLlm = (messages) => {
+				convertedPolicies.push(getCurrentSystemPrompt(messages));
+				return convert(messages);
+			};
+			harness.setResponses([
+				(context) => {
+					sent = context;
+					return fauxAssistantMessage("saved-policy tree summary");
+				},
+			]);
+			expect(harness.session.systemPrompt).toContain("NEW SAVED TREE POLICY");
+			const result = await harness.session.navigateTree(target, { summarize: true });
+			expect(result.summaryEntry?.summary).toContain("saved-policy tree summary");
+			const policy = getCurrentSystemPrompt(sent!.messages);
+			expect(policy).toContain("NEW SAVED TREE POLICY");
+			expect(policy).not.toContain("OLD TREE POLICY");
+			expect(policy).toContain("CUSTOM TREE SECTION");
+			expect(policies).toEqual([policy]);
+			expect(convertedPolicies).toEqual([policy]);
+			expect(harness.faux.state.callCount).toBe(1);
+			expect(JSON.stringify(sent!.messages)).toContain("abandoned question");
+			expect(JSON.stringify(sent!.messages)).not.toContain("shared question");
+			expect(getCurrentTools(sent!.messages).map((tool) => tool.name)).toEqual(harness.session.getActiveToolNames());
+			for (const entry of original) expect(reopened.getEntry(entry.id)).toEqual(entry);
+			const disk = SessionManager.open(file);
+			for (const entry of original) expect(disk.getEntry(entry.id)).toEqual(entry);
+		} finally {
+			harness?.cleanup();
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it.each([false, true])("keeps legacy mid-history policy once and ordered in split=%s compaction", async (split) => {
+		const hookMessages: AgentMessage[][] = [];
+		const harness = await createHarness({
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("context_with_system", (event) => {
+						hookMessages.push(structuredClone(event.messages));
+					});
+					pi.on("session_before_compact", (event) => {
+						expect(event.preparation.isSplitTurn).toBe(split);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.sessionManager.appendMessage({ role: "user", content: "before legacy policy", timestamp: 1 });
+		harness.sessionManager.appendMessage({
+			role: "system",
+			content: "LEGACY RAW POLICY",
+			sections: { custom: "CUSTOM LEGACY SECTION" },
+			timestamp: 2,
+		});
+		harness.sessionManager.appendMessage(createAssistant(harness, { timestamp: 3 }));
+		if (split) {
+			harness.sessionManager.appendMessage({ role: "user", content: "split user", timestamp: 4 });
+			harness.sessionManager.appendMessage({ role: "system", content: "LATER RAW POLICY", timestamp: 5 });
+			harness.sessionManager.appendMessage(createAssistant(harness, { timestamp: 6 }));
+		} else harness.sessionManager.appendMessage({ role: "user", content: "kept user", timestamp: 4 });
+		harness.session.refreshContext();
+		let sent: TranscriptContext | undefined;
+		harness.setResponses([
+			(context) => {
+				sent = context;
+				return fauxAssistantMessage("legacy summary");
+			},
+		]);
+		await harness.session.compact({ keepRecentMessages: 1 });
+		expect(hookMessages).toHaveLength(1);
+		expect(harness.faux.state.callCount).toBe(1);
+		for (const messages of [hookMessages[0], sent!.messages]) {
+			const policy = getCurrentSystemPrompt(messages);
+			expect(policy.match(/LEGACY RAW POLICY/g)).toHaveLength(1);
+			expect(policy).toContain("CUSTOM LEGACY SECTION");
+			if (split) expect(policy.match(/LATER RAW POLICY/g)).toHaveLength(1);
+			const legacy = messages.findIndex(
+				(message) => message.role === "system" && message.content === "LEGACY RAW POLICY",
+			);
+			const user = messages.findIndex(
+				(message) => message.role === "user" && message.content === "before legacy policy",
+			);
+			expect(legacy).toBeGreaterThan(user);
+		}
+	});
+
 	it("reuses the agent context pipeline so the summarization request stays cache-compatible", async () => {
 		const harness = await createHarness({ settings: { compaction: { keepRecentTokens: 1 } } });
 		harnesses.push(harness);

@@ -399,3 +399,32 @@ Canonical receipt, semantic deduplication, two-item validator, exact coverage au
 ### Verdict
 
 Round-13 repairs verified locally; continue full merge review after local commit. No push, PR, dependency metadata, upstream replay or released changelog change.
+
+## Full merge review loop: round 14
+
+Round-13 repair commit: `d6c72b25a293c3678781ba36a8ea9f3d34e1bc10`; normal hook No fixes applied and tested product/guide blobs match. Fourteenth fresh fixed-base -> HEAD review covers all 422 paths, 72 runtime source paths and 60,476 diff lines; digest `455cca45e1ffb8907db6f0ace4faa0beb43c5b4e255d35e6412d602350562e0b`. Eleven canonical personas completed. Five candidates semantically deduplicated to four findings, independently validated true; canonical receipt passed before mutation (`artifact://8156`). Exact adversarial partition: 110 investigated / 312 insufficient detailed paths. Inventory and source-hunk review are not exhaustive whole-file/caller clearance.
+
+### Confirmed findings and repairs
+
+- R14-#1 (P2): Session-owned branch summaries omitted effective restored policy reconciliation. Trusted reopen followed immediately by summarized tree navigation therefore used old conversational policy. The request-local old-branch projection now includes the effective structured-policy patch before context/converter hooks, preserving source identities, custom sections, declarations and durable history. Standalone explicit projection authority remains unchanged. Actual trusted-reopen/navigation RED and source-resolved faux/durable-summary smoke cover the corrected boundary.
+- R14-#2 (P2): compaction's synthesized leading baseline folded selected mid-history legacy raw system content, duplicating it when selected history supplied that content again. Baselines now restore only preceding policy; shared Agent fallback neither duplicates selected raw content nor imports an unselected suffix. Split/unsplit and standalone REDs observe duplicate policy; actual hook/provider ordering and exactly-once raw content pass.
+- R14-#4 (P2): adding a virtual sibling wrapped both native provider dispatch functions without retained provenance, disabling physical sibling token counts, attributable file extraction and output budgeting. A private wrapper-object WeakMap recognizes only intact repository-owned wrappers and captured underlying dispatch pairs; both runtime capabilities then delegate to existing provenance checks. Virtual models, manual matching-API transports and wrapper/underlying replacements remain denied. Five RED failures include actual SDK summaryTokens undefined; real localhost native HTTP smoke observes summary count 3, chat count 27, physical completion intact and replacement revocation. Consumer tests retain summaryTokens=42, context=100, requested file paths and useful bounded-summary output headroom.
+- R14-#5 (P2): failed extension reactivation left resources closed but restarted ordinary input while the shutdown latch prevented retry. A restricted built-in recovery editor and admission gate block ordinary prompts, continuation, bash, extension commands/shortcuts and captured submissions. Only /quit or empty-editor Ctrl+D retries disposal; a consumed retry token prevents concurrent disposal. Both interactive/signal VirtualTerminal REDs admitted /continue before repair. Actual MCP control works before failure; forbidden work afterward consumes no response, sends no tool call and creates no transport. Standalone terminal smoke observes restricted guidance, zero forbidden requests and retry exit 0.
+
+### Verification
+
+Post-format combined owners: **532 passed / 10 skipped, 20 files passed / 1 skipped, 31.53s**, `artifact://8181`. Initial full check formatted three owned files. Final full `npm run check`: **1770 / No fixes applied, 11.74s**. First original isolated root aggregate failed: **8948 passed / 1 failed / 915 skipped, 91.39s**, `artifact://8184`. The retained-output /quit test compared interval heartbeat deadlines across editor activity; isolated execution reproduced the 1ms difference. Exact trace: submit clears editor -> onChange -> markActivity resets interval cadence; idle recovery tick leaves future deadlines alone. Only the test oracle changed: identities/text remain exact, interactive interval deadlines remain non-null and not earlier, direct signal deadline remains exact. No production heartbeat change. Owning file **55 passed**, separate targeted case **1 passed**. Fresh original isolated root `./test.sh`: **8949 passed / 0 failed / 915 skipped, 90.70s**, `artifact://8192`.
+
+Temporary runtime smokes removed. Existing SDK and compaction guides document restricted shutdown recovery, both Session-owned summary boundaries, legacy ordering and virtual-wrapper capability limits. Worker receipts retain setup errors and intermediate assertion failures; no paid/live provider used.
+
+### Actionable Findings
+
+All four confirmed findings repaired and verified. Commit and another fresh entire fixed-base -> latest committed HEAD review remain required; no convergence claim.
+
+### Coverage
+
+Canonical receipt, semantic deduplication, four-item validator, coverage audit, RED/GREEN, heartbeat-oracle diagnosis and tested source identity: `/tmp/compound-engineering-501/ce-code-review/20261025-full-wave14-65420d1a/`. Existing manual protected-worktree, unavailable graph, stale LSP positions, unattested external-family and bounded runtime/caller limitations remain.
+
+### Verdict
+
+Round-14 repairs verified locally; continue full merge review after local commit. No push, PR, dependency metadata, upstream replay or released changelog change.

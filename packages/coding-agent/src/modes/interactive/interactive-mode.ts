@@ -39,6 +39,7 @@ import {
 	CombinedAutocompleteProvider,
 	type Component,
 	Container,
+	Editor,
 	fuzzyFilter,
 	getCapabilities,
 	hyperlink,
@@ -1033,6 +1034,26 @@ export class InteractiveMode {
 			onChanged: () => this.updateEditorBorderColor(),
 			initialThemeSetting: options.initialThemeSetting,
 		});
+		this.setupShutdownInputHandler();
+	}
+
+	private setupShutdownInputHandler(): void {
+		// Register before extension input listeners so closed resources cannot receive keyboard work.
+		this.ui.addInputListener((data) => {
+			if (!this.isShuttingDown) return;
+			const recoveryEditor = this.shutdownRecoveryEditor;
+			if (recoveryEditor) {
+				if (this.keybindings.matches(data, "app.exit") && !recoveryEditor.getText()) {
+					void this.shutdown();
+				} else if (this.keybindings.matches(data, "app.clear")) {
+					recoveryEditor.setText("");
+				} else {
+					recoveryEditor.handleInput(data);
+				}
+				this.ui.requestRender();
+			}
+			return { consume: true };
+		});
 	}
 
 	private getAutocompleteSourceTag(sourceInfo?: SourceInfo): string | undefined {
@@ -1284,6 +1305,7 @@ export class InteractiveMode {
 			nextUi.restoreRenderState(this.mainScreenRenderState);
 		}
 		this.renderer = nextUi;
+		this.setupShutdownInputHandler();
 		this.options.tuiMode = mode;
 		this.mountInteractiveTui(nextUi, components);
 		nextUi.invalidate();
@@ -1616,6 +1638,7 @@ export class InteractiveMode {
 		// Main interactive loop
 		while (true) {
 			const userInput = await this.getUserInput();
+			if (this.isShuttingDown) continue;
 			try {
 				await this.session.prompt(userInput);
 			} catch (error: unknown) {
@@ -3546,6 +3569,10 @@ export class InteractiveMode {
 
 	private setupEditorSubmitHandler(): void {
 		const submit = async (text: string) => {
+			if (this.isShuttingDown) {
+				if (text.trim() === "/quit") await this.shutdown();
+				return;
+			}
 			text = text.trim();
 			if (!text) return;
 
@@ -4769,15 +4796,36 @@ export class InteractiveMode {
 	 * repaint the final frame while the process is exiting.
 	 */
 	private isShuttingDown = false;
+	private shutdownRecoveryEditor?: Editor;
+
+	private showShutdownRecovery(error: unknown): void {
+		const editor = new Editor(this.ui, getEditorTheme());
+		editor.onSubmit = (text) => {
+			editor.setText("");
+			if (text.trim() === "/quit") void this.shutdown();
+			else this.showStatus("Shutdown is pending. Use /quit or Ctrl+D to retry; ordinary commands are disabled.");
+		};
+		this.shutdownRecoveryEditor = editor;
+		this.disposeActiveSelector();
+		this.editorContainer.clear();
+		this.editorContainer.addChild(editor);
+		this.ui.setFocus(editor);
+		this.ui.start();
+		this.ui.requestRender(true);
+		this.showError(`Failed to shut down: ${error instanceof Error ? error.message : String(error)}`);
+		this.showStatus("Shutdown is pending. Use /quit or Ctrl+D to retry; ordinary commands are disabled.");
+	}
 
 	private async shutdown(options?: { fromSignal?: boolean }): Promise<void> {
-		if (this.isShuttingDown) return;
+		if (this.isShuttingDown && !this.shutdownRecoveryEditor) return;
+		const recovering = this.shutdownRecoveryEditor !== undefined;
+		this.shutdownRecoveryEditor = undefined;
 		this.isShuttingDown = true;
 		// Keep signal handlers registered until terminal cleanup has completed.
 		// `signal-exit` checks the listener list during the same SIGTERM/SIGHUP
 		// dispatch and re-sends the signal if only its own listeners remain.
 
-		if (options?.fromSignal) {
+		if (options?.fromSignal || recovering) {
 			// Signal-triggered shutdown (SIGTERM/SIGHUP). Emit extension cleanup
 			// (session_shutdown) BEFORE touching the terminal. Extension teardown
 			// such as removing sockets does not write to the tty, so it must not be
@@ -4789,11 +4837,17 @@ export class InteractiveMode {
 				await this.runtimeHost.dispose({ fromSignal: true });
 			} catch (error: unknown) {
 				if (this.runtimeHost.shutdownPending) {
-					this.showError(`Failed to shut down: ${error instanceof Error ? error.message : String(error)}`);
+					this.showShutdownRecovery(error);
 					return;
 				}
 				this.isShuttingDown = false;
 				this.shutdownRequested = false;
+				if (recovering) {
+					this.editorContainer.clear();
+					this.editorContainer.addChild(this.editor as Component);
+					this.ui.setFocus(this.editor);
+					this.themeController.applyFromSettings();
+				}
 				this.showError(`Failed to shut down: ${error instanceof Error ? error.message : String(error)}`);
 				void this.flushCompactionQueue().finally(() => this.fireDueScheduledMessages());
 				this.tickHeartbeats();
@@ -4833,9 +4887,7 @@ export class InteractiveMode {
 		} catch (error: unknown) {
 			// Disposal rejected before invalidation; resume the same host registrations.
 			if (this.runtimeHost.shutdownPending) {
-				this.ui.start();
-				this.ui.requestRender(true);
-				this.showError(`Failed to shut down: ${error instanceof Error ? error.message : String(error)}`);
+				this.showShutdownRecovery(error);
 				return;
 			}
 			this.isShuttingDown = false;
