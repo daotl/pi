@@ -37,7 +37,7 @@ import { createHarness } from "../harness.ts";
 
 type ShutdownThis = {
 	isShuttingDown: boolean;
-	session: { abort: () => Promise<void>; flushPendingUsage: () => void };
+	session: { abort: () => Promise<void>; flushPendingPersistence: () => void };
 	unregisterSignalHandlers: () => void;
 	runtimeHost: { dispose: () => Promise<void> };
 	ui: {
@@ -92,7 +92,7 @@ function restoreStdoutIsTTY(): void {
 function createContext(order: string[], sessionManager = createSessionManager()): ShutdownThis {
 	return {
 		isShuttingDown: false,
-		session: { abort: async () => {}, flushPendingUsage: () => {} },
+		session: { abort: async () => {}, flushPendingPersistence: () => {} },
 		unregisterSignalHandlers: vi.fn(),
 		runtimeHost: {
 			dispose: vi.fn(async () => {
@@ -370,7 +370,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 				await bind(bindings);
 				if (starts > 1 && failReactivation) throw reactivationError;
 			});
-			const flush = vi.spyOn(harness.session, "flushPendingUsage");
+			const flush = vi.spyOn(harness.session, "flushPendingPersistence");
 			try {
 				await mode.init();
 				flush.mockImplementationOnce(() => {
@@ -486,13 +486,13 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 				isShuttingDown: boolean;
 				defaultEditor: { setText(text: string): void };
 			};
-			const flushPendingUsage = harness.session.flushPendingUsage.bind(harness.session);
-			const flush = vi.spyOn(harness.session, "flushPendingUsage").mockImplementation(() => {
+			const flushPendingPersistence = harness.session.flushPendingPersistence.bind(harness.session);
+			const flush = vi.spyOn(harness.session, "flushPendingPersistence").mockImplementation(() => {
 				if (failFlush) {
 					failFlush = false;
 					throw new Error("shutdown receipt unavailable");
 				}
-				flushPendingUsage();
+				flushPendingPersistence();
 			});
 			try {
 				await mode.init();

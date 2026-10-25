@@ -1742,6 +1742,13 @@ export class AgentSession {
 		this._flushPendingUsage(false);
 	}
 
+	/** Persist retained output and receipts before shutdown, without notifying outgoing subscribers. */
+	flushPendingPersistence(): void {
+		this._flushPendingBashMessages();
+		this._flushPendingCustomMessages(false);
+		this._flushPendingUsage(false);
+	}
+
 	/** Full agent state */
 	get state(): AgentState {
 		if (this._syncSummaryBlockMaxTokens()) this._refreshFinalizedContext();
@@ -4267,7 +4274,7 @@ export class AgentSession {
 		}
 	}
 
-	private _appendCustomMessage(appMessage: CustomMessage, pending = false): void {
+	private _appendCustomMessage(appMessage: CustomMessage, pending = false, notify = true): void {
 		this.sessionManager.appendCustomMessageEntry(
 			appMessage.customType,
 			appMessage.content,
@@ -4276,19 +4283,21 @@ export class AgentSession {
 		);
 		if (pending) this._pendingCustomMessages.shift();
 		this._refreshFinalizedContext();
-		this._emit({ type: "message_start", message: appMessage });
-		this._emit({ type: "message_end", message: appMessage });
+		if (notify) {
+			this._emit({ type: "message_start", message: appMessage });
+			this._emit({ type: "message_end", message: appMessage });
+		}
 	}
 
 	/**
 	 * Append custom messages queued while the agent was running.
 	 * Called once the current turn's tool results are in agent state and session history.
 	 */
-	private _flushPendingCustomMessages(): void {
+	private _flushPendingCustomMessages(notify = true): void {
 		if (this._pendingCustomMessages.length === 0) return;
 
 		while (this._pendingCustomMessages.length > 0) {
-			this._appendCustomMessage(this._pendingCustomMessages[0], true);
+			this._appendCustomMessage(this._pendingCustomMessages[0], true, notify);
 		}
 	}
 

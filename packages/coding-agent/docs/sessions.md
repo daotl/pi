@@ -111,7 +111,7 @@ Use `--no-session` for an ephemeral run. An ephemeral session cannot be resumed 
 
 Use `--session` when you already know the session path or ID. Use `--fork` to create a new session from an existing session before interactive mode starts.
 
-If persisting deferred bash output or context-only extension messages fails, the active prompt or continuation reports the storage error and releases its run ownership. Successfully appended records are not replayed; records not yet written remain pending for the next accepted prompt. This recovery state is in memory and does not survive a process crash before it is written.
+If persisting deferred bash output or context-only extension messages fails, the active prompt or continuation reports the storage error and releases its run ownership. Successfully appended records are not replayed; records not yet written remain pending for the next accepted prompt. Graceful shutdown and runtime replacement also drain these retained records before invalidating the outgoing session, without another provider request or redisplaying custom messages. A failed initial drain leaves the session available for retry. This recovery state is in memory and does not survive a process crash before it is written.
 
 If the first conversation write fails after exclusively creating its session file, Pi removes that failed attempt's file and leaves the entry unpublished, so the next append can retry. An exclusive-open collision never removes another writer's file. This is recoverable write/close error handling, not a guarantee against process crashes or independent concurrent writers.
 

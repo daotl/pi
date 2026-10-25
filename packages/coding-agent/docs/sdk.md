@@ -99,6 +99,8 @@ If both original terminal publication and its fallback content-free receipt appe
 
 `abort()` stops the active operation and waits for the session to become idle. `waitForIdle()` waits without aborting it.
 
+Hosts replacing or disposing a Session directly can call `flushPendingPersistence()` after aborting/settling it to publish retained deferred bash/custom output and usage receipts without outgoing subscriber notifications. Runtime replacement and interactive shutdown use this drain before invalidation. Records are consumed after successful storage, even if later projection refresh fails, so retry does not append them twice. `flushPendingUsage()` remains the narrower usage-only operation.
+
 `incomingMessagePrefix` is read from the supplied `SettingsManager` on each SDK context conversion. Historical and new string/array user text receive the current prefix without changing stored history, text metadata or images. The SDK uses the shared `prefixUserMessages` helper in its converter so direct summaries and token counts follow the same setting. Do not also set the Agent prefix to the same value; that would apply it twice. Cache warming replays the already converted original request, not a newly prefixed one.
 
 ## Subscribing to events

@@ -53,7 +53,7 @@ export class SessionImportFileNotFoundError extends Error {
 	}
 }
 
-/** Receipt persistence blocked replacement before shutdown; the outgoing runtime remains usable. */
+/** Retained output or receipt persistence blocked replacement before shutdown; the outgoing runtime remains usable. */
 export class SessionReplacementPendingUsageError extends Error {
 	constructor(cause: unknown) {
 		super(cause instanceof Error ? cause.message : String(cause), { cause });
@@ -75,7 +75,7 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
 /**
  * Owns the current AgentSession plus its cwd-bound services.
  *
- * Session replacement methods drain pending usage before tearing down the current
+ * Session replacement methods drain retained output and usage before tearing down the current
  * runtime. SessionReplacementPendingUsageError leaves it usable for a storage retry.
  * Errors after shutdown starts are propagated without that recoverable classification.
  * The caller is responsible for user-facing error handling.
@@ -184,7 +184,7 @@ export class AgentSessionRuntime {
 		// results) is persisted to the outgoing session before it is replaced.
 		await this.session.abort();
 		try {
-			this.session.flushPendingUsage();
+			this.session.flushPendingPersistence();
 		} catch (error) {
 			throw new SessionReplacementPendingUsageError(error);
 		}
@@ -193,7 +193,7 @@ export class AgentSessionRuntime {
 			reason,
 			targetSessionFile,
 		});
-		this.session.flushPendingUsage();
+		this.session.flushPendingPersistence();
 		this.beforeSessionInvalidate?.();
 		this.session.dispose();
 	}
@@ -427,7 +427,7 @@ export class AgentSessionRuntime {
 	}
 
 	/**
-	 * Settle and drain receipts before invalidation. Signal shutdown dispatches
+	 * Settle and drain retained output and receipts before invalidation. Signal shutdown dispatches
 	 * cleanup first, before abort can write progress to a disconnected terminal.
 	 */
 	async dispose(options?: { fromSignal?: boolean }): Promise<void> {
@@ -440,7 +440,7 @@ export class AgentSessionRuntime {
 		}
 		try {
 			await this.session.abort();
-			this.session.flushPendingUsage();
+			this.session.flushPendingPersistence();
 			if (!this.shutdownDispatched) {
 				await emitSessionShutdownEvent(this.session.extensionRunner, {
 					type: "session_shutdown",
@@ -448,7 +448,7 @@ export class AgentSessionRuntime {
 				});
 				this.shutdownDispatched = true;
 			}
-			this.session.flushPendingUsage();
+			this.session.flushPendingPersistence();
 		} catch (error) {
 			if (this.shutdownDispatched) {
 				try {

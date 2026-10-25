@@ -10,7 +10,7 @@ import { createAgentSession } from "../../src/core/sdk.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { getUsageCostBreakdown, getUsageTotals } from "../../src/core/usage-totals.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
-import { createHarness } from "./harness.ts";
+import { createHarness, getMessageText } from "./harness.ts";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -725,6 +725,211 @@ it.each([
 	}
 });
 
+it.each(
+	(["new", "dispose", "interactive", "signal"] as const).flatMap((operation) =>
+		(["bash", "custom"] as const).flatMap((record) => [false, true].map((outage) => ({ operation, record, outage }))),
+	),
+)(
+	"drains retained $record before $operation without another prompt (outage=$outage)",
+	async ({ operation, record, outage }) => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-outgoing-records-"));
+		const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+		const terminalInputs: string[] = [];
+		let shutdowns = 0;
+		const harness = await createHarness({
+			cwd,
+			sessionManager: manager,
+			settings: { retry: { enabled: false }, compaction: { enabled: false } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_start", (_event, context) => {
+						context.ui.onTerminalInput((data) => {
+							terminalInputs.push(data);
+							return undefined;
+						});
+					});
+					pi.on("session_shutdown", () => {
+						shutdowns++;
+					});
+				},
+			],
+		});
+		const actual = await vi.importActual<typeof fs>("fs");
+		const failure = new Error("retained output storage unavailable");
+		let unavailable = true;
+		let queued = false;
+		const expected = ["retained first", "retained second", "retained third"];
+		let customNotifications = 0;
+		const off = harness.session.subscribe((event) => {
+			if (event.type === "message_start" && event.message.role === "custom") customNotifications++;
+			if (event.type !== "agent_end" || queued) return;
+			queued = true;
+			for (const content of expected) {
+				if (record === "bash")
+					harness.session.recordBashResult(content, {
+						output: content,
+						exitCode: 0,
+						cancelled: false,
+						truncated: false,
+					});
+				else
+					void harness.session.sendCustomMessage(
+						{ customType: "outgoing-retained", content, display: true },
+						{ triggerTurn: false },
+					);
+			}
+		});
+		const records = () =>
+			SessionManager.open(manager.getSessionFile()!)
+				.getBranch()
+				.flatMap((entry) =>
+					record === "bash"
+						? entry.type === "message" && entry.message.role === "bashExecution"
+							? [entry.message.command]
+							: []
+						: entry.type === "custom_message" && entry.customType === "outgoing-retained"
+							? [getMessageText(entry)]
+							: [],
+				);
+		let runtime: AgentSessionRuntime | undefined;
+		let interactive: InteractiveMode | undefined;
+		const terminal = new VirtualTerminal(120, 40);
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+			throw new Error("test process exit");
+		});
+		try {
+			vi.mocked(fs.appendFileSync).mockImplementation((...args) => {
+				if (unavailable && typeof args[1] === "string" && args[1].includes("retained second")) throw failure;
+				return actual.appendFileSync(...args);
+			});
+			harness.setResponses([fauxAssistantMessage("completed answer")]);
+			await expect(harness.session.prompt("accepted request")).rejects.toBe(failure);
+			expect(harness.session.isIdle).toBe(true);
+			expect(records()).toEqual(["retained first"]);
+			const calls = harness.faux.state.callCount;
+			const notificationsBefore = customNotifications;
+			const services = {
+				cwd,
+				agentDir: harness.tempDir,
+				modelRuntime: harness.session.modelRuntime,
+				settingsManager: harness.settingsManager,
+				resourceLoader: harness.session.resourceLoader,
+				diagnostics: [],
+			};
+			let replacements = 0;
+			runtime = new AgentSessionRuntime(harness.session, services, async ({ sessionManager }) => {
+				expect(records()).toEqual(expected);
+				replacements++;
+				return {
+					...(await createAgentSession({
+						cwd,
+						agentDir: harness.tempDir,
+						model: harness.getModel(),
+						modelRuntime: services.modelRuntime,
+						settingsManager: services.settingsManager,
+						resourceLoader: services.resourceLoader,
+						sessionManager,
+						tools: [],
+					})),
+					services,
+					diagnostics: [],
+				};
+			});
+			runtime.setBeforeSessionInvalidate(() => {
+				expect(records()).toEqual(expected);
+			});
+			const disposed = vi.spyOn(harness.session, "dispose");
+			if (operation === "interactive" || operation === "signal") {
+				interactive = new InteractiveMode(runtime, { terminal });
+				await interactive.init();
+				terminal.sendInput("retryable draft");
+			}
+			const mode = interactive as unknown as {
+				shutdown(options?: { fromSignal?: boolean }): Promise<void>;
+				isInitialized: boolean;
+				isShuttingDown: boolean;
+				defaultEditor: { onSubmit(text: string): Promise<void> };
+				handleScheduleCommand(text: string): Promise<void>;
+				scheduledMessages: Array<{ id: number; text: string; when: unknown }>;
+				handleHeartbeatCommand(text: string): Promise<void>;
+				heartbeats: Array<{ id: number; text: string; nextFireAt: number | null }>;
+			};
+			if (interactive) {
+				await mode.handleScheduleCommand("1h\nretained scheduled work");
+				await mode.handleHeartbeatCommand("1h\nretained heartbeat");
+			}
+			const scheduled = interactive ? mode.scheduledMessages.map(({ id, text, when }) => ({ id, text, when })) : [];
+			const heartbeats = interactive
+				? mode.heartbeats.map(({ id, text, nextFireAt }) => ({ id, text, nextFireAt }))
+				: [];
+			const listeners = process.listeners("SIGTERM");
+			const leave = () =>
+				operation === "new"
+					? runtime!.newSession()
+					: operation === "interactive"
+						? mode.defaultEditor.onSubmit("/quit")
+						: interactive
+							? mode.shutdown({ fromSignal: true })
+							: runtime!.dispose();
+			if (outage) {
+				if (interactive) await leave();
+				else if (operation === "new")
+					await expect(leave()).rejects.toMatchObject({
+						constructor: SessionReplacementPendingUsageError,
+						cause: failure,
+					});
+				else await expect(leave()).rejects.toBe(failure);
+				expect(runtime.session).toBe(harness.session);
+				expect(replacements).toBe(0);
+				expect(disposed).not.toHaveBeenCalled();
+				expect(exit).not.toHaveBeenCalled();
+				expect(records()).toEqual(["retained first"]);
+				expect(shutdowns).toBe(operation === "signal" ? 1 : 0);
+				if (interactive) {
+					expect(mode.isInitialized).toBe(true);
+					expect(mode.isShuttingDown).toBe(false);
+					expect(process.listeners("SIGTERM")).toEqual(listeners);
+					expect(mode.scheduledMessages.map(({ id, text, when }) => ({ id, text, when }))).toEqual(scheduled);
+					expect(mode.heartbeats.map(({ id, text, nextFireAt }) => ({ id, text, nextFireAt }))).toEqual(
+						heartbeats,
+					);
+					// /quit consumes its command text before attempting shutdown.
+					if (operation === "interactive") terminal.sendInput("retryable draft");
+					terminal.sendInput(" remains usable");
+					await vi.waitFor(async () =>
+						expect((await terminal.flushAndGetViewport()).join("\n")).toContain("retryable draft remains usable"),
+					);
+					expect(terminalInputs).toContain(" remains usable");
+				}
+			}
+			unavailable = false;
+			if (operation === "signal") await expect(leave()).rejects.toThrow("test process exit");
+			else await leave();
+			if (operation === "interactive") await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+			expect(records()).toEqual(expected);
+			expect(harness.faux.state.callCount).toBe(calls);
+			expect(customNotifications).toBe(notificationsBefore);
+			expect(disposed).toHaveBeenCalledTimes(1);
+			expect(shutdowns).toBe(operation === "signal" && outage ? 2 : 1);
+			if (operation === "new") {
+				expect(replacements).toBe(1);
+				expect(runtime.session).not.toBe(harness.session);
+			}
+		} finally {
+			unavailable = false;
+			off();
+			vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);
+			runtime?.setBeforeSessionInvalidate(undefined);
+			interactive?.stop();
+			exit.mockRestore();
+			await runtime?.dispose();
+			await harness.session.abort();
+			harness.cleanup();
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	},
+);
+
 it.each(["shutdown-receipt", "invalidation", "creation"] as const)(
 	"keeps interactive replacement failures fatal after %s",
 	async (stage) => {
@@ -758,7 +963,7 @@ it.each(["shutdown-receipt", "invalidation", "creation"] as const)(
 		try {
 			await interactive.init();
 			if (stage === "shutdown-receipt") {
-				vi.spyOn(session, "flushPendingUsage")
+				vi.spyOn(session, "flushPendingPersistence")
 					.mockImplementationOnce(() => {})
 					.mockImplementationOnce(() => {
 						throw failure;

@@ -322,3 +322,29 @@ Canonical receipt, independent validator, exact coverage audit, RED/GREEN and te
 ### Verdict
 
 Round-10 repairs verified locally; continue full merge review after local commit. No push, PR, dependency, upstream replay or released changelog change.
+
+## Full merge review loop: round 11
+
+Round-10 repair commit: `20091ac4164bff10b99b5ef721e72bffbcb11810`; normal hook No fixes applied and tested product/guide blobs match. Eleventh fresh fixed-base -> HEAD review covers all 420 paths, 72 runtime source paths and 59,558 diff lines; digest `0fe90f7b9a5dd4a6f4cc2dadc08ccab48d6f1ee4fe0535417aeba3c1585eafa4`. Eleven canonical personas completed; one distinct reliability finding independently validated true. Canonical receipt passed before mutation (`artifact://7560`). Exact adversarial partition: 103 investigated / 317 insufficient detailed paths; all 420 accounted, not whole-merge deep clearance.
+
+### Confirmed finding and repair
+
+- R11-#1 (P2): failed deferred bash/custom persistence released run ownership while retaining records, but graceful disposal/replacement drained only usage. Direct /quit or /new could therefore discard accepted output even after storage recovered. New `flushPendingPersistence()` composes existing retained bash/custom and usage drains; runtime teardown/disposal and interactive pre-stop use it before invalidation. Existing `flushPendingUsage()` remains usage-only. Records consume after durable append, before projection refresh/notifications; outgoing custom redisplay is suppressed. Signal cleanup/reactivation order and initial recoverable replacement-error classification remain unchanged.
+
+### Verification
+
+Actual RED: **8** deferred-output disposal cases (`artifact://7573`) and **16** new/dispose/interactive quit/signal × bash/custom × recovered/sustained-outage cases (`artifact://7575`). Final post-format owners: **183 passed / 7 files, 21.72s**. Final full `npm run check`: **1770 / No fixes applied, 11.26s**; initial check formatted two owned files. Original isolated root `./test.sh`: **8931 passed / 0 failed / 915 skipped, 94.44s**, `artifact://7589`. Actual-source real filesystem EISDIR smoke rejects disposal while retaining the same session, then after storage restoration disposes without a new prompt and reopens bash/custom exactly once. Actual /quit submit and VirtualTerminal input recovery run through consumer boundaries; no additional provider request or custom redisplay. SDK/session/compaction guides updated.
+
+Intermediate fixture failures are recorded in the consumer receipt: old usage-only shutdown mocks required migration to the new outgoing drain; actual /quit consumes its editor command, so the harness observes exit and retypes a recovery draft. A worker's mistaken `pnpm exec` command timed out after dependency resolution/downloads. Its solely-owned new root pnpm-lock.yaml was removed; no tracked dependency metadata changed. Dependency environment is not claimed untouched. Subsequent full check, install-lock/shrinkwrap gates, SDK/CLI consumer packaging smoke and isolated root aggregate all passed. Protected recovery-file hashes are checked separately before commit.
+
+### Actionable Findings
+
+Confirmed finding repaired and verified; commit and another fresh entire fixed-base -> latest committed HEAD review remain required. No convergence claim.
+
+### Coverage
+
+Canonical receipt, independent validator, exact coverage audit, RED/GREEN, tool incident and tested source identity: `/tmp/compound-engineering-501/ce-code-review/20261025-full-wave11-858f4737/`. Prior protected-worktree/manual-loop, unavailable graph, unattested external model family, source/caller/runtime and process-crash limitations remain. LSP reference filenames were usable but some source line positions stale; exact source was read and tool issue reported.
+
+### Verdict
+
+Round-11 repair verified locally; continue full merge review after local commit. No push, PR, dependency metadata, upstream replay or released changelog change.

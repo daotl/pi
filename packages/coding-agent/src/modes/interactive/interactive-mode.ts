@@ -4805,11 +4805,11 @@ export class InteractiveMode {
 			process.exit(0);
 		}
 
-		// Persist retained receipts before stop() disposes the UI and its subscriptions.
+		// Persist retained output and receipts before stop() disposes the UI and its subscriptions.
 		// Aborting first also collects any charge from the run being shut down.
 		try {
 			await this.session.abort();
-			this.session.flushPendingUsage();
+			this.session.flushPendingPersistence();
 		} catch (error: unknown) {
 			this.isShuttingDown = false;
 			this.shutdownRequested = false;

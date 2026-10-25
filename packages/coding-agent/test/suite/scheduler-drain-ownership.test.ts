@@ -138,7 +138,7 @@ it("holds due work through shutdown abort settlement and resumes once after reje
 		},
 	]);
 	const shutdownMode = ui.mode as unknown as { shutdown(): Promise<void>; isShuttingDown: boolean };
-	const flush = vi.spyOn(ui.harness.session, "flushPendingUsage").mockImplementationOnce(() => {
+	const flush = vi.spyOn(ui.harness.session, "flushPendingPersistence").mockImplementationOnce(() => {
 		throw shutdownError;
 	});
 	let running: Promise<void> | undefined;
