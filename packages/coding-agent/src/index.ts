@@ -270,6 +270,7 @@ export {
 	createReadTool,
 	createWriteTool,
 	type PromptTemplate,
+	SessionReplacementPendingUsageError,
 } from "./core/sdk.ts";
 export {
 	type BranchSummaryEntry,

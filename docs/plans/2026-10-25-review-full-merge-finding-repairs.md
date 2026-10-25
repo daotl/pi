@@ -272,3 +272,28 @@ Canonical receipt, independent five-item validator, exact coverage audit, RED/GR
 ### Verdict
 
 Round-8 repairs verified locally; continue full merge review after local commit. No push, PR, dependency, upstream replay or released changelog change.
+
+## Full merge review loop: round 9
+
+Round-8 repair commit: `e651453fbb0479bfb6302e05169e21d86740c14c`; normal hook No fixes applied, tested product/guide bytes match. Ninth fresh fixed-base -> HEAD review covers all 419 paths, snapshot digest `c91bdcfd568bc5a2e9746e6fe6b7cf6ea03e2d2173f1338b35326d0e1c14549c`. Eleven canonical personas completed; two distinct candidates independently validated, both true. Canonical receipt passed before mutation. Exact adversarial ledger: 97 investigated / 322 insufficient detailed paths. Source changed-hunk review and full inventory remain bounded evidence, not exhaustive whole-tree or caller clearance.
+
+### Confirmed findings and repairs
+
+- R9-#1 (P2): interactive replacement handlers treated initial pre-shutdown receipt-drain rejection as fatal and exited with the only unpublished receipt in memory. Actual `/new` and resume REDs reached process.exit(1). Only this initial drain now throws exported `SessionReplacementPendingUsageError` with exact original cause. Interactive new/resume/import and extension new/fork report the typed recoverable failure without exiting or replacing outgoing Session; missing-cwd retry routes share the classification. Late drain/invalidation/construction controls remain fatal. Real VirtualTerminal smoke displays the storage error, accepts a typed draft, recovers persistence, retries and reopens one summary receipt costing 0.11. SDK/core/root exports and the existing guide document the typed boundary; SDK's existing runtime wildcard supplies the root export.
+- R9-#2 (P2): a prompt reset accepted custom sections before awaiting before_agent_start, without owning a run. Actual held-preflight/competing-untrusted-continuation RED loses accepted discovery even though the delayed prompt is rejected. Remove that premature reset; the already existing final ownership-checked snapshot replacement remains the publication boundary. The actual continued request and persisted system state retain accepted discovery; subsequent fresh-start removal and hostile-history exclusion controls remain green.
+
+### Verification
+
+Actual REDs: replacement **2**, competing preflight **1**. Final post-format combined owners: **77 passed / 6 files, 7.71s**. Final full `npm run check`: **1770 / No fixes applied, 18.28s**; first check formatted five owned files. Original isolated root `./test.sh`: **8899 passed / 0 failed / 915 skipped, 125.92s**, `artifact://7337`. Standalone actual interactive smoke and deterministic provider/hook interleaving are separate from source-only reviewer verdicts.
+
+### Actionable Findings
+
+Both confirmed findings repaired and verified. Commit and a fresh complete fixed-base -> latest committed HEAD review remain required; no convergence claim yet.
+
+### Coverage
+
+Canonical receipt, independent validator, exact coverage audit, RED/GREEN and tested source identity: `/tmp/compound-engineering-501/ce-code-review/20261025-full-wave9-469c6ced/`. Existing manual protected-worktree exception, graph/external-family/source/caller and runtime limitations remain.
+
+### Verdict
+
+Round-9 repairs verified locally; continue full merge review after local commit. No push, PR, dependency, upstream replay or released changelog change.

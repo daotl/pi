@@ -271,3 +271,57 @@ it("reselects the preserved saved-policy suffix of a continued swipe", async () 
 		vi.useRealTimers();
 	}
 });
+
+it("keeps accepted discovery while a rejected competing prompt awaits preflight", async () => {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const streaming = Promise.withResolvers<void>();
+	const finish = Promise.withResolvers<void>();
+	const harness = await createHarness({
+		fauxApi: "openai-completions",
+		settings: { compaction: { enabled: false }, retry: { enabled: false } },
+		extensionFactories: [
+			(pi) => {
+				pi.on("before_agent_start", async (event) => {
+					if (event.prompt === "paused competing prompt") {
+						entered.resolve();
+						await release.promise;
+					} else event.systemPromptOptions.sections.mcp_servers = "accepted current namespace";
+				});
+			},
+		],
+	});
+	let continuation: Promise<void> | undefined;
+	let paused: Promise<unknown> | undefined;
+	try {
+		harness.settingsManager.setProjectTrusted(false);
+		harness.setResponses([fauxAssistantMessage("accepted prefix", { stopReason: "aborted" })]);
+		await harness.session.prompt("initial request");
+		paused = harness.session.prompt("paused competing prompt").catch((error: unknown) => error);
+		await entered.promise;
+		let discovery: string | null | undefined;
+		harness.setResponses([
+			async (context) => {
+				discovery = getCurrentSystemMessage(context.messages)?.sections?.mcp_servers;
+				streaming.resolve();
+				await finish.promise;
+				return fauxAssistantMessage("accepted prefix completed");
+			},
+		]);
+		continuation = harness.session.continue();
+		await streaming.promise;
+		release.resolve();
+		expect(await paused).toBeInstanceOf(Error);
+		expect(discovery).toBe("<mcp_servers>\naccepted current namespace\n</mcp_servers>");
+		finish.resolve();
+		await continuation;
+		expect(getCurrentSystemMessage(harness.session.messages)?.sections?.mcp_servers).toBe(discovery);
+	} finally {
+		release.resolve();
+		finish.resolve();
+		await paused;
+		await continuation;
+		await harness.session.abort();
+		harness.cleanup();
+	}
+});

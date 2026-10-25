@@ -53,6 +53,14 @@ export class SessionImportFileNotFoundError extends Error {
 	}
 }
 
+/** Receipt persistence blocked replacement before shutdown; the outgoing runtime remains usable. */
+export class SessionReplacementPendingUsageError extends Error {
+	constructor(cause: unknown) {
+		super(cause instanceof Error ? cause.message : String(cause), { cause });
+		this.name = "SessionReplacementPendingUsageError";
+	}
+}
+
 function extractUserMessageText(content: string | Array<{ type: string; text?: string }>): string {
 	if (typeof content === "string") {
 		return content;
@@ -67,9 +75,10 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
 /**
  * Owns the current AgentSession plus its cwd-bound services.
  *
- * Session replacement methods tear down the current runtime first, then create
- * and apply the next runtime. If creation fails, the error is propagated to the
- * caller. The caller is responsible for user-facing error handling.
+ * Session replacement methods drain pending usage before tearing down the current
+ * runtime. SessionReplacementPendingUsageError leaves it usable for a storage retry.
+ * Errors after shutdown starts are propagated without that recoverable classification.
+ * The caller is responsible for user-facing error handling.
  */
 export class AgentSessionRuntime {
 	private rebindSession?: (session: AgentSession) => Promise<void>;
@@ -174,7 +183,11 @@ export class AgentSessionRuntime {
 		// Settle any active response first so the aborted turn (including tool
 		// results) is persisted to the outgoing session before it is replaced.
 		await this.session.abort();
-		this.session.flushPendingUsage();
+		try {
+			this.session.flushPendingUsage();
+		} catch (error) {
+			throw new SessionReplacementPendingUsageError(error);
+		}
 		await emitSessionShutdownEvent(this.session.extensionRunner, {
 			type: "session_shutdown",
 			reason,

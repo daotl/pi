@@ -3966,7 +3966,6 @@ export class AgentSession {
 			return;
 		}
 
-		this._acceptedPromptSections = undefined;
 		// Emit before_agent_start before normalizing images so extension-driven model
 		// selection determines the resize profile used for the request and history.
 		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;

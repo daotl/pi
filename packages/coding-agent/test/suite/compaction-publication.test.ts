@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createAssistantMessageEventStream, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, expect, it, vi } from "vitest";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
-import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
+import { AgentSessionRuntime, SessionReplacementPendingUsageError } from "../../src/core/agent-session-runtime.ts";
 import { createAgentSession } from "../../src/core/sdk.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { getUsageCostBreakdown, getUsageTotals } from "../../src/core/usage-totals.ts";
@@ -428,6 +428,14 @@ it.each([
 	"interactive",
 	"signal",
 	"late-interactive",
+	"interactive-new",
+	"interactive-resume",
+	"interactive-resume-missing-cwd",
+	"interactive-fork",
+	"interactive-import",
+	"interactive-import-missing-cwd",
+	"extension-new",
+	"extension-fork",
 ] as const)("persists pending summary charge to outgoing session before runtime %s", async (operation) => {
 	const cwd = mkdtempSync(join(tmpdir(), "pi-summary-switch-"));
 	const manager = SessionManager.create(cwd, join(cwd, "sessions"));
@@ -472,6 +480,9 @@ it.each([
 	const exit = vi.spyOn(process, "exit").mockImplementation(() => {
 		throw new Error("test process exit");
 	});
+	const replacingInteractively =
+		operation.startsWith("interactive-") || operation === "extension-new" || operation === "extension-fork";
+	const storageError = new Error("outgoing storage unavailable");
 	try {
 		for (let index = 0; index < 3; index++) {
 			manager.appendMessage({ role: "user", content: `question ${index}`, timestamp: index * 2 });
@@ -494,7 +505,7 @@ it.each([
 		};
 		vi.stubGlobal("fetch", async () => new Response("unavailable", { status: 404 }));
 		vi.mocked(fs.appendFileSync).mockImplementation(() => {
-			throw new Error("outgoing storage unavailable");
+			throw storageError;
 		});
 		await expect(harness.session.compact({ keepRecentMessages: 1 })).rejects.toThrow("outgoing storage unavailable");
 		const services = {
@@ -523,7 +534,12 @@ it.each([
 				diagnostics: [],
 			};
 		});
-		if (operation === "interactive" || operation === "signal" || operation === "late-interactive") {
+		if (
+			operation === "interactive" ||
+			operation === "signal" ||
+			operation === "late-interactive" ||
+			replacingInteractively
+		) {
 			interactive = new InteractiveMode(runtime, { terminal });
 			await interactive.init();
 			terminal.sendInput("retryable draft");
@@ -536,11 +552,18 @@ it.each([
 			handleHeartbeatCommand(text: string): Promise<void>;
 			scheduledMessages: Array<{ id: number; text: string; when: unknown }>;
 			heartbeats: Array<{ id: number; text: string; nextFireAt: number | null }>;
+			defaultEditor: { onSubmit(text: string): Promise<void> };
+			handleResumeSession(path: string): Promise<{ cancelled: boolean }>;
+			forkToMessage(entryId: string, role: "user" | "assistant"): Promise<void>;
+			handleImportCommand(text: string): Promise<void>;
 		};
 		const signalListeners = process.listeners("SIGTERM");
-		if (operation === "late-interactive" || operation === "signal") {
+		if (operation === "late-interactive" || operation === "signal" || replacingInteractively) {
 			await shutdownMode.handleScheduleCommand("1h\nretained scheduled work");
-			await shutdownMode.handleHeartbeatCommand("1h\nretained heartbeat");
+			// /new clears the editor, legitimately resetting idle-based interval deadlines.
+			await shutdownMode.handleHeartbeatCommand(
+				`${operation === "interactive-new" ? "23:59:59" : "1h"}\nretained heartbeat`,
+			);
 		}
 		const schedulesBefore = interactive
 			? shutdownMode.scheduledMessages.map(({ id, text, when }) => ({ id, text, when }))
@@ -550,8 +573,26 @@ it.each([
 			: [];
 		if (operation === "late-interactive") vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);
 		const outgoing = manager.getSessionFile()!;
-		const other = SessionManager.create(cwd, join(cwd, "other-sessions"));
+		const missingCwd = join(cwd, "missing-cwd");
+		if (operation.endsWith("missing-cwd")) actual.mkdirSync(missingCwd);
+		const other = SessionManager.create(
+			operation.endsWith("missing-cwd") ? missingCwd : cwd,
+			join(cwd, "other-sessions"),
+		);
 		other.appendMessage({ role: "user", content: "other", timestamp: 1 });
+		if (operation.endsWith("missing-cwd")) {
+			actual.rmdirSync(missingCwd);
+			vi.spyOn(
+				interactive as unknown as { promptForMissingSessionCwd(): Promise<string> },
+				"promptForMissingSessionCwd",
+			).mockResolvedValue(cwd);
+		}
+		if (operation.startsWith("interactive-import")) {
+			vi.spyOn(
+				interactive as unknown as { showExtensionConfirm(): Promise<boolean> },
+				"showExtensionConfirm",
+			).mockResolvedValue(true);
+		}
 		const replace = async () => {
 			if (operation === "new") await runtime!.newSession();
 			else if (operation === "resume") await runtime!.switchSession(other.getSessionFile()!);
@@ -559,11 +600,27 @@ it.each([
 			else if (operation === "fork") await runtime!.fork(target.id);
 			else if (operation === "import") await runtime!.importFromJsonl(other.getSessionFile()!);
 			else if (operation === "same-import") await runtime!.importFromJsonl(outgoing);
+			else if (operation === "interactive-new") {
+				await shutdownMode.defaultEditor.onSubmit("/new");
+			} else if (operation.startsWith("interactive-resume"))
+				await shutdownMode.handleResumeSession(other.getSessionFile()!);
+			else if (operation === "interactive-fork") await shutdownMode.forkToMessage(target.id, "user");
+			else if (operation.startsWith("interactive-import"))
+				await shutdownMode.handleImportCommand(`/import ${other.getSessionFile()!}`);
+			else if (operation === "extension-new")
+				await harness.session.extensionRunner.createCommandContext().newSession();
+			else if (operation === "extension-fork")
+				await harness.session.extensionRunner.createCommandContext().fork(target.id);
 			else if (interactive) await shutdownMode.shutdown({ fromSignal: operation === "signal" });
 			else await runtime!.dispose();
 		};
 		if (interactive) await replace();
-		else await expect(replace()).rejects.toThrow("outgoing storage unavailable");
+		else if (operation === "dispose") await expect(replace()).rejects.toBe(storageError);
+		else
+			await expect(replace()).rejects.toMatchObject({
+				constructor: SessionReplacementPendingUsageError,
+				cause: storageError,
+			});
 		expect(runtime.session).toBe(harness.session);
 		expect(replacements).toBe(0);
 		if (operation === "signal") {
@@ -582,7 +639,7 @@ it.each([
 			expect(shutdownMode.isShuttingDown).toBe(false);
 			if (operation !== "late-interactive") expect(process.listeners("SIGTERM")).toEqual(signalListeners);
 			else expect(process.listeners("SIGTERM")).toHaveLength(signalListeners.length);
-			if (operation === "late-interactive" || operation === "signal") {
+			if (operation === "late-interactive" || operation === "signal" || replacingInteractively) {
 				expect(shutdownMode.scheduledMessages.map(({ id, text, when }) => ({ id, text, when }))).toEqual(
 					schedulesBefore,
 				);
@@ -592,20 +649,35 @@ it.each([
 			}
 			await vi.waitFor(async () =>
 				expect((await terminal.flushAndGetViewport()).join("\n")).toContain(
-					"Failed to shut down: outgoing storage unavailable",
+					replacingInteractively
+						? "outgoing storage unavailable"
+						: "Failed to shut down: outgoing storage unavailable",
 				),
 			);
 			const inputCount = terminalInputs.length;
+			if (operation === "interactive-new") terminal.sendInput("retryable draft");
 			terminal.sendInput(" remains usable");
 			await vi.waitFor(async () =>
 				expect((await terminal.flushAndGetViewport()).join("\n")).toContain("retryable draft remains usable"),
 			);
-			if (operation === "late-interactive") expect(terminalInputs.slice(inputCount)).toContain(" remains usable");
+			if (operation === "late-interactive" || replacingInteractively)
+				expect(terminalInputs.slice(inputCount)).toContain(" remains usable");
+			if (replacingInteractively) {
+				expect(exit).not.toHaveBeenCalled();
+				expect(dispose).not.toHaveBeenCalled();
+				expect(shutdownTotals).toEqual([]);
+				expect(harness.session.extensionRunner.createContext().cwd).toBe(cwd);
+			}
 		}
 		vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);
-		if (interactive) await expect(replace()).rejects.toThrow("test process exit");
+		if (interactive && !replacingInteractively) await expect(replace()).rejects.toThrow("test process exit");
 		else await replace();
 		if (operation === "signal") expect(dispose).toHaveBeenCalledTimes(1);
+		if (replacingInteractively) {
+			expect(exit).not.toHaveBeenCalled();
+			expect(replacements).toBe(1);
+			expect(runtime.session).not.toBe(harness.session);
+		}
 		expect(getUsageTotals(SessionManager.open(outgoing).getEntries())).toEqual({
 			input: operation === "late-interactive" ? 200 : 100,
 			output: operation === "late-interactive" ? 20 : 10,
@@ -613,6 +685,14 @@ it.each([
 			cacheWrite: 0,
 			cost: operation === "late-interactive" ? 0.22 : 0.11,
 		});
+		expect(
+			SessionManager.open(outgoing)
+				.getEntries()
+				.filter((entry) => entry.type === "usage"),
+		).toEqual([
+			expect.objectContaining({ kind: "compaction", usage }),
+			...(operation === "late-interactive" ? [expect.objectContaining({ kind: "compaction", usage })] : []),
+		]);
 		if (operation === "same-resume" || operation === "same-import")
 			expect(getUsageTotals(runtime.session.sessionManager.getEntries())).toEqual({
 				input: 100,
@@ -644,3 +724,60 @@ it.each([
 		rmSync(cwd, { recursive: true, force: true });
 	}
 });
+
+it.each(["shutdown-receipt", "invalidation", "creation"] as const)(
+	"keeps interactive replacement failures fatal after %s",
+	async (stage) => {
+		const harness = await createHarness();
+		const session = harness.session;
+		const failure = new Error(`injected ${stage} failure`);
+		const runtime = new AgentSessionRuntime(
+			session,
+			{
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				modelRuntime: session.modelRuntime,
+				settingsManager: harness.settingsManager,
+				resourceLoader: session.resourceLoader,
+				diagnostics: [],
+			},
+			async () => {
+				throw failure;
+			},
+		);
+		const terminal = new VirtualTerminal(120, 40);
+		const interactive = new InteractiveMode(runtime, { terminal });
+		const mode = interactive as unknown as {
+			handleClearCommand(): Promise<void>;
+			handleFatalRuntimeError(prefix: string, error: unknown): Promise<never>;
+		};
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+			throw new Error("test process exit");
+		});
+		const fatal = vi.spyOn(mode, "handleFatalRuntimeError");
+		try {
+			await interactive.init();
+			if (stage === "shutdown-receipt") {
+				vi.spyOn(session, "flushPendingUsage")
+					.mockImplementationOnce(() => {})
+					.mockImplementationOnce(() => {
+						throw failure;
+					});
+			} else if (stage === "invalidation") {
+				runtime.setBeforeSessionInvalidate(() => {
+					throw failure;
+				});
+			}
+			await expect(mode.handleClearCommand()).rejects.toThrow("test process exit");
+			expect(exit).toHaveBeenCalledWith(1);
+			expect(fatal).toHaveBeenCalledWith("Failed to create session", failure);
+		} finally {
+			runtime.setBeforeSessionInvalidate(undefined);
+			interactive.stop();
+			exit.mockRestore();
+			fatal.mockRestore();
+			await runtime.dispose();
+			harness.cleanup();
+		}
+	},
+);

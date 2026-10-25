@@ -16,6 +16,7 @@ export {
 	type CreateAgentSessionRuntimeFactory,
 	type CreateAgentSessionRuntimeResult,
 	createAgentSessionRuntime,
+	SessionReplacementPendingUsageError,
 } from "./agent-session-runtime.ts";
 export {
 	type AgentSessionRuntimeDiagnostic,

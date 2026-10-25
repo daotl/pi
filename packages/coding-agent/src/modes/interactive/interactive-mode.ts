@@ -79,7 +79,11 @@ import {
 	parseSkillBlock,
 	type SwipeGroup,
 } from "../../core/agent-session.ts";
-import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
+import {
+	type AgentSessionRuntime,
+	SessionImportFileNotFoundError,
+	SessionReplacementPendingUsageError,
+} from "../../core/agent-session-runtime.ts";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.ts";
 import {
 	CACHE_TTL_MS,
@@ -2345,7 +2349,7 @@ export class InteractiveMode {
 					try {
 						return await this.runtimeHost.newSession(options);
 					} catch (error: unknown) {
-						return this.handleFatalRuntimeError("Failed to create session", error);
+						return this.handleRuntimeReplacementError("Failed to create session", error);
 					}
 				},
 				fork: async (entryId, options) => {
@@ -2357,7 +2361,7 @@ export class InteractiveMode {
 						}
 						return { cancelled: result.cancelled };
 					} catch (error: unknown) {
-						return this.handleFatalRuntimeError("Failed to fork session", error);
+						return this.handleRuntimeReplacementError("Failed to fork session", error);
 					}
 				},
 				navigateTree: async (targetId, options) => {
@@ -2473,6 +2477,14 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
+	}
+
+	private async handleRuntimeReplacementError(prefix: string, error: unknown): Promise<{ cancelled: boolean }> {
+		if (error instanceof SessionReplacementPendingUsageError) {
+			this.showError(`${prefix}: ${error.message}`);
+			return { cancelled: true };
+		}
+		return this.handleFatalRuntimeError(prefix, error);
 	}
 
 	private async handleFatalRuntimeError(prefix: string, error: unknown): Promise<never> {
@@ -7926,18 +7938,20 @@ export class InteractiveMode {
 					this.showStatus("Resume cancelled");
 					return { cancelled: true };
 				}
-				const result = await this.runtimeHost.switchSession(sessionPath, {
-					cwdOverride: selectedCwd,
-					withSession: options?.withSession,
-					projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
-				});
+				const result = await this.runtimeHost
+					.switchSession(sessionPath, {
+						cwdOverride: selectedCwd,
+						withSession: options?.withSession,
+						projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
+					})
+					.catch((error: unknown) => this.handleRuntimeReplacementError("Failed to resume session", error));
 				if (result.cancelled) {
 					return result;
 				}
 				this.showStatus("Resumed session in current cwd");
 				return result;
 			}
-			return this.handleFatalRuntimeError("Failed to resume session", error);
+			return this.handleRuntimeReplacementError("Failed to resume session", error);
 		}
 	}
 
@@ -8720,7 +8734,9 @@ export class InteractiveMode {
 					this.showStatus("Import cancelled");
 					return;
 				}
-				const result = await this.runtimeHost.importFromJsonl(inputPath, selectedCwd);
+				const result = await this.runtimeHost
+					.importFromJsonl(inputPath, selectedCwd)
+					.catch((error: unknown) => this.handleRuntimeReplacementError("Failed to import session", error));
 				if (result.cancelled) {
 					this.showStatus("Import cancelled");
 					return;
@@ -8732,7 +8748,7 @@ export class InteractiveMode {
 				this.showError(`Failed to import session: ${error.message}`);
 				return;
 			}
-			await this.handleFatalRuntimeError("Failed to import session", error);
+			await this.handleRuntimeReplacementError("Failed to import session", error);
 		}
 	}
 
@@ -9148,7 +9164,7 @@ export class InteractiveMode {
 			this.chatContainer.addChild(new ThemedText(() => theme.fg("accent", "✓ New session started"), 1, 1));
 			this.ui.requestRender();
 		} catch (error: unknown) {
-			await this.handleFatalRuntimeError("Failed to create session", error);
+			await this.handleRuntimeReplacementError("Failed to create session", error);
 		}
 	}
 
