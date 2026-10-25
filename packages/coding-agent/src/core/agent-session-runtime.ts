@@ -79,6 +79,7 @@ export class AgentSessionRuntime {
 	private readonly createRuntime: CreateAgentSessionRuntimeFactory;
 	private _diagnostics: AgentSessionRuntimeDiagnostic[];
 	private _modelFallbackMessage?: string;
+	private signalShutdownDispatched = false;
 
 	constructor(
 		_session: AgentSession,
@@ -184,6 +185,7 @@ export class AgentSessionRuntime {
 		this._services = result.services;
 		this._diagnostics = result.diagnostics;
 		this._modelFallbackMessage = result.modelFallbackMessage;
+		this.signalShutdownDispatched = false;
 	}
 
 	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
@@ -406,13 +408,27 @@ export class AgentSessionRuntime {
 		return { cancelled: false };
 	}
 
-	async dispose(): Promise<void> {
+	/**
+	 * Settle and drain receipts before invalidation. Signal shutdown dispatches
+	 * cleanup first, before abort can write progress to a disconnected terminal.
+	 */
+	async dispose(options?: { fromSignal?: boolean }): Promise<void> {
+		if (options?.fromSignal && !this.signalShutdownDispatched) {
+			await emitSessionShutdownEvent(this.session.extensionRunner, {
+				type: "session_shutdown",
+				reason: "quit",
+			});
+			// A retained-receipt failure can leave this session usable for a retry.
+			this.signalShutdownDispatched = true;
+		}
 		await this.session.abort();
 		this.session.flushPendingUsage();
-		await emitSessionShutdownEvent(this.session.extensionRunner, {
-			type: "session_shutdown",
-			reason: "quit",
-		});
+		if (!this.signalShutdownDispatched) {
+			await emitSessionShutdownEvent(this.session.extensionRunner, {
+				type: "session_shutdown",
+				reason: "quit",
+			});
+		}
 		this.session.flushPendingUsage();
 		this.beforeSessionInvalidate?.();
 		this.session.dispose();

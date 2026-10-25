@@ -167,3 +167,28 @@ Canonical review, validator, exact coverage audit and tested content identity: `
 ### Verdict
 
 Round-4 repairs verified locally; continue full merge review after local commit. No push, PR, upstream replay, dependency or released changelog change.
+
+## Full merge review loop: round 5
+
+Round-4 repair commit: `50a522d52e016cd47fea5bc355da84f72b9e9f8f`; normal hook No fixes applied, tested source blobs match. Fifth fresh fixed-base -> HEAD review covers all 417 paths, snapshot digest `0270b17e4685edc7d380711bbcdded74afabc2ac858fed7c7fbb809bf065ec20`. Eleven canonical personas completed. Two candidates independently validated and retained; canonical receipt passed before mutation. Adversarial exact attributed coverage is 129 investigated changed-hunk/text paths / 288 insufficient detailed evidence, partitioning all 417 without overlap or omission. Other detailed runtime-hunk claims remain attributed, not exhaustive source/caller clearance.
+
+### Confirmed findings and repairs
+
+- R5-#1 (P2): signal disposal awaited active abort before dispatching cleanup; abort's actual agent_end progress write could hit EIO/EPIPE and emergency-exit first. Both terminal-error regressions observed cleanup count zero before repair. Signal-only `dispose({fromSignal:true})` now dispatches cleanup first, then aborts, drains receipts and invalidates. Successful signal cleanup is remembered across retained-receipt failure/retry so cleanup is not duplicated; session replacement resets it. Ordinary disposal remains abort-first. Actual InteractiveMode/VirtualTerminal/faux blocking-tool subprocesses with real SIGTERM listeners and unmocked exit observe cleanup -> abort -> progress error -> exit129 for both injected tty errors. Receipt retry retains UI/signals/draft/schedules/heartbeats and publishes its charge once. This is injected tty failure, not physical disconnection proof.
+- R5-#2 (P2): the Footer cache-hit path rescanned complete structural history, violating the explicit compaction guide's unchanged-frame contract. Earlier rounds treated complexity alone as an unmeasured residual; this round's validator identified the concrete documented contract. Actual-source smoke with 1000 history entries observed 101 projection scans for 101 unchanged usage reads before repair, then one scan after repair. Session caches structural estimates/checkpoint applicability by Manager context revision while checking live model/converter/transform/prefix/image/transport/count validity on every read. Revisions cover successful durable commits/appends, same-leaf soft-delete/restoration, replacement, selection, load and summary-budget changes. Rewrite failure alone does not advance revision. Footer does not duplicate policy internals. Permanent tests prove same-leaf deletion/restoration values and the existing during/after policy/count invariants; implementation-call-count assertions remain throwaway runtime proof, not permanent wiring tests. Owned smoke/resolver scripts were removed.
+
+### Verification
+
+Post-format focused owners: **126 passed / 7 files, 17.91s** (the requested extra #5724 filename did not select an additional file; no eight-file claim). Structural cache/revision/value owners separately **76 passed / 4 files, 4.84s**. Final full `npm run check`: **1770 / No fixes applied, 23.89s**; first integration formatted three files. Isolated root `./test.sh`: **8871 passed / 0 failed / 915 skipped, 186.15s**, `artifact://6738`. Tests modified in this repair were executed. Runtime structural scan proof and signal actual subprocess proof are distinct from static reviewer verification.
+
+### Actionable Findings
+
+Both confirmed defects repaired and verified. A new full fixed-base -> committed latest-HEAD review is still required after this repair commit; convergence is not claimed.
+
+### Coverage
+
+Canonical receipt, validator, exact coverage audit and runtime evidence: `/tmp/compound-engineering-501/ce-code-review/20261025-full-wave5-b4e0600e/`. Original protected 749 files remain excluded and checked against recovery snapshot. Same manual-loop, graph, external-family and runtime limits apply. No measured latency improvement is claimed beyond the observed structural scan reduction.
+
+### Verdict
+
+Round-5 repairs verified locally; continue full merge review after local commit. No push, PR, dependency, upstream replay or released changelog change.

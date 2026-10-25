@@ -467,6 +467,7 @@ it.each([
 	const actual = await vi.importActual<typeof fs>("fs");
 	let runtime: AgentSessionRuntime | undefined;
 	let interactive: InteractiveMode | undefined;
+	const dispose = vi.spyOn(harness.session, "dispose");
 	const terminal = new VirtualTerminal(120, 40);
 	const exit = vi.spyOn(process, "exit").mockImplementation(() => {
 		throw new Error("test process exit");
@@ -537,7 +538,7 @@ it.each([
 			heartbeats: Array<{ id: number; text: string; nextFireAt: number | null }>;
 		};
 		const signalListeners = process.listeners("SIGTERM");
-		if (operation === "late-interactive") {
+		if (operation === "late-interactive" || operation === "signal") {
 			await shutdownMode.handleScheduleCommand("1h\nretained scheduled work");
 			await shutdownMode.handleHeartbeatCommand("1h\nretained heartbeat");
 		}
@@ -565,12 +566,23 @@ it.each([
 		else await expect(replace()).rejects.toThrow("outgoing storage unavailable");
 		expect(runtime.session).toBe(harness.session);
 		expect(replacements).toBe(0);
+		if (operation === "signal") {
+			expect(shutdownTotals).toEqual([{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }]);
+			expect(dispose).not.toHaveBeenCalled();
+			expect(getUsageTotals(SessionManager.open(outgoing).getEntries())).toEqual({
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: 0,
+			});
+		}
 		if (interactive) {
 			expect(shutdownMode.isInitialized).toBe(true);
 			expect(shutdownMode.isShuttingDown).toBe(false);
 			if (operation !== "late-interactive") expect(process.listeners("SIGTERM")).toEqual(signalListeners);
 			else expect(process.listeners("SIGTERM")).toHaveLength(signalListeners.length);
-			if (operation === "late-interactive") {
+			if (operation === "late-interactive" || operation === "signal") {
 				expect(shutdownMode.scheduledMessages.map(({ id, text, when }) => ({ id, text, when }))).toEqual(
 					schedulesBefore,
 				);
@@ -593,6 +605,7 @@ it.each([
 		vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);
 		if (interactive) await expect(replace()).rejects.toThrow("test process exit");
 		else await replace();
+		if (operation === "signal") expect(dispose).toHaveBeenCalledTimes(1);
 		expect(getUsageTotals(SessionManager.open(outgoing).getEntries())).toEqual({
 			input: operation === "late-interactive" ? 200 : 100,
 			output: operation === "late-interactive" ? 20 : 10,
@@ -614,7 +627,9 @@ it.each([
 						{ input: 100, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0.11 },
 						{ input: 200, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.22 },
 					]
-				: [{ input: 100, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0.11 }],
+				: operation === "signal"
+					? [{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }]
+					: [{ input: 100, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0.11 }],
 		);
 	} finally {
 		vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);

@@ -4770,11 +4770,11 @@ export class InteractiveMode {
 			// (session_shutdown) BEFORE touching the terminal. Extension teardown
 			// such as removing sockets does not write to the tty, so it must not be
 			// skipped if a later terminal-restore write fails on a dead or stalled
-			// terminal. If the terminal is gone, the restore writes below emit EIO,
-			// which the stdout/stderr error handler turns into emergencyTerminalExit;
-			// the render loop is already idle, so this cannot hot-spin (see #4144).
+			// terminal. Active-run abort can itself write progress, so the runtime
+			// dispatches cleanup before aborting too. Later dead-tty writes trigger
+			// emergencyTerminalExit via the stdout/stderr error handler (see #4144).
 			try {
-				await this.runtimeHost.dispose();
+				await this.runtimeHost.dispose({ fromSignal: true });
 			} catch (error: unknown) {
 				this.isShuttingDown = false;
 				this.shutdownRequested = false;

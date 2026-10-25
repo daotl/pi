@@ -293,3 +293,21 @@ it.each(
 		}
 	},
 );
+
+it("invalidates structural context estimates after same-leaf soft deletion and restoration", async () => {
+	const current = await fixture();
+	const id = current.manager.appendMessage({
+		role: "user",
+		content: "large current context ".repeat(1000),
+		timestamp: 99,
+	});
+	current.session.refreshContext();
+	const before = current.session.getContextUsage()?.tokens;
+	const leaf = current.manager.getLeafId();
+	current.manager.softDeleteUnits([{ entryId: id }]);
+	expect(current.manager.getLeafId()).toBe(leaf);
+	const removed = current.session.getContextUsage()?.tokens;
+	expect(removed).toBeLessThan(before!);
+	current.manager.restoreDeletedEntryIds([id]);
+	expect(current.session.getContextUsage()?.tokens).toBe(before);
+});

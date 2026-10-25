@@ -1167,6 +1167,7 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	private contextRevision = 0;
 	/** Max tokens for the compaction summaries block in the prefix (see
 	 * BuildContextOptions.summaryBlockMaxTokens). Settable by the session owner. */
 	private summaryBlockMaxTokens: number | undefined = DEFAULT_SUMMARY_BLOCK_MAX_TOKENS;
@@ -1174,6 +1175,7 @@ export class SessionManager {
 	/** Set the maximum total tokens allowed for the compaction summaries block in
 	 * the context prefix. Pass undefined to keep all summaries. */
 	setSummaryBlockMaxTokens(tokens: number | undefined): void {
+		if (tokens !== this.summaryBlockMaxTokens) this.contextRevision++;
 		this.summaryBlockMaxTokens = tokens;
 	}
 
@@ -1253,6 +1255,7 @@ export class SessionManager {
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
+		this.contextRevision++;
 		this.flushed = false;
 
 		if (this.persist) {
@@ -1281,6 +1284,7 @@ export class SessionManager {
 	}
 
 	private _buildIndex(): void {
+		this.contextRevision++;
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -1378,6 +1382,7 @@ export class SessionManager {
 		this.labelsById = labelsById;
 		this.labelTimestampsById = labelTimestampsById;
 		this.leafId = leafId;
+		this.contextRevision++;
 		if (this.persist && this.sessionFile) this.flushed = true;
 	}
 
@@ -1497,6 +1502,7 @@ export class SessionManager {
 		this._persist(entry, !this.flushed && this.persist ? [...this.fileEntries, entry] : this.fileEntries);
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
+		this.contextRevision++;
 		this.leafId = entry.id;
 	}
 
@@ -2119,6 +2125,11 @@ export class SessionManager {
 		return this.byId.size;
 	}
 
+	/** Changes on structural history, selection and summary-budget mutations. */
+	getContextRevision(): number {
+		return this.contextRevision;
+	}
+
 	/**
 	 * Get all session entries (excludes header). Returns a shallow copy.
 	 * The session is append-only: use appendXXX() to add entries, branch() to
@@ -2279,6 +2290,7 @@ export class SessionManager {
 		if (marked > 0) {
 			try {
 				this._rewriteFile();
+				this.contextRevision++;
 			} catch (error) {
 				for (const [entry, saved] of previous) {
 					if (saved.deletedAt === undefined) delete entry.deletedAt;
@@ -2359,6 +2371,7 @@ export class SessionManager {
 		if (restored.length > 0) {
 			try {
 				this._rewriteFile();
+				this.contextRevision++;
 			} catch (error) {
 				for (const [entry, saved] of previous) {
 					if (saved.deletedAt !== undefined) entry.deletedAt = saved.deletedAt;
@@ -2391,6 +2404,7 @@ export class SessionManager {
 		if (restored > 0) {
 			try {
 				this._rewriteFile();
+				this.contextRevision++;
 			} catch (error) {
 				for (const [entry, deletedAt] of previous) entry.deletedAt = deletedAt;
 				throw error;
@@ -2596,6 +2610,7 @@ export class SessionManager {
 
 		try {
 			this._rewriteFile();
+			this.contextRevision++;
 		} catch (error) {
 			if (previousEntries && previousValues) {
 				for (const { entry, value } of previousValues) {
@@ -2824,6 +2839,7 @@ export class SessionManager {
 		if (!this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
+		if (this.leafId !== branchFromId) this.contextRevision++;
 		this.leafId = branchFromId;
 	}
 
@@ -2833,6 +2849,7 @@ export class SessionManager {
 	 * Use this when navigating to re-edit the first user message.
 	 */
 	resetLeaf(): void {
+		if (this.leafId !== null) this.contextRevision++;
 		this.leafId = null;
 	}
 

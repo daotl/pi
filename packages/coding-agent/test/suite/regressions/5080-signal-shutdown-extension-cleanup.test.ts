@@ -1,8 +1,16 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isPadLinesToWidth, isWrapLinesToWidth, setPadLinesToWidth, setWrapLinesToWidth } from "@earendil-works/pi-tui";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
+import {
+	isPadLinesToWidth,
+	isWrapLinesToWidth,
+	ProcessTerminal,
+	setPadLinesToWidth,
+	setWrapLinesToWidth,
+} from "@earendil-works/pi-tui";
 import chalk from "chalk";
+import { Type } from "typebox";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { VirtualTerminal } from "../../../../tui/test/virtual-terminal.ts";
 import { APP_NAME } from "../../../src/config.ts";
@@ -138,6 +146,141 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		expect(order).toEqual(["dispose", "drainInput", "stop"]);
 		expect(context.isShuttingDown).toBe(true);
 	});
+
+	test.each(["EIO", "EPIPE"])(
+		"finishes signal cleanup before active abort writes progress to a dead tty (%s)",
+		async (code) => {
+			const previous = {
+				pad: isPadLinesToWidth(),
+				wrap: isWrapLinesToWidth(),
+				background: isMessageBackground(),
+				separator: isMessageSeparator(),
+			};
+			const started = Promise.withResolvers<void>();
+			const order: string[] = [];
+			const progressCleanupCounts: number[] = [];
+			let cleanupCount = 0;
+			let failProgress = false;
+			const harness = await createHarness({
+				settings: {
+					quietStartup: true,
+					terminal: { showTerminalProgress: true },
+					compaction: { enabled: false },
+					retry: { enabled: false },
+				},
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_shutdown", async () => {
+							await Promise.resolve();
+							cleanupCount++;
+							order.push("cleanup");
+						});
+						pi.registerTool({
+							name: "block",
+							label: "Block",
+							description: "Wait for abort",
+							parameters: Type.Object({}),
+							execute: (_id, _params, signal) => {
+								const result = Promise.withResolvers<{
+									content: { type: "text"; text: string }[];
+									details: object;
+								}>();
+								signal?.addEventListener(
+									"abort",
+									() => {
+										order.push("abort");
+										result.resolve({ content: [{ type: "text", text: "interrupted tool" }], details: {} });
+									},
+									{ once: true },
+								);
+								started.resolve();
+								return result.promise;
+							},
+						});
+					},
+				],
+			});
+			const services: AgentSessionServices = {
+				cwd: harness.sessionManager.getCwd(),
+				agentDir: harness.tempDir,
+				modelRuntime: harness.session.modelRuntime,
+				settingsManager: harness.settingsManager,
+				resourceLoader: harness.session.resourceLoader,
+				diagnostics: [],
+			};
+			const runtime = new AgentSessionRuntime(harness.session, services, async () => {
+				throw new Error("Unexpected session replacement");
+			});
+			const terminal = new VirtualTerminal(120, 40);
+			const progressTerminal = new ProcessTerminal();
+			vi.spyOn(terminal, "setProgress").mockImplementation((active) => {
+				if (!active && failProgress) progressTerminal.setProgress(false);
+			});
+			const mode = new InteractiveMode(runtime, { terminal });
+			const internal = mode as unknown as { shutdown(options?: { fromSignal?: boolean }): Promise<void> };
+			const disposed = vi.spyOn(harness.session, "dispose");
+			const exit = vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new ProcessExitError();
+			}) as typeof process.exit);
+			let running: Promise<void> | undefined;
+			let restoreStdoutWrite: (() => void) | undefined;
+			try {
+				await mode.init();
+				harness.setResponses([fauxAssistantMessage(fauxToolCall("block", {}), { stopReason: "toolUse" })]);
+				running = harness.session.prompt("start blocking tool");
+				await started.promise;
+				await terminal.waitForRender();
+				expect(terminal.getViewport().join("\n")).toContain("start blocking tool");
+				const stdoutWrite = vi.spyOn(process.stdout, "write").mockImplementation(((chunk: string | Uint8Array) => {
+					if (String(chunk) === "\x1b]9;4;0\x07") {
+						progressCleanupCounts.push(cleanupCount);
+						failProgress = false;
+						try {
+							process.stdout.emit("error", Object.assign(new Error("dead tty"), { code }));
+						} catch (error) {
+							if (!(error instanceof ProcessExitError)) throw error;
+						}
+					}
+					return true;
+				}) as typeof process.stdout.write);
+				restoreStdoutWrite = () => stdoutWrite.mockRestore();
+				failProgress = true;
+				try {
+					await internal.shutdown({ fromSignal: true });
+				} catch (error) {
+					if (!(error instanceof ProcessExitError)) throw error;
+				}
+				await running;
+				expect(progressCleanupCounts).toEqual([1]);
+				expect(order).toEqual(["cleanup", "abort"]);
+				expect(harness.eventsOfType("agent_end")).toHaveLength(1);
+				expect(disposed).toHaveBeenCalledTimes(1);
+				expect(exit).toHaveBeenCalledWith(129);
+				expect(harness.sessionManager.getEntries()).toEqual(
+					expect.arrayContaining([
+						expect.objectContaining({
+							type: "message",
+							message: expect.objectContaining({
+								role: "toolResult",
+								content: [{ type: "text", text: "interrupted tool" }],
+							}),
+						}),
+					]),
+				);
+			} finally {
+				failProgress = false;
+				restoreStdoutWrite?.();
+				mode.stop();
+				await harness.session.abort();
+				await running;
+				harness.cleanup();
+				setPadLinesToWidth(previous.pad);
+				setWrapLinesToWidth(previous.wrap);
+				setMessageBackground(previous.background);
+				setMessageSeparator(previous.separator);
+			}
+		},
+	);
 
 	test("interactive quit stops the TUI before emitting session_shutdown", async () => {
 		vi.spyOn(process, "exit").mockImplementation((() => {

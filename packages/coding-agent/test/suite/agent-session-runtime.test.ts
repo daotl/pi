@@ -213,6 +213,47 @@ describe("AgentSessionRuntime characterization", () => {
 		]);
 	});
 
+	it("settles the active tool before ordinary disposal cleanup observes the transcript", async () => {
+		const started = Promise.withResolvers<void>();
+		let cleanupState: { idle: boolean; toolResult: string | undefined } | undefined;
+		const { runtime, faux } = await createRuntimeForTest((pi) => {
+			pi.registerTool({
+				name: "block",
+				label: "Block",
+				description: "Wait for abort",
+				parameters: Type.Object({}),
+				execute: (_id, _params, signal) => {
+					const result = Promise.withResolvers<AgentToolResult<unknown>>();
+					signal?.addEventListener(
+						"abort",
+						() => result.resolve({ content: [{ type: "text", text: "settled tool" }], details: {} }),
+						{ once: true },
+					);
+					started.resolve();
+					return result.promise;
+				},
+			});
+			pi.on("session_shutdown", () => {
+				const result = runtime.session.sessionManager
+					.getEntries()
+					.find((entry) => entry.type === "message" && entry.message.role === "toolResult");
+				cleanupState = {
+					idle: runtime.session.isIdle,
+					toolResult:
+						result?.type === "message" && result.message.role === "toolResult"
+							? result.message.content.find((part) => part.type === "text")?.text
+							: undefined,
+				};
+			});
+		});
+		faux.setResponses([fauxAssistantMessage(fauxToolCall("block", {}), { stopReason: "toolUse" })]);
+		const running = runtime.session.prompt("start blocking tool");
+		await started.promise;
+		await runtime.dispose();
+		await running;
+		expect(cleanupState).toEqual({ idle: true, toolResult: "settled tool" });
+	});
+
 	it("preserves an existing session when importing a file with the same name", async () => {
 		const { runtime, tempDir } = await createRuntimeForTest(() => {});
 		const sessionDir = runtime.session.sessionManager.getSessionDir();

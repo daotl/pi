@@ -530,6 +530,13 @@ export class AgentSession {
 	private _latestContextEditId: string | undefined;
 	private _summaryBlockMaxTokens: number;
 	private _contextSettingsChanged = false;
+	private _contextUsageStructure?: {
+		revision: number;
+		compactionId: string | undefined;
+		contextEditId: string | undefined;
+		hasPostCompactionUsage: boolean;
+		estimatedTokens: number;
+	};
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -6816,11 +6823,12 @@ export class AgentSession {
 		// After compaction, the last assistant usage reflects pre-compaction context size.
 		// We can only trust usage from an assistant that responded after the latest compaction.
 		// If no such assistant exists, context token count is unknown until the next LLM response.
-		const projection = this.sessionManager.buildSessionProjection();
-		const branch = this.sessionManager.getBranch();
-		const latestCompaction = getLatestCompactionEntry(branch);
-
-		if (latestCompaction) {
+		const revision = this.sessionManager.getContextRevision();
+		let structure = this._contextUsageStructure;
+		if (!structure || structure.revision !== revision) {
+			const projection = this.sessionManager.buildSessionProjection();
+			const branch = this.sessionManager.getBranch();
+			const latestCompaction = getLatestCompactionEntry(branch);
 			let contextEditId: string | undefined;
 			const projectedAssistants = new Set(
 				projection.entries.flatMap((entry) => {
@@ -6836,38 +6844,42 @@ export class AgentSession {
 						: [];
 				}),
 			);
-			const compactionIndex = branch.findIndex((entry) => entry.id === latestCompaction.id);
-			const hasPostCompactionUsage = branch
-				.slice(compactionIndex + 1)
-				.some((entry) => projectedAssistants.has(entry.id));
-			if (!hasPostCompactionUsage) {
-				const counted = this._postCompactionContextTokens;
-				const tokens =
-					counted?.compactionId === latestCompaction.id &&
-					counted.contextEditId === contextEditId &&
-					counted.leafId === this.sessionManager.getLeafId() &&
-					counted.model === model &&
-					counted.transform === this.agent.transformContext &&
-					counted.converter === this.agent.convertToLlm &&
-					counted.blockImages === this.settingsManager.getBlockImages() &&
-					counted.settingsPrefix === this.settingsManager.getIncomingMessagePrefix() &&
-					counted.incomingPrefix === this.agent.incomingMessagePrefix &&
-					this._canUploadTokenizationText(counted.model)
-						? counted.tokens
-						: undefined;
-				return tokens !== undefined && tokens > 0
-					? { tokens, contextWindow, percent: (tokens / contextWindow) * 100 }
-					: { tokens: null, contextWindow, percent: null };
-			}
+			const compactionIndex = latestCompaction ? branch.findIndex((entry) => entry.id === latestCompaction.id) : -1;
+			structure = {
+				revision,
+				compactionId: latestCompaction?.id,
+				contextEditId,
+				hasPostCompactionUsage: branch
+					.slice(compactionIndex + 1)
+					.some((entry) => projectedAssistants.has(entry.id)),
+				estimatedTokens: estimateProjectedContextTokens(projection, branch).tokens,
+			};
+			this._contextUsageStructure = structure;
+		}
+		if (structure.compactionId && !structure.hasPostCompactionUsage) {
+			const counted = this._postCompactionContextTokens;
+			const tokens =
+				counted?.compactionId === structure.compactionId &&
+				counted.contextEditId === structure.contextEditId &&
+				counted.leafId === this.sessionManager.getLeafId() &&
+				counted.model === model &&
+				counted.transform === this.agent.transformContext &&
+				counted.converter === this.agent.convertToLlm &&
+				counted.blockImages === this.settingsManager.getBlockImages() &&
+				counted.settingsPrefix === this.settingsManager.getIncomingMessagePrefix() &&
+				counted.incomingPrefix === this.agent.incomingMessagePrefix &&
+				this._canUploadTokenizationText(counted.model)
+					? counted.tokens
+					: undefined;
+			return tokens !== undefined && tokens > 0
+				? { tokens, contextWindow, percent: (tokens / contextWindow) * 100 }
+				: { tokens: null, contextWindow, percent: null };
 		}
 
-		const estimate = estimateProjectedContextTokens(projection, branch);
-		const percent = (estimate.tokens / contextWindow) * 100;
-
 		return {
-			tokens: estimate.tokens,
+			tokens: structure.estimatedTokens,
 			contextWindow,
-			percent,
+			percent: (structure.estimatedTokens / contextWindow) * 100,
 		};
 	}
 
