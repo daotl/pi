@@ -641,7 +641,7 @@ export class AgentSession {
 	private _promptFileSources: { systemPrompt?: string; addendum: string[] } = { addendum: [] };
 	/** Prompt options after before_agent_start mutations for the active run. */
 	private _runSystemPromptOptions?: NormalizedBuildSystemPromptOptions;
-	private _acceptedRunSections: Record<string, string> = {};
+	private _continuationSections?: SystemPromptSections;
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -2964,6 +2964,13 @@ export class AgentSession {
 	/** Keep saved static sections unless an option changes; runtime loadout and cwd remain current. */
 	private _buildEffectivePromptSections(options: NormalizedBuildSystemPromptOptions): SystemPromptSections {
 		const generated = buildSystemPromptSections(options);
+		for (const [name, content] of Object.entries(this._continuationSections ?? {})) {
+			if (
+				!["preamble", "tools", "rules", "docs", "addendum", "project_context", "skills", "cwd"].includes(name) &&
+				!Object.hasOwn(options.sections, name)
+			)
+				generated[name] = content;
+		}
 		if (!this._restoredSystemPromptSections || !this._restoredPromptBaseline) return generated;
 		const sections: SystemPromptSections = { preamble: generated.preamble, ...this._restoredSystemPromptSections };
 		for (const name of new Set([
@@ -3305,7 +3312,6 @@ export class AgentSession {
 		this._lastPersistedSystemPrompt = undefined;
 		this._restoreSystemPrompt = true;
 		this._runSystemPromptOptions = undefined;
-		this._acceptedRunSections = {};
 		// Tool restoration is runtime-only: do not publish an intermediate abandoned-policy snapshot.
 		this._restoreToolsFromTranscript(false);
 		this._commitBaseSystemPrompt(this._rebuildSystemPrompt(this.getActiveToolNames()));
@@ -3509,9 +3515,13 @@ export class AgentSession {
 		this._isAgentRunActive = true;
 		try {
 			this._flushPendingCompactionUsage();
+			this._continuationSections = Object.fromEntries(
+				Object.entries(getCurrentSystemMessage(this._buildLiveProjection().messages)?.sections ?? {}).filter(
+					(entry): entry is [string, string] => entry[1] !== null,
+				),
+			);
 			const options = normalizeBuildSystemPromptOptions({
 				...this._baseSystemPromptOptions,
-				sections: { ...this._acceptedRunSections, ...this._baseSystemPromptOptions.sections },
 				selectedTools: this.getActiveToolNames(),
 			});
 			const updateMessage = this._preparePromptAndToolLoadout(options);
@@ -3538,6 +3548,7 @@ export class AgentSession {
 			try {
 				if (this._agentRunAbortRequested) this._finishCancelledRetry();
 				this._runSystemPromptOptions = undefined;
+				this._continuationSections = undefined;
 				this._prefillEntryId = undefined;
 				if (!this._prefillRestoreFailed) {
 					this._pendingPrefill = undefined;
@@ -3994,7 +4005,6 @@ export class AgentSession {
 		}
 		const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
 		this._runSystemPromptOptions = result.systemPromptOptions;
-		this._acceptedRunSections = { ...result.systemPromptOptions.sections };
 		if (updateMessage) messages.unshift(updateMessage);
 
 		preflightResult?.("started");

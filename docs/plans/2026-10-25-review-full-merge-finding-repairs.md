@@ -192,3 +192,29 @@ Canonical receipt, validator, exact coverage audit and runtime evidence: `/tmp/c
 ### Verdict
 
 Round-5 repairs verified locally; continue full merge review after local commit. No push, PR, dependency, upstream replay or released changelog change.
+
+## Full merge review loop: round 6
+
+Round-5 repair commit: `8d9c6473a9e5fb342222f98fffef9228934612b3`; normal hook No fixes applied, tested source blobs match. Sixth fresh fixed-base -> HEAD review covers all 418 paths, snapshot digest `e702ab5d0a8fa0071178b352c8503de6839263f4b82ee3541289689477217873`. Eleven canonical personas completed. Three raw candidates -> one semantic discovery duplicate consolidated -> two independently validated. Canonical receipt passed before mutation. Exact adversarial ledger: 97 investigated / 321 insufficient detailed paths. Source changed-hunk review and whole-inventory accounting remain distinct from exhaustive source/caller/runtime clearance.
+
+### Confirmed finding and repair
+
+R6-#2 (P2; correctness + adversarial): the volatile accepted-section snapshot fixed same-instance continuation but was empty after branch reconciliation or reopen. Actual regenerate/reopen requests both lost selected mcp_servers before repair. Continuation now snapshots the selected canonical structured section map and merges only dynamic sections into already-rendered generated sections, after `buildSystemPromptSections` has returned. No wrapper parsing, no second wrapping and no abandoned-branch volatile authority. Base-owned sections refresh as before; explicit custom inputs override preservation; fresh-start removals remain authoritative. Active continuation state clears after settlement. The obsolete accepted raw-value map is removed. Coverage includes first-start-only injection, repeated continuation, new-start removal, interrupted regeneration followed by another continuation, and file reopen without another before_agent_start handler.
+
+R6-#1 same-leaf soft-delete exact-count candidate was rejected as pre-existing: the fixed baseline already retained the count through that mutation. No unrelated counting expansion was added. The known behavior remains explicitly outside this round's introduced-defect repair scope.
+
+### Verification
+
+Actual RED: **2 failed** regenerate/reopen consumer cases, `bg_301` terminal result. Post-format focused discovery/prompt restoration/transaction/swipe/MCP owners: **93 passed / 5 files, 6.18s**. Final full `npm run check`: **1770 / No fixes applied, 20.30s**; first check formatted two owned files. Isolated root `./test.sh`: **8873 passed / 0 failed / 915 skipped, 136.03s**, `artifact://6869`. Tests assert exact single-wrapper structured value and accepted removals. The first two-file probe also named a nonexistent untrusted-summary test path; no third-file execution is claimed.
+
+### Actionable Findings
+
+The single confirmed introduced defect is repaired and verified. Commit and another full fixed-base -> latest-HEAD review remain required; no convergence claim yet.
+
+### Coverage
+
+Canonical receipt, validator, exact path audit and tested content identity: `/tmp/compound-engineering-501/ce-code-review/20261025-full-wave6-8c732390/`. Existing manual protected-worktree exception, source/caller limits and runtime exclusions remain. No live MCP server proof or full arbitrary-extension timing guarantee.
+
+### Verdict
+
+Round-6 repair verified locally; continue full merge review after local commit. No push, PR, dependency, upstream replay or released changelog change.

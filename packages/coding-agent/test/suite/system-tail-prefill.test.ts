@@ -165,3 +165,67 @@ it("preserves accepted dynamic discovery sections on continuation while refreshi
 		harness.cleanup();
 	}
 });
+
+it.each(["regenerate", "reopen"] as const)(
+	"preserves selected discovery through %s continuation",
+	async (operation) => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-discovery-resume-"));
+		let injected = false;
+		let harness = await createHarness({
+			cwd,
+			sessionManager: SessionManager.create(cwd, join(cwd, "sessions")),
+			fauxApi: "openai-completions",
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", (event) => {
+						if (injected) return;
+						injected = true;
+						event.systemPromptOptions.sections.mcp_servers = "selected namespace docs";
+					});
+				},
+			],
+		});
+		try {
+			harness.setResponses([fauxAssistantMessage("selected prefix", { stopReason: "aborted" })]);
+			await harness.session.prompt("selected request");
+			if (operation === "reopen") {
+				const file = harness.sessionManager.getSessionFile()!;
+				harness.cleanup();
+				harness = await createHarness({
+					cwd,
+					sessionManager: SessionManager.open(file),
+					fauxApi: "openai-completions",
+					settings: { compaction: { enabled: false }, retry: { enabled: false } },
+				});
+			}
+			let discovery: string | null | undefined;
+			harness.setResponses([
+				(context) => {
+					discovery = getCurrentSystemMessage(context.messages)?.sections?.mcp_servers;
+					return fauxAssistantMessage(
+						operation === "reopen" ? "selected prefix completed" : "regenerated prefix",
+						operation === "regenerate" ? { stopReason: "aborted" } : {},
+					);
+				},
+			]);
+			if (operation === "regenerate") await harness.session.regenerateSwipe(harness.session.getSwipeGroup()!);
+			else await harness.session.continue();
+			expect(discovery).toBe("<mcp_servers>\nselected namespace docs\n</mcp_servers>");
+			if (operation === "regenerate") {
+				harness.setResponses([
+					(context) => {
+						discovery = getCurrentSystemMessage(context.messages)?.sections?.mcp_servers;
+						return fauxAssistantMessage("regenerated prefix completed");
+					},
+				]);
+				await harness.session.continue();
+				expect(discovery).toBe("<mcp_servers>\nselected namespace docs\n</mcp_servers>");
+			}
+		} finally {
+			await harness.session.abort();
+			harness.cleanup();
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	},
+);
