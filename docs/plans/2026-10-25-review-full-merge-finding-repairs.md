@@ -8,6 +8,8 @@ No upstream replay, branch/worktree/push/PR/ticket, released changelog, dependen
 
 Round sections retain their pre-commit status as historical snapshots, not current open work. Their successor headers record the completed repair commits: round 1 `fe50e664f82286dc460c6adc5653addc5bf55901`; round 2 `8daceb2998221a8465630320ee8c76353b68c720`; round 3 `510b7d3031edc3421f74541b053b80ba3edce467`; round 4 `50a522d52e016cd47fea5bc355da84f72b9e9f8f`; round 5 `8d9c6473a9e5fb342222f98fffef9228934612b3`; round 6 `90a97b2ea16655a3c790f7085472e02bcca463d1`. Only the latest section determines current loop status. Round-7 three-reviewer provenance is grounded in the actual agent-native-reviewer.json finding at lines 3-24 as well as security/correctness reports; all are same-family reviews, not cross-model independence.
 
+Final status: round 16 reviews fixed base `839dc79197595a4285d711e37d02fb623e5b6b7b` through product HEAD `d9a399d788562a070d79b803a00464a385c649e8`, with all eleven canonical personas terminal and no new findings. Final unchanged-product check and isolated aggregate pass. The final commit only adds this audit closure; it is not retroactively represented as the product review/test SHA. Detailed evidence and limitations are in round 16 below.
+
 ## Implemented behavior and observed proof
 
 - #5: Any assistant terminal rejected before publication carries its completed physical identity/diagnostics/usage through `TerminalResponseError`. Actual ordinary listener RED lost all metadata and charged zero; fixed ordinary/prefill owners **13 passed / 2 files, 4.62s**. No postpublication duplicate receipt is introduced.
@@ -453,3 +455,29 @@ Canonical receipt, two-item validator, exact coverage audit, RED/GREEN and teste
 ### Verdict
 
 Round-15 repairs verified locally; continue full merge review after local commit. No push, PR, dependency metadata, upstream replay or released changelog change.
+
+## Full merge review loop: round 16 — no new findings
+
+Round-15 repair commit and reviewed/tested product HEAD: `d9a399d788562a070d79b803a00464a385c649e8`. Fixed full-review base remains `839dc79197595a4285d711e37d02fb623e5b6b7b`. The sixteenth fresh complete comparison covers **423 paths, 73 runtime source paths, 858 hunks and 61,814 diff lines**, immutable digest `3b569e322acd5b4801a0b4893e19594c74b65133d48875e049c3ac947d08e976`; it is not a review of the last repair delta.
+
+### Review result
+
+All eleven unchanged canonical personas completed independently: correctness, project standards, testing, maintainability, agent-native, security, performance, API contract, reliability, adversarial and frontend races. Every report contains zero findings; no candidate validator batch was needed. Mechanical synthesis also contains zero findings. Canonical receipt passed on the unchanged product tree, verdict **Ready to merge**, `actionable_findings: []` (`artifact://8508`). No peer jobs remain outstanding.
+
+### Final verification
+
+After all review reports completed, full `npm run check` passed: **1770 files / No fixes applied, 12.40s**. Fresh authoritative isolated root `./test.sh` on the unchanged reviewed product HEAD: **8956 passed / 0 failed / 915 skipped, 94.59s**, `artifact://8510`. It includes actual SDK/CLI consumer packaging smoke and all existing faux/native-offline/VirtualTerminal regression consumers. Earlier REDs, failed checks, aggregate failures and the package-manager incident remain preserved in their original round records rather than overwritten by final-green evidence.
+
+The final audit change is documentation-only in this tracked report. All product, tests and guide content remain identical to the reviewed/tested product commit; final audit commit identity is recorded separately in delivery and machine-local final-verification evidence. It does not receive a fabricated review/test SHA or invalidate the recorded product scope by silently relabeling it.
+
+### Coverage and residual limitations
+
+Exact adversarial ledger: **85 detailed changed-hunk/mechanism paths / 338 insufficient detailed paths**, disjoint and exhaustive over 423 inventory paths; all 73 runtime source paths are in the detailed set. Other personas supply their own attributed source/test/contract coverage and limitations. Inventory, lexical screening and changed-hunk investigation do not mean every line, whole file, unchanged body, dynamic registration or external SDK caller was deeply cleared. Same-model personas do not establish independent model-family proof; external-family independence was unattested and code was not externally sent. Graph indexing remained unavailable; some LSP positions were stale and exact source supplied fallback evidence.
+
+Protected-worktree exception remains explicit: the original 749 untracked environment-target files are preserved, not removed to manufacture a clean entry. Consequently this is completion of the user-authorized manual full-review/fix/commit loop with canonical receipts, **not** a claim that strict ce-code-review-loop clean-worktree protocol converged. Protection comparisons use the available recovery snapshot, not a missing original manifest. No live paid-provider/tokenizer numerical, arbitrary physical-terminal/ANSI, process-crash or independent concurrent-writer guarantee is made. Historical HTML visual proof is not a permanent viewer-action suite. The earlier accidental pnpm invocation means dependency environment is not claimed byte-identical; tracked dependency metadata stayed unchanged and subsequent package/lock/consumer/full-suite gates passed.
+
+Artifacts: `/tmp/compound-engineering-501/ce-code-review/20261025-full-wave16-22289e30/` contains immutable scope, all eleven reports, raw/mechanical synthesis, exact coverage audit, zero-candidate validation state, canonical receipt and final verification. No new product issue remains confirmed/actionable in this fresh wave.
+
+### Verdict
+
+User-requested loop complete locally: fifteen repair rounds committed, followed by a fresh sixteenth entire-merge review with no new findings and passing final verification. No push, PR, branch/worktree switch, upstream replay, backup movement, dependency metadata or released changelog change. Final docs-only audit commit closes this record without changing the reviewed product.
