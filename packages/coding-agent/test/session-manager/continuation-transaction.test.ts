@@ -155,7 +155,6 @@ describe("assistant continuation storage transactions", () => {
 		const second = session.replaceAssistantContinuation(first, response("second continuation", 7));
 		expect(messageEntry(session, second)).toMatchObject({
 			deletedAt: snapshot.deletedAt,
-			deletedToolCalls: snapshot.deletedToolCalls,
 		});
 		expect(held).toEqual(snapshot);
 		expect(session.getEntry(source)?.supersededBy).toBe(first);
@@ -172,9 +171,7 @@ describe("assistant continuation storage transactions", () => {
 		const restored = session.restoreAssistantPrefill(held.parentId, response("restored partial", 7), second, []);
 		expect(messageEntry(session, restored)).toMatchObject({
 			deletedAt: snapshot.deletedAt,
-			deletedToolCalls: snapshot.deletedToolCalls,
 		});
-		expect(messageEntry(session, restored).deletedToolCalls).not.toBe(messageEntry(session, second).deletedToolCalls);
 		expect(session.getEntry(second)?.supersededBy).toBe(restored);
 	});
 

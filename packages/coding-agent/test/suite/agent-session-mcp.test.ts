@@ -1,10 +1,12 @@
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import type { SystemMessage, ToolResultMessage } from "@earendil-works/pi-ai/compat";
+import type { Model, SystemMessage, ToolResultMessage, Usage } from "@earendil-works/pi-ai/compat";
 import { type JsonRpcRequest, LATEST_PROTOCOL_VERSION } from "@earendil-works/pi-mcp";
 import { createInMemoryTransportPair } from "@earendil-works/pi-mcp/testing";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
 import type { ExtensionAPI, ExtensionFactory } from "../../src/core/extensions/types.ts";
+import { getUsageTotals } from "../../src/core/usage-totals.ts";
 import { createCodemodeExtension } from "../../src/extensions/codemode/index.ts";
 import type { McpExposure, McpServerEntry } from "../../src/extensions/mcp/config.ts";
 import { createMcpExtension, MCP_SERVERS_SECTION } from "../../src/extensions/mcp/index.ts";
@@ -340,6 +342,77 @@ describe("AgentSession MCP integration", () => {
 		const result = toolResult(harness, "mcp__docs__search");
 		expect(getMessageText(result)).toBe("direct guide\ndirect faq");
 	});
+
+	it.each(["receipt", "abort"] as const)(
+		"reactivates real MCP connections after signal %s failure",
+		async (failure) => {
+			const { harness, calls, servers } = await setup("direct");
+			const runtime = new AgentSessionRuntime(
+				harness.session,
+				{
+					cwd: harness.sessionManager.getCwd(),
+					agentDir: harness.tempDir,
+					modelRuntime: harness.session.modelRuntime,
+					settingsManager: harness.settingsManager,
+					resourceLoader: harness.session.resourceLoader,
+					diagnostics: [],
+				},
+				async () => {
+					throw new Error("Unexpected replacement");
+				},
+			);
+			const storageError = new Error("retained receipt unavailable");
+			const appendUsage = harness.sessionManager.appendUsage.bind(harness.sessionManager);
+			const publish = vi.spyOn(harness.sessionManager, "appendUsage").mockImplementation(() => {
+				throw storageError;
+			});
+			const usage = {
+				input: 100,
+				output: 10,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 110,
+				cost: { input: 0.1, output: 0.01, cacheRead: 0, cacheWrite: 0, total: 0.11 },
+			};
+			// Retain the same completed-summary receipt used by the publication failure path.
+			const pending = harness.session as unknown as {
+				_retainCompactionUsage(usage: Usage, model: Model<string>): void;
+			};
+			pending._retainCompactionUsage(usage, harness.getModel());
+			const closed = vi.spyOn(servers[0], "close");
+			const abort = vi.spyOn(harness.session, "abort");
+			if (failure === "abort") abort.mockRejectedValueOnce(storageError);
+			try {
+				await expect(runtime.dispose({ fromSignal: true })).rejects.toBe(storageError);
+				expect(closed).toHaveBeenCalledTimes(1);
+				publish.mockImplementation(appendUsage);
+				harness.setResponses([
+					fauxAssistantMessage(fauxToolCall("mcp__docs__search", { query: "recovered" }), {
+						stopReason: "toolUse",
+					}),
+					fauxAssistantMessage("done"),
+				]);
+				await harness.session.prompt("use the MCP server after cancelled shutdown");
+				expect(getMessageText(toolResult(harness, "mcp__docs__search"))).toBe("recovered guide\nrecovered faq");
+				expect(toolResult(harness, "mcp__docs__search").isError).toBe(false);
+				expect(calls).toEqual(['search:{"query":"recovered"}']);
+				expect(servers).toHaveLength(2);
+				const reactivatedClosed = vi.spyOn(servers[1], "close");
+				await runtime.dispose({ fromSignal: true });
+				expect(closed).toHaveBeenCalledTimes(1);
+				expect(reactivatedClosed).toHaveBeenCalledTimes(1);
+				expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "usage")).toEqual([
+					expect.objectContaining({ usage }),
+				]);
+				expect(
+					getUsageTotals(harness.sessionManager.getEntries().filter((entry) => entry.type === "usage")),
+				).toEqual({ input: 100, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0.11 });
+			} finally {
+				publish.mockRestore();
+				abort.mockRestore();
+			}
+		},
+	);
 
 	it.each(["direct", "codemode"] as const)(
 		"withdraws and restores %s MCP tools the server changes",

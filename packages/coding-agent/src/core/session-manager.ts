@@ -88,6 +88,8 @@ export interface SessionEntryBase {
 export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
 	message: AgentMessage;
+	/** Latest edit/checkpoint included in a freshly billed canonical continuation request. */
+	usageContextEntryId?: string;
 	/**
 	 * Tool call blocks soft-deleted from this assistant message: toolCallId →
 	 * deletion timestamp. The message itself stays visible with the remaining
@@ -1420,6 +1422,9 @@ export class SessionManager {
 		if (clone.type === "message" && clone.deletedToolCalls) {
 			clone.deletedToolCalls = { ...clone.deletedToolCalls };
 		}
+		if (clone.type === "message" && clone.usageContextEntryId !== undefined) {
+			clone.usageContextEntryId = idMap.get(clone.usageContextEntryId) ?? clone.usageContextEntryId;
+		}
 		if (clone.type === "compaction") {
 			clone.firstKeptEntryId =
 				idMap.get(clone.firstKeptEntryId) ?? boundaryIds?.get(clone.firstKeptEntryId) ?? clone.firstKeptEntryId;
@@ -1564,6 +1569,10 @@ export class SessionManager {
 			if (source.id === entryId && clone.type === "message") {
 				clone.message = message;
 				delete clone.usageSourceId;
+				delete clone.deletedToolCalls;
+				delete clone.usageContextEntryId;
+				const boundary = tail.findLast((entry) => entry.type === "compaction" || entry.type === "context_edit");
+				if (boundary) clone.usageContextEntryId = idMap.get(boundary.id)!;
 				clone.timestamp = new Date().toISOString();
 			}
 			entries.push(clone);

@@ -1,6 +1,7 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeAll, expect, it } from "vitest";
 import type { AgentSessionEvent } from "../../src/core/agent-session.ts";
+import { estimateProjectedContextTokens } from "../../src/core/compaction/compaction.ts";
 import { FooterComponent } from "../../src/modes/interactive/components/footer.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../../src/modes/interactive/theme/theme.ts";
@@ -310,4 +311,27 @@ it("invalidates structural context estimates after same-leaf soft deletion and r
 	expect(removed).toBeLessThan(before!);
 	current.manager.restoreDeletedEntryIds([id]);
 	expect(current.session.getContextUsage()?.tokens).toBe(before);
+});
+
+it("replaces the exact checkpoint count with native continued response usage before its cloned checkpoint", async () => {
+	const current = await fixture();
+	const model = current.session.model!;
+	current.manager.appendMessage({
+		...fauxAssistantMessage("partial", { stopReason: "aborted" }),
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+	});
+	current.session.refreshContext();
+	await current.session.compact({ keepRecentMessages: 2 });
+	expect(current.session.getContextUsage()?.tokens).toBe(100);
+	current.setResponses([fauxAssistantMessage("partial completed")]);
+	await current.session.continue();
+	expect(
+		estimateProjectedContextTokens(current.manager.buildSessionProjection(), current.manager.getBranch()).usageTokens,
+	).toBe(12);
+	expect(current.session.getSessionStats().contextUsage?.tokens).toBeGreaterThanOrEqual(12);
+	expect(stripAnsi(footer(current).render(160)[1])).not.toContain("?/");
+	const request = JSON.parse(current.summaries.at(-1)!.body) as { messages: Array<{ role: string; content: string }> };
+	expect(request.messages.at(-1)).toMatchObject({ role: "assistant", content: "partial" });
 });

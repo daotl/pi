@@ -642,6 +642,9 @@ export class AgentSession {
 	/** Prompt options after before_agent_start mutations for the active run. */
 	private _runSystemPromptOptions?: NormalizedBuildSystemPromptOptions;
 	private _continuationSections?: SystemPromptSections;
+	/** Only custom sections accepted from hooks in this lifecycle, never restored history. */
+	private _acceptedPromptSections?: SystemPromptSections;
+	private _acceptedPromptLeafId?: string | null;
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -2256,13 +2259,13 @@ export class AgentSession {
 				childrenByParent.set(entry.parentId, [entry]);
 			}
 		}
-		let leaf: SessionEntry = versionRoot;
+		let leaf: SessionEntry | undefined;
 		const stack: SessionEntry[] = [versionRoot];
 		while (stack.length > 0) {
 			const node = stack.pop()!;
 			const children = childrenByParent.get(node.id);
 			if (!children || children.length === 0) {
-				if (node.timestamp >= leaf.timestamp) {
+				if (!leaf || node.timestamp >= leaf.timestamp) {
 					leaf = node;
 				}
 				continue;
@@ -2270,7 +2273,7 @@ export class AgentSession {
 			stack.push(...children);
 		}
 
-		manager.branch(leaf.id);
+		manager.branch((leaf ?? versionRoot).id);
 		return true;
 	}
 
@@ -3041,9 +3044,13 @@ export class AgentSession {
 				const head: SystemMessage = {
 					role: "system",
 					content: "",
-					sections: this._buildEffectivePromptSections(
-						this._runSystemPromptOptions ?? this._baseSystemPromptOptions,
-					),
+					sections: {
+						...(this._acceptedPromptLeafId &&
+						this.sessionManager.getBranch().some((entry) => entry.id === this._acceptedPromptLeafId)
+							? this._acceptedPromptSections
+							: undefined),
+						...this._buildEffectivePromptSections(this._runSystemPromptOptions ?? this._baseSystemPromptOptions),
+					},
 					...(current?.toolsAdded ? { toolsAdded: current.toolsAdded } : {}),
 					timestamp: current?.timestamp ?? Date.now(),
 				};
@@ -3302,6 +3309,7 @@ export class AgentSession {
 
 	/** Reconcile the effective resource state with the selected durable path, not the abandoned leaf. */
 	private _restoreBaseSystemPromptFromBranch(persist = true): void {
+		this._acceptedPromptSections = undefined;
 		this._customSystemPromptOverride = undefined;
 		this._restoredSystemPromptSections = undefined;
 		this._restoredPromptBaseline = undefined;
@@ -3473,6 +3481,7 @@ export class AgentSession {
 				this._refreshFinalizedContext();
 				this._flushPendingBashMessages();
 				this._flushPendingCustomMessages();
+				if (this._acceptedPromptSections) this._acceptedPromptLeafId = this.sessionManager.getLeafId();
 			} finally {
 				await this._emitAgentSettled();
 			}
@@ -3515,13 +3524,19 @@ export class AgentSession {
 		this._isAgentRunActive = true;
 		try {
 			this._flushPendingCompactionUsage();
+			if (
+				this._acceptedPromptLeafId &&
+				!this.sessionManager.getBranch().some((entry) => entry.id === this._acceptedPromptLeafId)
+			) {
+				this._acceptedPromptSections = undefined;
+			}
 			this._continuationSections = this.settingsManager.isProjectTrusted()
 				? Object.fromEntries(
 						Object.entries(getCurrentSystemMessage(this._buildLiveProjection().messages)?.sections ?? {}).filter(
 							(entry): entry is [string, string] => entry[1] !== null,
 						),
 					)
-				: undefined;
+				: this._acceptedPromptSections;
 			const options = normalizeBuildSystemPromptOptions({
 				...this._baseSystemPromptOptions,
 				selectedTools: this.getActiveToolNames(),
@@ -3561,6 +3576,7 @@ export class AgentSession {
 				this._refreshFinalizedContext();
 				this._flushPendingBashMessages();
 				this._flushPendingCustomMessages();
+				if (this._acceptedPromptSections) this._acceptedPromptLeafId = this.sessionManager.getLeafId();
 			} finally {
 				await this._emitAgentSettled();
 			}
@@ -3950,6 +3966,7 @@ export class AgentSession {
 			return;
 		}
 
+		this._acceptedPromptSections = undefined;
 		// Emit before_agent_start before normalizing images so extension-driven model
 		// selection determines the resize profile used for the request and history.
 		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
@@ -4005,6 +4022,12 @@ export class AgentSession {
 				timestamp: Date.now(),
 			});
 		}
+		this._acceptedPromptSections = Object.fromEntries(
+			Object.entries(buildSystemPromptSections(result.systemPromptOptions)).filter(
+				([name]) =>
+					!["preamble", "tools", "rules", "docs", "addendum", "project_context", "skills", "cwd"].includes(name),
+			),
+		);
 		const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
 		this._runSystemPromptOptions = result.systemPromptOptions;
 		if (updateMessage) messages.unshift(updateMessage);
@@ -6047,6 +6070,8 @@ export class AgentSession {
 		flagValues?: Map<string, boolean | string>;
 		includeAllExtensionTools?: boolean;
 	}): void {
+		this._acceptedPromptSections = undefined;
+		this._acceptedPromptLeafId = undefined;
 		const autoResizeImages = this.settingsManager.getImageAutoResize();
 		const shellCommandPrefix = this.settingsManager.getShellCommandPrefix();
 		const shellPath = this.settingsManager.getShellPath();
@@ -6841,30 +6866,17 @@ export class AgentSession {
 			const projection = this.sessionManager.buildSessionProjection();
 			const branch = this.sessionManager.getBranch();
 			const latestCompaction = getLatestCompactionEntry(branch);
+			const estimate = estimateProjectedContextTokens(projection, branch);
 			let contextEditId: string | undefined;
-			const projectedAssistants = new Set(
-				projection.entries.flatMap((entry) => {
-					if (entry.sourceEntry.type === "context_edit") contextEditId = entry.sourceEntry.id;
-					return entry.messages.some(
-						(message) =>
-							message.role === "assistant" &&
-							message.stopReason !== "aborted" &&
-							message.stopReason !== "error" &&
-							calculateContextTokens(message.usage) > 0,
-					)
-						? [entry.sourceEntry.id]
-						: [];
-				}),
-			);
-			const compactionIndex = latestCompaction ? branch.findIndex((entry) => entry.id === latestCompaction.id) : -1;
+			for (const entry of projection.entries) {
+				if (entry.sourceEntry.type === "context_edit") contextEditId = entry.sourceEntry.id;
+			}
 			structure = {
 				revision,
 				compactionId: latestCompaction?.id,
 				contextEditId,
-				hasPostCompactionUsage: branch
-					.slice(compactionIndex + 1)
-					.some((entry) => projectedAssistants.has(entry.id)),
-				estimatedTokens: estimateProjectedContextTokens(projection, branch).tokens,
+				hasPostCompactionUsage: estimate.lastUsageIndex !== null,
+				estimatedTokens: estimate.tokens,
 			};
 			this._contextUsageStructure = structure;
 		}

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, fstatSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
@@ -293,6 +293,138 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 
 		expect(order).toEqual(["drainInput", "suspend", "dispose", "stop"]);
 	});
+
+	test.each([false, true])(
+		"holds shutdown work until resource reactivation settles (reactivation fails: %s)",
+		async (failReactivation) => {
+			const previous = {
+				pad: isPadLinesToWidth(),
+				wrap: isWrapLinesToWidth(),
+				background: isMessageBackground(),
+				separator: isMessageSeparator(),
+			};
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const resourceFile = createTempFile();
+			writeFileSync(resourceFile, "resource remains callable");
+			const closed: number[] = [];
+			let resource: number | undefined;
+			let starts = 0;
+			const harness = await createHarness({
+				settings: { quietStartup: true, compaction: { enabled: false }, retry: { enabled: false } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_start", async () => {
+							resource = openSync(resourceFile, "r");
+							if (++starts > 1) {
+								entered.resolve();
+								await release.promise;
+							}
+						});
+						pi.on("session_shutdown", () => {
+							if (resource !== undefined) {
+								closed.push(resource);
+								closeSync(resource);
+								resource = undefined;
+							}
+						});
+						pi.registerTool({
+							name: "read_resource",
+							label: "Read resource",
+							description: "Read the extension-owned open file",
+							parameters: Type.Object({}),
+							execute: async () => {
+								if (resource === undefined) throw new Error("Resource closed");
+								return { content: [{ type: "text", text: readFileSync(resource, "utf8") }], details: {} };
+							},
+						});
+					},
+				],
+			});
+			const runtime = new AgentSessionRuntime(
+				harness.session,
+				{
+					cwd: harness.sessionManager.getCwd(),
+					agentDir: harness.tempDir,
+					modelRuntime: harness.session.modelRuntime,
+					settingsManager: harness.settingsManager,
+					resourceLoader: harness.session.resourceLoader,
+					diagnostics: [],
+				},
+				async () => {
+					throw new Error("Unexpected replacement");
+				},
+			);
+			const terminal = new VirtualTerminal(120, 40);
+			const mode = new InteractiveMode(runtime, { terminal });
+			const internal = mode as unknown as {
+				shutdown(options?: { fromSignal?: boolean }): Promise<void>;
+				isShuttingDown: boolean;
+				compactionQueuedMessages: Array<{ text: string; mode: "followUp" }>;
+			};
+			const storageError = new Error("retained receipt unavailable");
+			const reactivationError = new Error("resource discovery failed");
+			const disposal = vi.spyOn(runtime, "dispose");
+			const bind = harness.session.bindExtensions.bind(harness.session);
+			const bindSpy = vi.spyOn(harness.session, "bindExtensions").mockImplementation(async (bindings) => {
+				await bind(bindings);
+				if (starts > 1 && failReactivation) throw reactivationError;
+			});
+			const flush = vi.spyOn(harness.session, "flushPendingUsage");
+			try {
+				await mode.init();
+				flush.mockImplementationOnce(() => {
+					throw storageError;
+				});
+				harness.setResponses([
+					fauxAssistantMessage(fauxToolCall("read_resource", {}), { stopReason: "toolUse" }),
+					fauxAssistantMessage("resource consumer finished"),
+				]);
+				internal.compactionQueuedMessages.push({ text: "consume recovered resource", mode: "followUp" });
+				const shutdown = internal.shutdown({ fromSignal: true });
+				await entered.promise;
+				expect(internal.isShuttingDown).toBe(true);
+				expect(harness.eventsOfType("agent_start")).toEqual([]);
+				expect(closed).toHaveLength(1);
+				release.resolve();
+				await shutdown;
+				await terminal.waitForRender();
+				const screen = terminal.getViewport().join("\n");
+				expect(screen).toContain("retained receipt unavailable");
+				if (failReactivation) {
+					expect(screen).toContain("extension reactivation failed: resource discovery failed");
+					expect(internal.isShuttingDown).toBe(true);
+					expect(runtime.shutdownPending).toBe(true);
+					expect(closed).toHaveLength(2);
+					expect(() => fstatSync(closed[1])).toThrow();
+					expect(harness.eventsOfType("agent_start")).toEqual([]);
+					const failure = await disposal.mock.results[0].value.catch((error: unknown) => error);
+					expect(failure).toMatchObject({ cause: storageError, errors: [storageError, reactivationError] });
+				} else {
+					expect(internal.isShuttingDown).toBe(false);
+					await vi.waitFor(() => expect(harness.eventsOfType("agent_settled")).toHaveLength(1));
+					expect(harness.session.messages).toContainEqual(
+						expect.objectContaining({
+							role: "toolResult",
+							content: [{ type: "text", text: "resource remains callable" }],
+							isError: false,
+						}),
+					);
+				}
+			} finally {
+				release.resolve();
+				bindSpy.mockRestore();
+				flush.mockRestore();
+				mode.stop();
+				await runtime.dispose();
+				harness.cleanup();
+				setPadLinesToWidth(previous.pad);
+				setWrapLinesToWidth(previous.wrap);
+				setMessageBackground(previous.background);
+				setMessageSeparator(previous.separator);
+			}
+		},
+	);
 
 	test.each(["regular", "fullscreen"] as const)(
 		"repaints %s after disposal rejects with shutdown UI updates pending, without keyboard input",

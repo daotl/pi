@@ -88,6 +88,8 @@ For sessions with a parent (created via `/fork`, `/clone`, or `newSession({ pare
 
 A message in the conversation. The `message` field contains an `AgentMessage`. System messages carry the prompt and tool loadout: the first request of a session persists one with every prompt section and tool declaration, and later changes persist as system messages that patch `sections` by name (`null` removes one) and list `toolsAdded`/`toolsRemoved`. Replaying them in order yields the current prompt and tools; there is no separate prompt state entry.
 
+A freshly billed canonical assistant continuation may have `usageContextEntryId`, naming the latest compaction or context-edit boundary included in its request. The assistant retains its original logical position before the replayed suffix; this field lets current-context usage recognize its fresh measurement even when that boundary follows it physically. Tail cloning remaps the reference. A later invalidation boundary or a different `usageSourceId` prevents reuse; the field does not add a charge or turn copied historical usage into a fresh measurement.
+
 ```json
 {"type":"message","id":"a0b1c2d3","parentId":null,"timestamp":"2024-12-03T14:00:00.000Z","message":{"role":"system","content":"","sections":{"preamble":"You are an expert coding assistant...","tools":"<tools>\n- read: ...\n</tools>","cwd":"/project"},"toolsAdded":[{"name":"read","description":"...","parameters":{}}],"timestamp":1733234400000}}
 {"type":"message","id":"d4e5f6g7","parentId":"c3d4e5f6","timestamp":"2024-12-03T14:04:00.000Z","message":{"role":"system","content":"","sections":{"skills":"<skills>...</skills>"},"toolsRemoved":[{"name":"write"}],"timestamp":1733234640000}}

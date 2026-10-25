@@ -244,3 +244,31 @@ Canonical receipt, independent validation, exact path audit and tested source id
 ### Verdict
 
 Round-7 repair verified locally; continue full merge review after local commit. No push, PR, dependency, upstream replay or released changelog change.
+
+## Full merge review loop: round 8
+
+Round-7 repair commit: `5335339d2fdf3413ca93e47151b3c6c0b878af4c`; normal hook No fixes applied, tested source blobs match. Eighth fresh fixed-base -> HEAD review covers all 418 paths, snapshot digest `18119a3519c9fecd83629c9c998022ac2b39e5e4f1d115c322cd51267b1912f8`. Eleven canonical personas completed; five distinct candidates independently validated in one batch, all true. Canonical receipt passed before mutation. Exact adversarial partition: 108 investigated / 310 insufficient detailed evidence; correctness 71 runtime-source hunks / 347 insufficient deep paths; reliability 37 detailed / 381 remaining. These are attributed lens-specific boundaries, not whole-tree semantic clearance.
+
+### Confirmed findings and repairs
+
+- R8-#1 (P2): fresh canonical continuation usage remained before a cloned checkpoint, defeating position-only freshness checks. Actual RED projected usageTokens=0 despite a newly billed response. New optional message-entry `usageContextEntryId` identifies the remapped latest checkpoint/edit included in that request. SDK/footer and projection estimates share the provenance-aware estimate; copied usage identity and later boundaries still invalidate. Live/file-reopened tests accept fresh continued usage and reject copied/later-invalidated values. Native exact count 100 is replaced by fresh provider usage 12. Standalone actual SDK/reopen/footer smoke observes 1334 tokens and `1.3k/125k (1.0%)`, not unknown.
+- R8-#2 (P2): swipe terminal-leaf search compared preserved older suffix timestamps against the newly timestamped nonterminal response root. Actual RED selects the assistant instead of its policy suffix. Selection now compares only terminal descendants, falling back to the version root only when none exists. Continued answer re-selection restores VERSION_ONE policy; historical suffix timestamps and billing identity remain unchanged.
+- R8-#3 (P2): cancelled signal disposal resumed UI after permanent extension cleanup without reactivation. Actual built-in MCP RED returns `MCP server "docs" is shut down` on a real post-failure tool call. Disposal now awaits existing bindExtensions/session_start activation before returning the original error; cleanup state resets only on success. Failed activation cleans the partial generation and retains shutdownPending, AggregateError details and original cause. Interactive recovery remains latched with no queue/heartbeat/schedule redrain until resources are ready. Real MCP JSON-RPC transports close once per generation; retained charge persists once. Standalone runtime/faux/MCP proof: two generations, one recovered transport call, original error identity preserved.
+- R8-#4 (P2): the historical trust guard also discarded safe current-lifecycle global-extension discovery during untrusted continuation. Actual RED omits the accepted mcp_servers section. Current hook-accepted custom sections now have separate lifecycle/selected-path authority, cleared on fresh prompt, runtime rebuild or selected-path replacement; historical untrusted sections remain excluded. Trusted/untrusted repeated continuation and hostile reopen/regeneration controls pass.
+- R8-#5 (P2): a newly billed continued tool call inherited an old deletedToolCalls tombstone, hiding a newly generated reused call ID while its real result remained. Actual RED executes once but the next canonical request omits call_1. New continuation replacements clear old tombstones while historical source tombstones remain stored. The following provider request and file reopen retain the new call/result pair.
+
+### Verification
+
+All four continuation consumer defects and the real MCP cancellation defect produced RED before implementation; setup-only fixture mistakes are separated in worker receipts. Post-format combined owning tests: **279 passed / 19 files, 19.37s**. Final full `npm run check`: **1770 / No fixes applied, 20.14s**; first check formatted four owned files. Original isolated root `./test.sh`: **8887 passed / 0 failed / 915 skipped, 134.93s**, `artifact://7183`. Existing SDK, compaction and session-format guides document disposal recovery, lifecycle section authority and durable usage provenance. No new source-regex, fake-DOM or internal call-count test is used as consumer proof.
+
+### Actionable Findings
+
+All five confirmed findings repaired and verified. Commit and another fresh full fixed-base -> latest committed HEAD review remain required; no convergence claim yet.
+
+### Coverage
+
+Canonical receipt, independent five-item validator, exact coverage audit, RED/GREEN and actual smoke receipts: `/tmp/compound-engineering-501/ce-code-review/20261025-full-wave8-805d1875/`. Same protected-worktree/manual-loop, unavailable graph, unattested external family and runtime limitations apply. In-memory MCP transport is actual protocol/resource lifecycle proof, not live remote-server proof.
+
+### Verdict
+
+Round-8 repairs verified locally; continue full merge review after local commit. No push, PR, dependency, upstream replay or released changelog change.

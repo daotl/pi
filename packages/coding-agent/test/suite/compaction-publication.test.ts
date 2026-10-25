@@ -628,7 +628,10 @@ it.each([
 						{ input: 200, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.22 },
 					]
 				: operation === "signal"
-					? [{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }]
+					? [
+							{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+							{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+						]
 					: [{ input: 100, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0.11 }],
 		);
 	} finally {

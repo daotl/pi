@@ -230,20 +230,20 @@ export function estimateProjectedContextTokens(
 	const estimate = estimateContextTokens(projection.messages);
 	if (estimate.lastUsageIndex !== null) {
 		let projectedMessageIndex = 0;
-		let usageEntryId: string | undefined;
+		let usageEntry: SessionEntry | undefined;
 		for (const entry of projection.entries) {
 			const nextMessageIndex = projectedMessageIndex + entry.messages.length;
 			if (estimate.lastUsageIndex < nextMessageIndex) {
 				const sourceEntry = entry.sourceEntry;
 				if (sourceEntry.usageSourceId === undefined || sourceEntry.usageSourceId === sourceEntry.id) {
-					usageEntryId = sourceEntry.id;
+					usageEntry = sourceEntry;
 				}
 				break;
 			}
 			projectedMessageIndex = nextMessageIndex;
 		}
 
-		const usageEntryIndex = usageEntryId ? branchEntries.findIndex((entry) => entry.id === usageEntryId) : -1;
+		const usageEntryIndex = usageEntry ? branchEntries.findIndex((entry) => entry.id === usageEntry.id) : -1;
 		let latestInvalidatingEntryIndex = -1;
 		for (let i = branchEntries.length - 1; i >= 0; i--) {
 			const entry = branchEntries[i];
@@ -252,7 +252,13 @@ export function estimateProjectedContextTokens(
 				break;
 			}
 		}
-		if (usageEntryIndex > latestInvalidatingEntryIndex) return estimate;
+		if (
+			usageEntryIndex > latestInvalidatingEntryIndex ||
+			(usageEntry?.type === "message" &&
+				usageEntry.usageContextEntryId !== undefined &&
+				usageEntry.usageContextEntryId === branchEntries[latestInvalidatingEntryIndex]?.id)
+		)
+			return estimate;
 	}
 
 	const currentSystem = getCurrentSystemMessage(projection.messages);

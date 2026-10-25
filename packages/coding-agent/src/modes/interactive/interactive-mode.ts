@@ -4776,6 +4776,10 @@ export class InteractiveMode {
 			try {
 				await this.runtimeHost.dispose({ fromSignal: true });
 			} catch (error: unknown) {
+				if (this.runtimeHost.shutdownPending) {
+					this.showError(`Failed to shut down: ${error instanceof Error ? error.message : String(error)}`);
+					return;
+				}
 				this.isShuttingDown = false;
 				this.shutdownRequested = false;
 				this.showError(`Failed to shut down: ${error instanceof Error ? error.message : String(error)}`);
@@ -4816,6 +4820,12 @@ export class InteractiveMode {
 			await this.runtimeHost.dispose();
 		} catch (error: unknown) {
 			// Disposal rejected before invalidation; resume the same host registrations.
+			if (this.runtimeHost.shutdownPending) {
+				this.ui.start();
+				this.ui.requestRender(true);
+				this.showError(`Failed to shut down: ${error instanceof Error ? error.message : String(error)}`);
+				return;
+			}
 			this.isShuttingDown = false;
 			this.shutdownRequested = false;
 			this.ui.start();

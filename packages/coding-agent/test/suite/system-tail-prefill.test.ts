@@ -6,7 +6,7 @@ import {
 	fauxAssistantMessage,
 	getCurrentSystemMessage,
 } from "@earendil-works/pi-ai";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { createHarness, getMessageText } from "./harness.ts";
 
@@ -106,7 +106,7 @@ it.each((["success", "mismatch"] as const).flatMap((outcome) => [false, true].ma
 	},
 );
 
-it("preserves accepted dynamic discovery sections on continuation while refreshing base policy", async () => {
+it.each([true, false])("preserves live discovery on continuation (trusted %s)", async (trusted) => {
 	let injected = false;
 	const harness = await createHarness({
 		fauxApi: "openai-completions",
@@ -122,6 +122,7 @@ it("preserves accepted dynamic discovery sections on continuation while refreshi
 		],
 	});
 	try {
+		harness.settingsManager.setProjectTrusted(trusted);
 		harness.setResponses([fauxAssistantMessage("partial", { stopReason: "aborted" })]);
 		await harness.session.prompt("start discovery");
 		expect(getCurrentSystemMessage(harness.session.messages)?.sections?.mcp_servers).toContain("docs");
@@ -166,9 +167,11 @@ it("preserves accepted dynamic discovery sections on continuation while refreshi
 	}
 });
 
-it.each(["regenerate", "reopen"] as const)(
-	"preserves selected discovery through %s continuation",
-	async (operation) => {
+it.each(
+	(["regenerate", "reopen"] as const).flatMap((operation) => [true, false].map((trusted) => ({ operation, trusted }))),
+)(
+	"preserves only authorized discovery through $operation continuation with project trust $trusted",
+	async ({ operation, trusted }) => {
 		const cwd = mkdtempSync(join(tmpdir(), "pi-discovery-resume-"));
 		let injected = false;
 		let harness = await createHarness({
@@ -187,6 +190,7 @@ it.each(["regenerate", "reopen"] as const)(
 			],
 		});
 		try {
+			harness.settingsManager.setProjectTrusted(trusted);
 			harness.setResponses([fauxAssistantMessage("selected prefix", { stopReason: "aborted" })]);
 			await harness.session.prompt("selected request");
 			if (operation === "reopen") {
@@ -198,6 +202,7 @@ it.each(["regenerate", "reopen"] as const)(
 					fauxApi: "openai-completions",
 					settings: { compaction: { enabled: false }, retry: { enabled: false } },
 				});
+				harness.settingsManager.setProjectTrusted(trusted);
 			}
 			let discovery: string | null | undefined;
 			harness.setResponses([
@@ -211,7 +216,7 @@ it.each(["regenerate", "reopen"] as const)(
 			]);
 			if (operation === "regenerate") await harness.session.regenerateSwipe(harness.session.getSwipeGroup()!);
 			else await harness.session.continue();
-			expect(discovery).toBe("<mcp_servers>\nselected namespace docs\n</mcp_servers>");
+			expect(discovery).toBe(trusted ? "<mcp_servers>\nselected namespace docs\n</mcp_servers>" : undefined);
 			if (operation === "regenerate") {
 				harness.setResponses([
 					(context) => {
@@ -220,7 +225,7 @@ it.each(["regenerate", "reopen"] as const)(
 					},
 				]);
 				await harness.session.continue();
-				expect(discovery).toBe("<mcp_servers>\nselected namespace docs\n</mcp_servers>");
+				expect(discovery).toBe(trusted ? "<mcp_servers>\nselected namespace docs\n</mcp_servers>" : undefined);
 			}
 		} finally {
 			await harness.session.abort();
@@ -229,3 +234,40 @@ it.each(["regenerate", "reopen"] as const)(
 		}
 	},
 );
+
+it("reselects the preserved saved-policy suffix of a continued swipe", async () => {
+	vi.useFakeTimers({ toFake: ["Date"] });
+	vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+	const harness = await createHarness({
+		fauxApi: "openai-completions",
+		settings: { compaction: { enabled: false }, retry: { enabled: false } },
+	});
+	try {
+		harness.setResponses([fauxAssistantMessage("partial", { stopReason: "aborted" })]);
+		await harness.session.prompt("start");
+		harness.session.setCustomSystemPrompt("VERSION_ONE");
+		harness.setResponses([
+			() => {
+				vi.setSystemTime(new Date("2026-01-01T00:01:00Z"));
+				return fauxAssistantMessage("partial completed");
+			},
+		]);
+		await harness.session.continue();
+		const selectedLeaf = harness.sessionManager.getLeafId();
+		const selectedVersion = harness.session.getSwipeGroup()!.versions[0].id;
+		harness.setResponses([fauxAssistantMessage("alternative answer")]);
+		await harness.session.regenerateSwipe(harness.session.getSwipeGroup()!);
+		const group = harness.session.getSwipeGroup()!;
+		expect(
+			harness.session.goToSwipeVersion(
+				group,
+				group.versions.findIndex((entry) => entry.id === selectedVersion),
+			),
+		).toBe(true);
+		expect(harness.sessionManager.getLeafId()).toBe(selectedLeaf);
+		expect(harness.session.systemPrompt).toContain("VERSION_ONE");
+	} finally {
+		harness.cleanup();
+		vi.useRealTimers();
+	}
+});

@@ -79,7 +79,7 @@ export class AgentSessionRuntime {
 	private readonly createRuntime: CreateAgentSessionRuntimeFactory;
 	private _diagnostics: AgentSessionRuntimeDiagnostic[];
 	private _modelFallbackMessage?: string;
-	private signalShutdownDispatched = false;
+	private shutdownDispatched = false;
 
 	constructor(
 		_session: AgentSession,
@@ -113,6 +113,11 @@ export class AgentSessionRuntime {
 
 	get modelFallbackMessage(): string | undefined {
 		return this._modelFallbackMessage;
+	}
+
+	/** Cleanup has run and extension reactivation has not completed. Hosts must not resume work. */
+	get shutdownPending(): boolean {
+		return this.shutdownDispatched;
 	}
 
 	setRebindSession(rebindSession?: (session: AgentSession) => Promise<void>): void {
@@ -185,7 +190,7 @@ export class AgentSessionRuntime {
 		this._services = result.services;
 		this._diagnostics = result.diagnostics;
 		this._modelFallbackMessage = result.modelFallbackMessage;
-		this.signalShutdownDispatched = false;
+		this.shutdownDispatched = false;
 	}
 
 	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
@@ -413,23 +418,51 @@ export class AgentSessionRuntime {
 	 * cleanup first, before abort can write progress to a disconnected terminal.
 	 */
 	async dispose(options?: { fromSignal?: boolean }): Promise<void> {
-		if (options?.fromSignal && !this.signalShutdownDispatched) {
+		if (options?.fromSignal && !this.shutdownDispatched) {
 			await emitSessionShutdownEvent(this.session.extensionRunner, {
 				type: "session_shutdown",
 				reason: "quit",
 			});
-			// A retained-receipt failure can leave this session usable for a retry.
-			this.signalShutdownDispatched = true;
+			this.shutdownDispatched = true;
 		}
-		await this.session.abort();
-		this.session.flushPendingUsage();
-		if (!this.signalShutdownDispatched) {
-			await emitSessionShutdownEvent(this.session.extensionRunner, {
-				type: "session_shutdown",
-				reason: "quit",
-			});
+		try {
+			await this.session.abort();
+			this.session.flushPendingUsage();
+			if (!this.shutdownDispatched) {
+				await emitSessionShutdownEvent(this.session.extensionRunner, {
+					type: "session_shutdown",
+					reason: "quit",
+				});
+				this.shutdownDispatched = true;
+			}
+			this.session.flushPendingUsage();
+		} catch (error) {
+			if (this.shutdownDispatched) {
+				try {
+					// Reuse the existing host bindings and session_start resource lifecycle;
+					// a full reload would dispatch cleanup a second time and replace the runner.
+					await this.session.bindExtensions({});
+					this.shutdownDispatched = false;
+				} catch (reactivationError) {
+					// session_start can acquire resources before later binding work rejects.
+					const errors = [error, reactivationError];
+					try {
+						await emitSessionShutdownEvent(this.session.extensionRunner, {
+							type: "session_shutdown",
+							reason: "quit",
+						});
+					} catch (cleanupError) {
+						errors.push(cleanupError);
+					}
+					throw new AggregateError(
+						errors,
+						`${error instanceof Error ? error.message : String(error)}; extension reactivation failed: ${reactivationError instanceof Error ? reactivationError.message : String(reactivationError)}`,
+						{ cause: error },
+					);
+				}
+			}
+			throw error;
 		}
-		this.session.flushPendingUsage();
 		this.beforeSessionInvalidate?.();
 		this.session.dispose();
 	}
