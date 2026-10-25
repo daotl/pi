@@ -505,8 +505,11 @@ export class AgentSession {
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
-	/** Completed built-in summary charges not yet published as a checkpoint or usage entry. */
-	private _pendingCompactionUsage: Array<{ provider: string; model: string; usage: Usage }> = [];
+	/** Completed charges not yet durably published as a response, checkpoint, or usage entry. */
+	private _pendingUsage: Array<
+		| { kind: "compaction"; provider: string; model: string; usage: Usage }
+		| { kind: "terminal"; message: AssistantMessage }
+	> = [];
 	private _overflowRecoveryAttempted = false;
 	/** A manual /compact queued while the agent was streaming, to run at the next turn boundary. */
 	private _queuedCompact?: { options?: CompactOptions | string };
@@ -747,6 +750,7 @@ export class AgentSession {
 		env?: Record<string, string>;
 		thinkingLevel: ThinkingLevel;
 	}> {
+		this._flushPendingUsage();
 		// Route a virtual model first: summaries size their input and output from the model they get.
 		const { model, thinkingLevel } = isVirtualModel(selectedModel)
 			? await this._modelRuntime.resolveModel(selectedModel, convertToLlm(this.messages), {
@@ -977,7 +981,7 @@ export class AgentSession {
 	private _installAgentRequestProjection(): void {
 		const previousPrepareRequest = this.agent.prepareRequest;
 		this.agent.prepareRequest = async (request, signal) => {
-			this._flushPendingCompactionUsage();
+			this._flushPendingUsage();
 			if (this._deferUntrustedSnapshot) {
 				this._deferUntrustedSnapshot = false;
 				this._persistBaseSystemPrompt();
@@ -1733,9 +1737,9 @@ export class AgentSession {
 		this._refreshFinalizedContext();
 	}
 
-	/** Persist completed summary receipts before replacement, without notifying outgoing subscribers. */
+	/** Persist completed receipts before replacement, without notifying outgoing subscribers. */
 	flushPendingUsage(): void {
-		this._flushPendingCompactionUsage(false);
+		this._flushPendingUsage(false);
 	}
 
 	/** Full agent state */
@@ -3439,7 +3443,10 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
-	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+	private async _runAgentPrompt(
+		messages: AgentMessage | AgentMessage[],
+		preflightResult?: PromptOptions["preflightResult"],
+	): Promise<void> {
 		if (this._isAgentRunActive || this.agent.signal) {
 			throw new Error(
 				"Agent is already processing. Use steer() or followUp() to queue messages, or wait for completion.",
@@ -3451,7 +3458,8 @@ export class AgentSession {
 		this._recordSelection();
 		this._isAgentRunActive = true;
 		try {
-			this._flushPendingCompactionUsage();
+			this._flushPendingUsage();
+			preflightResult?.("started");
 			await this.agent.prompt(messages);
 			// Always restore a captured prefix before honoring cancellation after a retry.
 			while (true) {
@@ -3466,6 +3474,9 @@ export class AgentSession {
 				if (!(await this._continuePastSettleBoundary())) break;
 				await this.agent.continue();
 			}
+		} catch (error) {
+			this._retainTerminalUsage(error);
+			throw error;
 		} finally {
 			try {
 				if (this._agentRunAbortRequested) this._finishCancelledRetry();
@@ -3523,7 +3534,7 @@ export class AgentSession {
 		this._failedResponse = undefined;
 		this._isAgentRunActive = true;
 		try {
-			this._flushPendingCompactionUsage();
+			this._flushPendingUsage();
 			if (
 				this._acceptedPromptLeafId &&
 				!this.sessionManager.getBranch().some((entry) => entry.id === this._acceptedPromptLeafId)
@@ -3561,6 +3572,9 @@ export class AgentSession {
 				if (!(await this._continuePastSettleBoundary())) break;
 				await this.agent.continue();
 			}
+		} catch (error) {
+			this._retainTerminalUsage(error);
+			throw error;
 		} finally {
 			try {
 				if (this._agentRunAbortRequested) this._finishCancelledRetry();
@@ -3649,6 +3663,7 @@ export class AgentSession {
 		try {
 			await this.agent.continue(effectivePrefill);
 		} catch (error) {
+			this._retainTerminalUsage(error);
 			// Prefill echo mismatch (or similar) aborts the run. Restore the
 			// original partial message so the transcript is not left without it.
 			if (this._pendingPrefill) {
@@ -4031,8 +4046,7 @@ export class AgentSession {
 		this._runSystemPromptOptions = result.systemPromptOptions;
 		if (updateMessage) messages.unshift(updateMessage);
 
-		preflightResult?.("started");
-		await this._runAgentPrompt(messages);
+		await this._runAgentPrompt(messages, preflightResult);
 	}
 
 	/**
@@ -4725,24 +4739,43 @@ export class AgentSession {
 		return this._requestHistoryPolicy(model, true);
 	}
 
-	private _flushPendingCompactionUsage(notify = true): void {
-		while (this._pendingCompactionUsage.length > 0) {
-			const receipt = this._pendingCompactionUsage[0];
-			const entry = this.sessionManager.appendUsage("compaction", receipt.provider, receipt.model, receipt.usage);
+	private _flushPendingUsage(notify = true): void {
+		while (this._pendingUsage.length > 0) {
+			const receipt = this._pendingUsage[0];
+			const entry =
+				receipt.kind === "terminal"
+					? this.sessionManager.getEntry(
+							this.sessionManager.appendMessage({ ...receipt.message, content: [{ type: "text", text: "" }] }),
+						)!
+					: this.sessionManager.appendUsage("compaction", receipt.provider, receipt.model, receipt.usage);
 			// Consume only after publication; a listener failure must not charge it again.
-			this._pendingCompactionUsage.shift();
+			this._pendingUsage.shift();
 			if (notify) this._emit({ type: "entry_appended", entry });
 		}
 	}
 
 	private _retainCompactionUsage(usage: Usage | undefined, model: Model<Api> | undefined): void {
 		if (!usage || !model) return;
-		this._pendingCompactionUsage.push({ provider: model.provider, model: model.id, usage: structuredClone(usage) });
+		this._pendingUsage.push({
+			kind: "compaction",
+			provider: model.provider,
+			model: model.id,
+			usage: structuredClone(usage),
+		});
 		try {
-			this._flushPendingCompactionUsage();
+			this._flushPendingUsage();
 		} catch {
 			// Keep the original failure; an unwritten receipt remains owned by this session.
 		}
+	}
+
+	/** Only an escaping terminal failure lacks both its original response and fallback receipt. */
+	private _retainTerminalUsage(error: unknown): void {
+		if (!(error instanceof TerminalResponseError) || !error.terminalMessage) return;
+		const message = error.terminalMessage;
+		if (this._entryIdsByMessage.has(message)) return;
+		if (this._pendingUsage.some((receipt) => receipt.kind === "terminal" && receipt.message === message)) return;
+		this._pendingUsage.push({ kind: "terminal", message });
 	}
 
 	/**
@@ -5160,7 +5193,7 @@ export class AgentSession {
 		let cancelledByExtension = false;
 
 		try {
-			this._flushPendingCompactionUsage();
+			this._flushPendingUsage();
 			const model = this.model;
 			if (!model) {
 				throw new Error(formatNoModelSelectedMessage());
@@ -5534,7 +5567,7 @@ export class AgentSession {
 
 			abortController = new AbortController();
 			this._autoCompactionAbortController = abortController;
-			this._flushPendingCompactionUsage();
+			this._flushPendingUsage();
 			started = true;
 			this._emit({ type: "compaction_start", reason });
 			abortController.signal.throwIfAborted();

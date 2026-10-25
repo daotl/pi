@@ -297,3 +297,28 @@ Canonical receipt, independent validator, exact coverage audit, RED/GREEN and te
 ### Verdict
 
 Round-9 repairs verified locally; continue full merge review after local commit. No push, PR, dependency, upstream replay or released changelog change.
+
+## Full merge review loop: round 10
+
+Round-9 repair commit: `59d5ed47e486a0f63805e3ae413d63153ddfbb02`; normal hook No fixes applied and tested product/guide bytes match. Tenth fresh fixed-base -> HEAD review covers all 420 paths, 72 runtime source paths and 59,005 diff lines; snapshot digest `cddd37d80653fef5c9d03ab064d7d2de387d4a4412238e7dcfe7a46e9f45cccb`. Eleven canonical personas completed. Both distinct reliability candidates independently validated true; canonical receipt passed before mutation (`artifact://7436`). Exact adversarial ledger: 106 investigated / 314 insufficient detailed paths, disjoint and exhaustive inventory. This is bounded changed-hunk evidence, not whole-tree deep clearance.
+
+### Confirmed findings and repairs
+
+- R10-#1 (P2): original terminal publication and fallback receipt append could both fail during a sustained storage outage. Canonical restore/refresh then discarded the only completed physical charge. Summary and unpublished terminal receipts now share one Session-owned pending queue and existing request, continuation, compaction and runtime flush boundaries. Escaping terminal failures retain physical metadata before prefill restoration; committed responses are excluded. Publication consumes the head only after durable storage and before notification. Four ordinary/prefill × recovery/disposal regressions produced RED, then persist exactly one physical charge after recovery/reopen and repeated drain.
+- R10-#2 (P2): prompt reported started before its mandatory run-owned pending-receipt drain. Actual RPC RED falsely accepted the prompt; actual interactive Enter/Alt+Enter RED lost queued input (`artifact://7442`). Started now occurs after run ownership and successful drain, before Agent dispatch. Existing queued/handled semantics remain unchanged. Real VirtualTerminal and JSONL RPC scenarios preserve/reject input during repeated outage, then accept each input once after recovery; actual faux compaction establishes the pending receipt without private-array mutation.
+
+### Verification
+
+Single AgentSession source owner; independent UI/RPC tests-only owner. Final post-format owners: **140 passed / 5 files, 23.97s**. Final full `npm run check`: **1770 / No fixes applied, 19.00s**; first check formatted three owned files. Original isolated root `./test.sh`: **8906 passed / 0 failed / 915 skipped, 130.68s**, `artifact://7459`. Standalone actual-source/faux/filesystem outage smoke: sustained outage rejects, one durable physical receipt, 20 tokens and cost 0.02 after recovery/reopen. Temporary smoke removed. SDK and compaction guides document unified receipt ownership and acceptance timing.
+
+### Actionable Findings
+
+Both confirmed findings repaired and verified. Commit and a fresh entire fixed-base -> latest committed HEAD review remain required; no convergence claim.
+
+### Coverage
+
+Canonical receipt, independent validator, exact coverage audit, RED/GREEN and tested source identity: `/tmp/compound-engineering-501/ce-code-review/20261025-full-wave10-860276e4/`. Manual protected-worktree exception, unavailable graph, unattested external model family and bounded caller/runtime evidence remain. Unwritten in-memory receipts do not survive process exit; no crash-persistence claim.
+
+### Verdict
+
+Round-10 repairs verified locally; continue full merge review after local commit. No push, PR, dependency, upstream replay or released changelog change.

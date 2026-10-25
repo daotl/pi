@@ -1,3 +1,7 @@
+import * as fs from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setImmediate } from "node:timers/promises";
 import { type AssistantMessage, fauxAssistantMessage, type TranscriptContext } from "@earendil-works/pi-ai";
 import { isPadLinesToWidth, isWrapLinesToWidth, setPadLinesToWidth, setWrapLinesToWidth } from "@earendil-works/pi-tui";
@@ -5,6 +9,7 @@ import { expect, it, type MockInstance, vi } from "vitest";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
 import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
 import { type AgentSessionServices, createAgentSessionFromServices } from "../../src/core/agent-session-services.ts";
+import { SessionManager } from "../../src/core/session-manager.ts";
 import type { TreeSelectorComponent } from "../../src/modes/interactive/components/tree-selector.ts";
 import {
 	type HeartbeatEntry,
@@ -18,6 +23,11 @@ import {
 	setMessageSeparator,
 } from "../../src/modes/interactive/theme/theme.ts";
 import { createHarness, getMessageText, type HarnessOptions } from "./harness.ts";
+
+vi.mock("fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof fs>();
+	return { ...actual, appendFileSync: vi.fn(actual.appendFileSync) };
+});
 
 async function createSchedulingMode(options: HarnessOptions = {}) {
 	const previous = {
@@ -2413,5 +2423,115 @@ it("keeps retry batch commands immediate and preserves steering before follow-up
 		response.resolve();
 		await running?.catch(() => {});
 		await ui.cleanup();
+	}
+});
+
+it("retains terminal-submitted first input through a pending summary receipt outage and recovers once", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-ui-receipt-outage-"));
+	const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+	const summaryEntered = Promise.withResolvers<void>();
+	const summaryRelease = Promise.withResolvers<void>();
+	const ui = await createSchedulingMode({ cwd, sessionManager: manager, fauxApi: "openai-completions" });
+	const actual = await vi.importActual<typeof fs>("fs");
+	let writable = false;
+	let compaction: Promise<unknown> | undefined;
+	const requests: string[] = [];
+	let receiptFailures = 0;
+	try {
+		await ui.mode.init();
+		for (let index = 0; index < 3; index++) {
+			manager.appendMessage({ role: "user", content: `question ${index}`, timestamp: index * 2 });
+			manager.appendMessage(fauxAssistantMessage(`answer ${index}`));
+		}
+		ui.harness.session.refreshContext();
+		ui.harness.setResponses([
+			async () => {
+				summaryEntered.resolve();
+				await summaryRelease.promise;
+				return fauxAssistantMessage("completed retained summary");
+			},
+			...Array.from({ length: 2 }, () => (context: TranscriptContext) => {
+				requests.push(
+					context.messages
+						.filter((message) => message.role === "user")
+						.map(getMessageText)
+						.at(-1)!,
+				);
+				expect(
+					manager.getEntries().filter((entry) => entry.type === "usage" && entry.kind === "compaction"),
+				).toHaveLength(1);
+				return fauxAssistantMessage("queued outage recovery completed");
+			}),
+		]);
+		vi.mocked(fs.appendFileSync).mockImplementation((...args) => {
+			const entry = JSON.parse(String(args[1])) as { type: string; kind?: string };
+			if (entry.type === "compaction") throw new Error("checkpoint storage unavailable");
+			if (entry.type === "usage" && entry.kind === "compaction" && !writable) {
+				receiptFailures++;
+				throw new Error("summary receipt storage unavailable");
+			}
+			return actual.appendFileSync(...args);
+		});
+		compaction = ui.harness.session.compact({ keepRecentMessages: 1 }).catch((error: unknown) => error);
+		await summaryEntered.promise;
+		ui.terminal.sendInput("first retained outage input");
+		ui.terminal.sendInput("\r");
+		ui.terminal.sendInput("second retained outage input");
+		ui.terminal.sendInput("\x1b[13;3u");
+		expect(ui.internal.compactionQueuedMessages.map((entry) => entry.text)).toEqual([
+			"first retained outage input",
+			"second retained outage input",
+		]);
+		summaryRelease.resolve();
+		expect(await compaction).toMatchObject({ message: "checkpoint storage unavailable" });
+		await vi.waitFor(() => expect(receiptFailures).toBeGreaterThanOrEqual(2));
+		await ui.harness.session.waitForIdle();
+		expect(requests).toEqual([]);
+		await vi.waitFor(() => {
+			expect(ui.internal.compactionQueuedMessages.map((entry) => entry.text)).toEqual([
+				"first retained outage input",
+				"second retained outage input",
+			]);
+		});
+		expect(
+			ui.harness.session.messages.filter((message) => message.role === "user").map(getMessageText),
+		).not.toContain("first retained outage input");
+		await ui.terminal.waitForRender();
+		expect(ui.terminal.getViewport().join("\n")).toContain("first retained outage input");
+		await ui.internal.flushCompactionQueue();
+		expect(requests).toEqual([]);
+		expect(ui.internal.compactionQueuedMessages.map((entry) => entry.text)).toEqual([
+			"first retained outage input",
+			"second retained outage input",
+		]);
+		writable = true;
+		await ui.internal.flushCompactionQueue();
+		await ui.harness.session.waitForIdle();
+		expect(requests).toEqual(["first retained outage input", "second retained outage input"]);
+		expect(
+			manager
+				.getEntries()
+				.flatMap((entry) =>
+					entry.type === "message" &&
+					entry.message.role === "user" &&
+					["first retained outage input", "second retained outage input"].includes(getMessageText(entry.message))
+						? [getMessageText(entry.message)]
+						: [],
+				),
+		).toEqual(requests);
+		expect(
+			SessionManager.open(manager.getSessionFile()!)
+				.getEntries()
+				.filter((entry) => entry.type === "usage" && entry.kind === "compaction"),
+		).toHaveLength(1);
+		await ui.terminal.waitForRender();
+		expect(ui.terminal.getViewport().join("\n")).toContain("queued outage recovery completed");
+	} finally {
+		summaryRelease.resolve();
+		writable = true;
+		vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);
+		await compaction;
+		await ui.cleanup();
+		rmSync(cwd, { recursive: true, force: true });
 	}
 });

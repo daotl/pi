@@ -1,7 +1,9 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
@@ -19,8 +21,14 @@ import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
 import { createInMemoryModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
+import { createHarness, getMessageText } from "./suite/harness.ts";
 import { enableBuiltinProviders } from "./test-network-env.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
+
+vi.mock("fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof fs>();
+	return { ...actual, appendFileSync: vi.fn(actual.appendFileSync) };
+});
 
 const rpcIo = vi.hoisted(() => ({
 	outputLines: [] as string[],
@@ -106,6 +114,7 @@ async function createRuntimeHost(options: {
 	cwd?: string;
 	resourceLoader?: ResourceLoader;
 	sessionManager?: SessionManager;
+	session?: AgentSession;
 }): Promise<{
 	runtimeHost: AgentSessionRuntime;
 	cleanup: () => Promise<void>;
@@ -145,15 +154,17 @@ async function createRuntimeHost(options: {
 		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
 	}
 
-	const session = new AgentSession({
-		agent,
-		sessionManager,
-		settingsManager,
-		cwd: tempDir,
-		modelRuntime: getModelRuntime(modelRegistry),
-		resourceLoader:
-			options.resourceLoader ?? createTestResourceLoader({ extensionsResult: options.extensionsResult }),
-	});
+	const session =
+		options.session ??
+		new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd: tempDir,
+			modelRuntime: getModelRuntime(modelRegistry),
+			resourceLoader:
+				options.resourceLoader ?? createTestResourceLoader({ extensionsResult: options.extensionsResult }),
+		});
 
 	const runtimeHost = {
 		session,
@@ -303,6 +314,118 @@ describe("RPC prompt response semantics", () => {
 			} finally {
 				rmSync(cwd, { recursive: true, force: true });
 			}
+		}
+	});
+
+	it("rejects RPC acceptance during a pending summary receipt outage and accepts recovery once", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-rpc-receipt-outage-"));
+		const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+		const harness = await createHarness({
+			cwd,
+			sessionManager: manager,
+			fauxApi: "openai-completions",
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+		});
+		const actual = await vi.importActual<typeof fs>("fs");
+		let writable = false;
+		let receiptFailures = 0;
+		let cleanup = async () => {};
+		const requests: string[] = [];
+		try {
+			for (let index = 0; index < 3; index++) {
+				manager.appendMessage({ role: "user", content: `question ${index}`, timestamp: index * 2 });
+				manager.appendMessage(fauxAssistantMessage(`answer ${index}`));
+			}
+			harness.session.refreshContext();
+			harness.setResponses([
+				fauxAssistantMessage("completed retained summary"),
+				(context) => {
+					requests.push(
+						context.messages
+							.filter((message) => message.role === "user")
+							.map(getMessageText)
+							.at(-1)!,
+					);
+					expect(
+						manager.getEntries().filter((entry) => entry.type === "usage" && entry.kind === "compaction"),
+					).toHaveLength(1);
+					expect(getPromptResponses(rpcIo.outputLines, "receipt-recovered")).toMatchObject([
+						{ success: true, data: { disposition: "started" } },
+					]);
+					return fauxAssistantMessage("RPC recovery completed");
+				},
+			]);
+			vi.mocked(fs.appendFileSync).mockImplementation((...args) => {
+				const entry = JSON.parse(String(args[1])) as { type: string; kind?: string };
+				if (entry.type === "compaction") throw new Error("checkpoint storage unavailable");
+				if (entry.type === "usage" && entry.kind === "compaction" && !writable) {
+					receiptFailures++;
+					throw new Error("summary receipt storage unavailable");
+				}
+				return actual.appendFileSync(...args);
+			});
+			await expect(harness.session.compact({ keepRecentMessages: 1 })).rejects.toThrow(
+				"checkpoint storage unavailable",
+			);
+			expect(receiptFailures).toBe(1);
+			const rpc = await startRpcMode({ withAuth: false, responseDelayMs: 0, session: harness.session });
+			cleanup = rpc.cleanup;
+			rpc.lineHandler(
+				JSON.stringify({ id: "receipt-blocked", type: "prompt", message: "retry retained RPC input" }),
+			);
+			await vi.waitFor(() => {
+				expect(getPromptResponses(rpcIo.outputLines, "receipt-blocked")).toEqual([
+					{
+						id: "receipt-blocked",
+						type: "response",
+						command: "prompt",
+						success: false,
+						error: "summary receipt storage unavailable",
+					},
+				]);
+			});
+			await harness.session.waitForIdle();
+			expect(requests).toEqual([]);
+			expect(
+				harness.session.messages.filter((message) => message.role === "user").map(getMessageText),
+			).not.toContain("retry retained RPC input");
+			expect(parseOutputLines(rpcIo.outputLines).filter((line) => line.type === "agent_start")).toEqual([]);
+			writable = true;
+			rpc.lineHandler(
+				JSON.stringify({ id: "receipt-recovered", type: "prompt", message: "retry retained RPC input" }),
+			);
+			await vi.waitFor(() => {
+				expect(getPromptResponses(rpcIo.outputLines, "receipt-recovered")).toEqual([
+					{
+						id: "receipt-recovered",
+						type: "response",
+						command: "prompt",
+						success: true,
+						data: { disposition: "started" },
+					},
+				]);
+			});
+			await harness.session.waitForIdle();
+			expect(getPromptResponses(rpcIo.outputLines, "receipt-blocked")).toMatchObject([{ success: false }]);
+			expect(requests).toEqual(["retry retained RPC input"]);
+			expect(
+				harness.session.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.filter((text) => text === "retry retained RPC input"),
+			).toEqual(["retry retained RPC input"]);
+			expect(
+				SessionManager.open(manager.getSessionFile()!)
+					.getEntries()
+					.filter((entry) => entry.type === "usage" && entry.kind === "compaction"),
+			).toHaveLength(1);
+			expect(parseOutputLines(rpcIo.outputLines).filter((line) => line.type === "agent_start")).toHaveLength(1);
+		} finally {
+			writable = true;
+			vi.mocked(fs.appendFileSync).mockImplementation(actual.appendFileSync);
+			await cleanup();
+			harness.cleanup();
+			rmSync(cwd, { recursive: true, force: true });
 		}
 	});
 

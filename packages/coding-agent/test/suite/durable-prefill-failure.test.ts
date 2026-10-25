@@ -9,19 +9,26 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { getUsageTotals } from "../../src/core/usage-totals.ts";
 import { createHarness, getMessageText } from "./harness.ts";
 
 vi.mock("fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof fs>();
-	return { ...actual, writeFileSync: vi.fn(actual.writeFileSync), renameSync: vi.fn(actual.renameSync) };
+	return {
+		...actual,
+		writeFileSync: vi.fn(actual.writeFileSync),
+		renameSync: vi.fn(actual.renameSync),
+		appendFileSync: vi.fn(actual.appendFileSync),
+	};
 });
 let cwd: string;
 beforeEach(async () => {
 	const actual = await vi.importActual<typeof fs>("fs");
 	vi.mocked(fs.writeFileSync).mockReset().mockImplementation(actual.writeFileSync);
 	vi.mocked(fs.renameSync).mockReset().mockImplementation(actual.renameSync);
+	vi.mocked(fs.appendFileSync).mockReset().mockImplementation(actual.appendFileSync);
 	cwd = fs.mkdtempSync(join(tmpdir(), "pi-prefill-publication-failure-"));
 });
 afterEach(() => {
@@ -870,3 +877,227 @@ it.each(["delete", "delete-parent", "soft-delete", "shred", "replace", "swipe-de
 		}
 	},
 );
+
+it.each([
+	{ prefill: false, recovery: "prompt" },
+	{ prefill: true, recovery: "prompt" },
+	{ prefill: false, recovery: "disposal" },
+	{ prefill: true, recovery: "disposal" },
+] as const)(
+	"retains one physical terminal charge across sustained storage outage (prefill $prefill, $recovery)",
+	async ({ prefill, recovery }) => {
+		const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+		const harness = await createHarness({
+			cwd,
+			sessionManager: manager,
+			fauxApi: "openai-completions",
+			settings: { retry: { enabled: false }, compaction: { enabled: false } },
+		});
+		try {
+			if (prefill) {
+				harness.setResponses([fauxAssistantMessage("original prefix", { stopReason: "aborted" })]);
+				await harness.session.prompt("original request");
+			}
+			const before = getUsageTotals(manager.getEntries());
+			const model = harness.getModel();
+			const terminal: AssistantMessage = {
+				...fauxAssistantMessage(prefill ? "original prefix completed" : "ordinary answer"),
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				responseId: "sustained-outage-physical-response",
+				responseModel: "physical-deployment",
+				diagnostics: [{ type: "provider-recovery", timestamp: 1, details: { attempt: 2 } }],
+				usage: {
+					input: 100,
+					output: 10,
+					cacheRead: 5,
+					cacheWrite: 3,
+					totalTokens: 118,
+					cost: { input: 0.1, output: 0.01, cacheRead: 0.005, cacheWrite: 0.003, total: 0.118 },
+				},
+			};
+			let outage = false;
+			const actual = await vi.importActual<typeof fs>("fs");
+			vi.mocked(fs.writeFileSync).mockImplementation((...args) => {
+				if (outage) throw new Error("sustained session storage outage");
+				return actual.writeFileSync(...args);
+			});
+			vi.mocked(fs.appendFileSync).mockImplementation((...args) => {
+				if (outage) throw new Error("sustained session storage outage");
+				return actual.appendFileSync(...args);
+			});
+			vi.mocked(fs.renameSync).mockImplementation((...args) => {
+				if (outage) throw new Error("sustained session storage outage");
+				return actual.renameSync(...args);
+			});
+			const off = harness.session.subscribe((event) => {
+				if (
+					event.type === "message_end" &&
+					event.message.role === "assistant" &&
+					event.message.responseId === terminal.responseId
+				)
+					outage = true;
+			});
+			harness.session.agent.streamFunction = () => {
+				const stream = createAssistantMessageEventStream();
+				stream.push({ type: "done", reason: "stop", message: structuredClone(terminal) });
+				return stream;
+			};
+			await expect(
+				prefill ? harness.session.continue() : harness.session.prompt("original request"),
+			).rejects.toThrow("sustained session storage outage");
+			expect(harness.session.isIdle).toBe(true);
+			expect(getUsageTotals(manager.getEntries())).toEqual(before);
+			expect(() => harness.session.flushPendingUsage()).toThrow("sustained session storage outage");
+			off();
+			outage = false;
+			let recoveredUsage = {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			};
+			if (recovery === "prompt") {
+				harness.session.agent.streamFunction = harness.session.modelRuntime.streamSimple.bind(
+					harness.session.modelRuntime,
+				);
+				harness.setResponses([
+					(context) => {
+						const receipt = SessionManager.open(manager.getSessionFile()!)
+							.getEntries()
+							.find(
+								(entry) =>
+									entry.type === "message" &&
+									entry.message.role === "assistant" &&
+									entry.message.responseId === terminal.responseId,
+							);
+						expect(receipt).toMatchObject({ message: { usage: terminal.usage } });
+						if (prefill) expect(context.messages.map(getMessageText)).toContain("original prefix");
+						return fauxAssistantMessage("recovered answer", { responseId: "recovered-request-response" });
+					},
+				]);
+				await harness.session.prompt("recovered request");
+				const recovered = manager
+					.getEntries()
+					.findLast(
+						(entry) =>
+							entry.type === "message" &&
+							entry.message.role === "assistant" &&
+							entry.message.responseId === "recovered-request-response",
+					);
+				if (recovered?.type !== "message" || recovered.message.role !== "assistant")
+					throw new Error("Missing recovered response");
+				recoveredUsage = recovered.message.usage;
+			} else {
+				const runtime = new AgentSessionRuntime(
+					harness.session,
+					{
+						cwd,
+						agentDir: harness.tempDir,
+						modelRuntime: harness.session.modelRuntime,
+						settingsManager: harness.settingsManager,
+						resourceLoader: harness.session.resourceLoader,
+						diagnostics: [],
+					},
+					async () => {
+						throw new Error("Disposal must not replace the runtime");
+					},
+				);
+				await runtime.dispose();
+			}
+			harness.session.flushPendingUsage();
+			for (const current of [manager, SessionManager.open(manager.getSessionFile()!)]) {
+				const receipts = current
+					.getEntries()
+					.flatMap((entry) =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						entry.message.responseId === terminal.responseId
+							? [entry.message]
+							: [],
+					);
+				expect(receipts).toEqual([
+					expect.objectContaining({
+						api: terminal.api,
+						provider: terminal.provider,
+						model: terminal.model,
+						responseModel: terminal.responseModel,
+						diagnostics: terminal.diagnostics,
+						usage: terminal.usage,
+						content: [{ type: "text", text: "" }],
+						stopReason: "error",
+					}),
+				]);
+				expect(getUsageTotals(current.getEntries())).toEqual({
+					input: before.input + 100 + recoveredUsage.input,
+					output: before.output + 10 + recoveredUsage.output,
+					cacheRead: before.cacheRead + 5 + recoveredUsage.cacheRead,
+					cacheWrite: before.cacheWrite + 3 + recoveredUsage.cacheWrite,
+					cost: expect.closeTo(before.cost + 0.118 + recoveredUsage.cost.total),
+				});
+				expect(current.buildSessionContext().messages.map(getMessageText)).not.toContain(getMessageText(terminal));
+			}
+		} finally {
+			harness.cleanup();
+		}
+	},
+);
+
+it("does not retain a second terminal charge after the original response committed", async () => {
+	const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+	const harness = await createHarness({
+		cwd,
+		sessionManager: manager,
+		settings: { retry: { enabled: false }, compaction: { enabled: false } },
+	});
+	try {
+		const terminal = {
+			...fauxAssistantMessage("durable answer"),
+			responseId: "already-committed",
+			usage: {
+				input: 17,
+				output: 3,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 20,
+				cost: { input: 0.017, output: 0.003, cacheRead: 0, cacheWrite: 0, total: 0.02 },
+			},
+		};
+		harness.session.agent.streamFunction = () => {
+			const stream = createAssistantMessageEventStream();
+			stream.push({ type: "done", reason: "stop", message: terminal });
+			return stream;
+		};
+		const off = harness.session.subscribe((event) => {
+			if (event.type === "turn_end") throw new Error("postpublication notification failed");
+		});
+		await expect(harness.session.prompt("request")).rejects.toThrow("postpublication notification failed");
+		off();
+		harness.session.flushPendingUsage();
+		harness.session.flushPendingUsage();
+		for (const current of [manager, SessionManager.open(manager.getSessionFile()!)]) {
+			expect(
+				current
+					.getEntries()
+					.filter(
+						(entry) =>
+							entry.type === "message" &&
+							entry.message.role === "assistant" &&
+							entry.message.responseId === terminal.responseId,
+					),
+			).toEqual([expect.objectContaining({ message: terminal })]);
+			expect(getUsageTotals(current.getEntries())).toEqual({
+				input: 17,
+				output: 3,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: 0.02,
+			});
+		}
+	} finally {
+		harness.cleanup();
+	}
+});
