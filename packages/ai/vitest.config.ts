@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { defaultExclude, defineConfig } from 'vitest/config';
 
 // Cloud e2e tests (*-e2e.test.ts) hit real provider APIs and activate on
@@ -13,6 +14,9 @@ if (process.env.PI_DISABLE_CLOUD_PROVIDERS === undefined) {
 }
 
 export default defineConfig({
+	resolve: {
+		alias: [{ find: /^@earendil-works\/pi-telemetry$/, replacement: fileURLToPath(new URL('../telemetry/src/index.ts', import.meta.url)) }],
+	},
   test: {
     globals: true,
     environment: 'node',

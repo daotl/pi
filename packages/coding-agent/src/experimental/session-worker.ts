@@ -1,20 +1,10 @@
 import { createConnection, type Socket } from "node:net";
 import { isAbsolute } from "node:path";
-import {
-	isJsonValue,
-	type JsonValue,
-	parseServiceProviderUpdate,
-	REMOTE_SERVICE_ERROR_CODES,
-	RemoteServiceError,
-	type RemoteServiceErrorCode,
-	type ServiceCall,
-	type ServiceProviderUpdate,
-} from "@earendil-works/chord";
+import type { Frame } from "@earendil-works/chord";
 import {
 	AgentHarness,
 	type AgentHarness as AgentHarnessInstance,
 	type AgentLane,
-	BACKGROUND_CONTEXT,
 	createBashTool,
 	createReadTool,
 	createWriteTool,
@@ -22,7 +12,6 @@ import {
 	JsonlSessionRepo,
 	type Session,
 	TODO_CONTEXT,
-	withCancel,
 } from "@earendil-works/pi-agent-core";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import lockfile from "proper-lockfile";
@@ -32,7 +21,7 @@ import { findInitialModel, resolveCliModel } from "../core/model-resolver.ts";
 import { ModelRuntime } from "../core/model-runtime.ts";
 import { SettingsManager } from "../core/settings-manager.ts";
 import { COORDINATOR_PROTOCOL_VERSION } from "./coordinator.ts";
-import { createSessionPluginFacetLoader } from "./plugins/bundled.ts";
+import { loadSessionPluginFacets } from "./plugins/bundled.ts";
 import {
 	consumeInternalProcessRole,
 	encodeControlLine,
@@ -50,20 +39,6 @@ export type { SessionWorkerRuntime } from "./services/worker.ts";
 
 const StrictObject = <const T extends Parameters<typeof Type.Object>[0]>(properties: T) =>
 	Type.Object(properties, { additionalProperties: false });
-const OpaqueJsonValueSchema = Type.Unsafe<JsonValue>(Type.Unknown());
-const ServiceCallSchema = Type.Unsafe<ServiceCall>(
-	StrictObject({
-		serviceId: Type.String({ minLength: 1 }),
-		instance: Type.Optional(
-			StrictObject({ key: Type.String({ minLength: 1 }), generation: Type.Integer({ minimum: 1 }) }),
-		),
-		member: Type.String({ minLength: 1 }),
-		args: Type.Array(Type.Unknown()),
-	}),
-);
-const RemoteServiceErrorCodeSchema = Type.Unsafe<RemoteServiceErrorCode>(
-	Type.String({ pattern: `^(?:${REMOTE_SERVICE_ERROR_CODES.join("|")})$` }),
-);
 
 export const SESSION_WORKER_CONTROL_ADDRESS_ENV = "PI_SESSION_WORKER_CONTROL_ADDRESS";
 export const SESSION_WORKER_CONTROL_TOKEN_ENV = "PI_SESSION_WORKER_CONTROL_TOKEN";
@@ -95,30 +70,11 @@ export const WorkerOperationScopeSchema = StrictObject({
 });
 export type WorkerOperationScope = WorkerServiceScope;
 
-export const WorkerOperationRequestSchema = StrictObject({
-	type: Type.Literal("operation"),
-	requestId: Type.String({ minLength: 1 }),
+export const WorkerFrameSchema = StrictObject({
+	type: Type.Literal("chord"),
 	scope: WorkerOperationScopeSchema,
-	call: ServiceCallSchema,
+	frame: Type.Unsafe<Frame>(Type.Object({ t: Type.String() })),
 });
-export type WorkerOperationRequest = Static<typeof WorkerOperationRequestSchema>;
-
-export const WorkerOperationResponseSchema = Type.Union([
-	StrictObject({
-		type: Type.Literal("operation_result"),
-		requestId: Type.String({ minLength: 1 }),
-		scope: WorkerOperationScopeSchema,
-		result: Type.Optional(OpaqueJsonValueSchema),
-	}),
-	StrictObject({
-		type: Type.Literal("operation_error"),
-		requestId: Type.String({ minLength: 1 }),
-		scope: WorkerOperationScopeSchema,
-		code: Type.Optional(RemoteServiceErrorCodeSchema),
-		message: Type.String(),
-	}),
-]);
-export type WorkerOperationResponse = Static<typeof WorkerOperationResponseSchema>;
 
 export const SessionWorkerCommandSchema = Type.Union([
 	Type.Object({ type: Type.Literal("shutdown") }),
@@ -130,12 +86,7 @@ export const SessionWorkerCommandSchema = Type.Union([
 		attachmentId: Type.String(),
 		attached: Type.Boolean(),
 	}),
-	WorkerOperationRequestSchema,
-	StrictObject({
-		type: Type.Literal("operation_cancel"),
-		requestId: Type.String({ minLength: 1 }),
-		scope: WorkerOperationScopeSchema,
-	}),
+	WorkerFrameSchema,
 ]);
 export type SessionWorkerCommand = Static<typeof SessionWorkerCommandSchema>;
 
@@ -171,18 +122,11 @@ export const SessionWorkerEventSchema = Type.Union([
 		message: Type.String(),
 	}),
 	Type.Object({
-		type: Type.Literal("operation_response"),
-		token: Type.String(),
-		sessionKey: Type.String(),
-		response: WorkerOperationResponseSchema,
-	}),
-	Type.Object({
-		type: Type.Literal("service_update"),
+		type: Type.Literal("chord"),
 		token: Type.String(),
 		sessionKey: Type.String(),
 		scope: WorkerOperationScopeSchema,
-		subscriptionId: Type.String({ minLength: 1 }),
-		update: Type.Unknown(),
+		frame: Type.Unsafe<Frame>(Type.Object({ t: Type.String() })),
 	}),
 ]);
 export type SessionWorkerEvent = Static<typeof SessionWorkerEventSchema>;
@@ -378,8 +322,7 @@ async function readCommands(
 		onShutdown(): void;
 		onDiscovery(): void;
 		onDemand(command: Extract<SessionWorkerCommand, { type: "session_demand" }>): Promise<void>;
-		onOperation(command: WorkerOperationRequest): void;
-		onOperationCancel(command: Extract<SessionWorkerCommand, { type: "operation_cancel" }>): void;
+		onFrame(command: Static<typeof WorkerFrameSchema>): void;
 		onServerConnected(serverConnectionId: string): void;
 		onServerDisconnected(serverConnectionId: string): void;
 	},
@@ -403,8 +346,7 @@ async function readCommands(
 		if (command.type === "shutdown") handlers.onShutdown();
 		else if (command.type === "discover_workers") handlers.onDiscovery();
 		else if (command.type === "session_demand") await handlers.onDemand(command);
-		else if (command.type === "operation_cancel") handlers.onOperationCancel(command);
-		else handlers.onOperation(command);
+		else handlers.onFrame(command);
 	}
 }
 
@@ -456,17 +398,8 @@ function writeJsonLine(socket: Socket, message: unknown): Promise<void> {
 	});
 }
 
-function toWorkerServiceUpdate(update: ServiceProviderUpdate): ServiceProviderUpdate {
-	if (!isJsonValue(update)) throw new Error("Service produced a non-JSON update");
-	return parseServiceProviderUpdate(update);
-}
-
 function demandKey(serverConnectionId: string, attachmentId: string): string {
 	return `${serverConnectionId}\0${attachmentId}`;
-}
-
-function sameScope(left: WorkerOperationScope, right: WorkerOperationScope): boolean {
-	return left.serverConnectionId === right.serverConnectionId && left.attachmentId === right.attachmentId;
 }
 
 function lifecycleDelay(name: string, fallback: number): number {
@@ -542,6 +475,8 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 	let harness: AgentHarnessInstance | undefined;
 	let lane: AgentLane | undefined;
 	let services: SessionWorkerServices | undefined;
+	let lifecycle: WorkerLifecycle | undefined;
+	const activeCalls = new Map<string, { scope: WorkerOperationScope; release(): void }>();
 	try {
 		session = await repo.open(metadata, TODO_CONTEXT);
 		const runtime = await createHarness(session, options, executionEnv);
@@ -552,15 +487,17 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 			modelRuntime: runtime.modelRuntime,
 			settingsManager: runtime.settingsManager,
 			facetLoader: runtime.facetLoader,
-			publish: (scope, subscriptionId, update) =>
-				control.send({
-					type: "service_update",
-					token,
-					sessionKey,
-					scope,
-					subscriptionId,
-					update: toWorkerServiceUpdate(update),
-				}),
+			publish: async (scope, frame) => {
+				try {
+					await control.send({ type: "chord", token, sessionKey, scope, frame });
+				} finally {
+					if (frame.t === "result") {
+						const key = `${demandKey(scope.serverConnectionId, scope.attachmentId)}\0${frame.id}`;
+						activeCalls.get(key)?.release();
+						activeCalls.delete(key);
+					}
+				}
+			},
 		});
 	} catch (error) {
 		try {
@@ -571,19 +508,11 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 		throw error;
 	}
 
-	const activeRequests = new Map<
-		string,
-		{ readonly scope: WorkerOperationScope; readonly cancel: (reason?: unknown) => void }
-	>();
-	let lifecycle: WorkerLifecycle | undefined;
 	let removeLifecycleListeners: (() => void)[] = [];
 	let closing: Promise<void> | undefined;
 	const close = (): Promise<void> => {
 		if (closing) return closing;
 		lifecycle?.close();
-		services.removeSubscriptions(() => true);
-		for (const request of activeRequests.values()) request.cancel(new Error("Session worker is closing"));
-		activeRequests.clear();
 		for (const remove of removeLifecycleListeners) remove();
 		removeLifecycleListeners = [];
 		closing = closeResources({ harness, services, repo, executionEnv, releaseOwnership });
@@ -624,54 +553,17 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 		),
 		harness.events.on("fault", closeAndExit),
 	];
-
-	const handleOperation = async (request: WorkerOperationRequest): Promise<void> => {
-		let releaseRequest = (): void => {};
-		const cancellable = withCancel(BACKGROUND_CONTEXT);
-		try {
-			releaseRequest = lifecycle!.beginRequest(request.scope.serverConnectionId, request.scope.attachmentId);
-			activeRequests.set(request.requestId, { scope: request.scope, cancel: cancellable.cancel });
-			const result = await services.invoke(request.call, request.scope, cancellable.context);
-			if (result !== undefined && !isJsonValue(result)) throw new Error("Service produced a non-JSON result");
-			await control.send({
-				type: "operation_response",
-				token,
-				sessionKey,
-				response: {
-					type: "operation_result",
-					requestId: request.requestId,
-					scope: request.scope,
-					...(result === undefined ? {} : { result }),
-				},
+	const handleFrame = (command: Static<typeof WorkerFrameSchema>): void => {
+		if (command.frame.t === "call") {
+			const key = `${demandKey(command.scope.serverConnectionId, command.scope.attachmentId)}\0${command.frame.id}`;
+			if (activeCalls.has(key)) throw new Error("Duplicate native request ID");
+			activeCalls.set(key, {
+				scope: command.scope,
+				release: lifecycle!.beginRequest(command.scope.serverConnectionId, command.scope.attachmentId),
 			});
-		} catch (error) {
-			let code: RemoteServiceErrorCode | undefined;
-			if (error instanceof RemoteServiceError) {
-				code = error.code;
-			} else if (error instanceof Error && "code" in error) {
-				const candidate = error.code;
-				if (Check(RemoteServiceErrorCodeSchema, candidate)) code = candidate;
-			}
-			await control.send({
-				type: "operation_response",
-				token,
-				sessionKey,
-				response: {
-					type: "operation_error",
-					requestId: request.requestId,
-					scope: request.scope,
-					...(code === undefined ? {} : { code }),
-					message: error instanceof Error ? error.message : String(error),
-				},
-			});
-		} finally {
-			if (activeRequests.get(request.requestId)?.cancel === cancellable.cancel) {
-				activeRequests.delete(request.requestId);
-			}
-			releaseRequest();
 		}
+		services.receive(command.scope, command.frame);
 	};
-
 	let ready = false;
 	const announce = (): void => {
 		if (!ready) return;
@@ -694,11 +586,26 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 			const releaseRetirement = lifecycle?.holdRetirement() ?? (() => {});
 			try {
 				try {
-					if (!command.attached) {
-						const matches = (scope: WorkerOperationScope): boolean =>
-							scope.serverConnectionId === command.serverConnectionId &&
-							scope.attachmentId === command.attachmentId;
-						services.removeSubscriptions(matches);
+					if (command.attached)
+						services.attach({
+							serverConnectionId: command.serverConnectionId,
+							attachmentId: command.attachmentId,
+						});
+					else {
+						await services.removeAttachments(
+							(scope) =>
+								scope.serverConnectionId === command.serverConnectionId &&
+								scope.attachmentId === command.attachmentId,
+						);
+						for (const [key, call] of activeCalls) {
+							if (
+								call.scope.serverConnectionId !== command.serverConnectionId ||
+								call.scope.attachmentId !== command.attachmentId
+							)
+								continue;
+							activeCalls.delete(key);
+							call.release();
+						}
 					}
 					lifecycle?.setDemand(command.serverConnectionId, command.attachmentId, command.attached);
 				} catch (error) {
@@ -723,22 +630,21 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 				releaseRetirement();
 			}
 		},
-		onOperation: (request) => {
-			void handleOperation(request).catch(() => closeAndExit());
-		},
-		onOperationCancel: (command) => {
-			const active = activeRequests.get(command.requestId);
-			if (active !== undefined && sameScope(active.scope, command.scope)) {
-				active.cancel(new DOMException("Service operation cancelled", "AbortError"));
-			}
-		},
+		onFrame: handleFrame,
 		onServerConnected: (serverConnectionId) => lifecycle?.serverConnected(serverConnectionId),
 		onServerDisconnected: (serverConnectionId) => {
-			const matches = (scope: WorkerOperationScope): boolean => scope.serverConnectionId === serverConnectionId;
-			services.removeSubscriptions(matches);
-			for (const request of activeRequests.values()) {
-				if (matches(request.scope)) request.cancel(new Error("Server disconnected"));
-			}
+			void services
+				.removeAttachments((scope) => scope.serverConnectionId === serverConnectionId)
+				.then(
+					() => {
+						for (const [key, call] of activeCalls) {
+							if (call.scope.serverConnectionId !== serverConnectionId) continue;
+							activeCalls.delete(key);
+							call.release();
+						}
+					},
+					() => closeAndExit(),
+				);
 			lifecycle?.serverDisconnected(serverConnectionId);
 		},
 	}).catch(() => closeAndExit());
@@ -859,7 +765,7 @@ async function createCodingAgentHarness(
 			lane,
 			modelRuntime,
 			settingsManager,
-			facetLoader: createSessionPluginFacetLoader(options.pluginManifestPaths),
+			facetLoader: () => loadSessionPluginFacets(options.pluginManifestPaths),
 		};
 	} catch (error) {
 		try {

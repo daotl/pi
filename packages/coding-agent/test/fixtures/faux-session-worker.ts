@@ -1,8 +1,9 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createStaticFacetLoader, defineFacet } from "@earendil-works/chord";
+import { defineFacet, local } from "@earendil-works/chord";
 import { AgentHarness, BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core";
 import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { consumeInternalProcessRole } from "../../src/experimental/process.ts";
 import { runSessionWorkerWithHarness } from "../../src/experimental/session-worker.ts";
 import { KeyedProbe } from "./keyed-service.ts";
@@ -30,33 +31,42 @@ if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(
 				BACKGROUND_CONTEXT,
 			)
 		).harness;
-		const keyedProbeFacet = defineFacet({
-			id: "@test/keyed-probe",
-			setup(env) {
-				const probes = env.provideMany(KeyedProbe);
-				const spawn = (value: string): void => {
-					const state = env.replicatedState({ value });
-					let close = (): void => {};
-					close = probes.spawn("probe", {
-						state,
-						async replace(next) {
-							close();
-							spawn(next);
-						},
-						async wait(context) {
-							const signal = context.abortSignal;
-							if (signal === undefined) throw new Error("Probe wait requires cancellation");
-							if (signal.aborted) throw abortError(signal);
-							await new Promise<void>((_resolve, reject) => {
-								signal.addEventListener("abort", () => reject(abortError(signal)), { once: true });
-							});
-						},
-					});
-				};
-				env.onActivate(() => spawn("first"));
+		const ProbeState = local("test.local.keyed-probe", {
+			version: 1,
+			input: Type.Object({ key: Type.String() }),
+			members: {
+				state: Type.Object({ value: Type.String() }),
+				replace: KeyedProbe.def.variants.active.methods.replace,
 			},
 		});
-		return { harness, facetLoader: createStaticFacetLoader([keyedProbeFacet]) };
+		const keyedProbeFacet = {
+			name: "@test/keyed-probe",
+			...defineFacet(({ serve }) => {
+				serve(
+					ProbeState,
+					(_input, _principal, self) => {
+						const state = self.state("probe", Type.Object({ value: Type.String() }), { value: "first" });
+						return { state, replace: (value, ctx) => state.replace(ctx, { value }) };
+					},
+					{ linger: 0 },
+				);
+				serve(KeyedProbe, ({ key }, _principal, self) => {
+					const probe = self.get(ProbeState, { key }, { principal: "worker" });
+					return {
+						variant: "active",
+						state: probe.state,
+						replace: (value, ctx) => probe.replace(value, ctx),
+						async wait(ctx) {
+							ctx.signal.throwIfAborted();
+							await new Promise<void>((_resolve, reject) =>
+								ctx.signal.addEventListener("abort", () => reject(abortError(ctx.signal)), { once: true }),
+							);
+						},
+					};
+				});
+			}),
+		};
+		return { harness, facetLoader: async () => ({ facets: [keyedProbeFacet], async dispose() {} }) };
 	}).catch((error: unknown) => {
 		console.error(error);
 		process.exit(1);

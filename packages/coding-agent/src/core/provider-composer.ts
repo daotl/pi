@@ -7,6 +7,7 @@ import {
 	type AuthInteraction,
 	type AuthResult,
 	type ClassifierApi,
+	type ClassifierModel,
 	type Credential,
 	getProviderApiStreams,
 	type ImageApi,
@@ -98,7 +99,8 @@ export interface ProviderChatModelConfig extends ProviderModelConfigBase {
 	promptCache?: Model<Api>["promptCache"];
 	contextWindow: number;
 	maxTokens: number;
-	samplingParams?: Record<string, unknown>;
+	samplingParams?: Model<Api>["samplingParams"];
+	samplingParamsByThinkingLevel?: Model<Api>["samplingParamsByThinkingLevel"];
 	compat?: Model<Api>["compat"];
 }
 
@@ -112,6 +114,7 @@ export interface ProviderClassifierModelConfig extends ProviderModelConfigBase {
 	type: "classifier";
 	api?: ClassifierApi;
 	contextWindow: number;
+	compat?: ClassifierModel<ClassifierApi>["compat"];
 }
 
 export type ProviderModelConfig = ProviderChatModelConfig | ProviderImageModelConfig | ProviderClassifierModelConfig;
@@ -190,6 +193,19 @@ function mergeInputLimits(
 	};
 }
 
+function mergeSamplingParamsByThinkingLevel(
+	base: Model<Api>["samplingParamsByThinkingLevel"],
+	override: Model<Api>["samplingParamsByThinkingLevel"],
+): Model<Api>["samplingParamsByThinkingLevel"] {
+	if (!override) return base;
+	const merged = { ...base };
+	for (const level of ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const) {
+		const params = override[level];
+		if (params) merged[level] = { ...base?.[level], ...params };
+	}
+	return merged;
+}
+
 function applyModelOverride(model: Model<Api>, override: ModelsJsonModelOverride): Model<Api> {
 	return {
 		...model,
@@ -215,6 +231,10 @@ function applyModelOverride(model: Model<Api>, override: ModelsJsonModelOverride
 		samplingParams: override.samplingParams
 			? { ...model.samplingParams, ...override.samplingParams }
 			: model.samplingParams,
+		samplingParamsByThinkingLevel: mergeSamplingParamsByThinkingLevel(
+			model.samplingParamsByThinkingLevel,
+			override.samplingParamsByThinkingLevel,
+		),
 		compat: mergeCompat(model.compat, override.compat),
 	};
 }
@@ -254,6 +274,7 @@ function modelFromJson(
 		contextWindow: definition.contextWindow ?? 262144,
 		maxTokens: definition.maxTokens ?? 16384,
 		samplingParams: definition.samplingParams,
+		samplingParamsByThinkingLevel: definition.samplingParamsByThinkingLevel,
 		headers: undefined,
 		compat: mergeCompat(providerConfig.compat, definition.compat),
 	};
@@ -335,9 +356,12 @@ function applyModelsJson(
 
 	const models: AnyModel[] = baseModels.map((model) => {
 		const baseUrl = config.oauth === "radius" ? model.baseUrl : (config.baseUrl ?? model.baseUrl);
-		return isModelType(model, "chat")
-			? { ...model, baseUrl, compat: mergeCompat(model.compat, config.compat) }
-			: { ...model, baseUrl };
+		if (isModelType(model, "chat")) return { ...model, baseUrl, compat: mergeCompat(model.compat, config.compat) };
+		// Classifier APIs read their own compat fields, such as how a System One service takes images.
+		if (isModelType(model, "classifier") && config.compat) {
+			return { ...model, baseUrl, compat: { ...model.compat, ...config.compat } };
+		}
+		return { ...model, baseUrl };
 	});
 	for (const definition of config.models ?? []) {
 		const existingIndex = models.findIndex((model) => isModelType(model, "chat") && model.id === definition.id);

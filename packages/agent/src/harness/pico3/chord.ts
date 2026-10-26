@@ -1,11 +1,20 @@
 import {
 	type Context,
+	type Ctx,
 	type Draft,
-	defineService,
+	defineFacet,
+	hostNamed,
+	local,
 	type MutableReplicatedState,
+	method,
+	opaque,
 	type ReplicatedState,
+	remote,
+	replicatedState,
 } from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import type { Op, Path, Seg } from "@earendil-works/chord/delta";
+import { Type } from "typebox";
 import type { ConversationHandle, Harness } from "./harness.ts";
 import type {
 	ConversationSpec,
@@ -39,8 +48,182 @@ export interface PicoConversationService {
 }
 
 /** Local registration/control plane and remote keyed conversation contract used by Chord facets. */
-export const PicoHarnessService = defineService<Harness>("pi.harness", { local: true });
-export const PicoConversationService = defineService<PicoConversationService>("pi.conversation");
+export const PicoHarnessService = local("pi.harness", {
+	version: 1,
+	input: Type.Object({}),
+	members: { harness: opaque<Harness>("pi.harness@1") },
+});
+
+const IdSchema = Type.Integer({ minimum: 0 });
+const JsonObjectSchema = Type.Unsafe<JsonObject>(Type.Record(Type.String(), Type.Unknown()));
+const ConversationSpecSchema = Type.Unsafe<Omit<ConversationSpec, "parent">>(
+	Type.Object({
+		rewindable: Type.Optional(JsonObjectSchema),
+		sticky: Type.Optional(JsonObjectSchema),
+		sections: Type.Optional(
+			Type.Array(
+				Type.Union([
+					Type.Object({ key: Type.String(), value: Type.Unknown() }),
+					Type.Object({ key: Type.String(), remove: Type.Literal(true) }),
+				]),
+			),
+		),
+	}),
+);
+
+export const PicoConversationService = remote("pi.conversation", {
+	version: 1,
+	input: Type.Object({ conversationId: IdSchema }),
+	host: hostNamed("harness"),
+	variants: {
+		conversation: {
+			state: {
+				view: Type.Unsafe<PublishedConversationView>(
+					Type.Object({
+						conversation: Type.Object({ id: IdSchema }),
+						entries: Type.Array(Type.Unknown()),
+						config: JsonObjectSchema,
+						inbox: Type.Array(Type.Unknown()),
+						turn: Type.Optional(Type.Object({})),
+						compaction: Type.Optional(Type.Object({})),
+						tasks: JsonObjectSchema,
+						plugins: JsonObjectSchema,
+						commit: Type.Object({ events: Type.Array(Type.Unknown()) }),
+					}),
+				),
+			},
+			methods: {
+				send: method(
+					Type.Unsafe<SendInput>(
+						Type.Object({
+							content: Type.Union([Type.String(), Type.Array(Type.Unknown())]),
+							requestId: Type.Optional(Type.String()),
+							whenBusy: Type.Optional(
+								Type.Union([Type.Literal("steer"), Type.Literal("followUp"), Type.Literal("reject")]),
+							),
+						}),
+					),
+					IdSchema,
+				),
+				write: method(
+					Type.Unsafe<NewEntry>(
+						Type.Object({
+							kind: Type.String(),
+							model: Type.Optional(Type.Array(Type.Unknown())),
+							data: Type.Optional(JsonObjectSchema),
+							head: Type.Optional(Type.Union([IdSchema, Type.Literal("self")])),
+							edits: Type.Optional(Type.Array(Type.Unknown())),
+						}),
+					),
+					IdSchema,
+				),
+				inputAbort: method(
+					IdSchema,
+					Type.Union([Type.Literal("aborted"), Type.Literal("already_placed"), Type.Literal("not_found")]),
+				),
+				configSet: method(JsonObjectSchema),
+				abort: method(),
+				reset: method(Type.Union([Type.String(), Type.Null()])),
+				collapse: method(Type.Union([Type.String(), Type.Null()]), IdSchema),
+				fork: method(
+					Type.Object({ at: Type.Union([IdSchema, Type.Literal("start")]), spec: ConversationSpecSchema }),
+					IdSchema,
+				),
+				entries: method(
+					Type.Unsafe<EntryScan>(
+						Type.Object({
+							conversationId: IdSchema,
+							kind: Type.Optional(Type.String()),
+							withHead: Type.Optional(Type.Boolean()),
+							before: Type.Optional(IdSchema),
+							limit: Type.Integer({ minimum: 0 }),
+						}),
+					),
+					Type.Unsafe<Entry[]>(
+						Type.Array(Type.Object({ id: IdSchema, conversationId: IdSchema, kind: Type.String() })),
+					),
+				),
+			},
+		},
+	},
+});
+
+/** Host the durable harness and its keyed conversations through native Chord objects. */
+export function createPicoHarnessFacet(harness: Harness) {
+	return {
+		name: "pi.harness",
+		...defineFacet(({ serve }) => {
+			serve(PicoHarnessService, () => ({ harness }), { lifetime: "host" });
+			serve(PicoConversationService, ({ conversationId }, _principal, self) => {
+				const source = self.resource("conversation", {
+					version: 1,
+					async open({ signal }) {
+						const context = withAbortSignal(signal, BACKGROUND_CONTEXT);
+						const conversation = await harness.conversation(conversationId, context);
+						if (conversation === undefined) throw new Error(`conversation ${conversationId} not found`);
+						return attachChordView(conversation, replicatedState, context);
+					},
+					close: (bridge) => bridge.close(),
+				});
+				const view = self.state("view", PicoConversationService.def.variants.conversation.state.view, {
+					init: () => source.value.view.value,
+				});
+				self.on(
+					"view",
+					source,
+					(bridge) => bridge.view,
+					(value, ctx) => view.replace(ctx, value),
+				);
+				const conversation = async (ctx: Ctx) => {
+					const context = withAbortSignal(ctx.signal, BACKGROUND_CONTEXT);
+					const handle = await harness.conversation(conversationId, context);
+					if (handle === undefined) throw new Error(`conversation ${conversationId} not found`);
+					return { service: createPicoConversationService(harness, handle, source.value.view), context };
+				};
+				return {
+					variant: "conversation",
+					view,
+					async send(input, ctx) {
+						const active = await conversation(ctx);
+						return active.service.send(input, active.context);
+					},
+					async write(entry, ctx) {
+						const active = await conversation(ctx);
+						return active.service.write(entry, active.context);
+					},
+					async inputAbort(id, ctx) {
+						const active = await conversation(ctx);
+						return active.service.inputAbort(id, active.context);
+					},
+					async configSet(patch, ctx) {
+						const active = await conversation(ctx);
+						await active.service.configSet(patch, active.context);
+					},
+					async abort(ctx) {
+						const active = await conversation(ctx);
+						await active.service.abort(active.context);
+					},
+					async reset(handoff, ctx) {
+						const active = await conversation(ctx);
+						await active.service.reset(handoff, active.context);
+					},
+					async collapse(instructions, ctx) {
+						const active = await conversation(ctx);
+						return active.service.collapse(instructions, active.context);
+					},
+					async fork({ at, spec }, ctx) {
+						const active = await conversation(ctx);
+						return active.service.fork(at, spec, active.context);
+					},
+					async entries(scan, ctx) {
+						const active = await conversation(ctx);
+						return active.service.entries(scan, active.context);
+					},
+				};
+			});
+		}),
+	};
+}
 
 export function createPicoConversationService<Cfg extends object>(
 	harness: Pick<Harness, "abortInput" | "entries">,

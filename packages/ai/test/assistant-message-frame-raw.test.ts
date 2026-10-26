@@ -166,3 +166,28 @@ it("persists long raw streams with linear storage rather than repeated raw snaps
 	expect(reduceAssistantMessageFrames(JSON.parse(persisted))?.content).toEqual([call]);
 	expect(persisted.length).toBeLessThan(chunks.join("").length * 3);
 });
+
+it.each([undefined, "Invalid tool arguments: expected a JSON object"])(
+	"replays authoritative argument validation error %j with raw tool tokens",
+	(argumentsError) => {
+		const call: ToolCall = {
+			type: "toolCall",
+			id: "call",
+			name: "read",
+			arguments: {},
+			argumentsError: "stale error from the initial snapshot",
+			raw: "<prefix>",
+		};
+		const stream = recording([call]);
+		const final: ToolCall = {
+			type: "toolCall",
+			id: "call",
+			name: "read",
+			arguments: argumentsError === undefined ? { path: "/final" } : {},
+			...(argumentsError === undefined ? {} : { argumentsError }),
+			raw: "<final>",
+		};
+		stream.emit({ type: "toolcall_end", contentIndex: 0, toolCall: final, partial: stream.partial });
+		expect(stream.replay()?.content).toEqual([final]);
+	},
+);

@@ -1,5 +1,6 @@
-import { defineFacet, type Facet, type JsonValue } from "@earendil-works/chord";
+import { defineFacet, type Facet, type JsonValue, local } from "@earendil-works/chord";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { Type } from "typebox";
 import { AgentController } from "./agent-controller.ts";
 import { type ModelSummary, Models, type Models as ModelsService } from "./models.ts";
 import { PresentationPlugins, SessionPlugins } from "./plugins.ts";
@@ -75,47 +76,64 @@ export class SlashCommandRegistry implements SlashCommands {
 }
 
 export function createSlashCommandsRuntimeFacet(registry = new SlashCommandRegistry()): Facet {
-	return defineFacet({
-		id: "@pi/slash-commands-runtime",
-		setup(env) {
-			env.provide(SlashCommands, registry);
-		},
-	});
+	return {
+		name: "@pi/slash-commands-runtime",
+		...defineFacet(({ serve }) => {
+			serve(SlashCommands, () => ({ registry }), { lifetime: "host" });
+		}),
+	};
 }
 
 export function createBuiltInSlashCommandsFacet(options: {
 	reloadPresentationPlugins(data: JsonValue): Promise<void>;
 }): Facet {
-	return defineFacet({
-		id: "@pi/slash-commands-builtin",
-		setup(env) {
-			const commands = env.use(SlashCommands);
-			const models = env.use(Models);
-			const controller = env.use(AgentController);
-			const ui = env.use(PresentationUI);
-			const presentationPlugins = env.use(PresentationPlugins);
-			const sessionPlugins = env.use(SessionPlugins);
-			env.onActivate(() => {
-				env.own(commands.replace(modelCommand(models, ui)));
-				env.own(commands.replace(thinkingCommand(models, ui)));
-				env.own(commands.replace(compactCommand(controller, ui)));
-				env.own(
-					commands.replace({
-						name: "reload",
-						description: "Reload server-selected plugins",
-						async run(_args, context) {
-							ui.showStatus("Reloading plugins…", context);
-							const data = await presentationPlugins.reload(context);
-							await sessionPlugins.reload(context);
-							await options.reloadPresentationPlugins(data);
-							ui.showStatus("Reloaded plugins.", context);
-							return undefined;
+	const Builtins = local("pi.local.builtin-commands", { version: 1, input: Type.Object({}) });
+	return {
+		name: "@pi/slash-commands-builtin",
+		...defineFacet(({ serve }) => {
+			serve(
+				Builtins,
+				(_input, _principal, self) => {
+					const commands = self.get(SlashCommands, {});
+					const models = self.get(Models, {});
+					const controller = self.get(AgentController, {});
+					const ui = self.get(PresentationUI, {});
+					const presentationPlugins = self.get(PresentationPlugins, {});
+					const sessionPlugins = self.get(SessionPlugins, {});
+					self.resource("commands", {
+						version: 1,
+						deps: [commands, models, controller, ui, presentationPlugins, sessionPlugins],
+						open() {
+							const registry = commands.registry!;
+							const presentation = ui.ui!;
+							return [
+								registry.replace(modelCommand(models, presentation)),
+								registry.replace(thinkingCommand(models, presentation)),
+								registry.replace(compactCommand(controller, presentation)),
+								registry.replace({
+									name: "reload",
+									description: "Reload server-selected plugins",
+									async run(_args, context) {
+										presentation.showStatus("Reloading plugins…", context);
+										const data = await presentationPlugins.reload(context);
+										await sessionPlugins.reload(context);
+										await options.reloadPresentationPlugins(data);
+										presentation.showStatus("Reloaded plugins.", context);
+										return undefined;
+									},
+								}),
+							];
 						},
-					}),
-				);
-			});
-		},
-	});
+						close: (unregister) => {
+							for (const close of unregister.reverse()) close();
+						},
+					});
+					return {};
+				},
+				{ lifetime: "host" },
+			);
+		}),
+	};
 }
 
 function modelCommand(models: ModelsService, ui: PresentationUI): SlashCommandContribution {

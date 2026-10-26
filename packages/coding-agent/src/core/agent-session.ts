@@ -45,6 +45,7 @@ import {
 	countTokensWithRetry,
 	createInitialSystemMessage,
 	getCurrentSystemMessage,
+	getCurrentTools,
 	getSystemMessageText,
 	normalizeContext,
 	type RetryPolicy,
@@ -141,7 +142,8 @@ import {
 	type TurnStartEvent,
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
-import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import {
 	editBlockToMessage,
 	formatMessageContent,
@@ -168,7 +170,12 @@ import {
 	type SessionMessageEntry,
 	type SessionProjection,
 } from "./session-manager.ts";
-import { type CacheWarmingMode, DEFAULT_TOOL_NAMES, type SettingsManager } from "./settings-manager.ts";
+import {
+	applyToolModifiers,
+	type CacheWarmingMode,
+	DEFAULT_TOOL_NAMES,
+	type SettingsManager,
+} from "./settings-manager.ts";
 import type { Skill } from "./skills.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { BUILTIN_PATH_PREFIX, createSyntheticSourceInfo, isSyntheticPath, type SourceInfo } from "./source-info.ts";
@@ -234,7 +241,7 @@ export type AgentSessionEvent =
 			messages: AgentMessage[];
 			willRetry: boolean;
 	  }
-	| { type: "agent_settled" }
+	| { type: "agent_settled"; aborted: boolean }
 	| {
 			type: "queue_update";
 			steering: readonly string[];
@@ -318,13 +325,24 @@ export interface AgentSessionConfig {
 	/** Initial active built-in tool names. Default: [read, bash, edit, write] */
 	initialActiveToolNames?: string[];
 	/**
-	 * Whether the initial tools come from the `defaultTools` setting. When true, reload activates
-	 * tools newly added to the setting. Tools removed from it stay active.
+	 * Whether the initial tools come from the `defaultTools` setting. When true, a resumed session
+	 * replaces them with the loadout its transcript records, with `defaultToolModifiers` applied, and
+	 * reload activates tools newly added to the setting. Tools removed from it stay active.
 	 */
 	usesDefaultTools?: boolean;
-	/** Optional allowlist of tool names. When provided, only these tool names are exposed. */
+	/**
+	 * `+name`/`-name` entries applied on top of the `defaultTools` setting, from `--tools`. Reload
+	 * applies them to the reloaded setting too, so a removed tool stays removed.
+	 */
+	defaultToolModifiers?: string[];
+	/**
+	 * Optional allowlist of tool names or patterns (`*` matches any characters). When provided, only
+	 * matching tools are exposed. A non-empty list without `mcp__` entries also keeps MCP tools
+	 * registered for codemode and tool_search; only tool_search can declare them. An empty list
+	 * exposes no tools.
+	 */
 	allowedToolNames?: string[];
-	/** Optional denylist of tool names. When provided, these tool names are not exposed. */
+	/** Optional denylist of tool names or patterns. When provided, matching tools are not exposed. */
 	excludedToolNames?: string[];
 	/**
 	 * Override base tools (useful for custom runtimes).
@@ -466,6 +484,12 @@ interface ToolDefinitionEntry {
 	sourceInfo: SourceInfo;
 }
 
+interface PreparedAgentPrompt {
+	messages: AgentMessage[];
+	nextTurnMessageCount: number;
+	admit: () => void;
+}
+
 function estimateMessagesTokens(messages: AgentMessage[]): number {
 	let tokens = 0;
 	for (const message of messages) {
@@ -584,7 +608,6 @@ export class AgentSession {
 	private readonly _entryIdsByMessage = new WeakMap<object, string>();
 	private readonly _boundaryDispatchedMessages = new WeakSet<object>();
 	private _lastAssistantMessage: AssistantMessage | undefined;
-	private _lastAssistantToolResults: AgentMessage[] = [];
 	private _lastActivityOutcome: AgentActivityOutcome = "completed";
 	private _isBeforeSettle = false;
 	private _abortDuringBeforeSettle = false;
@@ -599,9 +622,22 @@ export class AgentSession {
 	private _extensionPayloadTransform?: Agent["onPayload"];
 	private _standardStreamFunction?: Agent["streamFunction"];
 	private _initialActiveToolNames?: string[];
+	/**
+	 * Tools of the restored or reloaded loadout that are not registered yet, such as tools of MCP
+	 * servers that are still connecting. They are activated when they are registered, and dropped when
+	 * `setActiveToolsByName()` deactivates a tool or the next agent run starts.
+	 */
+	private _pendingToolNames = new Set<string>();
 	private _usesDefaultTools: boolean;
-	private _allowedToolNames?: Set<string>;
-	private _excludedToolNames?: Set<string>;
+	private _defaultToolModifiers: string[];
+	/** Matches the `--tools` entries: tool names or patterns. */
+	private _allowedTools?: (name: string) => boolean;
+	/**
+	 * Whether the allowlist filters MCP tools: it is empty (`--no-tools`) or names an MCP tool
+	 * (`mcp__*`). Otherwise it keeps MCP tools registered for codemode and tool_search.
+	 */
+	private _allowlistFiltersMcp = false;
+	private _excludedTools?: (name: string) => boolean;
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
@@ -671,8 +707,13 @@ export class AgentSession {
 		this._standardStreamFunction = config.standardStreamFunction;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._usesDefaultTools = config.usesDefaultTools ?? false;
-		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
-		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
+		this._defaultToolModifiers = config.defaultToolModifiers ?? [];
+		if (config.allowedToolNames) {
+			this._allowedTools = createToolNameMatcher(config.allowedToolNames);
+			this._allowlistFiltersMcp =
+				config.allowedToolNames.length === 0 || config.allowedToolNames.some((entry) => entry.startsWith("mcp__"));
+		}
+		this._excludedTools = config.excludedToolNames ? createToolNameMatcher(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		this._restoreSystemPrompt = config.restoreSystemPrompt ?? true;
@@ -693,7 +734,7 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
-		if (this._initialActiveToolNames === undefined) this._restoreToolsFromTranscript();
+		if (this._usesDefaultTools) this._restoreToolsFromTranscript(this._defaultToolModifiers);
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -1332,8 +1373,9 @@ export class AgentSession {
 		this._isEmittingAgentSettled = true;
 		let notificationFailed = false;
 		try {
-			await this._extensionRunner.emit({ type: "agent_settled" });
-			this._emit({ type: "agent_settled" });
+			const aborted = this._agentRunAbortRequested;
+			await this._extensionRunner.emit({ type: "agent_settled", aborted });
+			this._emit({ type: "agent_settled", aborted });
 		} catch (error) {
 			notificationFailed = true;
 			for (const action of this._deferredSettledActions.splice(0)) action.discard?.(error);
@@ -1364,6 +1406,9 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		// An abort requested while the run was starting, e.g. during before_agent_start, stops it
+		// here. agent_start is awaited before the first request.
+		if (event.type === "agent_start" && this._agentRunAbortRequested) this.agent.abort();
 		// Record the calls a tool made through ctx.executeTool() and their usage on its result message.
 		if (this._nestedToolCalls) {
 			if (event.type === "message_start" && event.message.role === "toolResult") {
@@ -1494,7 +1539,6 @@ export class AgentSession {
 		// extension and listener dispatch above also picks up messages that turn_end
 		// handlers queued.
 		if (event.type === "turn_end") {
-			this._lastAssistantToolResults = event.toolResults;
 			this._flushPendingCustomMessages();
 		}
 	};
@@ -1544,7 +1588,24 @@ export class AgentSession {
 		return undefined;
 	}
 
-	private _omitRecoveryAttempt(message: AssistantMessage, toolResults: AgentMessage[] = []): void {
+	/**
+	 * Persistently omit a failed attempt and its tool results from model context. Results are
+	 * found in the projected context, so the pair stays together whether the attempt comes from
+	 * the current run or a resumed session. An unpaired result fails the next request (#11227).
+	 */
+	private _omitRecoveryAttempt(message: AssistantMessage): void {
+		const toolCallIds = new Set(message.content.flatMap((block) => (block.type === "toolCall" ? [block.id] : [])));
+		// A context edit replaces the projected copy, so match it by source entry as well.
+		const entryId = this._findPersistedMessageEntryId(message);
+		const messages = this.agent.state.messages;
+		const index = messages.findIndex(
+			(m) => m === message || (entryId !== undefined && this._entryIdsByMessage.get(m) === entryId),
+		);
+		const toolResults: AgentMessage[] = [];
+		for (const m of index < 0 ? [] : messages.slice(index + 1)) {
+			if (m.role === "assistant") break;
+			if (m.role === "toolResult" && toolCallIds.has(m.toolCallId)) toolResults.push(m);
+		}
 		const targets = [message, ...toolResults];
 		const targetIds = targets.map((target) => this._findPersistedMessageEntryId(target));
 		const unresolvedProjectedTarget = targets.some(
@@ -1671,6 +1732,7 @@ export class AgentSession {
 				toolName: event.toolName,
 				result: event.result,
 				isError: event.isError,
+				...(event.durationMs === undefined ? {} : { durationMs: event.durationMs }),
 			};
 			await this._extensionRunner.emit(extensionEvent);
 		}
@@ -1832,6 +1894,7 @@ export class AgentSession {
 			exposure: this._getToolExposure(definition.name),
 			...(definition.namespace ? { namespace: definition.namespace } : {}),
 			...(definition.annotations ? { annotations: { ...definition.annotations } } : {}),
+			...(definition.reachesTools ? { reachesTools: definition.reachesTools } : {}),
 			sourceInfo,
 		}));
 	}
@@ -1847,8 +1910,39 @@ export class AgentSession {
 	 * Changes take effect on the next agent turn.
 	 */
 	setActiveToolsByName(toolNames: string[]): void {
+		const previous = this.getActiveToolNames();
+		this._setActiveTools(toolNames);
+		// A loadout that deactivates a tool replaces the restored one, whose pending tools are dropped.
+		// One that only adds tools, like activating tool_search, keeps them.
+		const active = new Set(this.getActiveToolNames());
+		if (previous.some((name) => !active.has(name))) this._pendingToolNames.clear();
+	}
+
+	private _setActiveTools(toolNames: string[]): void {
 		const tools = this._applyToolLoadout(toolNames);
+		for (const tool of tools) this._pendingToolNames.delete(tool.name);
 		this._commitBaseSystemPrompt(this._rebuildSystemPrompt(tools.map((tool) => tool.name)));
+	}
+
+	/**
+	 * Whether `--tools` and `--exclude-tools` keep the tool registered. MCP tools stay registered
+	 * unless the allowlist filters them (see `_allowlistFiltersMcp`).
+	 */
+	private _isAllowedTool(name: string): boolean {
+		if (this._excludedTools?.(name)) return false;
+		if (!this._allowedTools || this._allowedTools(name)) return true;
+		return !this._allowlistFiltersMcp && isMcpToolName(name);
+	}
+
+	/**
+	 * Whether the tool may be active, which declares it to the model. MCP tools the allowlist keeps
+	 * without matching them are only for codemode and tool_search: they may be declared only when
+	 * tool_search can load them (non-`direct` exposure and tool_search registered). This also applies
+	 * to tools restored from the transcript or set by extensions.
+	 */
+	private _isActivatable(name: string): boolean {
+		if (!this._allowedTools || this._allowedTools(name) || !isMcpToolName(name)) return true;
+		return this._getToolExposure(name) !== "direct" && this._toolRegistry.has("tool_search");
 	}
 
 	private _getToolExposure(name: string): ToolExposure {
@@ -1875,7 +1969,7 @@ export class AgentSession {
 	private _applyToolLoadout(toolNames: string[]): AgentTool[] {
 		const tools = [...new Set(toolNames)].flatMap((name) => {
 			const tool = this._toolRegistry.get(name);
-			return tool && this._getToolExposure(name) !== "hidden" ? [tool] : [];
+			return tool && this._getToolExposure(name) !== "hidden" && this._isActivatable(name) ? [tool] : [];
 		});
 		const hooks = tools.flatMap((tool) => {
 			const entry = this._toolDefinitions.get(tool.name);
@@ -1890,6 +1984,7 @@ export class AgentSession {
 				registered: [...this._toolRegistry.values()],
 				getExposure: (name) => this._getToolExposure(name),
 				getNamespace: (name) => this._toolDefinitions.get(name)?.definition.namespace,
+				getPromptGuidelines: (name) => this._toolPromptGuidelines.get(name) ?? [],
 			};
 			const descriptions = new Map<string, string>();
 			for (const { definition, sourceInfo } of hooks) {
@@ -2932,8 +3027,8 @@ export class AgentSession {
 		const toolSnippets: Record<string, string> = {};
 		for (const name of this._toolRegistry.keys()) {
 			const snippet = this._toolPromptSnippets.get(name);
-			// Tools without a snippet are not listed. Hidden tools are only callable through another tool.
-			if (snippet && !this._hiddenDeclarations.has(name)) toolSnippets[name] = snippet;
+			// Tools without a snippet are not listed.
+			if (snippet) toolSnippets[name] = snippet;
 		}
 
 		const loaderSystemPrompt = this._resourceLoader.getSystemPrompt();
@@ -2969,6 +3064,7 @@ export class AgentSession {
 			customPrompt,
 			appendSystemPrompt,
 			selectedTools: validToolNames,
+			hiddenTools: [...this._hiddenDeclarations],
 			toolSnippets,
 			toolGuidelines: Object.fromEntries(this._toolPromptGuidelines),
 		});
@@ -3034,10 +3130,8 @@ export class AgentSession {
 		messages: AgentMessage[] = this._buildLiveProjection().messages,
 	): SystemMessage | undefined {
 		options.selectedTools = this._applyToolLoadout(options.selectedTools).map((tool) => tool.name);
-		// The tool list must match the declarations the request carries, so hidden tools are not listed.
-		options.toolSnippets = Object.fromEntries(
-			Object.entries(options.toolSnippets).filter(([name]) => !this._hiddenDeclarations.has(name)),
-		);
+		// The tool list and rules must match the declarations the request carries.
+		options.hiddenTools = [...this._hiddenDeclarations];
 		const sections = diffSystemPromptSections(
 			getCurrentSystemMessage(messages)?.sections ?? {},
 			this._buildEffectivePromptSections(options),
@@ -3127,14 +3221,33 @@ export class AgentSession {
 	 * Restore the active tool loadout declared by the session transcript, if it declares one.
 	 * Tools reachable only from other tools are never declared, but they do not depend on the active
 	 * set, so the transcript's declarations are the whole loadout.
+	 * @param modifiers `+name`/`-name` entries applied to the restored loadout.
 	 */
-	private _restoreToolsFromTranscript(persist = true): void {
-		const current = getCurrentSystemMessage(this.sessionManager.buildSessionContext().messages);
-		if (!current) return;
-		const names = (current.toolsAdded ?? []).map((tool) => tool.name);
-		if (persist) this.setActiveToolsByName(names);
+	private _restoreToolsFromTranscript(modifiers: readonly string[] = [], persist = true): void {
+		this._pendingToolNames.clear();
+		// Replay every branch system delta, including declarations preceding compaction.
+		const systemMessages = this.sessionManager
+			.getBranch()
+			.flatMap((entry) => (entry.type === "message" && entry.message.role === "system" ? [entry.message] : []));
+		if (systemMessages.length === 0) return;
+		const mentioned = new Set(
+			systemMessages.flatMap((message) =>
+				[...(message.toolsAdded ?? []), ...(message.toolsRemoved ?? [])].map((tool) => tool.name),
+			),
+		);
+		const newTools = [...this._toolRegistry.keys()].filter(
+			(name) =>
+				!mentioned.has(name) && !this._baseToolDefinitions.has(name) && this._isActivatedOnRegistration(name),
+		);
+		const names = applyToolModifiers(
+			[...getCurrentTools(systemMessages).map((tool) => tool.name), ...newTools],
+			modifiers,
+		);
+		this._pendingToolNames = new Set(names.filter((name) => this._isAllowedTool(name)));
+		if (persist) this._setActiveTools(names);
 		else {
 			const tools = this._applyToolLoadout(names);
+			for (const tool of tools) this._pendingToolNames.delete(tool.name);
 			this._baseSystemPrompt = this._rebuildSystemPrompt(tools.map((tool) => tool.name));
 		}
 	}
@@ -3332,7 +3445,7 @@ export class AgentSession {
 		this._restoreSystemPrompt = true;
 		this._runSystemPromptOptions = undefined;
 		// Tool restoration is runtime-only: do not publish an intermediate abandoned-policy snapshot.
-		this._restoreToolsFromTranscript(false);
+		this._restoreToolsFromTranscript([], false);
 		this._commitBaseSystemPrompt(this._rebuildSystemPrompt(this.getActiveToolNames()));
 		// Navigation uses the already-discovered resources and is not another startup lifecycle.
 		this._deferUntrustedSnapshot = false;
@@ -3450,11 +3563,16 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
-	private async _runAgentPrompt(
-		messages: AgentMessage | AgentMessage[],
+	private async _startRun(
+		trigger: BeforeAgentStartTrigger,
 		preflightResult?: PromptOptions["preflightResult"],
-		nextTurnMessageCount = 0,
-		admit?: () => void,
+	): Promise<void> {
+		await this._runAgentPrompt(trigger, preflightResult);
+	}
+
+	private async _runAgentPrompt(
+		input: BeforeAgentStartTrigger | PreparedAgentPrompt,
+		preflightResult?: PromptOptions["preflightResult"],
 	): Promise<void> {
 		if (this._isAgentRunActive || this.agent.signal) {
 			throw new Error(
@@ -3462,19 +3580,29 @@ export class AgentSession {
 			);
 		}
 		this._agentRunAbortRequested = false;
-		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
-		this._failedResponse = undefined;
-		this._recordSelection();
 		this._isAgentRunActive = true;
 		let admitted = false;
 		try {
+			if (this._prefillRestoreFailed && this._pendingPrefill) {
+				this._restorePrefill(this._prefillRestorePoint ?? null, this._pendingPrefill);
+			}
+			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
+			const prepared = "messageType" in input ? await this._prepareRun(input) : input;
+			if (!prepared) return;
+			// Deferred output precedes starting input and cannot split a tool pair.
+			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
+			this._failedResponse = undefined;
+			this._recordSelection();
 			this._flushPendingUsage();
-			admit?.();
+			prepared.admit();
 			admitted = true;
-			// Consume only this prompt's batch after receipt admission, before callbacks can queue more.
-			if (nextTurnMessageCount > 0) this._pendingNextTurnMessages.splice(0, nextTurnMessageCount);
+			// Only the captured prefix belongs to this request; callbacks may enqueue the next batch.
+			if (prepared.nextTurnMessageCount > 0) this._pendingNextTurnMessages.splice(0, prepared.nextTurnMessageCount);
+			this._pendingToolNames.clear();
 			preflightResult?.("started");
-			await this.agent.prompt(messages);
+			await this.agent.prompt(prepared.messages);
 			// Always restore a captured prefix before honoring cancellation after a retry.
 			while (true) {
 				if (await this._handlePostAgentRun()) {
@@ -3689,11 +3817,99 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Prepare a run after compaction: emit before_agent_start and build the starting message,
+	 * reserved nextTurn context and hook messages. Policy/loadout publication and reservation
+	 * consumption wait for mandatory receipt admission.
+	 */
+	private async _prepareRun(
+		trigger: BeforeAgentStartTrigger,
+		dispatchToActiveRun?: () => Promise<void>,
+	): Promise<PreparedAgentPrompt | undefined> {
+		// Check if we need to compact before sending (catches aborted responses).
+		// The starting message is sent below, so do not call agent.continue() here.
+		const lastAssistant = this._findLastAssistantMessage();
+		if (lastAssistant) {
+			await this._checkCompaction(lastAssistant, false);
+		}
+		if (dispatchToActiveRun && (this.isStreaming || this.agent.signal || this.isCompacting)) {
+			await dispatchToActiveRun();
+			return undefined;
+		}
+
+		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
+		const result = await this._extensionRunner.emitBeforeAgentStart(
+			trigger,
+			this._baseSystemPromptOptions,
+			(options) => this._renderEffectiveSystemPrompt(options),
+		);
+		if (dispatchToActiveRun && (this.isStreaming || this.agent.signal || this.isCompacting)) {
+			await dispatchToActiveRun();
+			return undefined;
+		}
+		// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
+		// which updates the live loadout instead. An explicit edit wins; otherwise the live
+		// loadout is authoritative, so a setActiveTools() call is not undone here.
+		const handlerEditedTools =
+			result.systemPromptOptions.selectedTools.length !== selectedToolsBefore.length ||
+			result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
+		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
+
+		const messages: AgentMessage[] = [];
+		if (trigger.messageType === "custom") {
+			messages.push(trigger.message);
+		} else {
+			// Normalize images after before_agent_start so extension-driven model selection
+			// determines the resize profile used for the request and history.
+			const normalized = await this._normalizePromptImages(trigger.images);
+			if (dispatchToActiveRun && (this.isStreaming || this.agent.signal || this.isCompacting)) {
+				await dispatchToActiveRun();
+				return undefined;
+			}
+			const text =
+				normalized.hints.length > 0 ? `${trigger.prompt}\n\n${normalized.hints.join("\n")}` : trigger.prompt;
+			messages.push({
+				role: "user",
+				content: [{ type: "text", text }, ...normalized.images],
+				timestamp: Date.now(),
+			});
+		}
+		// Reserve without consuming until the mandatory receipt drain succeeds.
+		const nextTurnMessageCount = this._pendingNextTurnMessages.length;
+		messages.push(...this._pendingNextTurnMessages);
+		for (const msg of result.messages) {
+			messages.push({
+				role: "custom",
+				customType: msg.customType,
+				// Untyped extensions can pass null/missing content; normalize at ingestion.
+				content: msg.content ?? [],
+				display: msg.display,
+				details: msg.details,
+				timestamp: Date.now(),
+			});
+		}
+		const acceptedSections = Object.fromEntries(
+			Object.entries(buildSystemPromptSections(result.systemPromptOptions)).filter(
+				([name]) =>
+					!["preamble", "tools", "rules", "docs", "addendum", "project_context", "skills", "cwd"].includes(name),
+			),
+		);
+		return {
+			messages,
+			nextTurnMessageCount,
+			admit: () => {
+				const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
+				this._acceptedPromptSections = acceptedSections;
+				this._acceptedPromptLeafId = this.sessionManager.getLeafId();
+				this._runSystemPromptOptions = result.systemPromptOptions;
+				if (updateMessage) messages.unshift(updateMessage);
+			},
+		};
+	}
+
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const message = this._lastAssistantMessage;
-		const toolResults = this._lastAssistantToolResults;
 		this._lastAssistantMessage = undefined;
-		this._lastAssistantToolResults = [];
 		// Restore before honoring cancellation; only durable replacement may clear recovery.
 		let retryPrefill: AssistantMessage | undefined;
 		let restoredPrefillId: string | undefined;
@@ -3704,7 +3920,6 @@ export class AgentSession {
 			this._prefillEntryId = undefined;
 			this._prefillRestorePoint = undefined;
 		}
-
 		if (this._agentRunAbortRequested) {
 			this._finishCancelledRetry();
 			return false;
@@ -3763,7 +3978,7 @@ export class AgentSession {
 			return (!retryGranted && queuedCompactResume) || this.agent.hasQueuedMessages();
 		}
 
-		if (await this._checkCompaction(message, true, toolResults)) {
+		if (await this._checkCompaction(message)) {
 			return !this._agentRunAbortRequested;
 		}
 
@@ -3959,7 +4174,6 @@ export class AgentSession {
 		// Flush any pending bash and custom messages before the new prompt
 		this._flushPendingBashMessages();
 		this._flushPendingCustomMessages();
-
 		// Validate model
 		if (!this.model) {
 			throw new Error(formatNoModelSelectedMessage());
@@ -3984,85 +4198,11 @@ export class AgentSession {
 			return;
 		}
 
-		// Check if we need to compact before sending (catches aborted responses).
-		// The user's new prompt is sent below, so do not call agent.continue() here.
-		const lastAssistant = this._findLastAssistantMessage();
-		if (lastAssistant) {
-			await this._checkCompaction(lastAssistant, false);
-		}
-		if (this.isStreaming || this.agent.signal || this.isCompacting) {
-			await dispatchToActiveRun();
-			return;
-		}
-
-		// Emit before_agent_start before normalizing images so extension-driven model
-		// selection determines the resize profile used for the request and history.
-		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
-		const result = await this._extensionRunner.emitBeforeAgentStart(
-			expandedText,
-			currentImages,
-			this._baseSystemPromptOptions,
-			(options) => this._renderEffectiveSystemPrompt(options),
+		const prepared = await this._prepareRun(
+			{ messageType: "user", prompt: expandedText, images: currentImages },
+			dispatchToActiveRun,
 		);
-		if (this.isStreaming || this.agent.signal || this.isCompacting) {
-			await dispatchToActiveRun();
-			return;
-		}
-		// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
-		// which updates the live loadout instead. An explicit edit wins; otherwise the live
-		// loadout is authoritative, so a setActiveTools() call is not undone here.
-		const handlerEditedTools =
-			result.systemPromptOptions.selectedTools.length !== selectedToolsBefore.length ||
-			result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
-		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
-
-		const normalized = await this._normalizePromptImages(currentImages);
-		if (this.isStreaming || this.agent.signal || this.isCompacting) {
-			await dispatchToActiveRun();
-			return;
-		}
-		const userText = normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
-
-		// Build messages only after hooks and image normalization have completed.
-		const messages: AgentMessage[] = [];
-		const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: userText }];
-		userContent.push(...normalized.images);
-		messages.push({
-			role: "user",
-			content: userContent,
-			timestamp: Date.now(),
-		});
-
-		// Inject any pending "nextTurn" messages as context alongside the user message
-		const nextTurnMessageCount = this._pendingNextTurnMessages.length;
-		for (const msg of this._pendingNextTurnMessages) {
-			messages.push(msg);
-		}
-
-		for (const msg of result.messages) {
-			messages.push({
-				role: "custom",
-				customType: msg.customType,
-				// Untyped extensions can pass null/missing content; normalize at ingestion.
-				content: msg.content ?? [],
-				display: msg.display,
-				details: msg.details,
-				timestamp: Date.now(),
-			});
-		}
-		const acceptedSections = Object.fromEntries(
-			Object.entries(buildSystemPromptSections(result.systemPromptOptions)).filter(
-				([name]) =>
-					!["preamble", "tools", "rules", "docs", "addendum", "project_context", "skills", "cwd"].includes(name),
-			),
-		);
-		await this._runAgentPrompt(messages, preflightResult, nextTurnMessageCount, () => {
-			const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
-			this._acceptedPromptSections = acceptedSections;
-			this._acceptedPromptLeafId = this.sessionManager.getLeafId();
-			this._runSystemPromptOptions = result.systemPromptOptions;
-			if (updateMessage) messages.unshift(updateMessage);
-		});
+		if (prepared) await this._runAgentPrompt(prepared, preflightResult);
 	}
 
 	/**
@@ -4268,10 +4408,10 @@ export class AgentSession {
 			}
 		} else if (options?.triggerTurn) {
 			if (this._isEmittingAgentSettled) {
-				this._deferredSettledActions.push({ execute: async () => await this._runAgentPrompt(appMessage) });
+				this._deferredSettledActions.push({ execute: async () => await this.sendCustomMessage(message, options) });
 				return;
 			}
-			await this._runAgentPrompt(appMessage);
+			await this._startRun({ messageType: "custom", message: appMessage });
 		} else if (this.isStreaming) {
 			// Appending now would put the message between an assistant tool call and its
 			// result, which providers that validate message order reject on replay. Defer
@@ -5458,11 +5598,7 @@ export class AgentSession {
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
 	 * @returns Whether the post-run loop should call `agent.continue()` for overflow recovery or queued messages
 	 */
-	private async _checkCompaction(
-		assistantMessage: AssistantMessage,
-		skipAbortedCheck = true,
-		toolResults: AgentMessage[] = [],
-	): Promise<boolean> {
+	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings(this.model);
 		if (!settings.enabled) return false;
 
@@ -5554,7 +5690,7 @@ export class AgentSession {
 
 			// Persistently omit the selected final attempt before post-run recovery compaction.
 			this._overflowRecoveryAttempted = true;
-			this._omitRecoveryAttempt(assistantMessage, toolResults);
+			this._omitRecoveryAttempt(assistantMessage);
 			const retry = await this._runAutoCompaction("overflow", willRetry);
 			if (retry) this._failedResponse = assistantMessage;
 			return retry;
@@ -6056,10 +6192,7 @@ export class AgentSession {
 			[...this._toolRegistry.keys()].filter((name) => this._isActivatedOnRegistration(name)),
 		);
 		const previousActiveToolNames = this.getActiveToolNames();
-		const allowedToolNames = this._allowedToolNames;
-		const excludedToolNames = this._excludedToolNames;
-		const isAllowedTool = (name: string): boolean =>
-			(!allowedToolNames || allowedToolNames.has(name)) && !excludedToolNames?.has(name);
+		const allowedTools = this._allowedTools;
 
 		const registeredTools = this._extensionRunner.getAllRegisteredTools();
 		const allCustomTools = [
@@ -6068,10 +6201,10 @@ export class AgentSession {
 				definition,
 				sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, { source: "sdk" }),
 			})),
-		].filter((tool) => isAllowedTool(tool.definition.name));
+		].filter((tool) => this._isAllowedTool(tool.definition.name));
 		const definitionRegistry = new Map<string, ToolDefinitionEntry>(
 			Array.from(this._baseToolDefinitions.entries())
-				.filter(([name]) => isAllowedTool(name))
+				.filter(([name]) => this._isAllowedTool(name))
 				.map(([name, definition]) => [
 					name,
 					{
@@ -6107,7 +6240,7 @@ export class AgentSession {
 		const wrappedExtensionTools = wrapRegisteredTools(allCustomTools, runner);
 		const wrappedBuiltInTools = wrapRegisteredTools(
 			Array.from(this._baseToolDefinitions.values())
-				.filter((definition) => isAllowedTool(definition.name))
+				.filter((definition) => this._isAllowedTool(definition.name))
 				.map((definition) => ({
 					definition,
 					sourceInfo: createSyntheticSourceInfo(`${BUILTIN_PATH_PREFIX}${definition.name}`, {
@@ -6125,12 +6258,13 @@ export class AgentSession {
 
 		const nextActiveToolNames = (
 			options?.activeToolNames ? [...options.activeToolNames] : [...previousActiveToolNames]
-		).filter((name) => isAllowedTool(name));
+		).filter((name) => this._isAllowedTool(name));
 
-		if (allowedToolNames) {
+		if (allowedTools) {
 			for (const toolName of this._toolRegistry.keys()) {
-				// Naming a tool activates it even when it is not active by default.
-				if (allowedToolNames.has(toolName) && this._isDeclarable(toolName)) {
+				// Naming or matching a tool activates it even when it is not active by default. MCP tools
+				// kept registered without being named stay inactive.
+				if (allowedTools(toolName) && this._isDeclarable(toolName)) {
 					nextActiveToolNames.push(toolName);
 				}
 			}
@@ -6145,8 +6279,10 @@ export class AgentSession {
 				}
 			}
 		}
+		// Pending tools that are registered now become active.
+		nextActiveToolNames.push(...this._pendingToolNames);
 
-		this.setActiveToolsByName([...new Set(nextActiveToolNames)]);
+		this._setActiveTools([...new Set(nextActiveToolNames)]);
 	}
 
 	/** Whether activating the tool declares it to the model. */
@@ -6221,9 +6357,14 @@ export class AgentSession {
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
 		oldRunner.invalidate();
-		const previousDefaultTools = new Set(
-			this._usesDefaultTools ? (this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES) : [],
-		);
+		const getDefaultTools = () =>
+			this._usesDefaultTools
+				? applyToolModifiers(
+						this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES,
+						this._defaultToolModifiers,
+					)
+				: [];
+		const previousDefaultTools = new Set(getDefaultTools());
 		await this.settingsManager.reload();
 		if (this._syncSummaryBlockMaxTokens()) this._refreshFinalizedContext();
 		this.syncQueueModesFromSettings();
@@ -6233,11 +6374,9 @@ export class AgentSession {
 		this._effectiveContextFiles = undefined;
 		// Activate tools newly added to defaultTools. Removed ones stay active, and tools disabled
 		// during the session stay disabled unless the setting newly adds them.
-		const addedDefaultTools = this._usesDefaultTools
-			? (this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES).filter(
-					(name) => !previousDefaultTools.has(name),
-				)
-			: [];
+		const addedDefaultTools = getDefaultTools().filter((name) => !previousDefaultTools.has(name));
+		// Tools the new extensions register later, such as MCP tools, are pending until then.
+		for (const name of this.getActiveToolNames()) this._pendingToolNames.add(name);
 		this._buildRuntime({
 			activeToolNames: [...this.getActiveToolNames(), ...addedDefaultTools],
 			flagValues: previousFlagValues,
@@ -7027,7 +7166,8 @@ export class AgentSession {
 
 		// Create tool renderer if we have an extension runner (for custom tool HTML rendering)
 		const toolRenderer: ToolHtmlRenderer = createToolHtmlRenderer({
-			getToolDefinition: (name) => this.getToolDefinition(name),
+			getToolRenderers: (name) =>
+				this._extensionRunner.resolveToolRenderers(name, () => this.getToolDefinition(name)),
 			theme,
 			cwd: this.sessionManager.getCwd(),
 		});

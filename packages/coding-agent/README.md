@@ -12,61 +12,39 @@
 
 ---
 
-Pi is a minimal terminal coding harness. Adapt pi to your workflows, not the other way around, without having to fork and modify pi internals. Extend it with TypeScript [Extensions](#extensions), [Skills](#skills), [Prompt Templates](#prompt-templates), and [Themes](#themes). Put your extensions, skills, prompt templates, and themes in [Pi Packages](#pi-packages) and share them with others via npm or git.
+This checkout is Pi Crystal. See the [repository README](../../README.md) for retained swipe/edit/continuation, compaction and rendering behavior; installation commands below target official Pi rather than this fork build.
 
-Pi ships with powerful defaults but skips features like sub agents and plan mode. Instead, you can ask pi to build what you want or install a third party pi package that matches your workflow.
+Pi is a minimal, extensible agent harness that you can make your own.
+
+Adapt Pi to your workflows, not the other way around. Customize Pi with [extensions](docs/extensions.md), [skills](docs/skills.md), [prompt templates](docs/prompt-templates.md), and [themes](docs/themes.md). Bundle them as [Pi packages](docs/packages.md) and share via npm or git.
+
+Pi ships with powerful defaults but skips features like sub-agents and plan mode. Ask Pi to build what you want, or install a package that does it your way.
+
+Use Pi [interactively](docs/usage.md), automate it in [print or JSON mode](docs/cli.md), control it over [RPC](docs/rpc.md), or build apps with the [Pi TypeScript SDK](docs/sdk.md). See [OpenClaw](https://github.com/OpenClaw/OpenClaw) for a real-world integration.
 
 Pi runs in four modes: interactive, print or JSON, RPC for process integration, and an SDK for embedding in your own apps.
 
-## Share your OSS coding agent sessions
+Install the command-line interface:
 
-If you use pi for open source work, please share your coding agent sessions.
+```bash
+curl -fsSL https://pi.dev/install.sh | sh
+```
 
-Public OSS session data helps improve models, prompts, tools, and evaluations using real development workflows.
+On Windows:
 
-For the full explanation, see [this post on X](https://x.com/badlogicgames/status/2037811643774652911).
+```shell
+powershell -c "irm https://pi.dev/install.ps1 | iex"
+```
 
-To publish sessions, use [`badlogic/pi-share-hf`](https://github.com/badlogic/pi-share-hf). Read its README.md for setup instructions. All you need is a Hugging Face account, the Hugging Face CLI, and `pi-share-hf`.
-
-## Table of Contents
-
-- [Quick Start](#quick-start)
-- [Providers & Models](#providers--models)
-- [Interactive Mode](#interactive-mode)
-  - [Editor](#editor)
-  - [Commands](#commands)
-  - [Keyboard Shortcuts](#keyboard-shortcuts)
-  - [Message Queue](#message-queue)
-- [Sessions](#sessions)
-  - [Branching](#branching)
-  - [Compaction](#compaction)
-- [Settings](#settings)
-- [Context Files](#context-files)
-- [Customization](#customization)
-  - [Prompt Templates](#prompt-templates)
-  - [Skills](#skills)
-  - [Extensions](#extensions)
-  - [Themes](#themes)
-  - [Pi Packages](#pi-packages)
-- [Programmatic Usage](#programmatic-usage)
-- [Philosophy](#philosophy)
-- [CLI Reference](#cli-reference)
-
----
-
-## Quick Start
+The installer pins all dependencies and updates Pi with `pi update`. Alternatively, install directly with npm, which does not pin transitive dependencies:
 
 ```bash
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 ```
 
-`--ignore-scripts` disables dependency lifecycle scripts during install. Pi does not require install scripts for normal npm installs.
+Pi requires Node.js 22.19 or newer. The macOS, Linux, and Windows installers can install it if needed. Pi does not require dependency lifecycle scripts for a normal npm installation.
 
-Installer alternative:
-
-```bash
-curl -fsSL https://pi.dev/install.sh | sh
-```
+On macOS and Linux, Nix users can install the latest release with `nix profile add github:earendil-works/pi/stable`. See the [quickstart](docs/quickstart.md#1-install-pi) for updating and pinning releases.
 
 Authenticate with an API key:
 
@@ -75,11 +53,31 @@ export ANTHROPIC_API_KEY=sk-ant-...
 pi
 ```
 
-Or use your existing subscription:
+For a built-in AI provider, run `/login` inside Pi to connect a subscription or API key. Then give Pi a task.
+
+See the [documentation](docs/index.md) for full setup and usage instructions.
+
+## Share your OSS coding agent sessions
+
+If you use Pi for open source work, please share your coding agent sessions.
+
+Public OSS session data helps improve models, prompts, tools, and evaluations using real development workflows.
+
+For the full explanation, see [this post on X](https://x.com/badlogicgames/status/2037811643774652911).
+
+To publish sessions, use [`badlogic/pi-share-hf`](https://github.com/badlogic/pi-share-hf) using a Hugging Face account and the Hugging Face CLI.
+
+- [Demo video](https://x.com/badlogicgames/status/2041151967695634619) on how to publish Pi sessions
+- Published Pi development sessions: [`badlogicgames/pi-mono` on Hugging Face](https://huggingface.co/datasets/badlogicgames/pi-mono).
+
+## Development
+
+Clone the repository, install its dependencies, and run Pi from source:
 
 ```bash
-pi
-/login  # Then select provider
+npm install --ignore-scripts
+npm run build:offline
+./pi-test.sh
 ```
 
 Then just talk to pi. By default, pi gives the model four tools: `read`, `write`, `edit`, and `bash`. The model uses these to fulfill your requests. Add capabilities via [skills](#skills), [prompt templates](#prompt-templates), [extensions](#extensions), or [pi packages](#pi-packages).

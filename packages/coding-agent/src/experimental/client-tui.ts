@@ -1,13 +1,5 @@
 import { resolve } from "node:path";
-import {
-	combineFacetLoaders,
-	createFacetHost,
-	defineFacet,
-	type FacetHost,
-	type FacetLoader,
-	type JsonValue,
-	type LoadedFacets,
-} from "@earendil-works/chord";
+import { defineFacet, type Host, type JsonValue, local } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
 	CombinedAutocompleteProvider,
@@ -19,6 +11,7 @@ import {
 	Text,
 	type TUI,
 } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
 import { getAgentDir } from "../config.ts";
 import { KeybindingsManager } from "../core/keybindings.ts";
@@ -31,7 +24,7 @@ import { InteractiveThemeController } from "../modes/interactive/theme/theme-con
 import { createInteractiveTui } from "../modes/interactive/tui-renderer.ts";
 import { type OpenClientRuntimeOptions, openClientRuntime } from "./client-runtime.ts";
 import { ExperimentalChatView } from "./client-tui-chat.ts";
-import { createPresentationFacetLoaders } from "./plugins/bundled.ts";
+import { type LoadedPluginFacets, loadPresentationFacets } from "./plugins/bundled.ts";
 import { AgentController, type AgentOperationResponse, type AgentQueueResponse } from "./services/agent-controller.ts";
 import type {
 	ServerConnectionState,
@@ -50,7 +43,7 @@ import {
 import { Transcript, type Transcript as TranscriptService } from "./services/transcript.ts";
 
 export interface RunClientTuiOptions extends OpenClientRuntimeOptions {
-	readonly facetLoader?: FacetLoader;
+	readonly facetLoader?: () => Promise<LoadedPluginFacets>;
 }
 
 export interface ClientTuiServer {
@@ -99,11 +92,13 @@ export class ExperimentalClientTui implements Component {
 	readonly #editorContainer = new Container();
 	readonly #footerComponent = new Text("", 1, 0);
 	readonly #layoutRoot: Component;
-	readonly #sharedFacets: LoadedFacets;
+	readonly #sharedFacets: LoadedPluginFacets;
 	readonly #keybindings = KeybindingsManager.create();
-	#presentationFacets: LoadedFacets | undefined;
-	#facetHost: FacetHost | undefined;
+	#presentationFacets: LoadedPluginFacets | undefined;
+	#facetHost: Host | undefined;
 	#facetReloadTail = Promise.resolve();
+	#rebindPresentation: (() => Promise<void>) | undefined;
+	readonly #statusUnsubscribes: (() => void)[] = [];
 	#session: SessionFeature | undefined;
 	#slashCommands: SlashCommands | undefined;
 	#controller: AgentController | undefined;
@@ -121,7 +116,7 @@ export class ExperimentalClientTui implements Component {
 	#laneUnsubscribe: (() => void) | undefined;
 	#chatView: ExperimentalChatView | undefined;
 
-	private constructor(ui: TUI, requestRender: () => void, finish: () => void, loadedFacets: LoadedFacets) {
+	private constructor(ui: TUI, requestRender: () => void, finish: () => void, loadedFacets: LoadedPluginFacets) {
 		this.#ui = ui;
 		this.#requestRender = requestRender;
 		this.#finish = finish;
@@ -156,14 +151,12 @@ export class ExperimentalClientTui implements Component {
 		readonly command: ClientCommand;
 		readonly ui: TUI;
 		readonly servers: readonly ClientTuiServer[];
-		readonly facetLoader?: FacetLoader;
+		readonly facetLoader?: () => Promise<LoadedPluginFacets>;
 		requestRender(): void;
 		finish(): void;
 	}): Promise<ExperimentalClientTui> {
 		const prepared = await prepareClientSession(options.command, options.servers);
-		const loadedFacets = await combineFacetLoaders(
-			options.facetLoader === undefined ? [] : [options.facetLoader],
-		).load();
+		const loadedFacets = await (options.facetLoader?.() ?? Promise.resolve({ facets: [], async dispose() {} }));
 		const component = new ExperimentalClientTui(options.ui, options.requestRender, options.finish, loadedFacets);
 		try {
 			await component.#start(prepared);
@@ -237,16 +230,19 @@ export class ExperimentalClientTui implements Component {
 
 	async #start(prepared: PreparedClientSession): Promise<void> {
 		const server = prepared.server;
-		let presentationFacets = await combineFacetLoaders(
-			createPresentationFacetLoaders(prepared.presentationPlugins),
-		).load();
+		let presentationFacets = await loadPresentationFacets(prepared.presentationPlugins);
 		this.#presentationFacets = presentationFacets;
-		let facetHost!: FacetHost;
+		const facetHost = server.server.host;
+		this.#facetHost = facetHost;
 		const reloadPresentationPlugins = (data: JsonValue): Promise<void> => {
 			const operation = this.#facetReloadTail.then(async () => {
-				const candidate = await combineFacetLoaders(createPresentationFacetLoaders(data)).load();
+				const candidate = await loadPresentationFacets(data);
 				try {
-					await facetHost.reload(candidate.facets);
+					await facetHost.reload(candidate.facets, {
+						remove: presentationFacets.facets
+							.filter((old) => !candidate.facets.some((next) => next.name === old.name))
+							.map((facet) => facet.name),
+					});
 				} catch (error) {
 					try {
 						await candidate.dispose();
@@ -263,64 +259,86 @@ export class ExperimentalClientTui implements Component {
 			this.#facetReloadTail = operation.catch(() => {});
 			return operation;
 		};
-		const presentationBridgeFacet = defineFacet({
-			id: "@pi/presentation-bridge",
-			setup: (env) => {
-				env.provide(PresentationUI, {
-					select: (title, items, selectedValue) =>
-						this.#select(
-							title,
-							items.map((item) => ({ ...item })),
-							selectedValue,
-						),
-					showStatus: (status) => {
-						this.#status = status;
-						this.#rebuild();
+		const Bridge = local("pi.local.presentation-bridge", { version: 1, input: Type.Object({}) });
+		const presentationBridgeFacet = {
+			name: "@pi/presentation-bridge",
+			...defineFacet(({ serve }) => {
+				serve(
+					PresentationUI,
+					() => ({
+						ui: {
+							select: (
+								title: string,
+								items: readonly { value: string; label: string; description?: string }[],
+								selectedValue: string | undefined,
+							) => this.#select(title, items, selectedValue),
+							showStatus: (status: string) => {
+								this.#status = status;
+								this.#rebuild();
+							},
+						},
+					}),
+					{ lifetime: "host" },
+				);
+				serve(
+					Bridge,
+					(_input, _principal, self) => {
+						const commands = self.get(SlashCommands, {});
+						const controller = self.get(AgentController, {});
+						const transcript = self.get(Transcript, {});
+						self.resource("presentation", {
+							version: 1,
+							deps: [commands, controller, transcript],
+							open: () => {
+								const registry = commands.registry!;
+								const feature: SessionFeature = {
+									serverId: server.serverId,
+									session: server.session,
+									transcript,
+								};
+								this.#session = feature;
+								this.#slashCommands = registry;
+								this.#controller = controller;
+								const cleanup = [registry.subscribe(() => this.#updateAutocomplete())];
+								return { feature, registry, cleanup };
+							},
+							close: ({ feature, registry, cleanup }) => {
+								for (const close of cleanup.reverse()) close();
+								if (this.#session === feature) this.#session = undefined;
+								if (this.#slashCommands === registry) this.#slashCommands = undefined;
+								if (this.#controller === controller) this.#controller = undefined;
+							},
+						});
+						return {};
 					},
-				});
-				const commands = env.use(SlashCommands);
-				const controller = env.use(AgentController);
-				const transcript = env.use(Transcript);
-				const sessionFeature: SessionFeature = {
-					serverId: server.serverId,
-					session: server.session,
-					transcript,
-				};
-				env.onActivate(() => {
-					if (this.#session !== undefined || this.#slashCommands !== undefined || this.#controller !== undefined) {
-						throw new Error("Presentation services are already active");
-					}
-					this.#session = sessionFeature;
-					this.#slashCommands = commands;
-					this.#controller = controller;
-					env.own(() => {
-						if (this.#session === sessionFeature) this.#session = undefined;
-						if (this.#slashCommands === commands) this.#slashCommands = undefined;
-						if (this.#controller === controller) this.#controller = undefined;
-					});
-					env.own(commands.subscribe(() => this.#updateAutocomplete()));
-					if (server.radius) {
-						env.own(
-							server.server.connection.subscribe((state) => this.#handleConnectionState(server.serverId, state)),
-						);
-						env.own(
-							server.session.attachment.subscribe((state) => this.#handleAttachmentState(sessionFeature, state)),
-						);
-					}
-				});
-			},
-		});
-		facetHost = await createFacetHost({
-			facets: [
-				createSlashCommandsRuntimeFacet(),
-				presentationBridgeFacet,
-				createBuiltInSlashCommandsFacet({ reloadPresentationPlugins }),
-				...this.#sharedFacets.facets,
-				...presentationFacets.facets,
-			],
-			serviceSources: [server.server, server.session],
-		});
-		this.#facetHost = facetHost;
+					{ lifetime: "host" },
+				);
+			}),
+		};
+		const facets = () => [
+			createSlashCommandsRuntimeFacet(),
+			presentationBridgeFacet,
+			createBuiltInSlashCommandsFacet({ reloadPresentationPlugins }),
+			...this.#sharedFacets.facets,
+			...presentationFacets.facets,
+		];
+		this.#rebindPresentation = async () => {
+			await this.#facetReloadTail;
+			await facetHost.reload([], { remove: facets().map((facet) => facet.name) });
+			await facetHost.load(facets());
+		};
+		await facetHost.load(facets());
+		if (server.radius) {
+			this.#statusUnsubscribes.push(
+				server.server.connection.subscribe((state) => this.#handleConnectionState(server.serverId, state)),
+			);
+			this.#statusUnsubscribes.push(
+				server.session.attachment.subscribe((state) => {
+					const feature = this.#session;
+					if (feature !== undefined) this.#handleAttachmentState(feature, state);
+				}),
+			);
+		}
 	}
 
 	async #openPreparedSession(prepared: PreparedClientSession): Promise<void> {
@@ -340,6 +358,7 @@ export class ExperimentalClientTui implements Component {
 		this.#closed = true;
 		this.#completeSelection(undefined);
 		const errors: unknown[] = [];
+		for (const unsubscribe of this.#statusUnsubscribes.splice(0)) unsubscribe();
 		try {
 			await this.#recoveryTransition;
 			await this.#closeLane();
@@ -349,14 +368,14 @@ export class ExperimentalClientTui implements Component {
 		}
 		if (this.#facetHost !== undefined) {
 			try {
-				await this.#facetHost.dispose();
+				await this.#facetHost.close();
 			} catch (error) {
 				errors.push(error);
 			}
 			this.#facetHost = undefined;
 		}
 		const generations = [this.#presentationFacets, this.#sharedFacets].filter(
-			(generation): generation is LoadedFacets => generation !== undefined,
+			(generation): generation is LoadedPluginFacets => generation !== undefined,
 		);
 		this.#presentationFacets = undefined;
 		const results = await Promise.allSettled(generations.map((generation) => generation.dispose()));
@@ -464,7 +483,12 @@ export class ExperimentalClientTui implements Component {
 		if (this.#closed || this.#selectedServerId !== feature.serverId || this.#sessionId === undefined) return;
 		if (state.status === "attached" && state.sessionId === this.#sessionId) {
 			this.#queueRecovery(async () => {
-				if (this.#laneUnsubscribe === undefined) await this.#openLane(feature);
+				if (this.#laneUnsubscribe === undefined) {
+					await this.#rebindPresentation?.();
+					const active = this.#session;
+					if (active === undefined) throw new Error("Session presentation did not reactivate");
+					await this.#openLane(active);
+				}
 				this.#busy = false;
 				this.#status = "";
 				this.#rebuild();
@@ -474,6 +498,7 @@ export class ExperimentalClientTui implements Component {
 		if (state.status === "attaching" && state.sessionId === this.#sessionId) {
 			this.#busy = true;
 			this.#status = "Reattaching Session…";
+			this.#queueRecovery(() => this.#closeLane());
 			this.#rebuild();
 		}
 	}
@@ -549,7 +574,7 @@ export class ExperimentalClientTui implements Component {
 			return;
 		}
 		try {
-			const result = await command.run(args, BACKGROUND_CONTEXT);
+			const result = await this.#facetHost!.root((context) => command.run(args, context));
 			if (result !== undefined) {
 				if ("entryId" in result) this.#reportQueue(result);
 				else this.#reportOperation(result);
@@ -567,8 +592,14 @@ export class ExperimentalClientTui implements Component {
 		const running = operation !== null && operation !== undefined;
 		this.#status = running ? "Queueing steering message…" : "Running turn…";
 		this.#rebuild();
-		if (running) this.#reportQueue(await controller.steer({ message: prompt, images: null }, BACKGROUND_CONTEXT));
-		else this.#reportOperation(await controller.prompt({ message: prompt, images: null }, BACKGROUND_CONTEXT));
+		if (running)
+			this.#reportQueue(
+				await this.#facetHost!.root((context) => controller.steer({ message: prompt, images: null }, context)),
+			);
+		else
+			this.#reportOperation(
+				await this.#facetHost!.root((context) => controller.prompt({ message: prompt, images: null }, context)),
+			);
 	}
 
 	async #queueFollowUp(text: string): Promise<void> {
@@ -577,7 +608,9 @@ export class ExperimentalClientTui implements Component {
 		try {
 			this.#status = "Queueing follow-up…";
 			this.#rebuild();
-			this.#reportQueue(await controller.followUp({ message: text, images: null }, BACKGROUND_CONTEXT));
+			this.#reportQueue(
+				await this.#facetHost!.root((context) => controller.followUp({ message: text, images: null }, context)),
+			);
 		} catch (error) {
 			this.#status = `Error: ${message(error)}`;
 			this.#rebuild();
@@ -604,10 +637,12 @@ export class ExperimentalClientTui implements Component {
 		if (operation === null || operation === undefined || controller === undefined) return;
 		this.#status = `Aborting ${operation.id}…`;
 		this.#rebuild();
-		void controller.requestAbort(operation.id, BACKGROUND_CONTEXT).catch((error: unknown) => {
-			this.#status = `Error: ${message(error)}`;
-			this.#rebuild();
-		});
+		void this.#facetHost!.root((context) => controller.requestAbort(operation.id, context)).catch(
+			(error: unknown) => {
+				this.#status = `Error: ${message(error)}`;
+				this.#rebuild();
+			},
+		);
 	}
 
 	#selectedController(): AgentController | undefined {
@@ -632,20 +667,15 @@ async function prepareClientSession(
 ): Promise<PreparedClientSession> {
 	const opened = servers.map((server) => ({
 		server,
-		services: server.server.open({
-			services: [SessionDirectory, SessionManagement, PresentationPlugins],
-			assertAccess() {},
-			onError() {},
-		}),
+		directory: server.server.host.hold(SessionDirectory, {}),
+		management: server.server.host.hold(SessionManagement, {}),
+		plugins: server.server.host.hold(PresentationPlugins, {}),
 	}));
 	try {
-		const features = opened.map(({ server, services }) => ({
-			server,
-			directory: services.use(SessionDirectory),
-			management: services.use(SessionManagement),
-			plugins: services.use(PresentationPlugins),
-		}));
-		await Promise.all(opened.map(({ services }) => services.ready(BACKGROUND_CONTEXT)));
+		await Promise.all(
+			opened.flatMap(({ directory, management, plugins }) => [directory.ready, management.ready, plugins.ready]),
+		);
+		const features = opened;
 		let selected:
 			| {
 					readonly server: ClientTuiServer;
@@ -676,7 +706,9 @@ async function prepareClientSession(
 					server: feature.server,
 					management: feature.management,
 					plugins: feature.plugins,
-					summary: await feature.management.create({ id: command.sessionId }, BACKGROUND_CONTEXT),
+					summary: await feature.server.server.host.root((context) =>
+						feature.management.create({ id: command.sessionId }, context),
+					),
 				};
 			}
 		} else if (command.continue === true || command.resume === true) {
@@ -702,17 +734,21 @@ async function prepareClientSession(
 				server: feature.server,
 				management: feature.management,
 				plugins: feature.plugins,
-				summary: await feature.management.create({}, BACKGROUND_CONTEXT),
+				summary: await feature.server.server.host.root((context) => feature.management.create({}, context)),
 			};
 		}
-		const presentationPlugins = await selected.plugins.prepareSession(
-			{
-				sessionId: selected.summary.sessionId,
-				packagePaths: command.pluginPackages?.map((packagePath) => resolve(packagePath)) ?? null,
-			},
-			BACKGROUND_CONTEXT,
+		const presentationPlugins = await selected.server.server.host.root((context) =>
+			selected!.plugins.prepareSession(
+				{
+					sessionId: selected!.summary.sessionId,
+					packagePaths: command.pluginPackages?.map((packagePath) => resolve(packagePath)) ?? null,
+				},
+				context,
+			),
 		);
-		await selected.management.attach(selected.summary.sessionId, BACKGROUND_CONTEXT);
+		await selected.server.server.host.root((context) =>
+			selected!.management.attach(selected!.summary.sessionId, context),
+		);
 		await selected.server.session.whenAttached(selected.summary.sessionId, BACKGROUND_CONTEXT);
 		return {
 			server: selected.server,
@@ -720,7 +756,11 @@ async function prepareClientSession(
 			presentationPlugins,
 		};
 	} finally {
-		await Promise.allSettled(opened.map(({ services }) => services.dispose(BACKGROUND_CONTEXT)));
+		for (const { directory, management, plugins } of opened) {
+			directory.release();
+			management.release();
+			plugins.release();
+		}
 	}
 }
 

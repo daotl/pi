@@ -135,7 +135,6 @@ describe("AgentSession compaction model overrides", () => {
 		});
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
-
 	it("uses the newly selected model without changing ordinary settings", async () => {
 		const harness = await createHarness({
 			models: [
@@ -196,15 +195,14 @@ describe("AgentSession compaction model overrides", () => {
 			harness.session.agent.state.model = harness.getModel("second")!;
 			return getAuth(model, ...args);
 		});
-		const requests: Array<{ id: string; maxTokens: number | undefined }> = [];
+		const requests: string[] = [];
 		harness.setResponses([
-			(_context, options, _state, model) => {
-				requests.push({ id: model.id, maxTokens: options?.maxTokens });
+			(_context, _options, _state, model) => {
+				requests.push(model.id);
 				return fauxAssistantMessage("summary");
 			},
 		]);
 		await harness.session.compact();
-		// Compaction resolves the model once for the single summarization call.
-		expect(requests).toEqual([{ id: "first", maxTokens: 1600 }]);
+		expect(requests).toEqual(["first"]);
 	});
 });

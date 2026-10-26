@@ -1,82 +1,38 @@
-import {
-	createServiceCatalogueCall,
-	createServiceStateDecoder,
-	createServiceSubscribeCall,
-	createServiceUnsubscribeCall,
-	type JsonValue,
-	parseServiceCall,
-	parseServiceCatalogue,
-	parseWireServiceProviderUpdate,
-	parseWireServiceSubscriptionSnapshot,
-	type RemoteServiceTransport,
-	type ServiceCall,
-	type ServiceCatalogueEntry,
-	type ServiceMode,
-	type ServiceProviderUpdate,
-	type ServiceStateDecoder,
-	type ServiceSubscriptionSnapshot,
-} from "@earendil-works/chord";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { Frame, Link } from "@earendil-works/chord";
 import {
 	type AttachmentEnvelope,
 	encodeClientMessage,
+	type FrameEnvelope,
 	isServerId,
 	ProtocolValidationError,
-	type ResponseEnvelope,
 	type RpcTarget,
 	type ServerHello,
-	type ServiceEventEnvelope,
 	type SessionTarget,
 } from "@earendil-works/pi-protocol";
 import { Connection } from "./connection.ts";
-import { ClientDisposedError, DisconnectedError, ServerError, toError } from "./errors.ts";
-import { createPromiseResolvers } from "./promise.ts";
+import { ClientDisposedError, DisconnectedError, toError } from "./errors.ts";
 import type {
 	AttachmentChangeListener,
 	ClientOptions,
 	ConnectionState,
 	ConnectionStateChange,
-	ServiceSubscription,
 	Unsubscribe,
 } from "./types.ts";
-
-type ServiceResult = JsonValue | undefined;
-
-interface PendingRequest {
-	resolve(result: ServiceResult): void;
-	reject(error: Error): void;
-	cleanup(): void;
-}
-
-interface ActiveServiceListener {
-	readonly target: RpcTarget;
-	readonly listener: (update: ServiceProviderUpdate) => void | Promise<void>;
-	readonly decoder: ServiceStateDecoder;
-	readonly queuedWireUpdates: JsonValue[];
-	readonly queued: ServiceProviderUpdate[];
-	deliveryTail: Promise<void>;
-	hydrated: boolean;
-	ready: boolean;
-}
 
 export class Client {
 	readonly #options: ClientOptions;
 	readonly #connection: Connection;
-	readonly #pendingRequests = new Map<string, PendingRequest>();
 	readonly #connectionStateListeners = new Set<(change: ConnectionStateChange) => void>();
 	readonly #attachmentListeners = new Set<AttachmentChangeListener>();
-	readonly #serviceListeners = new Map<string, ActiveServiceListener>();
-	#requestSequence = 0;
-	#serviceSubscriptionSequence = 0;
+	readonly #links = new Set<ClientChordLink>();
+	readonly #queuedFrames = new Map<string, Frame[]>();
 	#hello: ServerHello | undefined;
 	#attachment: SessionTarget | undefined;
 	#disposed = false;
 	#disposePromise: Promise<void> | undefined;
 
 	constructor(options: ClientOptions) {
-		if (!isServerId(options.serverId)) {
-			throw new TypeError("serverId must be a canonical lowercase UUIDv4");
-		}
+		if (!isServerId(options.serverId)) throw new TypeError("serverId must be a canonical lowercase UUIDv4");
 		this.#options = options;
 		this.#connection = new Connection({
 			transportFactory: options.transportFactory,
@@ -93,23 +49,18 @@ export class Client {
 	get disposed(): boolean {
 		return this.#disposed;
 	}
-
 	get connectionState(): ConnectionState {
 		return this.#connection.state;
 	}
-
 	get connected(): boolean {
 		return this.#connection.state === "connected";
 	}
-
 	get serverId(): string {
 		return this.#options.serverId;
 	}
-
 	get hello(): ServerHello | undefined {
 		return this.#hello;
 	}
-
 	get attachment(): SessionTarget | undefined {
 		return this.#attachment;
 	}
@@ -134,7 +85,6 @@ export class Client {
 	reconnect(): Promise<ServerHello> {
 		return this.connect();
 	}
-
 	disconnect(reason = "Client disconnected"): void {
 		this.#connection.disconnect(reason);
 	}
@@ -151,203 +101,64 @@ export class Client {
 		return () => this.#attachmentListeners.delete(listener);
 	}
 
-	/** Invoke one low-level protocol call against an explicit routed target. */
-	request(target: RpcTarget, call: ServiceCall, signal?: AbortSignal): Promise<ServiceResult> {
-		return this.#request(target, call, signal);
-	}
-
-	async serviceCatalogue(target: RpcTarget, signal?: AbortSignal): Promise<readonly ServiceCatalogueEntry[]> {
-		const result = await this.#request(target, createServiceCatalogueCall(), signal);
-		try {
-			return parseServiceCatalogue(result);
-		} catch (error) {
-			const validationError = new ProtocolValidationError(
-				error instanceof Error ? error.message : "Invalid service catalogue",
-			);
-			this.#connection.fail(validationError);
-			throw validationError;
+	/** Opens the native Chord channel for one live routed capability. Only one channel owns a route. */
+	chordLink(target: RpcTarget): Link {
+		this.#assertNotDisposed();
+		if (!this.connected || !this.#targetIsCurrent(target)) throw new DisconnectedError("Chord route is unavailable");
+		for (const existing of this.#links) {
+			if (sameTarget(existing.target, target)) throw new Error("Chord route already has a link");
 		}
-	}
-
-	async subscribeService(
-		target: RpcTarget,
-		serviceId: string,
-		mode: ServiceMode,
-		listener: (update: ServiceProviderUpdate) => void | Promise<void>,
-		signal?: AbortSignal,
-	): Promise<ServiceSubscription> {
-		const subscriptionId = `service-${++this.#serviceSubscriptionSequence}`;
-		const active: ActiveServiceListener = {
-			target,
-			listener,
-			decoder: createServiceStateDecoder(),
-			queuedWireUpdates: [],
-			queued: [],
-			deliveryTail: Promise.resolve(),
-			hydrated: false,
-			ready: false,
-		};
-		this.#serviceListeners.set(subscriptionId, active);
-		let snapshot: ServiceSubscriptionSnapshot;
-		try {
-			snapshot = await this.#request(
-				target,
-				createServiceSubscribeCall(subscriptionId, serviceId, mode),
-				signal,
-				(result) => {
-					const decoded = active.decoder.decodeSnapshot(parseWireServiceSubscriptionSnapshot(result));
-					active.hydrated = true;
-					for (const update of active.queuedWireUpdates.splice(0)) {
-						active.queued.push(active.decoder.decodeUpdate(parseWireServiceProviderUpdate(update)));
-					}
-					return decoded;
-				},
-			);
-		} catch (error) {
-			if (this.#serviceListeners.get(subscriptionId) === active) this.#serviceListeners.delete(subscriptionId);
-			throw error;
-		}
-		if (this.#serviceListeners.get(subscriptionId) !== active) throw new DisconnectedError();
-		let disposed = false;
-		return {
-			id: subscriptionId,
-			target,
-			snapshot,
-			start: () => {
-				if (disposed || active.ready) return;
-				active.ready = true;
-				for (const update of active.queued.splice(0)) this.#deliverServiceUpdate(active, update);
-			},
-			dispose: async () => {
-				if (disposed) return;
-				disposed = true;
-				if (this.#serviceListeners.get(subscriptionId) === active) this.#serviceListeners.delete(subscriptionId);
-				try {
-					if (this.connected && this.#targetIsCurrent(target)) {
-						await this.#request(target, createServiceUnsubscribeCall(subscriptionId));
-					}
-					await active.deliveryTail;
-				} finally {
-					active.queuedWireUpdates.length = 0;
-					active.queued.length = 0;
-				}
-			},
-		};
-	}
-
-	#request<T = ServiceResult>(
-		target: RpcTarget,
-		call: ServiceCall,
-		signal?: AbortSignal,
-		transform?: (result: ServiceResult) => T,
-	): Promise<T> {
-		if (this.#disposed) return Promise.reject(new ClientDisposedError());
-		if (!this.connected) return Promise.reject(new DisconnectedError());
-		if (signal?.aborted) return Promise.reject(abortError(signal));
-		const id = `request-${++this.#requestSequence}`;
-		const { promise, resolve, reject } = createPromiseResolvers<T>();
-		let sent = false;
-		let aborted = false;
-		let onAbort: (() => void) | undefined;
-		const sendCancel = (): void => {
-			if (!sent || !this.connected) return;
-			try {
-				this.#connection.send(
-					encodeClientMessage({ type: "cancel", id, target }, { maxFrameLength: this.#connection.maxFrameLength }),
+		const captured = { ...target };
+		const link = new ClientChordLink(
+			captured,
+			(frame) => {
+				if (!this.connected || !this.#targetIsCurrent(captured)) throw new DisconnectedError();
+				// Native frames use optional undefined fields. A JSON link omits those before the strict CBOR boundary.
+				const normalized = JSON.parse(JSON.stringify(frame)) as Frame;
+				const encoded = encodeClientMessage(
+					{ type: "chord", target: captured, frame: normalized },
+					{ maxFrameLength: this.#connection.maxFrameLength },
 				);
-			} catch (error) {
-				this.#connection.fail(toError(error));
-			}
-		};
-		if (signal !== undefined) {
-			onAbort = () => {
-				if (aborted) return;
-				aborted = true;
-				reject(abortError(signal));
-				sendCancel();
-			};
-			signal.addEventListener("abort", onAbort, { once: true });
-		}
-		this.#pendingRequests.set(id, {
-			resolve: (result) => {
-				try {
-					resolve(transform === undefined ? (result as T) : transform(result));
-				} catch (error) {
-					const validationError = new ProtocolValidationError(
-						error instanceof Error ? error.message : "Invalid service operation stream",
-					);
-					this.#connection.fail(validationError);
-					reject(validationError);
-				}
+				this.#connection.send(encoded);
+				return encoded.byteLength;
 			},
-			reject,
-			cleanup: () => {
-				if (signal !== undefined && onAbort !== undefined) signal.removeEventListener("abort", onAbort);
-			},
-		});
-		let frame: Uint8Array;
-		try {
-			frame = encodeClientMessage(
-				{ type: "request", id, target, call: parseServiceCall(call) as unknown as JsonValue },
-				{ maxFrameLength: this.#connection.maxFrameLength },
-			);
-		} catch (error) {
-			this.#takePendingRequest(id)?.reject(toError(error));
-			return promise;
-		}
-		this.#connection.send(frame);
-		sent = true;
-		if (aborted) sendCancel();
-		return promise;
+			() => this.#links.delete(link),
+		);
+		this.#links.add(link);
+		const key = targetKey(captured);
+		for (const frame of this.#queuedFrames.get(key) ?? []) link.deliver(frame);
+		this.#queuedFrames.delete(key);
+		return link;
 	}
 
-	#handleMessage(message: ResponseEnvelope | ServiceEventEnvelope | AttachmentEnvelope): void {
+	#handleMessage(message: FrameEnvelope | AttachmentEnvelope): void {
 		if (message.type === "attachment") {
-			if (message.attachment !== null && message.attachment.serverId !== this.#options.serverId) {
+			if (message.attachment !== null && message.attachment.serverId !== this.serverId) {
 				this.#connection.fail(new ProtocolValidationError("Attachment update belongs to another server"));
 				return;
 			}
 			this.#setAttachment(message.attachment ?? undefined);
 			return;
 		}
-		if (message.type === "service_update") {
-			const active = this.#serviceListeners.get(message.subscriptionId);
-			if (active === undefined) return;
-			if (!active.hydrated) {
-				active.queuedWireUpdates.push(message.update);
+		if (!this.#targetIsCurrent(message.target)) return;
+		for (const link of this.#links) {
+			if (sameTarget(link.target, message.target)) {
+				link.deliver(message.frame);
 				return;
 			}
-			let update: ServiceProviderUpdate;
-			try {
-				update = active.decoder.decodeUpdate(parseWireServiceProviderUpdate(message.update));
-			} catch (error) {
-				this.#connection.fail(
-					new ProtocolValidationError(error instanceof Error ? error.message : "Invalid service operation stream"),
-				);
-				return;
-			}
-			if (active.ready) this.#deliverServiceUpdate(active, update);
-			else active.queued.push(update);
-			return;
 		}
-		const pending = this.#takePendingRequest(message.id);
-		if (!pending) {
-			this.#connection.fail(new ProtocolValidationError("Response has no matching request"));
-			return;
-		}
-		if (!message.ok) {
-			pending.reject(new ServerError(message.error));
-			return;
-		}
-		pending.resolve(message.result);
+		const key = targetKey(message.target);
+		const queued = this.#queuedFrames.get(key) ?? [];
+		queued.push(message.frame);
+		this.#queuedFrames.set(key, queued);
 	}
 
 	#handleConnectionStateChange(change: ConnectionStateChange): void {
 		if (change.state === "disconnected") {
 			this.#hello = undefined;
+			for (const link of [...this.#links]) link.end(change.error?.message ?? "disconnected");
+			this.#queuedFrames.clear();
 			this.#setAttachment(undefined);
-			this.#rejectPendingRequests(change.error ?? new DisconnectedError());
-			this.#serviceListeners.clear();
 		}
 		for (const listener of this.#connectionStateListeners) {
 			try {
@@ -358,36 +169,16 @@ export class Client {
 		}
 	}
 
-	#takePendingRequest(id: string): PendingRequest | undefined {
-		const request = this.#pendingRequests.get(id);
-		if (request) {
-			this.#pendingRequests.delete(id);
-			request.cleanup();
-		}
-		return request;
-	}
-
-	#rejectPendingRequests(error: Error): void {
-		const requests = [...this.#pendingRequests.values()];
-		this.#pendingRequests.clear();
-		for (const request of requests) {
-			request.cleanup();
-			request.reject(error);
-		}
-	}
-
 	dispose(): Promise<void> {
 		if (this.#disposePromise) return this.#disposePromise;
 		this.#disposed = true;
 		this.#disposePromise = Promise.resolve();
-		const error = new ClientDisposedError();
-		this.#rejectPendingRequests(error);
-		this.#connection.disconnect(error);
+		this.#connection.disconnect(new ClientDisposedError());
 		this.#hello = undefined;
 		this.#setAttachment(undefined);
 		this.#connectionStateListeners.clear();
 		this.#attachmentListeners.clear();
-		this.#serviceListeners.clear();
+		this.#queuedFrames.clear();
 		return this.#disposePromise;
 	}
 
@@ -398,13 +189,19 @@ export class Client {
 	#setAttachment(attachment: SessionTarget | undefined): void {
 		const previous = this.#attachment;
 		if (
-			previous?.serverId === attachment?.serverId &&
-			previous?.sessionId === attachment?.sessionId &&
-			previous?.attachmentId === attachment?.attachmentId
-		) {
+			previous === undefined
+				? attachment === undefined
+				: attachment !== undefined && sameTarget(previous, attachment)
+		)
 			return;
-		}
 		this.#attachment = attachment;
+		for (const link of [...this.#links]) {
+			if ("sessionId" in link.target && !this.#targetIsCurrent(link.target)) link.end("attachment changed");
+		}
+		for (const [key] of this.#queuedFrames) {
+			const target = JSON.parse(key) as RpcTarget;
+			if (!this.#targetIsCurrent(target)) this.#queuedFrames.delete(key);
+		}
 		for (const listener of this.#attachmentListeners) {
 			try {
 				listener(attachment);
@@ -414,66 +211,99 @@ export class Client {
 		}
 	}
 
-	#deliverServiceUpdate(active: ActiveServiceListener, update: ServiceProviderUpdate): void {
-		active.deliveryTail = active.deliveryTail
-			.then(() => active.listener(update))
-			.catch((error: unknown) => this.#reportListenerError(error));
-	}
-
 	#targetIsCurrent(target: RpcTarget): boolean {
 		if (!("sessionId" in target)) return this.#hello?.serverId === target.serverId;
-		const attachment = this.#attachment;
-		return (
-			attachment?.serverId === target.serverId &&
-			attachment.sessionId === target.sessionId &&
-			attachment.attachmentId === target.attachmentId
-		);
+		return this.#attachment !== undefined && sameTarget(this.#attachment, target);
 	}
-
 	#assertNotDisposed(): void {
 		if (this.#disposed) throw new ClientDisposedError();
 	}
-
 	#reportListenerError(error: unknown): void {
-		if (!this.#options.onListenerError) return;
 		try {
-			this.#options.onListenerError(toError(error));
+			this.#options.onListenerError?.(toError(error));
 		} catch {
-			// Diagnostics cannot affect protocol or transport state.
+			/* Diagnostics never affect the transport. */
 		}
 	}
 }
 
-/** Adapts a lazily resolved routed client target to a Chord service transport. */
-export function createClientServiceTransport(
-	client: Client,
-	getTarget: () => RpcTarget | undefined,
-): RemoteServiceTransport {
-	const target = (): RpcTarget => {
-		const resolved = getTarget();
-		if (resolved === undefined) throw new Error("Remote service target is unavailable");
-		return resolved;
-	};
-	return {
-		invoke: async (call, context) => client.request(target(), call, context.abortSignal),
-		async subscribe(serviceId, mode, listener, context) {
-			const subscription = await client.subscribeService(
-				target(),
-				serviceId,
-				mode,
-				(update) => listener(update, BACKGROUND_CONTEXT),
-				context.abortSignal,
-			);
-			return {
-				snapshot: subscription.snapshot,
-				activate: () => subscription.start(),
-				close: () => subscription.dispose(),
-			};
-		},
-	};
+class ClientChordLink implements Link {
+	closed = false;
+	readonly target: RpcTarget;
+	readonly #send: (frame: Frame) => number;
+	readonly #remove: () => void;
+	readonly #handlers = new Set<(reason: string) => void>();
+	#receiver: ((frame: Frame) => void) | undefined;
+	#queue: Frame[] = [];
+	constructor(target: RpcTarget, send: (frame: Frame) => number, remove: () => void) {
+		this.target = target;
+		this.#send = send;
+		this.#remove = remove;
+	}
+	send(frame: Frame): number | undefined {
+		if (this.closed) return undefined;
+		try {
+			return this.#send(frame);
+		} catch (error) {
+			this.end(toError(error).message);
+			throw error;
+		}
+	}
+	receive(handler: (frame: Frame) => void): void {
+		this.#receiver = handler;
+		for (const frame of this.#queue.splice(0)) {
+			if (this.closed) break;
+			handler(frame);
+		}
+	}
+	onClose(handler: (reason: string) => void): void {
+		if (this.closed) handler("closed");
+		else this.#handlers.add(handler);
+	}
+	close(reason = "closed"): void {
+		if (this.closed) return;
+		try {
+			this.#send({ t: "bye", reason });
+		} catch {
+			/* The byte transport may already be gone. */
+		} finally {
+			this.end(reason);
+		}
+	}
+	deliver(frame: Frame): void {
+		if (this.closed) return;
+		if (frame.t === "bye") this.end(frame.reason ?? "peer closed");
+		else if (this.#receiver) this.#receiver(frame);
+		else this.#queue.push(frame);
+	}
+	end(reason: string): void {
+		if (this.closed) return;
+		this.closed = true;
+		this.#queue.length = 0;
+		this.#receiver = undefined;
+		this.#remove();
+		for (const handler of this.#handlers) handler(reason);
+		this.#handlers.clear();
+	}
 }
 
-function abortError(signal: AbortSignal): Error {
-	const reason: unknown = signal.reason;
-	return reason instanceof Error ? reason : new DOMException("The operation was aborted", "AbortError");
+/** Captures a server or Session route as a native Chord link. Recreate it after route changes or disconnect. */
+export function createClientChordLink(client: Client, getTarget: () => RpcTarget | undefined): Link {
+	const target = getTarget();
+	if (target === undefined) throw new DisconnectedError("Chord route is unavailable");
+	return client.chordLink(target);
+}
+
+function sameTarget(left: RpcTarget, right: RpcTarget): boolean {
+	if (left.serverId !== right.serverId) return false;
+	if (!("sessionId" in left) || !("sessionId" in right)) return !("sessionId" in left) && !("sessionId" in right);
+	return left.sessionId === right.sessionId && left.attachmentId === right.attachmentId;
+}
+
+function targetKey(target: RpcTarget): string {
+	return JSON.stringify(
+		"sessionId" in target
+			? { serverId: target.serverId, sessionId: target.sessionId, attachmentId: target.attachmentId }
+			: { serverId: target.serverId },
+	);
 }

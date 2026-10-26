@@ -1,4 +1,4 @@
-import type { JsonValue, ServiceCall, ServiceProviderUpdate } from "@earendil-works/chord";
+import type { Link } from "@earendil-works/chord";
 import type { Context, SessionMetadata } from "@earendil-works/pi-agent-core";
 import type { ServerListener } from "./listener.ts";
 
@@ -16,12 +16,8 @@ export type MaybePromise<T> = T | Promise<T>;
 
 /** One presentation connection's live capability for a hosted Session. */
 export interface RoutedSessionAttachment {
-	/** Route one contract-agnostic service operation to the attached Session endpoint. */
-	invokeService(
-		call: ServiceCall,
-		publish: (subscriptionId: string, update: ServiceProviderUpdate, context: Context) => MaybePromise<void>,
-		context: Context,
-	): Promise<JsonValue | undefined>;
+	/** Native Chord channel admitted with this presentation's authenticated principal. */
+	readonly link: Link;
 	release(context: Context): MaybePromise<void>;
 }
 
@@ -35,11 +31,7 @@ export interface RoutedServerPresentation {
 
 /** One connection's server-scoped service endpoint. */
 export interface RoutedServerServiceAttachment {
-	invokeService(
-		call: ServiceCall,
-		publish: (subscriptionId: string, update: ServiceProviderUpdate, context: Context) => MaybePromise<void>,
-		context: Context,
-	): Promise<JsonValue | undefined>;
+	readonly link: Link;
 	release(context: Context): MaybePromise<void>;
 }
 

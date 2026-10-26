@@ -1,7 +1,9 @@
-import type { JsonValue, ServiceCall } from "@earendil-works/chord";
+import { createHost, hostNamed, method, remote } from "@earendil-works/chord";
 import type { Context, Session, SessionMetadata } from "@earendil-works/pi-agent-core";
 import { BACKGROUND_CONTEXT, MemorySessionRepo } from "@earendil-works/pi-agent-core";
+import { Type } from "typebox";
 import { SessionAmbiguousError, SessionNotFoundError } from "../errors.ts";
+import { createRoutedLinkPair } from "../link.ts";
 import type { RoutedServerServiceHost, RoutedSessionHandle, ServerHost } from "../types.ts";
 
 export class Deferred<T> {
@@ -23,6 +25,24 @@ interface OpenGate {
 	entered: Deferred<void>;
 	release: Deferred<void>;
 }
+export const TestSessionManagement = remote("test.session-management", {
+	version: 1,
+	input: Type.Object({}),
+	host: hostNamed("server"),
+	variants: { live: { methods: { attach: method(Type.String()), detach: method() } } },
+});
+
+export const TestSessionContract = remote("test.session", {
+	version: 1,
+	input: Type.Object({}),
+	host: hostNamed("session"),
+	variants: {
+		live: {
+			state: { revision: Type.Integer() },
+			methods: { run: method(Type.String(), Type.String()), increment: method(), wait: method() },
+		},
+	},
+});
 
 export class TestHarness {
 	readonly session: Session;
@@ -32,52 +52,57 @@ export class TestHarness {
 	attachedClients = 0;
 	attachmentReleaseCount = 0;
 	closeCount = 0;
-	readonly serviceCalls: ServiceCall[] = [];
+	readonly calls: string[] = [];
+	readonly waitEntered = new Deferred<void>();
+	readonly waitCancelled = new Deferred<void>();
 	failAttachmentRelease?: Error;
 	failClose?: Error;
-	nextServiceError?: Error;
-	nextServiceResult: JsonValue | undefined = { ok: true };
 	private nextCloseGate?: OpenGate;
-	private nextServiceGate?: OpenGate;
 
 	constructor(session: Session) {
 		this.session = session;
 	}
 
-	attachClient(_context: Context): {
-		invokeService: TestHarness["invokeService"];
-		release(context: Context): void;
-	} {
+	attachClient(_context: Context) {
 		this.attachedClients += 1;
+		const host = createHost({ name: "session", self: "session" });
+		host.serve(TestSessionContract, (_input, _principal, self) => {
+			const revision = self.state("revision", Type.Integer(), 0);
+			return {
+				variant: "live",
+				revision,
+				run: (value) => {
+					this.calls.push(value);
+					return value;
+				},
+				increment: (ctx) => {
+					revision.change(ctx, (value) => value + 1);
+				},
+				wait: async (ctx) => {
+					this.waitEntered.resolve(undefined);
+					await new Promise<void>((resolve) => {
+						if (ctx.signal.aborted) resolve();
+						else ctx.signal.addEventListener("abort", () => resolve(), { once: true });
+					});
+					this.waitCancelled.resolve(undefined);
+				},
+			};
+		});
+		const [link, provider] = createRoutedLinkPair();
+		host.accept(provider, { principal: "presentation" });
 		let released = false;
 		return {
-			invokeService: (call) => this.invokeService(call),
-			release: (_context) => {
+			link,
+			release: async (_context: Context) => {
 				if (released) return;
-				this.attachmentReleaseCount += 1;
-				if (this.failAttachmentRelease) throw this.failAttachmentRelease;
 				released = true;
+				this.attachmentReleaseCount += 1;
 				this.attachedClients -= 1;
+				link.close();
+				await host.close();
+				if (this.failAttachmentRelease) throw this.failAttachmentRelease;
 			},
 		};
-	}
-
-	async invokeService(call: ServiceCall): Promise<JsonValue | undefined> {
-		this.serviceCalls.push(call);
-		if (this.nextServiceError) {
-			const error = this.nextServiceError;
-			this.nextServiceError = undefined;
-			throw error;
-		}
-		const gate = this.nextServiceGate;
-		if (gate) {
-			this.nextServiceGate = undefined;
-			gate.entered.resolve(undefined);
-			await gate.release.promise;
-		}
-		const result = this.nextServiceResult;
-		this.nextServiceResult = { ok: true };
-		return result;
 	}
 
 	async close(context: Context): Promise<void> {
@@ -108,41 +133,25 @@ export class TestHarness {
 		this.nextCloseGate = gate;
 		return gate;
 	}
-
-	gateNextServiceCall(): OpenGate {
-		const gate = { entered: new Deferred<void>(), release: new Deferred<void>() };
-		this.nextServiceGate = gate;
-		return gate;
-	}
 }
 
 export function createTestServerServices(): RoutedServerServiceHost {
 	return {
 		attachClient(presentation) {
+			const host = createHost({ name: "server", self: "server" });
+			host.serve(TestSessionManagement, () => ({
+				variant: "live",
+				attach: (sessionId) => presentation.attachSession(sessionId, BACKGROUND_CONTEXT),
+				detach: () => presentation.detachSession(BACKGROUND_CONTEXT),
+			}));
+			const [link, provider] = createRoutedLinkPair();
+			host.accept(provider, { principal: "presentation" });
 			return {
-				async invokeService(call, _publish, context) {
-					if (
-						call.instance === undefined &&
-						call.serviceId === "pi.session-management" &&
-						call.member === "attach" &&
-						call.args.length === 1 &&
-						typeof call.args[0] === "string"
-					) {
-						await presentation.attachSession(call.args[0], context);
-						return null;
-					}
-					if (
-						call.instance === undefined &&
-						call.serviceId === "pi.session-management" &&
-						call.member === "detach" &&
-						call.args.length === 0
-					) {
-						await presentation.detachSession(context);
-						return null;
-					}
-					throw new Error(`Unsupported test server service ${call.serviceId}.${call.member}`);
+				link,
+				release: async () => {
+					link.close();
+					await host.close();
 				},
-				release() {},
 			};
 		},
 	};

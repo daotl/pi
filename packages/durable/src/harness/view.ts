@@ -1,10 +1,8 @@
-import { type AttachedReplicatedState, type Context, type JsonValue, replicatedState } from "@earendil-works/chord";
+import { type Context, type JsonValue, Watch, type WatchHandle } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
 import { applyImmutable, type NonEmptyPath, type Op, type Path } from "@earendil-works/chord/delta";
-import { CommittedStateSource, CommittedWatch } from "../session/observation.ts";
-import type { SessionImpl } from "../session/session.ts";
+import { contained, type ObservedCommit, type SessionImpl } from "../session/session.ts";
 import type {
-	CommitPublication,
 	ConversationDocToken,
 	ConversationId,
 	ConversationRecord,
@@ -12,12 +10,12 @@ import type {
 	EntryRecord,
 	JsonObject,
 	Storage,
-	WatchHandle,
 } from "../types.ts";
 import { AgentDoc } from "./agent.ts";
 import { activeEntries, captureContextBounds } from "./context.ts";
 import { InboxDoc } from "./inbox.ts";
 import { LiveDoc } from "./live.ts";
+import { ProviderDoc } from "./provider.ts";
 import { UsageDoc } from "./usage.ts";
 import { closedError } from "./util.ts";
 
@@ -26,7 +24,7 @@ export type ConversationView = {
 	readonly conversation: ConversationRecord;
 	/** Raw active entries, as `ContextView.entries`: the head marker, then the non-head entries from its head. */
 	readonly entries: readonly EntryRecord[];
-	/** `pi.agent`, `pi.live`, `pi.inbox`, and `pi.usage`, keyed by kind; absent documents are absent. */
+	/** Built-in conversation documents keyed by kind; absent documents are absent. */
 	readonly docs: Readonly<Record<string, JsonObject>>;
 };
 
@@ -38,13 +36,20 @@ export type ViewObserver = {
 		before: ConversationView,
 		after: ConversationView,
 		ops: readonly Op[],
-		publication: CommitPublication,
+		publication: ObservedCommit,
 		context: Context,
 	): void;
-	closeSession(): void;
+	/** The Session closed, or failed with `failure`. */
+	end(failure: { readonly error: unknown } | undefined): void;
 };
 
-const MOUNTED = [AgentDoc, LiveDoc, InboxDoc, UsageDoc] as unknown as readonly ConversationDocToken<JsonObject>[];
+const MOUNTED = [
+	AgentDoc,
+	LiveDoc,
+	InboxDoc,
+	ProviderDoc,
+	UsageDoc,
+] as unknown as readonly ConversationDocToken<JsonObject>[];
 const MOUNTED_KINDS: ReadonlySet<string> = new Set(MOUNTED.map((token) => token.definition.kind));
 
 /** One conversation's mount: its current revision, the document incarnations it shows, and its observers. */
@@ -66,7 +71,8 @@ export function conversationViews(harness: object): ConversationViews {
 
 /**
  * The Harness's conversation view mounts: at most one per conversation, built on the Session line by its first
- * observer and dropped with its last. Each mount advances from the Session's commit publications, which are durable.
+ * observer and dropped with its last. Each mount advances from the Session's commits as memory adopts them, deferred ones
+ * (`CommitPersistence`) before they are stored.
  */
 export class ConversationViews {
 	readonly #session: SessionImpl;
@@ -78,37 +84,33 @@ export class ConversationViews {
 		this.#session = session;
 		this.#storage = storage;
 		VIEWS.set(session, this);
-		session.subscribeCommits((publication, context) => {
-			for (const [id, mount] of this.#mounts) advance(id, mount, publication, context);
+		session.observeCommits((publication, context) => {
+			for (const [id, mount] of this.#mounts)
+				advance(id, mount, publication, context, (error) => this.report(error));
 		});
 		session.subscribeClose(() => {
 			this.#closed = true;
 			for (const mount of this.#mounts.values())
-				for (const observer of [...mount.observers]) observer.closeSession();
+				for (const observer of [...mount.observers]) {
+					contained(
+						() => observer.end(this.#session.failure),
+						(error) => this.report(error),
+					);
+				}
 			this.#mounts.clear();
 		});
 	}
 
-	/** A disposable read-only Chord state of the view. */
-	async state(id: ConversationId, context: Context): Promise<AttachedReplicatedState<ConversationView>> {
-		const { observer, detach } = await this.attach(
-			id,
-			(value, release) => new CommittedStateSource<ConversationView>(value, release),
-			context,
-		);
-		try {
-			return replicatedState(observer);
-		} catch (error) {
-			detach();
-			throw error;
-		}
+	/** Report an observer's listener error through the Harness. */
+	report(error: unknown): void {
+		this.#session.report(error);
 	}
 
-	/** A serialized exact-frame watch of the view; cancelling `context` stops it. */
+	/** A serialized watch of the view; cancelling `context` stops it. */
 	async watch(id: ConversationId, context: Context): Promise<WatchHandle<ConversationView>> {
 		const { observer } = await this.attach(
 			id,
-			(value, release) => new CommittedWatch<ConversationView>(value, release),
+			(value, release) => new Watch<ConversationView>(value, release, (error) => this.#session.report(error)),
 			context,
 		);
 		const signal = context.abortSignal;
@@ -138,7 +140,7 @@ export class ConversationViews {
 			};
 			const observer = await create(mount.value, detach, this.#storage);
 			// Close or cancellation may begin while the mount hydrates; register nothing then.
-			if (this.#closed) throw closedError();
+			if (this.#closed) throw closedError(this.#session);
 			context.abortSignal?.throwIfAborted();
 			this.#mounts.set(id, mount);
 			mount.observers.add(observer);
@@ -163,8 +165,17 @@ export class ConversationViews {
 	}
 }
 
-/** Derive the mount's operations from one publication, apply them, and hand the revision to every observer. */
-function advance(id: ConversationId, mount: Mount, publication: CommitPublication, context: Context): void {
+/**
+ * Derive the mount's operations from one publication, apply them, and hand the revision to every observer; one that
+ * throws is reported through `report`, and the others still get it.
+ */
+function advance(
+	id: ConversationId,
+	mount: Mount,
+	publication: ObservedCommit,
+	context: Context,
+	report: (error: unknown) => void,
+): void {
 	const docOps: Op[] = [];
 	const entryOps: Op[] = [];
 	let entries = mount.value.entries;
@@ -208,10 +219,12 @@ function advance(id: ConversationId, mount: Mount, publication: CommitPublicatio
 	if (ops.length > 0) {
 		const value = docOps.length === 0 ? mount.value : applyImmutable(mount.value, docOps);
 		mount.value = entries === value.entries ? value : { ...value, entries };
-		for (const observer of [...mount.observers]) observer.advance?.(mount.value, ops, frameContext);
+		for (const observer of [...mount.observers]) {
+			contained(() => observer.advance?.(mount.value, ops, frameContext), report);
+		}
 	}
 	for (const observer of [...mount.observers]) {
-		observer.publication?.(before, mount.value, ops, publication, frameContext);
+		contained(() => observer.publication?.(before, mount.value, ops, publication, frameContext), report);
 	}
 }
 

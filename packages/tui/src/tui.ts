@@ -557,6 +557,29 @@ export abstract class TuiBase extends Container implements TUI {
 
 	protected afterTerminalStop(_options: TuiStopOptions): void {}
 
+	/** Mode resets written before the terminal's own resets when the process exits without stop(). */
+	protected getExitRestorePrefix(): string {
+		return `${this.terminalColorSchemeNotificationsEnabled ? "\x1b[?2031l" : ""}\x1b[?25h`;
+	}
+
+	/** Mode resets written after the terminal's own resets when the process exits without stop(). */
+	protected getExitRestoreSuffix(): string {
+		return "";
+	}
+
+	/**
+	 * Last-resort restore for exit paths that skip stop(), e.g. a direct process.exit() (#11170).
+	 * Hard kills and native aborts run no JavaScript and cannot be covered.
+	 */
+	private readonly exitRestoreHandler = (): void => {
+		if (this.stopped) return;
+		try {
+			this.terminal.restoreOnExit?.(this.getExitRestorePrefix(), this.getExitRestoreSuffix());
+		} catch {
+			// Never throw from an exit handler.
+		}
+	};
+
 	get fullRedraws(): number {
 		return this.fullRedrawCount;
 	}
@@ -922,6 +945,8 @@ export abstract class TuiBase extends Container implements TUI {
 
 	start(): void {
 		this.stopped = false;
+		process.off("exit", this.exitRestoreHandler);
+		process.on("exit", this.exitRestoreHandler);
 		this.beforeTerminalStart();
 		this.terminal.start(
 			(data) => this.handleTerminalInput(data),
@@ -976,6 +1001,7 @@ export abstract class TuiBase extends Container implements TUI {
 
 	stop(options: TuiStopOptions = {}): void {
 		this.stopped = true;
+		process.off("exit", this.exitRestoreHandler);
 		this.cancelRenderTimer();
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031l");
@@ -1366,7 +1392,7 @@ export abstract class TuiBase extends Container implements TUI {
 			const { width, maxHeight } = this.resolveOverlayLayout(options, 0, termWidth, termHeight);
 
 			// Bound overlay layout without changing the transcript's native reflow policy.
-			let overlayLines = withWrappedLines(() => component.render(width));
+			let overlayLines = this.resolveFocusedCursor(withWrappedLines(() => component.render(width)));
 
 			// Apply maxHeight if specified
 			if (maxHeight !== undefined && overlayLines.length > maxHeight) {
@@ -1464,6 +1490,12 @@ export abstract class TuiBase extends Container implements TUI {
 			}
 		}
 		return null;
+	}
+
+	/** Keep the terminal cursor from overlapping the focused component's direct-SGR drawn cursor. */
+	protected resolveFocusedCursor(lines: string[]): string[] {
+		if (!this.showHardwareCursor) return lines;
+		return lines.map((line) => line.replace(/(\x1b_pi:c\x07)\x1b\[7m/, "$1"));
 	}
 
 	/**

@@ -3,7 +3,6 @@ import { chmod, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import type { Context } from "@earendil-works/chord";
-import type { FacetBundleArtifact } from "@earendil-works/chord/node";
 import {
 	BACKGROUND_CONTEXT,
 	type JsonlSessionMetadata,
@@ -28,6 +27,7 @@ import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { CoordinatorConnection, type CoordinatorStartupLease, ensureCoordinator } from "./coordinator.ts";
 import { createPresentationFacetData } from "./plugins/bundled.ts";
+import type { FacetBundleArtifact } from "./plugins/package.ts";
 import {
 	createServerPluginPackage,
 	normalizePluginPackagePaths,
@@ -435,7 +435,7 @@ async function startServerBackend(
 				workers.assertSessionPluginManifestPaths(metadata, selected.manifestPaths);
 			} catch (error) {
 				if (error instanceof SessionPluginSelectionConflictError) {
-					throw new RoutedServerError("service_invalid_value", error.message);
+					throw new RoutedServerError("invalid", error.message);
 				}
 				throw error;
 			}

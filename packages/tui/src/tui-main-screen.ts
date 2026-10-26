@@ -588,7 +588,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		};
 
 		// Render all components to get new lines
-		let newLines = this.render(width);
+		let newLines = this.resolveFocusedCursor(this.render(width));
 
 		// Extract cursor position before applying line resets (marker must be found first)
 		const cursorPos = this.extractCursorPosition(newLines, height);

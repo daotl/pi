@@ -13,6 +13,7 @@ import {
 	isWrapLinesToWidth,
 	setPadLinesToWidth,
 	setWrapLinesToWidth,
+	stripTerminalSequences,
 	visibleWidth,
 } from "../src/utils.ts";
 import { defaultEditorTheme } from "./test-themes.ts";
@@ -946,7 +947,7 @@ describe("Editor component", () => {
 			}
 
 			// Verify content split correctly
-			const contentLines = lines.slice(1, -1).map((l) => stripVTControlCharacters(l).trim());
+			const contentLines = lines.slice(1, -1).map((l) => stripTerminalSequences(l).trim());
 			assert.strictEqual(contentLines.length, 2);
 			assert.strictEqual(contentLines[0], "日本語テス"); // 5 chars = 10 columns
 			assert.strictEqual(contentLines[1], "ト"); // 1 char = 2 columns (+ padding)
@@ -978,7 +979,7 @@ describe("Editor component", () => {
 
 			// The cursor (reverse video space) should be visible
 			const contentLine = lines[1]!;
-			assert.ok(contentLine.includes("\x1b[7m"), "Should have reverse video cursor");
+			assert.ok(contentLine.includes("\x1b[7m"), "Should have fake cursor");
 
 			// Line should still be correct width
 			assert.strictEqual(visibleWidth(contentLine), width);
@@ -1029,7 +1030,7 @@ describe("Editor component", () => {
 			const lines = editor.render(width);
 
 			// Get content lines (between borders)
-			const contentLines = lines.slice(1, -1).map((l) => stripVTControlCharacters(l).trim());
+			const contentLines = lines.slice(1, -1).map((l) => stripTerminalSequences(l).trim());
 
 			// Should NOT break mid-word
 			// Line 1 should end with a complete word

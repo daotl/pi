@@ -3,10 +3,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	BACKGROUND_CONTEXT,
 	createContextKey,
-	getTelemetryContext,
 	withAbortSignal,
 	withContextValue,
-	withTelemetryContext,
+	withTelemetry,
 } from "../../src/harness/context.ts";
 import { HarnessEventBus } from "../../src/harness/events.ts";
 import { AbortRequested, createGate } from "../../src/harness/execution/effect-gate.ts";
@@ -162,7 +161,7 @@ describe("HookRegistry", () => {
 		let receivedValue: string | undefined;
 		hooks.on("before_tool", async (_event, context) => {
 			receivedValue = context.value(valueKey);
-			await getTelemetryContext(context).startSpan({ name: "handler.child" }, () => undefined);
+			await context.telemetry.startSpan({ name: "handler.child" }, () => undefined);
 			return undefined;
 		});
 
@@ -177,7 +176,7 @@ describe("HookRegistry", () => {
 					args: {},
 				},
 				createGate().gate,
-				withContextValue(valueKey, "preserved", withTelemetryContext(invocationSpan, BACKGROUND_CONTEXT)),
+				withContextValue(valueKey, "preserved", withTelemetry(invocationSpan, BACKGROUND_CONTEXT)),
 			),
 		);
 

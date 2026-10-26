@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { BACKGROUND_CONTEXT, type LaneWatchEvent } from "@earendil-works/pi-agent-core";
+import type { LaneWatchEvent } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
 import { activateBuiltinClientServices, openClientRuntime } from "./client-runtime.ts";
@@ -47,7 +47,7 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 				throw new Error("Client prompt requires exactly one discovered server to create a Session");
 			}
 			match = discovered[0]!;
-			sessionId = (await match.management.create({}, BACKGROUND_CONTEXT)).sessionId;
+			sessionId = (await match.server.host.root((ctx) => match.management.create({}, ctx))).sessionId;
 		} else {
 			const selectedSessionId = sessionId;
 			const matches = discovered.filter((candidate) =>
@@ -64,17 +64,19 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 					throw new Error(`No discovered server contains session ${selectedSessionId}`);
 				}
 				match = discovered[0]!;
-				await match.management.create({ id: selectedSessionId }, BACKGROUND_CONTEXT);
+				await match.server.host.root((ctx) => match.management.create({ id: selectedSessionId }, ctx));
 			}
 		}
-		await match.plugins.prepareSession(
-			{
-				sessionId,
-				packagePaths: command.pluginPackages?.map((packagePath) => resolve(packagePath)) ?? null,
-			},
-			BACKGROUND_CONTEXT,
+		await match.server.host.root((ctx) =>
+			match.plugins.prepareSession(
+				{
+					sessionId: sessionId!,
+					packagePaths: command.pluginPackages?.map((packagePath) => resolve(packagePath)) ?? null,
+				},
+				ctx,
+			),
 		);
-		await match.management.attach(sessionId, BACKGROUND_CONTEXT);
+		await match.server.host.root((ctx) => match.management.attach(sessionId!, ctx));
 		if (command.prompt === undefined) {
 			return { kind: "attached", serverId: match.route.serverId, sessionId };
 		}
@@ -84,8 +86,13 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 		const operationBoundaries = new Set<string>();
 		const boundaryWaiters = new Map<string, () => void>();
 		let deliveryTail = Promise.resolve();
-		const unsubscribe = match.transcript.state.subscribe((value, _context, delivery) => {
-			if (delivery.kind !== "update" || value.event === null) return;
+		let hydrated = false;
+		const unsubscribe = match.transcript.state.subscribe((value) => {
+			if (!hydrated) {
+				hydrated = true;
+				return;
+			}
+			if (value.event === null) return;
 			const event = value.event;
 			deliveryTail = deliveryTail.then(async () => {
 				if (event.type === "message_end" && event.runId !== undefined && event.message.role === "assistant") {
@@ -105,7 +112,9 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 		}
 		let response: AgentOperationResponse;
 		try {
-			response = await agent.prompt({ message: command.prompt, images: null }, BACKGROUND_CONTEXT);
+			response = await match.server.host.root((ctx) =>
+				agent.prompt({ message: command.prompt!, images: null }, ctx),
+			);
 			// The operation response and transcript updates use independent protocol
 			// messages, so the response can arrive before its terminal event.
 			if (response.accepted) {

@@ -35,7 +35,7 @@ describe("export HTML tool output whitespace", () => {
 			renderResult: () => component,
 		} as unknown as ToolDefinition;
 		const renderer = createToolHtmlRenderer({
-			getToolDefinition: () => tool,
+			getToolRenderers: () => tool,
 			theme: {} as Theme,
 			cwd: "/tmp",
 		});
@@ -61,11 +61,10 @@ describe("export HTML embedded scripts", () => {
 					: await exportFromFile(manager.getSessionFile()!, options);
 			const html = readFileSync(output, "utf8");
 			const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
-			const highlight = readFileSync(
-				new URL("../src/core/export-html/vendor/highlight.min.js", import.meta.url),
-				"utf8",
-			);
-			expect(scripts[1]).toBe(highlight);
+			for (const [index, file] of ["marked.min.js", "marked-cjk-friendly.min.js", "highlight.min.js"].entries()) {
+				const vendor = readFileSync(new URL(`../src/core/export-html/vendor/${file}`, import.meta.url), "utf8");
+				expect(scripts[index]).toBe(vendor);
+			}
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
 		}

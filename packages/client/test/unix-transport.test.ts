@@ -1,10 +1,9 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
-import { parseServiceCall } from "@earendil-works/chord";
 import { ClientMessageDecoder, encodeServerMessage, PROTOCOL_VERSION } from "@earendil-works/pi-protocol";
 import { afterEach, describe, expect, test } from "vitest";
-import { Client } from "../src/index.ts";
+import { Client, createClientChordLink } from "../src/index.ts";
 import { createUnixTransportFactory } from "../src/unix.ts";
 
 const serverId = "00000000-0000-4000-8000-000000000001";
@@ -52,7 +51,7 @@ test("rejects invalid Unix transport options", () => {
 });
 
 describe.runIf(process.platform !== "win32")("createUnixTransportFactory", () => {
-	test("carries a complete Client handshake and request over a real Unix socket", async () => {
+	test("carries native Chord frames over a real Unix socket", async () => {
 		const path = await makeSocketPath();
 		const receivedMembers: string[] = [];
 		const server = createServer((socket) => {
@@ -68,14 +67,11 @@ describe.runIf(process.platform !== "win32")("createUnixTransportFactory", () =>
 						for (const byte of frame) socket.write(Uint8Array.of(byte));
 						continue;
 					}
-					if (message.type === "cancel") continue;
-					const call = parseServiceCall(message.call);
-					receivedMembers.push(`${call.serviceId}.${call.member}`);
+					receivedMembers.push(message.frame.t);
 					const frame = encodeServerMessage({
-						type: "response",
-						id: message.id,
-						ok: true,
-						result: [],
+						type: "chord",
+						target: message.target,
+						frame: { t: "pong", n: 42 },
 					});
 					const split = Math.floor(frame.byteLength / 2);
 					socket.write(frame.subarray(0, split));
@@ -88,10 +84,11 @@ describe.runIf(process.platform !== "win32")("createUnixTransportFactory", () =>
 
 		try {
 			await expect(client.connect()).resolves.toMatchObject({ serverId });
-			await expect(
-				client.request({ serverId }, { serviceId: "test.server", member: "list", args: [] }),
-			).resolves.toEqual([]);
-			expect(receivedMembers).toEqual(["test.server.list"]);
+			const link = createClientChordLink(client, () => ({ serverId }));
+			const response = new Promise<unknown>((resolve) => link.receive(resolve));
+			link.send({ t: "ping", n: 42 });
+			await expect(response).resolves.toEqual({ t: "pong", n: 42 });
+			expect(receivedMembers).toEqual(["ping"]);
 		} finally {
 			await client.dispose();
 		}
@@ -122,9 +119,14 @@ describe.runIf(process.platform !== "win32")("createUnixTransportFactory", () =>
 
 		try {
 			await client.connect();
-			await expect(
-				client.request({ serverId }, { serviceId: "test.server", member: "list", args: [] }),
-			).rejects.toMatchObject({
+			const link = createClientChordLink(client, () => ({ serverId }));
+			const disconnected = new Promise<unknown>((resolve) => {
+				client.onConnectionStateChange((change) => {
+					if (change.state === "disconnected") resolve(change.error);
+				});
+			});
+			link.send({ t: "ping", n: 1 });
+			await expect(disconnected).resolves.toMatchObject({
 				name: "ProtocolValidationError",
 				message: expect.stringMatching(/truncated/i),
 			});

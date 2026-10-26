@@ -426,9 +426,10 @@ describe("AgentSession queue characterization", () => {
 			settings: { compaction: { enabled: false }, retry: { enabled: false } },
 			extensionFactories: [
 				(pi) => {
-					pi.on("before_agent_start", (event) => ({
-						message: { customType: "hook", content: `hook: ${event.prompt}`, display: false },
-					}));
+					pi.on("before_agent_start", (event) => {
+						if (event.messageType !== "user") return;
+						return { message: { customType: "hook", content: `hook: ${event.prompt}`, display: false } };
+					});
 				},
 			],
 		});
@@ -555,6 +556,7 @@ describe("AgentSession queue characterization", () => {
 			extensionFactories: [
 				(pi) => {
 					pi.on("before_agent_start", (event) => {
+						if (event.messageType !== "user") return;
 						const rejected = event.prompt === "rejected candidate";
 						event.systemPromptOptions.selectedTools = rejected ? [] : ["read"];
 						event.systemPromptOptions.sections.mcp_servers = rejected

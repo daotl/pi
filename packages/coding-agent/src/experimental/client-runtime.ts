@@ -1,5 +1,6 @@
 import { basename } from "node:path";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { Ref } from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import { Client, ServerError } from "@earendil-works/pi-client";
 import { createUnixTransportFactory, discoverUnixServers, type UnixServerRoute } from "@earendil-works/pi-client/unix";
 import { isServerId, type ServerId } from "@earendil-works/pi-protocol";
@@ -154,16 +155,12 @@ export async function openClientRuntime(
 			const server = createServerServiceSource(client);
 			serviceSources.push(server);
 			if (route.transport === "radius") {
-				const reconnectServices = server.open({
-					services: [SessionManagement],
-					assertAccess() {},
-					onError() {},
-				});
-				const reconnectManagement = reconnectServices.use(SessionManagement);
 				reconnectors.push(
 					new RadiusClientReconnect(client, async (sessionId) => {
-						await reconnectServices.ready(BACKGROUND_CONTEXT);
-						await reconnectManagement.attach(sessionId, BACKGROUND_CONTEXT);
+						await server.host.root(async (ctx) => {
+							const management = await ctx.get(SessionManagement, {});
+							await management.attach(sessionId, ctx);
+						});
 					}),
 				);
 			}
@@ -186,40 +183,65 @@ export async function openClientRuntime(
 export async function activateBuiltinClientServices(
 	server: ClientRuntimeServer,
 ): Promise<ActivatedClientRuntimeServer> {
-	const serverServices = server.server.open({
-		services: [SessionDirectory, SessionManagement, PresentationPlugins],
-		assertAccess() {},
-		onError() {},
-	});
-	const sessionServices = server.session.open({
-		services: [Models, AgentController, Transcript],
-		assertAccess() {},
-		onError() {},
-	});
-	const directory = serverServices.use(SessionDirectory);
-	const remoteManagement = serverServices.use(SessionManagement);
+	const host = server.server.host;
+	const [directory, remoteManagement, plugins] = await Promise.all([
+		host.get(SessionDirectory, {}),
+		host.get(SessionManagement, {}),
+		host.get(PresentationPlugins, {}),
+	]);
+	let sessionRefs:
+		| { models: Ref<typeof Models>; agent: Ref<typeof AgentController>; transcript: Ref<typeof Transcript> }
+		| undefined;
+	const releaseSession = (): void => {
+		if (sessionRefs === undefined) return;
+		sessionRefs.models.release();
+		sessionRefs.agent.release();
+		sessionRefs.transcript.release();
+		sessionRefs = undefined;
+	};
 	const management: SessionManagement = {
-		create: (options, context) => remoteManagement.create(options, context),
-		async remove(sessionId, context) {
-			const removesCurrentAttachment = server.client.attachment?.sessionId === sessionId;
-			await remoteManagement.remove(sessionId, context);
-			if (removesCurrentAttachment) await server.session.whenDetached(context);
+		create: (options, ctx) => remoteManagement.create(options, ctx),
+		async remove(sessionId, ctx) {
+			const removesCurrent = server.client.attachment?.sessionId === sessionId;
+			if (removesCurrent) releaseSession();
+			await remoteManagement.remove(sessionId, ctx);
+			if (removesCurrent) await server.session.whenDetached(withAbortSignal(ctx.signal, BACKGROUND_CONTEXT));
 		},
-		async attach(sessionId, context) {
-			await remoteManagement.attach(sessionId, context);
-			await server.session.whenAttached(sessionId, context);
+		async attach(sessionId, ctx) {
+			releaseSession();
+			await remoteManagement.attach(sessionId, ctx);
+			await server.session.whenAttached(sessionId, withAbortSignal(ctx.signal, BACKGROUND_CONTEXT));
+			const [models, agent, transcript] = await Promise.all([
+				host.get(Models, {}),
+				host.get(AgentController, {}),
+				host.get(Transcript, {}),
+			]);
+			sessionRefs = { models, agent, transcript };
 		},
-		async detach(context) {
-			await remoteManagement.detach(context);
-			await server.session.whenDetached(context);
+		async detach(ctx) {
+			releaseSession();
+			await remoteManagement.detach(ctx);
+			await server.session.whenDetached(withAbortSignal(ctx.signal, BACKGROUND_CONTEXT));
 		},
 	};
-	const plugins = serverServices.use(PresentationPlugins);
-	const models = sessionServices.use(Models);
-	const agent = sessionServices.use(AgentController);
-	const transcript = sessionServices.use(Transcript);
-	await Promise.all([serverServices.ready(BACKGROUND_CONTEXT), sessionServices.ready(BACKGROUND_CONTEXT)]);
-	return { ...server, directory, management, plugins, models, agent, transcript };
+	return {
+		...server,
+		directory,
+		management,
+		plugins,
+		get models() {
+			if (sessionRefs === undefined) throw new Error("No Session is attached");
+			return sessionRefs.models;
+		},
+		get agent() {
+			if (sessionRefs === undefined) throw new Error("No Session is attached");
+			return sessionRefs.agent;
+		},
+		get transcript() {
+			if (sessionRefs === undefined) throw new Error("No Session is attached");
+			return sessionRefs.transcript;
+		},
+	};
 }
 
 function routeFromExplicitPath(path: string): UnixServerRoute {

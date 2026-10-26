@@ -15,6 +15,7 @@ export type {
 export {
 	attachChordView,
 	createPicoConversationService,
+	createPicoHarnessFacet,
 	PicoConversationService,
 	PicoHarnessService,
 } from "./chord.ts";

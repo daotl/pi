@@ -2,10 +2,17 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, fauxToolCall, getCurrentSystemMessage, type Model } from "@earendil-works/pi-ai";
+import {
+	fauxAssistantMessage,
+	fauxToolCall,
+	getCurrentSystemMessage,
+	getCurrentSystemPrompt,
+	type Model,
+	type TranscriptContext,
+} from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ExtensionAPI, InputEvent } from "../../src/core/extensions/index.ts";
+import type { BeforeAgentStartEvent, ExtensionAPI, InputEvent } from "../../src/core/extensions/index.ts";
 import type { PromptTemplate } from "../../src/core/prompt-templates.ts";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.ts";
 import { createTestResourceLoader } from "../utilities.ts";
@@ -41,71 +48,83 @@ describe("AgentSession prompt characterization", () => {
 		}
 	});
 
-	it("preserves admitted hook policy and hidden declarations when a later receipt admission rejects", async () => {
-		let rejected = false;
-		const echo: AgentTool = {
-			name: "echo",
-			label: "Echo",
-			description: "Echo",
-			parameters: Type.Object({}),
-			execute: async () => ({ content: [{ type: "text", text: "echo" }], details: {} }),
-		};
-		const harness = await createHarness({
-			tools: [echo],
-			settings: { compaction: { enabled: false }, retry: { enabled: false } },
-			extensionFactories: [
-				(pi) => {
-					pi.registerTool({
-						name: "mask",
-						label: "Mask",
-						description: "Mask",
-						parameters: Type.Object({}),
-						defaultActive: false,
-						prepareLoadout: () => ({ hiddenDeclarations: ["echo"] }),
-						execute: async () => ({ content: [], details: {} }),
-					});
-					pi.on("before_agent_start", (event) => {
-						event.systemPromptOptions.sections.discovery = rejected ? "REJECTED DISCOVERY" : "ACCEPTED DISCOVERY";
-						event.systemPromptOptions.selectedTools = rejected ? ["mask", "echo"] : ["echo"];
-					});
+	it.each(["user", "custom"] as const)(
+		"preserves admitted hook policy and hidden declarations when a later %s receipt admission rejects",
+		async (trigger) => {
+			let rejected = false;
+			const echo: AgentTool = {
+				name: "echo",
+				label: "Echo",
+				description: "Echo",
+				parameters: Type.Object({}),
+				execute: async () => ({ content: [{ type: "text", text: "echo" }], details: {} }),
+			};
+			const harness = await createHarness({
+				tools: [echo],
+				settings: { compaction: { enabled: false }, retry: { enabled: false } },
+				extensionFactories: [
+					(pi) => {
+						pi.registerTool({
+							name: "mask",
+							label: "Mask",
+							description: "Mask",
+							parameters: Type.Object({}),
+							defaultActive: false,
+							prepareLoadout: () => ({ hiddenDeclarations: ["echo"] }),
+							execute: async () => ({ content: [], details: {} }),
+						});
+						pi.on("before_agent_start", (event) => {
+							event.systemPromptOptions.sections.discovery = rejected
+								? "REJECTED DISCOVERY"
+								: "ACCEPTED DISCOVERY";
+							event.systemPromptOptions.selectedTools = rejected ? ["mask", "echo"] : ["echo"];
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			vi.spyOn(harness.settingsManager, "isProjectTrusted").mockReturnValue(false);
+			harness.setResponses([
+				fauxAssistantMessage("first"),
+				fauxAssistantMessage("second"),
+				fauxAssistantMessage("summary"),
+				(context) => {
+					const system = getCurrentSystemMessage(context.messages);
+					expect(system?.sections?.discovery).toBe("ACCEPTED DISCOVERY");
+					expect(system?.toolsAdded?.map((tool) => tool.name)).toEqual(["echo"]);
+					return fauxAssistantMessage("continued");
 				},
-			],
-		});
-		harnesses.push(harness);
-		vi.spyOn(harness.settingsManager, "isProjectTrusted").mockReturnValue(false);
-		harness.setResponses([
-			fauxAssistantMessage("first"),
-			fauxAssistantMessage("second"),
-			fauxAssistantMessage("summary"),
-			(context) => {
-				const system = getCurrentSystemMessage(context.messages);
-				expect(system?.sections?.discovery).toBe("ACCEPTED DISCOVERY");
-				expect(system?.toolsAdded?.map((tool) => tool.name)).toEqual(["echo"]);
-				return fauxAssistantMessage("continued");
-			},
-		]);
-		await harness.session.prompt("one");
-		await harness.session.prompt("two");
-		const checkpoint = vi.spyOn(harness.sessionManager, "appendCompaction").mockImplementation(() => {
-			throw new Error("checkpoint unavailable");
-		});
-		const receipt = vi.spyOn(harness.sessionManager, "appendUsage").mockImplementation(() => {
-			throw new Error("receipt unavailable");
-		});
-		try {
-			await expect(harness.session.compact({ keepRecentMessages: 1 })).rejects.toThrow("checkpoint unavailable");
-			rejected = true;
-			await expect(harness.session.prompt("never admitted")).rejects.toThrow("receipt unavailable");
-			expect(harness.session.getActiveToolNames()).toEqual(["echo"]);
-		} finally {
-			checkpoint.mockRestore();
-			receipt.mockRestore();
-		}
-		// Continue from a pending user without another before_agent_start acceptance.
-		harness.sessionManager.appendMessage({ role: "user", content: "pending", timestamp: Date.now() });
-		harness.session.refreshContext();
-		await harness.session.continue();
-	});
+			]);
+			await harness.session.prompt("one");
+			await harness.session.prompt("two");
+			const checkpoint = vi.spyOn(harness.sessionManager, "appendCompaction").mockImplementation(() => {
+				throw new Error("checkpoint unavailable");
+			});
+			const receipt = vi.spyOn(harness.sessionManager, "appendUsage").mockImplementation(() => {
+				throw new Error("receipt unavailable");
+			});
+			try {
+				await expect(harness.session.compact({ keepRecentMessages: 1 })).rejects.toThrow("checkpoint unavailable");
+				rejected = true;
+				const submission =
+					trigger === "user"
+						? harness.session.prompt("never admitted")
+						: harness.session.sendCustomMessage(
+								{ customType: "rejected", content: "never admitted", display: false },
+								{ triggerTurn: true },
+							);
+				await expect(submission).rejects.toThrow("receipt unavailable");
+				expect(harness.session.getActiveToolNames()).toEqual(["echo"]);
+			} finally {
+				checkpoint.mockRestore();
+				receipt.mockRestore();
+			}
+			// Continue from a pending user without another before_agent_start acceptance.
+			harness.sessionManager.appendMessage({ role: "user", content: "pending", timestamp: Date.now() });
+			harness.session.refreshContext();
+			await harness.session.continue();
+		},
+	);
 
 	it("prompts while idle and records a single text response", async () => {
 		const harness = await createHarness();
@@ -621,5 +640,163 @@ describe("AgentSession prompt characterization", () => {
 		await expect(harness.session.prompt("hi")).rejects.toThrow(
 			`No API key found for ${harness.getModel().provider}.`,
 		);
+	});
+
+	// Issue #10267, #5581: a run started by sendMessage(..., { triggerTurn: true }) skipped
+	// before_agent_start, so its second request patched away the sections handlers had added.
+	describe("runs started by a custom message", () => {
+		it("keeps the same system prompt for every request of the run", async () => {
+			const events: BeforeAgentStartEvent[] = [];
+			const noopTool: AgentTool = {
+				name: "noop",
+				label: "Noop",
+				description: "Does nothing",
+				parameters: Type.Object({}),
+				execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+			};
+			const harness = await createHarness({
+				tools: [noopTool],
+				extensionFactories: [
+					(pi) => {
+						pi.on("before_agent_start", (event) => {
+							events.push(event);
+							event.systemPromptOptions.sections.extension_rules = "Answer in one word.";
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			const prompts: string[] = [];
+			const record = (response: ReturnType<typeof fauxAssistantMessage>) => (context: TranscriptContext) => {
+				prompts.push(getCurrentSystemPrompt(context.messages));
+				return response;
+			};
+			harness.setResponses([
+				record(fauxAssistantMessage("hi")),
+				record(fauxAssistantMessage([fauxToolCall("noop", {})], { stopReason: "toolUse" })),
+				record(fauxAssistantMessage("done")),
+			]);
+
+			await harness.session.prompt("hello");
+			await harness.session.sendCustomMessage(
+				{ customType: "task-done", content: "background task finished", display: true },
+				{ triggerTurn: true },
+			);
+
+			expect(prompts).toHaveLength(3);
+			expect(prompts[0]).toContain("Answer in one word.");
+			expect(new Set(prompts).size).toBe(1);
+			expect(events.map((event) => event.messageType)).toEqual(["user", "custom"]);
+			const customEvent = events[1];
+			expect(customEvent.messageType === "custom" && customEvent.message.customType).toBe("task-done");
+		});
+
+		it("queues a custom message sent while before_agent_start runs into the starting run", async () => {
+			let releaseHandler: () => void = () => {};
+			const handlerStarted = Promise.withResolvers<void>();
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("before_agent_start", async (event) => {
+							if (event.messageType !== "custom" || event.message.customType !== "first") return;
+							handlerStarted.resolve();
+							await new Promise<void>((resolve) => {
+								releaseHandler = resolve;
+							});
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			const requests: TranscriptContext[] = [];
+			harness.setResponses([
+				(context) => {
+					requests.push(context);
+					return fauxAssistantMessage("handled both");
+				},
+			]);
+
+			const first = harness.session.sendCustomMessage(
+				{ customType: "first", content: "task one finished", display: true },
+				{ triggerTurn: true },
+			);
+			await handlerStarted.promise;
+			expect(harness.session.isIdle).toBe(false);
+			const second = harness.session.sendCustomMessage(
+				{ customType: "second", content: "task two finished", display: true },
+				{ triggerTurn: true },
+			);
+			releaseHandler();
+			await Promise.all([first, second]);
+
+			expect(requests).toHaveLength(1);
+			const texts = requests[0].messages.flatMap((message) =>
+				message.role === "user" && typeof message.content !== "string"
+					? message.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
+					: [],
+			);
+			expect(texts).toEqual(["task one finished", "task two finished"]);
+		});
+
+		it("includes a custom message sent without triggerTurn while the run starts in its first request", async () => {
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("before_agent_start", () => {
+							pi.sendMessage(
+								{ customType: "note", content: "context from handler", display: true },
+								{ triggerTurn: false },
+							);
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			const requests: TranscriptContext[] = [];
+			harness.setResponses([
+				(context) => {
+					requests.push(context);
+					return fauxAssistantMessage("done");
+				},
+			]);
+
+			await harness.session.prompt("hello");
+
+			expect(requests).toHaveLength(1);
+			expect(JSON.stringify(requests[0].messages)).toContain("context from handler");
+		});
+
+		it("aborts a run when abort is requested while before_agent_start runs", async () => {
+			let releaseHandler: () => void = () => {};
+			const handlerStarted = Promise.withResolvers<void>();
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("before_agent_start", async () => {
+							handlerStarted.resolve();
+							await new Promise<void>((resolve) => {
+								releaseHandler = resolve;
+							});
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("should not complete")]);
+
+			const run = harness.session.sendCustomMessage(
+				{ customType: "task-done", content: "background task finished", display: true },
+				{ triggerTurn: true },
+			);
+			await handlerStarted.promise;
+			const aborted = harness.session.abort();
+			releaseHandler();
+			await Promise.all([run, aborted]);
+
+			const last = harness.session.messages.at(-1);
+			expect(last?.role).toBe("assistant");
+			expect(last?.role === "assistant" && last.stopReason).toBe("aborted");
+			expect(harness.session.isIdle).toBe(true);
+		});
 	});
 });

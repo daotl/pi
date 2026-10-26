@@ -112,6 +112,7 @@ export interface HarnessOptions {
 	/** Existing manager and working directory for persistence/reopen scenarios. The caller owns cwd cleanup. */
 	sessionManager?: SessionManager;
 	cwd?: string;
+	provider?: string;
 	models?: FauxModelDefinition[];
 	/** Override the faux provider API (e.g. "openai-completions" for prefill tests). */
 	fauxApi?: string;
@@ -157,6 +158,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const tempDir = createTempDir();
 	const cwd = options.cwd ?? tempDir;
 	const fauxProvider: FauxProviderRegistration = registerFauxProvider({
+		provider: options.provider,
 		models: options.models,
 		api: options.fauxApi,
 	});
@@ -247,6 +249,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		resourceLoader,
 		baseToolsOverride: toolMap,
 		initialActiveToolNames: options.initialActiveToolNames,
+		usesDefaultTools: options.initialActiveToolNames === undefined,
 		allowedToolNames: options.allowedToolNames,
 		excludedToolNames: options.excludedToolNames,
 		extensionRunnerRef,

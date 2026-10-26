@@ -291,6 +291,7 @@ it("keeps accepted discovery while a rejected competing prompt awaits preflight"
 		extensionFactories: [
 			(pi) => {
 				pi.on("before_agent_start", async (event) => {
+					if (event.messageType !== "user") return;
 					if (event.prompt === "paused competing prompt") {
 						entered.resolve();
 						await release.promise;

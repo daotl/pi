@@ -263,6 +263,7 @@ describe("openai-completions __raw tool-call capture", () => {
 				name: "read",
 				arguments: { path: "/tmp" },
 				raw: "<partial-raw>",
+				argumentsError: expect.stringContaining('{"path":"/tmp'),
 			},
 		]);
 
@@ -351,5 +352,36 @@ describe("openai-completions __raw tool-call capture", () => {
 		const content = [{ type: "toolCall", id: "call_1", name: "read", arguments: {} }];
 		expect((await s.result()).content).toEqual(content);
 		expect(reduceAssistantMessageFrames(frames)?.content).toEqual(content);
+	});
+
+	it("preserves raw tokens and the terminal argument error for malformed streamed calls", async () => {
+		mockState.chunks = [
+			{
+				choices: [
+					{
+						delta: {
+							tool_calls: [
+								{ index: 0, id: "broken", function: { name: "read", arguments: '{"path":' }, __raw: "<raw>" },
+							],
+						},
+						finish_reason: "tool_calls",
+					},
+				],
+			},
+		];
+		const response = streamSimple(model, normalizeContext({ messages: [] }), { apiKey: "test" });
+		const encoder = new AssistantMessageFrameEncoder();
+		const frames: AssistantMessageFrame[] = [];
+		for await (const event of response) {
+			const frame = encoder.encode(event);
+			if (frame) frames.push(frame);
+		}
+		const result = await response.result();
+		const call = result.content[0];
+		if (call?.type !== "toolCall") throw new Error("Missing malformed tool call");
+		expect(call.arguments).toEqual({});
+		expect(call.argumentsError).toContain('{"path":');
+		expect(call.raw).toBe("<raw>");
+		expect(reduceAssistantMessageFrames(frames)?.content).toEqual(result.content);
 	});
 });

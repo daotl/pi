@@ -24,7 +24,13 @@ export function addUsageToTotals(totals: UsageTotals, usage: Usage): void {
 	totals.output += usage.output;
 	totals.cacheRead += usage.cacheRead;
 	totals.cacheWrite += usage.cacheWrite;
-	totals.cost += usage.cost.total;
+	totals.cost +=
+		typeof usage.cost.total === "number"
+			? usage.cost.total
+			: (usage.cost.input ?? 0) +
+				(usage.cost.output ?? 0) +
+				(usage.cost.cacheRead ?? 0) +
+				(usage.cost.cacheWrite ?? 0);
 }
 
 /** Sum of two usages, keeping the optional token splits when either side reports them. */
@@ -47,6 +53,8 @@ export function combineUsage(first: Usage, second: Usage): Usage {
 			cacheRead: first.cost.cacheRead + second.cost.cacheRead,
 			cacheWrite: first.cost.cacheWrite + second.cost.cacheWrite,
 			total: first.cost.total + second.cost.total,
+			// A sum is provider-reported only when every part is.
+			totalFromProvider: first.cost.totalFromProvider === true && second.cost.totalFromProvider === true,
 		},
 	};
 }

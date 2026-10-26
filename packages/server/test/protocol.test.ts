@@ -51,10 +51,9 @@ afterEach(async () => {
 test("requires hello as the first message", async () => {
 	const client = connect();
 	await client.sendMessage({
-		type: "request",
-		id: "request-1",
+		type: "chord",
 		target: { serverId: "00000000-0000-4000-8000-000000000001" },
-		call: { serviceId: "pi.session-directory", member: "list", args: [] },
+		frame: { t: "ping", n: 1 },
 	});
 	await expect(client.next((message) => message.type === "hello_error")).resolves.toMatchObject({
 		type: "hello_error",
@@ -72,7 +71,7 @@ test("rejects unsupported protocol versions", async () => {
 	await client.waitForClose();
 });
 
-test("accepts fragmented hello and request frames", async () => {
+test("accepts fragmented hello and native frames", async () => {
 	const client = connect();
 	const hello = encodeClientMessage({ type: "hello", version: PROTOCOL_VERSION });
 	const helloResponse = client.next((message) => message.type === "hello");
@@ -81,17 +80,15 @@ test("accepts fragmented hello and request frames", async () => {
 		type: "hello",
 		serverId: "00000000-0000-4000-8000-000000000001",
 	});
-
-	const response = client.next((message) => message.type === "response");
+	const response = client.next((message) => message.type === "chord" && message.frame.t === "pong");
 	const request = {
-		type: "request" as const,
-		id: "request-1",
+		type: "chord" as const,
 		target: { serverId: "00000000-0000-4000-8000-000000000001" },
-		call: { serviceId: "pi.session-directory" as const, member: "list" as const, args: [] as [] },
+		frame: { t: "ping" as const, n: 7 },
 	};
 	const frame = encodeClientMessage(request);
 	await client.sendFragmentedMessage(request, Math.floor(frame.byteLength / 2));
-	await expect(response).resolves.toMatchObject({ ok: false, error: { code: "internal_error" } });
+	await expect(response).resolves.toMatchObject({ frame: { t: "pong", n: 7 } });
 });
 
 test.each([
@@ -119,14 +116,13 @@ test("rejects a second hello after completing the handshake", async () => {
 	await client.waitForClose();
 });
 
-test("processes a hello and request coalesced in one byte chunk", async () => {
+test("processes a hello and native frame coalesced in one byte chunk", async () => {
 	const client = connect();
 	const hello = encodeClientMessage({ type: "hello", version: PROTOCOL_VERSION });
 	const request = encodeClientMessage({
-		type: "request",
-		id: "request-1",
+		type: "chord",
 		target: { serverId: "00000000-0000-4000-8000-000000000001" },
-		call: { serviceId: "pi.session-directory", member: "list", args: [] },
+		frame: { t: "ping", n: 9 },
 	});
 	const wire = new Uint8Array(hello.byteLength + request.byteLength);
 	wire.set(hello);
@@ -134,11 +130,11 @@ test("processes a hello and request coalesced in one byte chunk", async () => {
 
 	await client.sendBytes(wire);
 	await expect(client.next((message) => message.type === "hello")).resolves.toMatchObject({ type: "hello" });
-	await expect(client.next((message) => message.type === "response")).resolves.toMatchObject({
-		type: "response",
-		id: "request-1",
-		ok: false,
-		error: { code: "internal_error" },
+	await expect(
+		client.next((message) => message.type === "chord" && message.frame.t === "pong"),
+	).resolves.toMatchObject({
+		type: "chord",
+		frame: { t: "pong", n: 9 },
 	});
 });
 

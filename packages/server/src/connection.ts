@@ -1,5 +1,4 @@
-import type { ServiceStateEncoder } from "@earendil-works/chord";
-import type { ClientMessageDecoder, RpcTarget } from "@earendil-works/pi-protocol";
+import type { ClientMessageDecoder } from "@earendil-works/pi-protocol";
 
 import type { MaybePromise, RoutedServerServiceAttachment } from "./types.ts";
 
@@ -23,13 +22,11 @@ export type ConnectionStage = "awaitingHello" | "handshaking" | "ready" | "closi
 export interface ConnectionState {
 	connection: ByteConnection;
 	decoder: ClientMessageDecoder;
-	serviceStateEncoders: Map<string, ServiceStateEncoder>;
 	stage: ConnectionStage;
 	disconnected: boolean;
 	handshake?: Promise<void>;
 	handshakeTimeout: NodeJS.Timeout;
 	serverServices?: RoutedServerServiceAttachment;
-	activeRequests: Map<string, { controller: AbortController; target: RpcTarget }>;
 }
 
 export function isTerminalConnection(state: ConnectionState): boolean {

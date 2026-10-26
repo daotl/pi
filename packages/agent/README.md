@@ -8,10 +8,6 @@ Stateful agent with tool execution and event streaming. Built on `@earendil-work
 npm install @earendil-works/pi-agent-core
 ```
 
-### SQLite session backends
-
-The SQLite session backend and the `node:sqlite` adapter live in a separate package, `@earendil-works/pi-session-backend-sqlite-node`, so the core package does not pull in runtime builtins or native SQLite dependencies by default. The backend accepts a runtime-specific SQLite factory, allowing other session backends to ship as their own packages in the future.
-
 ## Quick Start
 
 ```typescript
@@ -41,10 +37,6 @@ agent.subscribe((event) => {
 
 await agent.prompt("Hello!");
 ```
-
-## Experimental facet services
-
-Transport-neutral facet-service primitives live in `@earendil-works/chord`. The agent core does not export the service runtime.
 
 ## Core Concepts
 
@@ -255,6 +247,11 @@ const agent = new Agent({
 
   // Session ID for provider caching
   sessionId: "session-123",
+
+  // How requests identify the app to providers (pi-ai ClientIdentity), merged over
+  // DEFAULT_AGENT_IDENTITY ({ attribution: PI_ATTRIBUTION }: provider attribution headers name pi).
+  // Pass your app's attribution, or null to send none.
+  identity: { attribution: { name: "my-app", url: "https://my-app.example" } },
 
   // Dynamic API key resolution (for expiring OAuth tokens)
   getApiKey: async (provider) => refreshToken(),
@@ -548,7 +545,7 @@ const agent = new Agent({
 });
 ```
 
-Proxy requests forward `returnPrefill` to the backend for explicit assistant continuation. Proxy senders should retain optional `toolcall_delta.rawDelta` independently of the JSON argument `delta`, including raw-only chunks. The client accumulates these per content index, so an EOF/error before `toolcall_end` still retains the raw prefix needed for tool-call prefill. Older senders that omit raw increments cannot reconstruct metadata they never transmit.
+Proxy requests forward `identity` and `returnPrefill` to the backend for request attribution and explicit assistant continuation. Proxy senders should retain optional `toolcall_delta.rawDelta` independently of the JSON argument `delta`, including raw-only chunks. The client incrementally parses arguments and accumulates raw tokens per content index, so an EOF/error before `toolcall_end` still retains the raw prefix needed for tool-call prefill. The authoritative `toolcall_end` replaces accumulated raw tokens and preserves `argumentsError` for malformed arguments. Older senders that omit raw increments cannot reconstruct metadata they never transmit.
 
 ## Low-Level API
 

@@ -266,7 +266,7 @@ it("retains first settled delivery across asynchronous prompt preflight", async 
 					inputs.push(event.text);
 				});
 				pi.on("before_agent_start", async (event) => {
-					if (event.prompt === "first scheduled") {
+					if (event.messageType === "user" && event.prompt === "first scheduled") {
 						entered.resolve();
 						await preflight.promise;
 					}
@@ -407,7 +407,7 @@ it("does not release a held scheduled preflight when an unrelated run settles", 
 					inputs.push(event.text);
 				});
 				pi.on("before_agent_start", async (event) => {
-					if (event.prompt === "first scheduled") {
+					if (event.messageType === "user" && event.prompt === "first scheduled") {
 						entered.resolve();
 						await preflight.promise;
 					}
@@ -482,7 +482,7 @@ it("advances after a foreign-run fallback is handled without another run", async
 		extensionFactories: [
 			(pi) => {
 				pi.on("before_agent_start", async (event) => {
-					if (event.prompt === "first scheduled") {
+					if (event.messageType === "user" && event.prompt === "first scheduled") {
 						entered.resolve();
 						await preflight.promise;
 					}
@@ -569,7 +569,7 @@ it.each(["started", "handled"] as const)("retains compaction queue ownership thr
 					}
 				});
 				pi.on("before_agent_start", async (event) => {
-					if (event.prompt === "queued ordinary" && outcome === "started") {
+					if (event.messageType === "user" && event.prompt === "queued ordinary" && outcome === "started") {
 						entered.resolve();
 						await preflight.promise;
 					}
@@ -634,7 +634,7 @@ it("drains input added during owned preflight before deferred schedules", async 
 		extensionFactories: [
 			(pi) => {
 				pi.on("before_agent_start", async (event) => {
-					if (event.prompt === "first queued") {
+					if (event.messageType === "user" && event.prompt === "first queued") {
 						queuedEntered.resolve();
 						await queuedGate.promise;
 					}
@@ -827,7 +827,7 @@ it("keeps a child queue delivery owned after its scheduled extension command ret
 					},
 				});
 				pi.on("before_agent_start", async (event) => {
-					if (event.prompt === "child queued input") {
+					if (event.messageType === "user" && event.prompt === "child queued input") {
 						entered.resolve();
 						await preflight.promise;
 					}
@@ -955,7 +955,7 @@ it.each(
 						}
 					});
 					pi.on("before_agent_start", async (event) => {
-						if (event.prompt === "owning heartbeat" && outcome === "started") {
+						if (event.messageType === "user" && event.prompt === "owning heartbeat" && outcome === "started") {
 							entered.resolve();
 							await preflight.promise;
 						}
@@ -1048,7 +1048,7 @@ it.each(["started", "handled", "rejected"] as const)(
 			extensionFactories: [
 				(pi) => {
 					pi.on("before_agent_start", async (event) => {
-						if (event.prompt === "reserved heartbeat") {
+						if (event.messageType === "user" && event.prompt === "reserved heartbeat") {
 							entered.resolve();
 							await preflight.promise;
 						}
@@ -1398,7 +1398,7 @@ it.each(["time", "messages"] as const)(
 						inputs.push(event.text);
 					});
 					pi.on("before_agent_start", async (event) => {
-						if (event.prompt === "first direct") {
+						if (event.messageType === "user" && event.prompt === "first direct") {
 							entered.resolve();
 							await preflight.promise;
 						}
@@ -1741,7 +1741,7 @@ it.each(["external", "settlement handler"] as const)(
 						await settlementRelease.promise;
 					});
 					pi.on("before_agent_start", async (event) => {
-						if (event.prompt === "settlement queued input") {
+						if (event.messageType === "user" && event.prompt === "settlement queued input") {
 							preflightEntered.resolve();
 							await preflightRelease.promise;
 						}
@@ -1847,7 +1847,7 @@ it("retains queue ownership through actual nested compaction and drains newer in
 		extensionFactories: [
 			(pi) => {
 				pi.on("before_agent_start", async (event) => {
-					if (event.prompt === "nested first input") await compact!();
+					if (event.messageType === "user" && event.prompt === "nested first input") await compact!();
 				});
 				pi.on("session_before_compact", async () => {
 					compactEntered.resolve();
@@ -2141,7 +2141,7 @@ it("dequeues reserved batch rest through Alt+Up without cancelling its submitted
 					return { cancel: true };
 				});
 				pi.on("before_agent_start", async (event) => {
-					if (event.prompt === "submitted first") {
+					if (event.messageType === "user" && event.prompt === "submitted first") {
 						preflightEntered.resolve();
 						await preflightRelease.promise;
 					}

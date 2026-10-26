@@ -1,9 +1,9 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { createTypedSpanStarter, NOOP_TELEMETRY_CONTEXT, type TelemetryContext } from "@earendil-works/pi-telemetry";
+import { createTypedSpanStarter, NOOP_TELEMETRY_CONTEXT, type TelemetrySpan } from "@earendil-works/pi-telemetry";
 import { describe, expect, expectTypeOf, it } from "vitest";
 import { renderAgentTelemetrySchemaMarkdown } from "../../scripts/generate-telemetry-docs.ts";
-import { BACKGROUND_CONTEXT, withTelemetryContext } from "../../src/harness/context.ts";
+import { BACKGROUND_CONTEXT, withTelemetry } from "../../src/harness/context.ts";
 import {
 	AGENT_TELEMETRY_SCHEMAS,
 	AI_TELEMETRY_SCHEMA,
@@ -82,8 +82,8 @@ describe("agent telemetry schemas", () => {
 			"stop" | "length" | "tool_use" | "error" | "aborted" | "deferred" | undefined
 		>();
 
-		const telemetryContext: TelemetryContext = NOOP_TELEMETRY_CONTEXT;
-		const context = withTelemetryContext(telemetryContext, BACKGROUND_CONTEXT);
+		const telemetry: TelemetrySpan = NOOP_TELEMETRY_CONTEXT;
+		const context = withTelemetry(telemetry, BACKGROUND_CONTEXT);
 		await startAiSpan(
 			"pi.ai.request",
 			{
@@ -139,8 +139,8 @@ describe("agent telemetry schemas", () => {
 		expectTypeOf(writeStart["pi.session.item_count"]).toEqualTypeOf<number>();
 		expectTypeOf(writeEnd["pi.session.last_seq"]).toEqualTypeOf<number>();
 
-		const telemetryContext: TelemetryContext = NOOP_TELEMETRY_CONTEXT;
-		const context = withTelemetryContext(telemetryContext, BACKGROUND_CONTEXT);
+		const telemetry: TelemetrySpan = NOOP_TELEMETRY_CONTEXT;
+		const context = withTelemetry(telemetry, BACKGROUND_CONTEXT);
 		await startHarnessSpan(
 			"pi.harness.run",
 			{

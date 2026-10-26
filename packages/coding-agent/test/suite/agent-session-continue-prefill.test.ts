@@ -1,8 +1,8 @@
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
-	type AssistantMessageEvent,
-	EventStream,
+	type AssistantMessageEventStream,
+	createAssistantMessageEventStream,
 	fauxAssistantMessage,
 	fauxText,
 	fauxToolCall,
@@ -13,10 +13,7 @@ function setOpenaiCompletions(harness: Harness): void {
 	harness.session.agent.state.model = { ...harness.session.agent.state.model, api: "openai-completions" };
 }
 
-function pushAbortedResult(
-	stream: EventStream<AssistantMessageEvent, AssistantMessage>,
-	partial: AssistantMessage,
-): void {
+function pushAbortedResult(stream: AssistantMessageEventStream, partial: AssistantMessage): void {
 	queueMicrotask(() => {
 		stream.push({ type: "error", reason: "aborted", error: partial });
 	});
@@ -58,14 +55,7 @@ describe("AgentSession continue with prefill", () => {
 		harness.session.agent.streamFunction = ((_model, context, options) => {
 			capturedReturnPrefill = options?.returnPrefill;
 			capturedContextMessages = context.messages;
-			const stream = new EventStream<AssistantMessageEvent, AssistantMessage>(
-				(event) => event.type === "done" || event.type === "error",
-				(event) => {
-					if (event.type === "done") return event.message;
-					if (event.type === "error") return event.error;
-					throw new Error("Unexpected event type");
-				},
-			);
+			const stream = createAssistantMessageEventStream();
 			queueMicrotask(() => {
 				// With return_prefill the provider echoes the prefill before new tokens.
 				stream.push({
@@ -139,14 +129,7 @@ describe("AgentSession continue with prefill", () => {
 
 		setOpenaiCompletions(harness);
 		harness.session.agent.streamFunction = ((_model, _context, _options) => {
-			const stream = new EventStream<AssistantMessageEvent, AssistantMessage>(
-				(event) => event.type === "done" || event.type === "error",
-				(event) => {
-					if (event.type === "done") return event.message;
-					if (event.type === "error") return event.error;
-					throw new Error("Unexpected event type");
-				},
-			);
+			const stream = createAssistantMessageEventStream();
 			// The abort arrived before the echo completed: the streamed partial
 			// contains only a prefix of the prefill.
 			pushAbortedResult(stream, fauxAssistantMessage("Part", { stopReason: "aborted" }));
@@ -170,14 +153,7 @@ describe("AgentSession continue with prefill", () => {
 			await harness.session.prompt("Hello");
 			setOpenaiCompletions(harness);
 			const started = Promise.withResolvers<void>();
-			const stream = new EventStream<AssistantMessageEvent, AssistantMessage>(
-				(event) => event.type === "done" || event.type === "error",
-				(event) => {
-					if (event.type === "done") return event.message;
-					if (event.type === "error") return event.error;
-					throw new Error("Unexpected event type");
-				},
-			);
+			const stream = createAssistantMessageEventStream();
 			let signal: AbortSignal | undefined;
 			const aborted = () =>
 				stream.push({
@@ -216,14 +192,7 @@ describe("AgentSession continue with prefill", () => {
 		await harness.session.prompt("Hello");
 
 		harness.session.agent.streamFunction = ((_model, _context, _options) => {
-			const stream = new EventStream<AssistantMessageEvent, AssistantMessage>(
-				(event) => event.type === "done" || event.type === "error",
-				(event) => {
-					if (event.type === "done") return event.message;
-					if (event.type === "error") return event.error;
-					throw new Error("Unexpected event type");
-				},
-			);
+			const stream = createAssistantMessageEventStream();
 			// The abort arrived after the echo completed: the streamed partial
 			// contains the full prefill plus new tokens, so it is kept.
 			pushAbortedResult(stream, fauxAssistantMessage("Partial response continued", { stopReason: "aborted" }));
@@ -246,14 +215,7 @@ describe("AgentSession continue with prefill", () => {
 
 		setOpenaiCompletions(harness);
 		harness.session.agent.streamFunction = ((_model, _context, _options) => {
-			const stream = new EventStream<AssistantMessageEvent, AssistantMessage>(
-				(event) => event.type === "done" || event.type === "error",
-				(event) => {
-					if (event.type === "done") return event.message;
-					if (event.type === "error") return event.error;
-					throw new Error("Unexpected event type");
-				},
-			);
+			const stream = createAssistantMessageEventStream();
 			queueMicrotask(() => {
 				// The model did not reproduce the prefill; the echo mismatches.
 				stream.push({ type: "done", reason: "stop", message: fauxAssistantMessage("Different text") });
@@ -289,14 +251,7 @@ describe("AgentSession continue with prefill", () => {
 				returnPrefill: options?.returnPrefill,
 				lastRole: context.messages[context.messages.length - 1]?.role ?? "none",
 			});
-			const stream = new EventStream<AssistantMessageEvent, AssistantMessage>(
-				(event) => event.type === "done" || event.type === "error",
-				(event) => {
-					if (event.type === "done") return event.message;
-					if (event.type === "error") return event.error;
-					throw new Error("Unexpected event type");
-				},
-			);
+			const stream = createAssistantMessageEventStream();
 			queueMicrotask(() => {
 				if (turnCaptures.length === 1) {
 					// Turn 1 of the continuation: echo the prefill and finish the tool call.
@@ -347,14 +302,7 @@ describe("AgentSession continue with prefill", () => {
 		let capturedReturnPrefill: boolean | undefined;
 		harness.session.agent.streamFunction = ((_model, _context, options) => {
 			capturedReturnPrefill = options?.returnPrefill;
-			const stream = new EventStream<AssistantMessageEvent, AssistantMessage>(
-				(event) => event.type === "done" || event.type === "error",
-				(event) => {
-					if (event.type === "done") return event.message;
-					if (event.type === "error") return event.error;
-					throw new Error("Unexpected event type");
-				},
-			);
+			const stream = createAssistantMessageEventStream();
 			queueMicrotask(() => {
 				stream.push({ type: "done", reason: "stop", message: fauxAssistantMessage("edited answer continued") });
 			});

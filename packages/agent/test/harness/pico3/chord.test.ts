@@ -1,13 +1,17 @@
 import assert from "node:assert/strict";
-import { replicatedState } from "@earendil-works/chord";
+import { createHost, replicatedState } from "@earendil-works/chord";
 import { onTestFinished, test } from "vitest";
 import {
 	attachChordView,
 	createPicoConversationService,
+	createPicoHarnessFacet,
+	PicoConversationService,
 	type PublishedConversationView,
 } from "../../../src/harness/pico3/chord.ts";
+import { Harness } from "../../../src/harness/pico3/harness.ts";
+import { MemoryStorage } from "../../../src/harness/pico3/memory.ts";
 import type { Envelope, JsonObject } from "../../../src/harness/pico3/types.ts";
-import { ctx, open, sleep } from "./helpers.ts";
+import { ctx, fake, open, sleep } from "./helpers.ts";
 
 test("conversation observation reports loaded and newly committed conversations off the Session line", async () => {
 	const env = await open({});
@@ -109,4 +113,30 @@ test("Chord publication failure closes only the bridge and never rejects the per
 	await sleep(0);
 	assert.equal(bridge.closed, true);
 	assert.match(reported?.message ?? "", /publish failed/);
+});
+
+test("native Chord conversation objects retain keyed config and conversation scope", async () => {
+	const harness = await Harness.open(new MemoryStorage(), { models: fake({ respond: () => ({ text: "ok" }) }) }, ctx);
+	onTestFinished(() => harness.close(ctx));
+	const root = await harness.root(ctx);
+	const host = createHost({ name: "harness", self: { kind: "harness" } });
+	onTestFinished(() => host.close());
+	await host.install(createPicoHarnessFacet(harness));
+	const child = await harness.createConversation({}, ctx);
+	const first = await host.get(PicoConversationService, { conversationId: root.id });
+	const second = await host.get(PicoConversationService, { conversationId: child.id });
+	onTestFinished(() => {
+		first.release();
+		second.release();
+	});
+	await host.root((call) => first.configSet({ threshold: 123 }, call));
+	assert.equal((await root.config.get(ctx)).threshold, 123);
+	assert.notEqual((await child.config.get(ctx)).threshold, 123);
+	await host.root((call) => first.write({ kind: "note", data: { message: "through Chord" } }, call));
+	const entries = await host.root((call) => first.entries({ conversationId: child.id, limit: 100 }, call));
+	assert.ok(entries.some((entry) => entry.kind === "note" && entry.data?.message === "through Chord"));
+	assert.ok(entries.every((entry) => entry.conversationId === root.id));
+	await sleep(0);
+	assert.equal(first.view.value.conversation.id, root.id);
+	assert.equal(second.view.value.conversation.id, child.id);
 });

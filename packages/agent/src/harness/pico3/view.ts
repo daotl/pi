@@ -1,5 +1,4 @@
-import { applyImmutable, type Op } from "@earendil-works/chord/delta";
-import { type Tracker, track } from "./legacy-tracker.ts";
+import { applyImmutable, type Op, type Tracker, track } from "@earendil-works/chord/delta";
 import type { CommitResult, Session } from "./session.ts";
 import type {
 	AnyKind,
@@ -57,11 +56,10 @@ export class ViewManager {
 		let record = this.records.get(conversation.id);
 		if (record === undefined) {
 			const tracker = track(this.build(conversation, entries));
-			tracker.flush();
 			record = { conversationId: conversation.id, tracker, watchers: new Set(), revision: 0 };
 			this.records.set(conversation.id, record);
 		}
-		const watcher = new WatchImpl(structuredClone(record.tracker.target), record.revision, this.onReport, () => {
+		const watcher = new WatchImpl(structuredClone(record.tracker.value), record.revision, this.onReport, () => {
 			record!.watchers.delete(watcher);
 			if (record!.watchers.size === 0 && this.records.get(conversation.id) === record)
 				this.records.delete(conversation.id);
@@ -87,7 +85,8 @@ export class ViewManager {
 					.map((scoped) => scoped.event);
 				if (appended.length === 0 && documentChanges.length === 0 && !taskChanged && events.length === 0) continue;
 
-				const state = record.tracker.state;
+				const change = record.tracker.beginChange();
+				const state = change.state as ConversationView;
 				applyEntries(state.entries, appended);
 				const rewindableChanged = documentChanges.some(
 					(change) => change.ref.doc === "rewindable" && change.ref.conversationId === record.conversationId,
@@ -118,7 +117,9 @@ export class ViewManager {
 					syncRecord(state.plugins, this.plugins(rewindable!, sticky!, session));
 				}
 
-				const ops = record.tracker.flush();
+				const prepared = change.prepare();
+				record.tracker.adopt(prepared);
+				const ops = [...prepared.ops];
 				if (ops.length === 0 && events.length === 0) continue;
 				const envelope = Object.freeze({
 					revision: ++record.revision,

@@ -1,8 +1,7 @@
 import { type Context, isJsonValue } from "@earendil-works/chord";
 import { createContextKey, withContextValue, withoutAbortSignal } from "@earendil-works/chord/context";
-import { isBase, type Op } from "@earendil-works/chord/delta";
+import { type Change, isBase, type Op, type Tracker, track } from "@earendil-works/chord/delta";
 import { deriveContext } from "./context.ts";
-import { type Tracker, track } from "./legacy-tracker.ts";
 import { Membrane } from "./membrane.ts";
 import {
 	type AnyKind,
@@ -177,6 +176,7 @@ export class Defaults {
 
 class Docs {
 	private readonly trackers = new Map<string, Tracker<object>>();
+	private readonly requestedBases = new Set<string>();
 	private readonly storage: Storage;
 	private readonly defaults: Defaults;
 	/** Bytes of ops written since the last base, per document. Drives rebase+truncate. */
@@ -190,7 +190,10 @@ class Docs {
 		this.sinceBase.set(key, isBase(ops) ? 0 : (this.sinceBase.get(key) ?? 0) + JSON.stringify(ops).length);
 	}
 	requestBase(ref: DocRef) {
-		this.trackers.get(docKey(ref))?.rebase();
+		this.requestedBases.add(docKey(ref));
+	}
+	takeBase(ref: DocRef): boolean {
+		return this.requestedBases.delete(docKey(ref));
 	}
 	async get(ref: DocRef, ctx: Context): Promise<Tracker<object>> {
 		const key = docKey(ref);
@@ -200,18 +203,18 @@ class Docs {
 		if (stored === undefined) throw new Error(`document ${key} does not exist`);
 		if (ref.doc !== "session") this.defaults.fill(ref.doc, stored); // declared defaults are visible without being persisted
 		const t = track(stored as object);
-		t.flush(); // consume the synthetic first flush; never persisted
 		this.trackers.set(key, t);
 		return t;
 	}
 	evict(ref: DocRef) {
 		this.trackers.delete(docKey(ref));
+		this.requestedBases.delete(docKey(ref));
 	}
 	peek(ref: DocRef): Tracker<object> | undefined {
 		return this.trackers.get(docKey(ref));
 	}
 	loaded(ref: DocRef): JsonObject | undefined {
-		return this.trackers.get(docKey(ref))?.target as JsonObject | undefined;
+		return this.trackers.get(docKey(ref))?.value as JsonObject | undefined;
 	}
 	adopt(ref: DocRef, tracker: Tracker<object>) {
 		this.trackers.set(docKey(ref), tracker);
@@ -279,7 +282,7 @@ const CALLBACK_TX_METHODS = new Set<string>([...HOST_TX_METHODS, ...TASK_TX_METH
 
 class TxImpl implements CoreTx {
 	private readonly writes: Write[] = [];
-	private readonly touched = new Map<string, { ref: DocRef; tracker: Tracker<object> }>();
+	private readonly touched = new Map<string, { ref: DocRef; tracker: Tracker<object>; change: Change<object> }>();
 	private readonly membrane = new Membrane("tx");
 	// Overlays for direct reads: complete for the tables a closure reads after writing.
 	private readonly createdTasks = new Map<Id, Task>();
@@ -524,14 +527,15 @@ class TxImpl implements CoreTx {
 
 	// --- documents ----------------------------------------------------------
 
-	private doc(ref: DocRef): Tracker<object> {
+	private doc(ref: DocRef): Change<object> {
 		const key = docKey(ref);
 		const hit = this.touched.get(key);
-		if (hit !== undefined) return hit.tracker;
+		if (hit !== undefined) return hit.change;
 		const cached = this.docs.peek(ref);
 		if (cached !== undefined) {
-			this.touched.set(key, { ref, tracker: cached });
-			return cached;
+			const change = cached.beginChange();
+			this.touched.set(key, { ref, tracker: cached, change });
+			return change;
 		}
 		throw new Error(`document ${key} not loaded; pass it in commit({ docs })`);
 	}
@@ -542,7 +546,8 @@ class TxImpl implements CoreTx {
 		for (const ref of refs) {
 			const key = docKey(ref);
 			if (this.touched.has(key)) continue;
-			this.touched.set(key, { ref, tracker: await this.docs.get(ref, this.ctx) });
+			const tracker = await this.docs.get(ref, this.ctx);
+			this.touched.set(key, { ref, tracker, change: tracker.beginChange() });
 		}
 	}
 
@@ -970,12 +975,11 @@ class TxImpl implements CoreTx {
 	}
 	private seedDoc(ref: DocRef, value: object) {
 		const tracker = track(value);
-		tracker.rebase();
-		const base = tracker.flush();
+		const base: Op[] = [["r", tracker.value as JsonValue]];
 		this.writes.push({ type: "doc", ref, ops: base });
 		this.changes.docs.push({ ref, ops: base });
 		this.docs.adopt(ref, tracker);
-		this.touched.set(docKey(ref), { ref, tracker });
+		this.touched.set(docKey(ref), { ref, tracker, change: tracker.beginChange() });
 	}
 
 	markTask(id: Id) {
@@ -1159,8 +1163,10 @@ class TxImpl implements CoreTx {
 		for (const [conversationId, keys] of this.changedConfig) {
 			this.changes.events.push({ conversationId, event: { type: "config.changed", keys: [...keys] } });
 		}
-		for (const { ref, tracker } of this.touched.values()) {
-			const ops = tracker.flush();
+		for (const { ref, tracker, change } of this.touched.values()) {
+			const prepared = change.prepare();
+			tracker.adopt(prepared);
+			const ops: Op[] = this.docs.takeBase(ref) ? [["r", tracker.value as JsonValue]] : [...prepared.ops];
 			if (ops.length === 0) continue;
 			this.writes.push({ type: "doc", ref, ops });
 			this.changes.docs.push({ ref, ops });
@@ -1171,6 +1177,7 @@ class TxImpl implements CoreTx {
 	/** Every wrapper handed out by this transaction throws from now on. */
 	revoke() {
 		this.membrane.revoke();
+		for (const { change } of this.touched.values()) change.abort();
 	}
 	evictTouched() {
 		for (const { ref } of this.touched.values()) this.docs.evict(ref);

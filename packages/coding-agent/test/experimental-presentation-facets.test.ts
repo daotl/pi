@@ -2,18 +2,19 @@ import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { readFacetBundleManifest } from "@earendil-works/chord/node";
 import { afterEach, describe, expect, test } from "vitest";
 import {
 	activateBuiltinClientServices,
 	type ClientRuntime,
 	openClientRuntime,
 } from "../src/experimental/client-runtime.ts";
-import { createPresentationFacetData, createPresentationFacetLoaders } from "../src/experimental/plugins/bundled.ts";
-import { createServerPluginPackage, restoreServerPluginPackageProfile } from "../src/experimental/plugins/package.ts";
+import { createPresentationFacetData, loadPresentationFacets } from "../src/experimental/plugins/bundled.ts";
+import {
+	createServerPluginPackage,
+	readFacetBundleManifest,
+	restoreServerPluginPackageProfile,
+} from "../src/experimental/plugins/package.ts";
 import { type RunningServer, startServer } from "../src/experimental/server.ts";
-import { PresentationPlugins } from "../src/experimental/services/plugins.ts";
 
 const runtimes = new Set<ClientRuntime>();
 const runningServers = new Set<RunningServer>();
@@ -62,7 +63,7 @@ describe("server-selected presentation facets", () => {
 				name: "@earendil-works/test-plugin",
 				version: "1.0.0",
 				peerDependencies: {
-					"@earendil-works/chord": "^0.84.4",
+					"@earendil-works/chord": "^1.4.0",
 					"@earendil-works/pi-coding-agent": "^0.84.4",
 				},
 			})}\n`,
@@ -70,28 +71,35 @@ describe("server-selected presentation facets", () => {
 		const sourcePath = join(packagePath, "src", "tui.ts");
 		await writeFile(
 			sourcePath,
-			'import { defineFacet } from "@earendil-works/chord"; import { SlashCommands } from "@earendil-works/pi-coding-agent/experimental/plugin"; export default defineFacet({ id: "built-a", setup(env) { env.use(SlashCommands); } });\n',
+			'import { defineFacet } from "@earendil-works/chord"; export default defineFacet(() => { const generation = "built-a"; void generation; });\n',
 		);
 		const plugin = createServerPluginPackage(directory, serverId, packagePath);
 
 		const first = await plugin.build();
 		expect(first).toHaveLength(1);
 		expect(plugin.manifestPath).toMatch(
-			new RegExp(`/plugin-builds/${serverId}/pi-example-plugin-[a-f0-9]{12}/chord-facets\\.json$`, "u"),
+			new RegExp(`/plugin-builds/${serverId}/pi-example-plugin-[a-f0-9]{12}/pi-plugin-facets\\.json$`, "u"),
 		);
 		expect(first[0]?.plugin).toEqual({ id: "@earendil-works/test-plugin", version: "1.0.0" });
-		const firstLoaded = await createPresentationFacetLoaders(createPresentationFacetData(first))[0]!.load();
-		expect(firstLoaded.facets.map(({ id }) => id)).toEqual(["built-a"]);
+		const firstLoaded = await loadPresentationFacets(createPresentationFacetData(first));
+		expect(firstLoaded.facets.map(({ name }) => name)).toEqual(["@earendil-works/test-plugin/tui"]);
 		await firstLoaded.dispose();
+		await expect(
+			loadPresentationFacets(
+				createPresentationFacetData(
+					first.map((artifact) => ({ ...artifact, source: `${artifact.source}\n// corrupted` })),
+				),
+			),
+		).rejects.toThrow("integrity");
 
 		await writeFile(
 			sourcePath,
-			'import { defineFacet } from "@earendil-works/chord"; import { SlashCommands } from "@earendil-works/pi-coding-agent/experimental/plugin"; export default defineFacet({ id: "built-b", setup(env) { env.use(SlashCommands); } });\n',
+			'import { defineFacet } from "@earendil-works/chord"; export default defineFacet(() => { const generation = "built-b"; void generation; });\n',
 		);
 		const second = await plugin.build();
 		expect(second[0]?.source).not.toBe(first[0]?.source);
-		const secondLoaded = await createPresentationFacetLoaders(createPresentationFacetData(second))[0]!.load();
-		expect(secondLoaded.facets.map(({ id }) => id)).toEqual(["built-b"]);
+		const secondLoaded = await loadPresentationFacets(createPresentationFacetData(second));
+		expect(secondLoaded.facets.map(({ name }) => name)).toEqual(["@earendil-works/test-plugin/tui"]);
 		await secondLoaded.dispose();
 
 		const secondPackagePath = join(directory, "second-plugin");
@@ -102,12 +110,12 @@ describe("server-selected presentation facets", () => {
 				`${JSON.stringify({
 					name: "@earendil-works/second-test-plugin",
 					version: "1.0.0",
-					peerDependencies: { "@earendil-works/chord": "^0.84.4" },
+					peerDependencies: { "@earendil-works/chord": "^1.4.0" },
 				})}\n`,
 			),
 			writeFile(
 				join(secondPackagePath, "src", "tui.ts"),
-				'import { defineFacet } from "@earendil-works/chord"; export default defineFacet({ id: "second-built", setup() {} });\n',
+				'import { defineFacet } from "@earendil-works/chord"; export default defineFacet(() => {});\n',
 			),
 		]);
 		const running = await startServer({
@@ -123,36 +131,29 @@ describe("server-selected presentation facets", () => {
 		runtimes.add(runtime);
 		const activated = await activateBuiltinClientServices(runtime.servers[0]!);
 		const sessionId = randomUUID();
-		await activated.management.create({ id: sessionId }, BACKGROUND_CONTEXT);
-		const presentationPlugins = await activated.plugins.prepareSession(
-			{ sessionId, packagePaths: [packagePath, secondPackagePath] },
-			BACKGROUND_CONTEXT,
+		await activated.server.host.root((ctx) => activated.management.create({ id: sessionId }, ctx));
+		const presentationPlugins = await activated.server.host.root((ctx) =>
+			activated.plugins.prepareSession({ sessionId, packagePaths: [packagePath, secondPackagePath] }, ctx),
 		);
 		await expect(restoreServerPluginPackageProfile(join(directory, "server"), running.serverId)).resolves.toEqual([]);
-		const serverLoaded = await Promise.all(
-			createPresentationFacetLoaders(presentationPlugins).map((loader) => loader.load()),
-		);
-		expect(serverLoaded.flatMap(({ facets }) => facets.map(({ id }) => id))).toEqual(["built-b", "second-built"]);
-		await Promise.all(serverLoaded.map((loaded) => loaded.dispose()));
+		const serverLoaded = await loadPresentationFacets(presentationPlugins);
+		expect(serverLoaded.facets.map(({ name }) => name)).toEqual([
+			"@earendil-works/test-plugin/tui",
+			"@earendil-works/second-test-plugin/tui",
+		]);
+		await serverLoaded.dispose();
 
 		await writeFile(
 			sourcePath,
-			'import { defineFacet } from "@earendil-works/chord"; import { SlashCommands } from "@earendil-works/pi-coding-agent/experimental/plugin"; export default defineFacet({ id: "built-c", setup(env) { env.use(SlashCommands); } });\n',
+			'import { defineFacet } from "@earendil-works/chord"; export default defineFacet(() => { const generation = "built-c"; void generation; });\n',
 		);
-		const services = runtime.servers[0]!.server.open({
-			services: [PresentationPlugins],
-			assertAccess() {},
-			onError() {},
-		});
-		try {
-			await services.ready(BACKGROUND_CONTEXT);
-			const data = await services.use(PresentationPlugins).reload(BACKGROUND_CONTEXT);
-			const reloaded = await Promise.all(createPresentationFacetLoaders(data).map((loader) => loader.load()));
-			expect(reloaded.flatMap(({ facets }) => facets.map(({ id }) => id))).toEqual(["built-c", "second-built"]);
-			await Promise.all(reloaded.map((loaded) => loaded.dispose()));
-		} finally {
-			await services.dispose(BACKGROUND_CONTEXT);
-		}
+		const data = await activated.server.host.root((ctx) => activated.plugins.reload(ctx));
+		const reloaded = await loadPresentationFacets(data);
+		expect(reloaded.facets.map(({ name }) => name)).toEqual([
+			"@earendil-works/test-plugin/tui",
+			"@earendil-works/second-test-plugin/tui",
+		]);
+		await reloaded.dispose();
 	});
 
 	test("builds the example plugin package without a package-owned build script", async () => {
@@ -166,8 +167,8 @@ describe("server-selected presentation facets", () => {
 		const manifest = await readFacetBundleManifest(plugin.manifestPath);
 		expect(manifest.plugin).toEqual({ id: "@earendil-works/pi-example-plugin", version: "1.0.0" });
 		expect(Object.keys(manifest.entries)).toEqual(["session", "tui"]);
-		const loaded = await createPresentationFacetLoaders(createPresentationFacetData(artifacts))[0]!.load();
-		expect(loaded.facets.map(({ id }) => id)).toEqual(["@earendil-works/pi-example-plugin/tui"]);
+		const loaded = await loadPresentationFacets(createPresentationFacetData(artifacts));
+		expect(loaded.facets.map(({ name }) => name)).toEqual(["@earendil-works/pi-example-plugin/tui"]);
 		await loaded.dispose();
 	});
 });

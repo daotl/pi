@@ -1,12 +1,11 @@
+import { ChordError, type Context, createHost, type JsonValue, replicatedState } from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import {
-	type Context,
-	createRemoteServiceEndpoint,
-	type JsonValue,
-	RemoteServiceProvider,
-	replicatedState,
-} from "@earendil-works/chord";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { RoutedServerServiceAttachment, RoutedServerServiceHost } from "@earendil-works/pi-server";
+	createRoutedLinkPair,
+	type RoutedServerServiceAttachment,
+	type RoutedServerServiceHost,
+	ServerError,
+} from "@earendil-works/pi-server";
 import { PresentationPlugins } from "./plugins.ts";
 import {
 	type SessionCreateOptions,
@@ -40,12 +39,10 @@ export async function createExperimentalServerServices(options: {
 	});
 	const attachments = new Set<RoutedServerServiceAttachment>();
 	let mutationTail = Promise.resolve();
-
 	const refreshNow = async (context: Context): Promise<void> => {
 		const sessions = await options.list(context);
-		revision += 1;
 		directory.change(context, (draft) => {
-			draft.revision = revision;
+			draft.revision = ++revision;
 			draft.sessions = sessions;
 		});
 	};
@@ -55,62 +52,100 @@ export async function createExperimentalServerServices(options: {
 			() => undefined,
 			() => undefined,
 		);
-		return result;
+		return result.catch((error: unknown) => {
+			if (error instanceof ChordError) throw error;
+			if (error instanceof ServerError) throw new ChordError("invalid", error.message, { reason: error.code });
+			throw new ChordError("unavailable", "Internal server error", { reason: "internal_error", cause: error });
+		});
 	};
-
 	return {
 		host: {
 			attachClient(presentation) {
+				const host = createHost({ name: "server", self: "server" });
 				let preparedPluginPackagePaths: readonly string[] | undefined;
-				const provider = new RemoteServiceProvider([
-					{ service: SessionDirectory, mode: "singleton" },
-					{ service: SessionManagement, mode: "singleton" },
-					{ service: PresentationPlugins, mode: "singleton" },
-				]);
-				provider.provide(SessionDirectory, { state: directory });
-				provider.provide(PresentationPlugins, {
-					prepareSession: ({ sessionId, packagePaths }, context) =>
+				host.serve(SessionDirectory, () => ({
+					variant: "active",
+					state: {
+						get value() {
+							return directory.value!;
+						},
+						subscribe: (listener) =>
+							directory.subscribe((value) => {
+								if (value !== undefined) listener(value);
+							}),
+						events: (listener) =>
+							directory.subscribe((value) => {
+								if (value !== undefined) listener({ type: "reset", value });
+							}),
+					},
+				}));
+				host.serve(PresentationPlugins, () => ({
+					variant: "active",
+					prepareSession: ({ sessionId, packagePaths }, ctx) =>
 						serialize(async () => {
 							const selected = await options.prepareSessionPlugins(
 								sessionId,
 								packagePaths ?? undefined,
-								context,
+								withAbortSignal(ctx.signal, BACKGROUND_CONTEXT),
 							);
 							preparedPluginPackagePaths = selected.packagePaths;
 							return selected.presentationPlugins;
 						}),
-					reload: (context) =>
+					reload: (ctx) =>
 						serialize(() => {
-							if (preparedPluginPackagePaths === undefined) {
-								throw new Error("No Session plugin selection is prepared");
-							}
-							return options.reloadPresentationPlugins(preparedPluginPackagePaths, context);
+							if (preparedPluginPackagePaths === undefined)
+								throw new ChordError("invalid", "No Session plugin selection is prepared", {
+									reason: "session_not_attached",
+								});
+							return options.reloadPresentationPlugins(
+								preparedPluginPackagePaths,
+								withAbortSignal(ctx.signal, BACKGROUND_CONTEXT),
+							);
 						}),
-				});
-				provider.provide(SessionManagement, {
-					create: (createOptions, context) =>
+				}));
+				host.serve(SessionManagement, () => ({
+					variant: "active",
+					create: (createOptions, ctx) =>
 						serialize(async () => {
+							const context = withAbortSignal(ctx.signal, BACKGROUND_CONTEXT);
 							const created = await options.create(createOptions, context);
 							await refreshNow(context);
 							return created;
 						}),
-					remove: (sessionId, context) =>
+					remove: (sessionId, ctx) =>
 						serialize(async () => {
+							const context = withAbortSignal(ctx.signal, BACKGROUND_CONTEXT);
 							await presentation.prepareSessionRemoval(sessionId, context);
 							await options.remove(sessionId, context);
 							await refreshNow(context);
 						}),
-					attach: (sessionId, context) =>
+					attach: (sessionId, ctx) =>
+						serialize(() =>
+							presentation.attachSession(sessionId, withAbortSignal(ctx.signal, BACKGROUND_CONTEXT)),
+						),
+					detach: (ctx) =>
 						serialize(async () => {
-							await presentation.attachSession(sessionId, context);
-						}),
-					detach: (context) =>
-						serialize(async () => {
-							await presentation.detachSession(context);
+							await presentation.detachSession(withAbortSignal(ctx.signal, BACKGROUND_CONTEXT));
 							preparedPluginPackagePaths = undefined;
 						}),
-				});
-				const attachment = createProviderAttachment(provider, () => attachments.delete(attachment));
+				}));
+				const [provider, link] = createRoutedLinkPair();
+				host.accept(provider, { principal: "presentation", kind: "client" });
+				let released: Promise<void> | undefined;
+				const attachment: RoutedServerServiceAttachment = {
+					link,
+					release() {
+						released ??= (async () => {
+							link.close("Server attachment released");
+							try {
+								await host.close();
+							} finally {
+								attachments.delete(attachment);
+							}
+						})();
+						return released;
+					},
+				};
 				attachments.add(attachment);
 				return attachment;
 			},
@@ -120,32 +155,10 @@ export async function createExperimentalServerServices(options: {
 			const releases = await Promise.allSettled(
 				[...attachments].map((attachment) => attachment.release(BACKGROUND_CONTEXT)),
 			);
-			attachments.clear();
 			await mutationTail;
 			const errors = releases.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
 			if (errors.length === 1) throw errors[0];
-			if (errors.length > 1) throw new AggregateError(errors, "Failed to release server service attachments");
-		},
-	};
-}
-
-function createProviderAttachment(
-	provider: RemoteServiceProvider,
-	onRelease: () => void,
-): RoutedServerServiceAttachment {
-	const endpoint = createRemoteServiceEndpoint(provider);
-	let released = false;
-	return {
-		invokeService(call, publish, context) {
-			if (released) return Promise.reject(new Error("Server service attachment is released"));
-			return endpoint.invoke(call, publish, context);
-		},
-		release() {
-			if (released) return;
-			released = true;
-			endpoint.dispose();
-			provider.dispose();
-			onRelease();
+			if (errors.length > 1) throw new AggregateError(errors, "Failed to release server attachments");
 		},
 	};
 }

@@ -19,6 +19,7 @@ it.each(["reject", "followUp", "steer"] as const)(
 			extensionFactories: [
 				(pi) => {
 					pi.on("before_agent_start", async (event) => {
+						if (event.messageType !== "user") return;
 						if (event.prompt === "delayed A") {
 							preflightEntered.resolve();
 							await preflightGate.promise;

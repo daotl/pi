@@ -1,4 +1,5 @@
-import { type Context, defineService } from "@earendil-works/chord";
+import { type Ctx as Context, hostNamed, method, remote } from "@earendil-works/chord";
+import { Type } from "typebox";
 
 export interface AgentPromptImage {
 	type: "image";
@@ -51,4 +52,64 @@ export interface AgentController {
 	navigate(request: AgentNavigationRequest, context: Context): Promise<AgentOperationResponse>;
 }
 
-export const AgentController = defineService<AgentController>("pi.agent-controller");
+const prompt = Type.Object({
+	message: Type.String(),
+	images: Type.Union([
+		Type.Array(Type.Object({ type: Type.Literal("image"), data: Type.String(), mimeType: Type.String() })),
+		Type.Null(),
+	]),
+});
+const error = Type.Object({ code: Type.String(), message: Type.String() });
+const operation = Type.Unsafe<AgentOperationResponse>(
+	Type.Union([
+		Type.Object({
+			accepted: Type.Literal(true),
+			operationId: Type.String(),
+			error: Type.Union([error, Type.Null()]),
+		}),
+		Type.Object({ accepted: Type.Literal(false), operationId: Type.Union([Type.String(), Type.Null()]), error }),
+	]),
+);
+const queue = Type.Unsafe<AgentQueueResponse>(
+	Type.Union([
+		Type.Object({ accepted: Type.Literal(true), entryId: Type.String(), error: Type.Null() }),
+		Type.Object({ accepted: Type.Literal(false), entryId: Type.Null(), error }),
+	]),
+);
+export const AgentController = remote("pi.agent-controller", {
+	version: 1,
+	input: Type.Object({}),
+	host: hostNamed("session"),
+	variants: {
+		active: {
+			methods: {
+				prompt: method(prompt, operation),
+				requestAbort: method(Type.String()),
+				steer: method(prompt, queue),
+				followUp: method(prompt, queue),
+				nextRun: method(prompt, queue),
+				cancelQueued: method(
+					Type.String(),
+					Type.Object({
+						outcome: Type.Union([
+							Type.Literal("cancelled"),
+							Type.Literal("already_consumed"),
+							Type.Literal("not_found"),
+						]),
+					}),
+				),
+				resume: method(undefined, operation),
+				compact: method(Type.Object({ customInstructions: Type.Union([Type.String(), Type.Null()]) }), operation),
+				navigate: method(
+					Type.Object({
+						targetId: Type.Union([Type.String(), Type.Null()]),
+						summarize: Type.Boolean(),
+						label: Type.Union([Type.String(), Type.Null()]),
+						customInstructions: Type.Union([Type.String(), Type.Null()]),
+					}),
+					operation,
+				),
+			},
+		},
+	},
+});

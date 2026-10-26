@@ -1,4 +1,5 @@
-import { type Context, defineService } from "@earendil-works/chord";
+import { type Ctx as Context, local, opaque } from "@earendil-works/chord";
+import { Type } from "typebox";
 import type { AgentOperationResponse, AgentQueueResponse } from "./agent-controller.ts";
 
 export interface SlashCommandCompletion {
@@ -27,4 +28,8 @@ export interface SlashCommands {
 	subscribe(listener: (commands: readonly SlashCommandContribution[]) => void): () => void;
 }
 
-export const SlashCommands = defineService<SlashCommands>("pi.local.slash-commands", { local: true });
+export const SlashCommands = local("pi.local.slash-commands", {
+	version: 1,
+	input: Type.Object({}),
+	members: { registry: opaque<SlashCommands>("pi.slash-commands@1") },
+});

@@ -1,5 +1,5 @@
-import { type Context, defineFacet, type Facet, type MutableReplicatedState } from "@earendil-works/chord";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { defineFacet, type Facet, local } from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import {
 	type AgentLane,
 	type HarnessEvent,
@@ -7,95 +7,80 @@ import {
 	type LaneTranscriptSnapshot,
 	type LaneWatchEvent,
 	reduceLaneSnapshot,
-	type WatchHandle,
 } from "@earendil-works/pi-agent-core";
-import { Transcript, type Transcript as TranscriptService, type TranscriptState } from "./transcript.ts";
+import { Type } from "typebox";
+import { Transcript, TranscriptStateSchema } from "./transcript.ts";
 
-interface TranscriptRuntime {
-	readonly service: TranscriptService;
-	activate(): Promise<void>;
-	dispose(): Promise<void>;
-}
-
-export function createTranscriptService(
-	lane: AgentLane,
-	createState: (initial: TranscriptState) => MutableReplicatedState<TranscriptState>,
-): TranscriptRuntime {
-	const state = createState({ snapshot: null, event: null });
-	let watch: WatchHandle<LaneSnapshot> | undefined;
-	let rebase: Promise<void> | undefined;
-	let rebaseError: Error | undefined;
-
-	const publishSnapshot = (next: LaneSnapshot, event: LaneWatchEvent | null, context: Context): void => {
-		state.replace(context, { snapshot: next as LaneTranscriptSnapshot, event });
-	};
-
-	const scheduleRebase = (context: Context): void => {
-		if (rebase !== undefined) return;
-		const activeWatch = watch;
-		if (activeWatch === undefined) return;
-		const pending = (async () => {
-			const refreshed = await activeWatch.resnapshot(context);
-			publishSnapshot(refreshed, null, context);
-		})();
-		rebase = pending;
-		void pending.then(
-			() => {
-				if (rebase === pending) rebase = undefined;
-			},
-			(error: unknown) => {
-				rebaseError = error instanceof Error ? error : new Error(String(error));
-				if (rebase === pending) rebase = undefined;
-			},
-		);
-	};
-
-	const onEvent = (event: HarnessEvent, context: Context): void => {
-		if (rebaseError !== undefined) throw rebaseError;
-		const forwarded = toLaneWatchEvent(event);
-		if (forwarded === undefined) return;
-		if (state.value.snapshot === null) throw new Error("Transcript service is not active");
-		let needsRebase = false;
-		state.change(context, (draft) => {
-			needsRebase = reduceLaneSnapshot(draft.snapshot as unknown as LaneSnapshot, event) === "rebase";
-			draft.event = forwarded;
-		});
-		if (needsRebase) scheduleRebase(context);
-	};
-
-	return {
-		service: { state },
-		async activate() {
-			if (watch !== undefined) throw new Error("Transcript service is already active");
-			const opened = await lane.watch(BACKGROUND_CONTEXT);
-			watch = opened;
-			publishSnapshot(opened.snapshot, null, BACKGROUND_CONTEXT);
-			opened.start(onEvent);
-		},
-		async dispose() {
-			let failure: unknown;
-			try {
-				await rebase;
-			} catch (error) {
-				failure = error;
-			}
-			watch?.unsubscribe();
-			watch = undefined;
-			if (failure !== undefined) throw failure;
-		},
-	};
-}
+const TranscriptRuntime = local("pi.local.transcript-runtime", {
+	version: 1,
+	input: Type.Object({}),
+	members: { state: TranscriptStateSchema },
+});
 
 export function createTranscriptServiceFacet(lane: AgentLane): Facet {
-	return defineFacet({
-		id: "@pi/transcript",
-		setup(env) {
-			const runtime = createTranscriptService(lane, env.replicatedState);
-			env.provide(Transcript, runtime.service);
-			env.onActivate(() => runtime.activate());
-			env.own(() => runtime.dispose());
-		},
-	});
+	return {
+		name: "@pi/transcript",
+		...defineFacet(({ serve }) => {
+			serve(
+				TranscriptRuntime,
+				(_input, _principal, self) => {
+					const watch = self.resource("lane-watch", {
+						version: 1,
+						open: async ({ signal }) => {
+							const opened = await lane.watch(withAbortSignal(signal, BACKGROUND_CONTEXT));
+							return { opened, listener: undefined as ((event: HarnessEvent) => void) | undefined };
+						},
+						close: (watch) => watch.opened.unsubscribe(),
+					});
+					const state = self.state("transcript", TranscriptStateSchema, {
+						init: () => ({ snapshot: watch.value.opened.snapshot as LaneTranscriptSnapshot, event: null }),
+					});
+					let rebase: Promise<void> | undefined;
+					self.on(
+						"lane-events",
+						watch,
+						(resource) => ({
+							subscribe(listener: (event: HarnessEvent) => void) {
+								resource.listener = listener;
+								resource.opened.start((event) => resource.listener?.(event));
+								return () => {
+									resource.listener = undefined;
+								};
+							},
+						}),
+						async (event, ctx) => {
+							const forwarded = toLaneWatchEvent(event);
+							if (forwarded === undefined) return;
+							let needsRebase = false;
+							state.change(ctx, (draft) => {
+								needsRebase = reduceLaneSnapshot(draft.snapshot as unknown as LaneSnapshot, event) === "rebase";
+								draft.event = forwarded;
+							});
+							if (needsRebase && rebase === undefined) {
+								rebase = (async () => {
+									const snapshot = await watch.value.opened.resnapshot(
+										withAbortSignal(ctx.signal, BACKGROUND_CONTEXT),
+									);
+									state.replace(ctx, { snapshot: snapshot as LaneTranscriptSnapshot, event: null });
+								})();
+								try {
+									await rebase;
+								} finally {
+									rebase = undefined;
+								}
+							}
+						},
+					);
+					return { state };
+				},
+				{ lifetime: "host" },
+			);
+			serve(Transcript, (_input, _principal, self) => ({
+				variant: "active",
+				state: self.get(TranscriptRuntime, {}).state,
+			}));
+		}),
+	};
 }
 
 function toLaneWatchEvent(event: HarnessEvent): LaneWatchEvent | undefined {
@@ -107,14 +92,12 @@ function toLaneWatchEvent(event: HarnessEvent): LaneWatchEvent | undefined {
 		case "lane_created":
 			return undefined;
 		case "config_update":
-			if (event.property !== "model" && event.property !== "thinkingLevel" && event.property !== "activeTools") {
+			if (event.property !== "model" && event.property !== "thinkingLevel" && event.property !== "activeTools")
 				return undefined;
-			}
 			return event as LaneWatchEvent;
 		case "message_update": {
-			if (event.message.role !== "assistant") {
+			if (event.message.role !== "assistant")
 				throw new TypeError("Harness message_update did not carry an assistant message");
-			}
 			const { event: _providerEvent, ...update } = event;
 			return update as LaneWatchEvent;
 		}

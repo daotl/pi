@@ -1,4 +1,5 @@
-import { type Context, defineService } from "@earendil-works/chord";
+import { type Ctx as Context, local, opaque } from "@earendil-works/chord";
+import { Type } from "typebox";
 
 export interface PresentationSelectItem {
 	readonly value: string;
@@ -17,4 +18,8 @@ export interface PresentationUI {
 	showStatus(message: string, context: Context): void;
 }
 
-export const PresentationUI = defineService<PresentationUI>("pi.local.presentation-ui", { local: true });
+export const PresentationUI = local("pi.local.presentation-ui", {
+	version: 1,
+	input: Type.Object({}),
+	members: { ui: opaque<PresentationUI>("pi.presentation-ui@1") },
+});

@@ -1,29 +1,17 @@
+import { ChordError } from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT, type SessionMetadata, TODO_CONTEXT } from "@earendil-works/pi-agent-core";
 import {
-	createServiceStateEncoder,
-	decodeServiceControlCall,
-	type JsonValue,
-	parseServiceCall,
-	parseServiceSubscriptionSnapshot,
-	RemoteServiceError,
-	type ServiceCall,
-	type ServiceProviderUpdate,
-} from "@earendil-works/chord";
-import { BACKGROUND_CONTEXT, type SessionMetadata, TODO_CONTEXT, withAbortSignal } from "@earendil-works/pi-agent-core";
-import {
-	type CancelEnvelope,
 	type ClientHello,
 	type ClientMessage,
 	ClientMessageDecoder,
 	DEFAULT_MAX_FRAME_LENGTH,
 	encodeServerMessage,
+	type FrameEnvelope,
 	isServerId,
 	isSupportedProtocolVersion,
 	PROTOCOL_VERSION,
 	type ProtocolError,
 	ProtocolValidationError,
-	type RequestEnvelope,
-	type ResponseEnvelope,
-	type RpcTarget,
 	type ServerHello,
 	type ServerHelloError,
 	type ServerMessage,
@@ -55,6 +43,7 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 	private readonly onConnectionCountChanged: ((count: number) => void) | undefined;
 	private readonly onError: ((error: Error) => void) | undefined;
 	private readonly connections = new Set<ConnectionState>();
+	private readonly connectionCleanups = new Set<Promise<void>>();
 	private readonly sessions: SessionRouter<TMetadata>;
 	private closing = false;
 	private closePromise?: Promise<void>;
@@ -82,6 +71,9 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 					type: "attachment",
 					attachment: attachment ?? null,
 				});
+			},
+			publishFrame: async (client, target, frame) => {
+				await this.sendMessage(client as ConnectionState, { type: "chord", target, frame });
 			},
 			reportError: (error) => this.reportError(error),
 		});
@@ -154,11 +146,9 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 		state = {
 			connection,
 			decoder: new ClientMessageDecoder({ maxFrameLength: this.maxFrameLength }),
-			serviceStateEncoders: new Map(),
 			stage: "awaitingHello",
 			disconnected: false,
 			handshakeTimeout,
-			activeRequests: new Map(),
 		};
 		this.connections.add(state);
 		this.notifyConnectionCountChanged();
@@ -245,8 +235,7 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 		}
 
 		if (state.stage === "ready") {
-			if (message.type === "cancel") this.handleCancel(state, message);
-			else void this.handleRequest(state, message);
+			void this.handleFrame(state, message);
 			return;
 		}
 		if (state.stage !== "handshaking") return;
@@ -254,8 +243,7 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 		if (!handshake) return;
 		void handshake.then(() => {
 			if (state.stage !== "ready" || state.disconnected) return;
-			if (message.type === "cancel") this.handleCancel(state, message);
-			else void this.handleRequest(state, message);
+			void this.handleFrame(state, message);
 		});
 	}
 
@@ -280,6 +268,7 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 			TODO_CONTEXT,
 		);
 		if (this.closing || state.disconnected || state.stage !== "handshaking" || state.connection.closed) {
+			services.link.close("connection ended during handshake");
 			await services.release(TODO_CONTEXT);
 			return;
 		}
@@ -293,113 +282,34 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 			state.stage = "ready";
 			clearTimeout(state.handshakeTimeout);
 		}
-	}
-
-	private handleCancel(state: ConnectionState, envelope: CancelEnvelope): void {
-		if (envelope.target.serverId !== this.serverId) return;
-		const active = state.activeRequests.get(envelope.id);
-		if (active !== undefined && sameTarget(active.target, envelope.target)) {
-			active.controller.abort(new DOMException("RPC request cancelled", "AbortError"));
+		if (sent && !state.disconnected) {
+			const target = { serverId: this.serverId };
+			services.link.receive((frame) => {
+				void this.sendMessage(state, { type: "chord", target, frame });
+			});
+			services.link.onClose((reason) => {
+				void this.sendMessage(state, { type: "chord", target, frame: { t: "bye", reason } });
+			});
 		}
 	}
 
-	private async handleRequest(state: ConnectionState, envelope: RequestEnvelope): Promise<void> {
-		if (state.activeRequests.has(envelope.id)) {
-			await this.sendMessage(state, {
-				type: "response",
-				id: envelope.id,
-				ok: false,
-				error: { code: "invalid_request", message: "Request ID is already active" },
-			} satisfies ResponseEnvelope);
-			return;
-		}
-		let call: ServiceCall;
-		try {
-			call = parseServiceCall(envelope.call);
-		} catch {
-			await this.sendMessage(state, {
-				type: "response",
-				id: envelope.id,
-				ok: false,
-				error: { code: "invalid_request", message: "Invalid service call" },
-			} satisfies ResponseEnvelope);
-			return;
-		}
-		const controller = new AbortController();
-		const active = { controller, target: envelope.target };
-		state.activeRequests.set(envelope.id, active);
-		const context = withAbortSignal(controller.signal, TODO_CONTEXT);
-		const control = decodeServiceControlCall(call);
-		const subscribing = control?.type === "subscribe" ? control : undefined;
-		const pendingUpdates: { readonly update: ServiceProviderUpdate }[] = [];
-		let subscriptionReady = subscribing === undefined;
-		let installedSubscriptionEncoder = false;
-		let responded = false;
-		const publish = async (subscriptionId: string, update: ServiceProviderUpdate): Promise<void> => {
-			if (subscribing !== undefined && subscriptionId === subscribing.subscriptionId && !subscriptionReady) {
-				pendingUpdates.push({ update });
-				return;
-			}
-			await this.sendServiceUpdate(state, subscriptionId, update);
-		};
+	private async handleFrame(state: ConnectionState, envelope: FrameEnvelope): Promise<void> {
 		try {
 			if (envelope.target.serverId !== this.serverId) throw new WrongServerError();
-			if (subscribing !== undefined && state.serviceStateEncoders.has(subscribing.subscriptionId)) {
-				throw new ProtocolValidationError(`Duplicate service subscription ${subscribing.subscriptionId}`);
-			}
-			let result: JsonValue | undefined;
 			if ("sessionId" in envelope.target) {
-				result = await this.sessions.executeServiceCall(call, envelope.target, state, publish, context);
-			} else if (state.serverServices !== undefined) {
-				result = await state.serverServices.invokeService(call, publish, context);
+				await this.sessions.forwardFrame(envelope.frame, envelope.target, state);
 			} else {
-				throw new ProtocolValidationError(`Unknown service member ${call.serviceId}.${call.member}`);
-			}
-			if (subscribing !== undefined) {
-				if (result === undefined)
-					throw new ProtocolValidationError("Service subscription did not return a snapshot");
-				const stateEncoder = createServiceStateEncoder();
-				result = stateEncoder.encodeSnapshot(parseServiceSubscriptionSnapshot(result)) as unknown as JsonValue;
-				state.serviceStateEncoders.set(subscribing.subscriptionId, stateEncoder);
-				installedSubscriptionEncoder = true;
-			} else if (control?.type === "unsubscribe") {
-				state.serviceStateEncoders.delete(control.subscriptionId);
-			}
-			await this.sendMessage(
-				state,
-				result === undefined
-					? { type: "response", id: envelope.id, ok: true }
-					: { type: "response", id: envelope.id, ok: true, result },
-			);
-			responded = true;
-			if (subscribing !== undefined) {
-				while (pendingUpdates.length > 0) {
-					const pending = pendingUpdates.shift();
-					if (pending !== undefined)
-						await this.sendServiceUpdate(state, subscribing.subscriptionId, pending.update);
-				}
-				subscriptionReady = true;
+				if (!state.serverServices) throw new ProtocolValidationError("Server Chord endpoint is unavailable");
+				if (envelope.frame.t === "bye") state.serverServices.link.close(envelope.frame.reason);
+				else state.serverServices.link.send(envelope.frame);
 			}
 		} catch (error) {
-			if (subscribing !== undefined && installedSubscriptionEncoder && !responded) {
-				state.serviceStateEncoders.delete(subscribing.subscriptionId);
-			}
-			if (responded) {
-				this.reportError(error);
-				await this.closeConnection(state.connection);
-				this.disconnect(state);
-			} else {
-				await this.sendMessage(state, {
-					type: "response",
-					id: envelope.id,
-					ok: false,
-					error: controller.signal.aborted
-						? { code: "cancelled", message: "RPC request cancelled" }
-						: this.toProtocolError(error),
-				} satisfies ResponseEnvelope);
-			}
-		} finally {
-			if (state.activeRequests.get(envelope.id) === active) state.activeRequests.delete(envelope.id);
+			const bounded = this.toProtocolError(error);
+			await this.sendMessage(state, {
+				type: "chord",
+				target: envelope.target,
+				frame: { t: "bye", reason: `${bounded.code}: ${bounded.message}` },
+			});
 		}
 	}
 
@@ -419,34 +329,24 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 		connection.disconnected = true;
 		connection.stage = "closed";
 		clearTimeout(connection.handshakeTimeout);
-		for (const { controller } of connection.activeRequests.values()) {
-			controller.abort(new Error("Client disconnected"));
-		}
-		connection.activeRequests.clear();
-		connection.serviceStateEncoders.clear();
 		if (this.connections.delete(connection)) this.notifyConnectionCountChanged();
 		const serverServices = connection.serverServices;
 		delete connection.serverServices;
-		void Promise.allSettled([
+		serverServices?.link.close("client disconnected");
+		const cleanup = Promise.allSettled([
 			this.sessions.disconnect(connection, TODO_CONTEXT),
-			serverServices?.release(TODO_CONTEXT),
+			Promise.resolve().then(() => serverServices?.release(TODO_CONTEXT)),
 		]).then((results) => {
-			for (const result of results) if (result.status === "rejected") this.reportError(result.reason);
+			const errors = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
+			if (errors.length > 0) throw new AggregateError(errors, "Failed to release connection capabilities");
 		});
-	}
-
-	private async sendServiceUpdate(
-		connection: ConnectionState,
-		subscriptionId: string,
-		update: ServiceProviderUpdate,
-	): Promise<void> {
-		const stateEncoder = connection.serviceStateEncoders.get(subscriptionId);
-		if (stateEncoder === undefined) return;
-		await this.sendMessage(connection, {
-			type: "service_update",
-			subscriptionId,
-			update: stateEncoder.encodeUpdate(update) as unknown as JsonValue,
-		});
+		this.connectionCleanups.add(cleanup);
+		void cleanup.then(
+			() => this.connectionCleanups.delete(cleanup),
+			(error: unknown) => {
+				this.reportError(error);
+			},
+		);
 	}
 
 	private async sendMessage(connection: ConnectionState, message: ServerMessage): Promise<boolean> {
@@ -494,7 +394,12 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 		}
 		await Promise.all(connections.map((connection) => this.closeConnection(connection.connection)));
 		for (const connection of connections) this.disconnect(connection);
-		const cleanup = await Promise.allSettled([this.sessions.close(BACKGROUND_CONTEXT)]);
+		const cleanup = await Promise.allSettled([
+			...connections.flatMap((connection) => (connection.handshake === undefined ? [] : [connection.handshake])),
+			...this.connectionCleanups,
+			this.sessions.close(BACKGROUND_CONTEXT),
+		]);
+		this.connectionCleanups.clear();
 		this.connections.clear();
 		const errors = cleanup.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
 		if (errors.length === 1) throw errors[0];
@@ -510,7 +415,7 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 	}
 
 	private toProtocolError(error: unknown): ProtocolError {
-		if (error instanceof ServerError || error instanceof RemoteServiceError) {
+		if (error instanceof ServerError || error instanceof ChordError) {
 			return { code: error.code, message: error.message };
 		}
 		if (error instanceof ProtocolValidationError) {
@@ -542,14 +447,6 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 		if (error === undefined) this.resolveClosed();
 		else this.rejectClosed(error);
 	}
-}
-
-function sameTarget(left: RpcTarget, right: RpcTarget): boolean {
-	if (left.serverId !== right.serverId) return false;
-	if (!("sessionId" in left) || !("sessionId" in right)) {
-		return !("sessionId" in left) && !("sessionId" in right);
-	}
-	return left.sessionId === right.sessionId && left.attachmentId === right.attachmentId;
 }
 
 function resolveOptions(options: ServerOptions): {

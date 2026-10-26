@@ -775,7 +775,7 @@ export async function completeSummarization(
 export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
-	reserveTokens: number,
+	reserveTokens: number | undefined,
 	apiKey: string | undefined,
 	headers?: ProviderHeaders,
 	signal?: AbortSignal,
@@ -814,7 +814,7 @@ export async function generateSummary(
 export async function generateSummaryWithUsage(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
-	reserveTokens: number,
+	reserveTokens: number | undefined,
 	apiKey: string | undefined,
 	headers?: ProviderHeaders,
 	signal?: AbortSignal,
@@ -835,7 +835,7 @@ export async function generateSummaryWithUsage(
 		isKnownApiProvider(requestModel.api),
 ): Promise<{ text: string; usage: Usage; fileOps: FileOperations }> {
 	const maxTokens = Math.min(
-		Math.floor(0.8 * reserveTokens),
+		Math.floor(0.8 * (reserveTokens ?? DEFAULT_COMPACTION_SETTINGS.reserveTokens)),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
 

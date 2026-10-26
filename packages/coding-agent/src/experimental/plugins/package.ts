@@ -1,16 +1,131 @@
 import { createHash } from "node:crypto";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { bundleFacetPackage } from "@earendil-works/chord/bundler";
-import {
-	FACET_BUNDLE_MANIFEST_FILE,
-	type FacetBundleArtifact,
-	readFacetBundleArtifact,
-} from "@earendil-works/chord/node";
 import type { ServerId } from "@earendil-works/pi-protocol";
+import { build } from "esbuild";
 
 const PLUGIN_PACKAGE_PROFILE_VERSION = 1;
 const DEFAULT_PLUGIN_FACETS = Object.freeze({ session: "src/session.ts", tui: "src/tui.ts" });
+
+export const FACET_BUNDLE_MANIFEST_FILE = "pi-plugin-facets.json";
+export const FACET_BUNDLE_ARTIFACT_FORMAT = "pi-plugin-facet";
+export const FACET_BUNDLE_ARTIFACT_FORMAT_VERSION = 1;
+
+export interface FacetBundleEntry {
+	readonly file: string;
+	readonly integrity: string;
+	readonly externalImports: readonly string[];
+}
+
+export interface FacetBundleManifest {
+	readonly plugin: { readonly id: string; readonly version?: string };
+	readonly entries: Readonly<Record<string, FacetBundleEntry>>;
+}
+
+export interface FacetBundleArtifact {
+	readonly format: typeof FACET_BUNDLE_ARTIFACT_FORMAT;
+	readonly formatVersion: typeof FACET_BUNDLE_ARTIFACT_FORMAT_VERSION;
+	readonly plugin: FacetBundleManifest["plugin"];
+	readonly entryName: string;
+	readonly entry: FacetBundleEntry;
+	readonly source: string;
+}
+
+export async function readFacetBundleManifest(path: string): Promise<FacetBundleManifest> {
+	const value: unknown = JSON.parse(await readFile(path, "utf8"));
+	if (
+		value === null ||
+		typeof value !== "object" ||
+		!("plugin" in value) ||
+		!("entries" in value) ||
+		value.plugin === null ||
+		typeof value.plugin !== "object" ||
+		!("id" in value.plugin) ||
+		typeof value.plugin.id !== "string" ||
+		value.plugin.id.length === 0 ||
+		value.entries === null ||
+		typeof value.entries !== "object" ||
+		Array.isArray(value.entries)
+	) {
+		throw new Error(`Invalid plugin facet manifest ${path}`);
+	}
+	for (const entry of Object.values(value.entries)) {
+		if (
+			entry === null ||
+			typeof entry !== "object" ||
+			typeof entry.file !== "string" ||
+			basename(entry.file) !== entry.file ||
+			typeof entry.integrity !== "string" ||
+			!Array.isArray(entry.externalImports) ||
+			entry.externalImports.some((item: unknown) => typeof item !== "string")
+		) {
+			throw new Error(`Invalid plugin facet entry in ${path}`);
+		}
+	}
+	return value as FacetBundleManifest;
+}
+
+async function bundlePluginPackage(packagePath: string, outdir: string): Promise<FacetBundleManifest> {
+	const directory = basename(packagePath) === "package.json" ? dirname(packagePath) : packagePath;
+	const metadata: unknown = JSON.parse(await readFile(join(directory, "package.json"), "utf8"));
+	if (
+		metadata === null ||
+		typeof metadata !== "object" ||
+		!("name" in metadata) ||
+		typeof metadata.name !== "string" ||
+		("version" in metadata && typeof metadata.version !== "string")
+	)
+		throw new Error(`Invalid plugin package ${directory}`);
+	const entries: Record<string, FacetBundleEntry> = {};
+	await mkdir(outdir, { recursive: true });
+	for (const [name, relative] of Object.entries(DEFAULT_PLUGIN_FACETS)) {
+		const path = join(directory, relative);
+		try {
+			await stat(path);
+		} catch (error) {
+			if (error instanceof Error && "code" in error && error.code === "ENOENT") continue;
+			throw error;
+		}
+		const result = await build({
+			entryPoints: [path],
+			bundle: true,
+			write: false,
+			format: "esm",
+			platform: "node",
+			target: "node22",
+			external: [
+				"@earendil-works/chord",
+				"@earendil-works/chord/*",
+				"@earendil-works/pi-coding-agent/experimental/plugin",
+				"typebox",
+				"typebox/*",
+			],
+			metafile: true,
+		});
+		const source = result.outputFiles[0]!.text;
+		const file = `${name}.mjs`;
+		entries[name] = {
+			file,
+			integrity: `sha256-${createHash("sha256").update(source).digest("base64")}`,
+			externalImports: [
+				...new Set(
+					Object.values(result.metafile.outputs).flatMap((output) =>
+						output.imports.filter((item) => item.external).map((item) => item.path),
+					),
+				),
+			],
+		};
+		await writeFile(join(outdir, file), source, "utf8");
+	}
+	if (Object.keys(entries).length === 0)
+		throw new Error(`Plugin package ${directory} has no conventional session or tui entry`);
+	const manifest: FacetBundleManifest = {
+		plugin: { id: metadata.name, ...("version" in metadata ? { version: metadata.version as string } : {}) },
+		entries,
+	};
+	await writeFile(join(outdir, FACET_BUNDLE_MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+	return manifest;
+}
 
 export interface ConfiguredServerPluginPackage {
 	readonly manifestPath: string;
@@ -78,14 +193,20 @@ export function createServerPluginPackage(
 	return {
 		manifestPath,
 		build() {
-			const operation = buildTail.then(async () => {
-				const result = await bundleFacetPackage({
-					packagePath: normalizedPackagePath,
-					outdir,
-					defaultFacets: DEFAULT_PLUGIN_FACETS,
-				});
-				if (result.manifest.entries.tui === undefined) return [];
-				return [await readFacetBundleArtifact({ manifestPath: result.manifestPath, entry: "tui" })];
+			const operation = buildTail.then(async (): Promise<readonly FacetBundleArtifact[]> => {
+				const manifest = await bundlePluginPackage(normalizedPackagePath, outdir);
+				const entry = manifest.entries.tui;
+				if (entry === undefined) return [];
+				return [
+					{
+						format: FACET_BUNDLE_ARTIFACT_FORMAT,
+						formatVersion: FACET_BUNDLE_ARTIFACT_FORMAT_VERSION,
+						plugin: manifest.plugin,
+						entryName: "tui",
+						entry,
+						source: await readFile(join(outdir, entry.file), "utf8"),
+					},
+				];
 			});
 			buildTail = operation.then(
 				() => undefined,

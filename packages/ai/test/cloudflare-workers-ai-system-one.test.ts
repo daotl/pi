@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createModels } from "../src/models.ts";
 import { getBuiltinClassifierModel } from "../src/providers/all.ts";
 import { cloudflareWorkersAIProvider } from "../src/providers/cloudflare-workers-ai.ts";
-import type { ClassifierContext } from "../src/types.ts";
+import type { ClassifierContext, ClassifierModel } from "../src/types.ts";
 
 const context: ClassifierContext = {
 	state: { message: "Help! My payouts have been failing for 3 days." },
@@ -42,6 +42,37 @@ function restResponse(state: string, result: unknown = jevOutput) {
 		success: true,
 		errors: [],
 		messages: [],
+	};
+}
+
+// Cloudflare-hosted output observed from a live /ai/run call, question ids renamed to match `context`.
+// The envelope carries the output directly, without a run record.
+const clefOutput = {
+	model: "clef",
+	answers: {
+		is_urgent: { type: "noul", noul: 0.9912 },
+		department: {
+			type: "choice",
+			choice: "technical",
+			probabilities: { billing: 0.1632, technical: 0.8368 },
+			confidence: 0.4538,
+		},
+	},
+	usage: { input_tokens: 222, output_tokens: 0 },
+};
+
+// Adapter capabilities are tested independently of the versioned, published model catalog.
+function classifierModel(id: string, inputPrice = 0): ClassifierModel<"cloudflare-workers-ai-system-one"> {
+	return {
+		type: "classifier",
+		id,
+		name: id,
+		api: "cloudflare-workers-ai-system-one",
+		provider: "cloudflare-workers-ai",
+		baseUrl: "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai",
+		input: ["text", "image"],
+		cost: { input: inputPrice, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 64000,
 	};
 }
 
@@ -85,6 +116,146 @@ describe("Cloudflare Workers AI System One", () => {
 		expect(result.answers.is_urgent).toEqual({ type: "bool", probability: 0.95 });
 		expect(result.answers.department).toMatchObject({ type: "choice", choice: "billing", confidence: 0.8 });
 		expect(result.usage).toMatchObject({ input: 426, output: 73, totalTokens: 499 });
+	});
+
+	it.each([
+		["@cf/cloudflare/clef", 0.24],
+		["@cf/cloudflare/clef-flash", 0.038],
+		["@cf/cloudflare/clef-omni", 0.15],
+	])("runs %s through /ai/run and parses its direct output", async (id, inputPrice) => {
+		const { models } = setup();
+		const clef = classifierModel(id, inputPrice);
+		const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+			const payload = JSON.parse(String(init?.body)) as {
+				model: string;
+				input: { state: unknown; questions: Record<string, { type: string }> };
+			};
+			expect(payload.model).toBe(id);
+			expect(payload.input.state).toEqual(context.state);
+			expect(payload.input.questions.is_urgent?.type).toBe("noul");
+			return Response.json({ result: clefOutput, success: true, errors: [], messages: [] });
+		});
+
+		const result = await models.classify(clef, context, { ...auth, fetch });
+
+		expect(String(fetch.mock.calls[0]?.[0])).toBe("https://api.cloudflare.com/client/v4/accounts/account-id/ai/run");
+		expect(result.stopReason).toBe("stop");
+		expect(result.answers.is_urgent).toEqual({ type: "bool", probability: 0.9912 });
+		expect(result.answers.department).toMatchObject({ type: "choice", choice: "technical", confidence: 0.4538 });
+		expect(result.usage).toMatchObject({ input: 222, output: 0, totalTokens: 222 });
+		expect(result.usage?.cost.input).toBeCloseTo((222 * inputPrice) / 1_000_000);
+	});
+
+	it("sends images to Clef as data URLs", async () => {
+		const { models } = setup();
+		const clef = classifierModel("@cf/cloudflare/clef");
+		const bodies: Array<{ model: string; input: Record<string, unknown> }> = [];
+		const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+			bodies.push(JSON.parse(String(init?.body)) as { model: string; input: Record<string, unknown> });
+			return Response.json({ result: clefOutput, success: true, errors: [], messages: [] });
+		});
+
+		const result = await models.classify(
+			clef,
+			{
+				...context,
+				images: [
+					{ type: "image", data: "cG5n", mimeType: "image/png" },
+					{ type: "image", data: "d2VicA==", mimeType: "image/webp" },
+				],
+			},
+			{ ...auth, fetch },
+		);
+
+		expect(result.stopReason).toBe("stop");
+		// Clef rejects `assets` with a 422, so the state stays as is.
+		expect(bodies[0]?.input).toEqual({
+			state: context.state,
+			questions: expect.any(Object),
+			images: ["data:image/png;base64,cG5n", "data:image/webp;base64,d2VicA=="],
+		});
+		expect(new Headers(fetch.mock.calls[0]?.[1]?.headers).has("typesafe-danger-zone-images")).toBe(false);
+	});
+
+	it.each([
+		{
+			id: "@cf/acme/clef-finetune",
+			imageInput: "images" as const,
+			input: { state: context.state, images: ["data:image/png;base64,cG5n"] },
+		},
+		{
+			id: "@cf/cloudflare/clef",
+			imageInput: "assets" as const,
+			input: {
+				state: ["<image-1>", context.state],
+				assets: { "<image-1>": { type: "image", format: "png", data_base64: "cG5n" } },
+			},
+		},
+		{
+			id: "@cf/cloudflare/clef",
+			imageInput: "state-image-urls" as const,
+			input: {
+				state: [{ type: "image_url", image_url: { url: "data:image/png;base64,cG5n" } }, context.state],
+			},
+		},
+	])("reads $imageInput from compat before the model ID $id", async ({ id, imageInput, input }) => {
+		const { models } = setup();
+		const bodies: Array<{ input: Record<string, unknown> }> = [];
+		const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+			bodies.push(JSON.parse(String(init?.body)) as { input: Record<string, unknown> });
+			return Response.json({ result: clefOutput, success: true, errors: [], messages: [] });
+		});
+
+		const result = await models.classify(
+			{ ...classifierModel(id), compat: { imageInput } },
+			{ ...context, images: [{ type: "image", data: "cG5n", mimeType: "image/png" }] },
+			{ ...auth, fetch },
+		);
+
+		expect(result.stopReason).toBe("stop");
+		expect(bodies[0]?.input).toEqual({ ...input, questions: expect.any(Object) });
+	});
+
+	it("rejects more than four images for Clef before sending", async () => {
+		const { models } = setup();
+		const clef = classifierModel("@cf/cloudflare/clef-flash");
+		const fetch = vi.fn(async () => Response.json({ result: clefOutput, success: true }));
+		const image = { type: "image" as const, data: "cG5n", mimeType: "image/png" };
+
+		const result = await models.classify(clef, { ...context, images: Array(5).fill(image) }, { ...auth, fetch });
+
+		expect(fetch).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe(
+			"Cloudflare Workers AI accepts at most 4 images for @cf/cloudflare/clef-flash, got 5",
+		);
+	});
+
+	it.each(["typesafe/jev", "typesafe/jev-1.14.0"])("sends images to %s as System One assets", async (id) => {
+		const { models } = setup();
+		const jev = classifierModel(id);
+		const bodies: Array<{ model: string; input: Record<string, unknown> }> = [];
+		const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+			bodies.push(JSON.parse(String(init?.body)) as { model: string; input: Record<string, unknown> });
+			return Response.json(restResponse("Completed"));
+		});
+
+		const result = await models.classify(
+			jev,
+			{ ...context, images: [{ type: "image", data: "cG5n", mimeType: "image/png" }] },
+			{ ...auth, fetch },
+		);
+
+		expect(result.stopReason).toBe("stop");
+		expect(bodies[0]).toMatchObject({
+			model: id,
+			input: {
+				state: ["<image-1>", context.state],
+				assets: { "<image-1>": { type: "image", format: "png", data_base64: "cG5n" } },
+			},
+		});
+		// Workers AI needs no TypeSafe opt-in header.
+		expect(new Headers(fetch.mock.calls[0]?.[1]?.headers).has("typesafe-danger-zone-images")).toBe(false);
 	});
 
 	it("reports runs that did not complete", async () => {

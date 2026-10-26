@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { Markdown } from "../src/components/markdown.ts";
+import type { ProgramStatus } from "../src/program-status.ts";
 import type { Terminal } from "../src/terminal.ts";
 import type { Component } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
@@ -72,6 +73,10 @@ class ScrollbackClearSpyTerminal implements Terminal {
 	}
 	setProgress(active: boolean): void {
 		this.inner.setProgress(active);
+	}
+	setProgramStatus(status: ProgramStatus): void {
+		const terminal: Terminal = this.inner;
+		terminal.setProgramStatus(status);
 	}
 	async waitForRender(): Promise<void> {
 		await this.inner.waitForRender();

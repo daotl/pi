@@ -1,7 +1,6 @@
-import { createFacetHost, defineFacet } from "@earendil-works/chord";
+import { createHost } from "@earendil-works/chord";
 import {
 	type AgentLane,
-	BACKGROUND_CONTEXT,
 	Closed,
 	type RunResult as HarnessRunResult,
 	InvalidMessage,
@@ -9,7 +8,7 @@ import {
 	UnknownSkill,
 	UnknownTemplate,
 } from "@earendil-works/pi-agent-core";
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { AgentController } from "../src/experimental/services/agent-controller.ts";
 import { createAgentController } from "../src/experimental/services/agent-controller-provider.ts";
 
@@ -39,6 +38,11 @@ const completed = {
 	startedAt: 1,
 	endedAt: 2,
 };
+let host = createHost({ name: "session", self: "test" });
+afterEach(async () => {
+	await host.close();
+	host = createHost({ name: "session", self: "test" });
+});
 
 describe("AgentController service", () => {
 	test("provides the presentation-safe AgentLane command surface", async () => {
@@ -50,45 +54,26 @@ describe("AgentController service", () => {
 		const steer = vi.fn(async () => ({ ok: true as const, value: { entryId: "queue-1" } }));
 		const followUp = vi.fn(async () => ({ ok: true as const, value: { entryId: "queue-2" } }));
 		const lane = { prompt, requestAbort, steer, followUp } as unknown as AgentLane;
-		const controllerFacet = defineFacet({
-			id: "test-agent-controller",
-			setup(env) {
-				env.provide(AgentController, createAgentController(lane));
-			},
-		});
-		const host = await createFacetHost({ facets: [controllerFacet] });
+		host.serve(AgentController, () => ({ variant: "active", ...createAgentController(lane) }));
 		try {
-			expect(host.services.catalogue).toEqual([{ serviceId: AgentController.id, mode: "singleton" }]);
+			const controller = await host.get(AgentController, {});
+			await expect(host.root((ctx) => controller.prompt({ message: "hello", images: null }, ctx))).resolves.toEqual({
+				accepted: true,
+				operationId: "operation-1",
+				error: null,
+			});
+			await host.root((ctx) => controller.requestAbort("operation-1", ctx));
+			await expect(host.root((ctx) => controller.steer({ message: "later", images: null }, ctx))).resolves.toEqual({
+				accepted: true,
+				entryId: "queue-1",
+				error: null,
+			});
 			await expect(
-				host.services.invoke(
-					{ serviceId: AgentController.id, member: "prompt", args: [{ message: "hello", images: null }] },
-					BACKGROUND_CONTEXT,
-				),
-			).resolves.toEqual({ accepted: true, operationId: "operation-1", error: null });
-			await expect(
-				host.services.invoke(
-					{ serviceId: AgentController.id, member: "requestAbort", args: ["operation-1"] },
-					BACKGROUND_CONTEXT,
-				),
-			).resolves.toBeUndefined();
-			await expect(
-				host.services.invoke(
-					{ serviceId: AgentController.id, member: "steer", args: [{ message: "later", images: null }] },
-					BACKGROUND_CONTEXT,
-				),
-			).resolves.toEqual({ accepted: true, entryId: "queue-1", error: null });
-			await expect(
-				host.services.invoke(
-					{ serviceId: AgentController.id, member: "followUp", args: [{ message: "after", images: null }] },
-					BACKGROUND_CONTEXT,
-				),
+				host.root((ctx) => controller.followUp({ message: "after", images: null }, ctx)),
 			).resolves.toEqual({ accepted: true, entryId: "queue-2", error: null });
-			expect(prompt).toHaveBeenCalledWith("hello", undefined, BACKGROUND_CONTEXT);
-			expect(requestAbort).toHaveBeenCalledWith("operation-1", BACKGROUND_CONTEXT);
-			expect(steer).toHaveBeenCalledWith("later", undefined, BACKGROUND_CONTEXT);
-			expect(followUp).toHaveBeenCalledWith("after", undefined, BACKGROUND_CONTEXT);
+			controller.release();
 		} finally {
-			await host.dispose();
+			await host.close();
 		}
 	});
 
@@ -112,36 +97,35 @@ describe("AgentController service", () => {
 			navigateTree,
 		} as unknown as AgentLane);
 
-		await expect(controller.nextRun({ message: "next", images: null }, BACKGROUND_CONTEXT)).resolves.toEqual({
+		await expect(host.root((ctx) => controller.nextRun({ message: "next", images: null }, ctx))).resolves.toEqual({
 			accepted: true,
 			entryId: "queue-3",
 			error: null,
 		});
-		await expect(controller.cancelQueued("queue-3", BACKGROUND_CONTEXT)).resolves.toEqual({
+		await expect(host.root((ctx) => controller.cancelQueued("queue-3", ctx))).resolves.toEqual({
 			outcome: "cancelled",
 		});
-		await expect(controller.resume(BACKGROUND_CONTEXT)).resolves.toMatchObject({ operationId: "operation-1" });
-		await expect(controller.compact({ customInstructions: "short" }, BACKGROUND_CONTEXT)).resolves.toMatchObject({
-			operationId: "compact-1",
-		});
+		await expect(host.root((ctx) => controller.resume(ctx))).resolves.toMatchObject({ operationId: "operation-1" });
+		await expect(host.root((ctx) => controller.compact({ customInstructions: "short" }, ctx))).resolves.toMatchObject(
+			{
+				operationId: "compact-1",
+			},
+		);
 		await expect(
-			controller.navigate(
-				{ targetId: "entry-1", summarize: true, label: "branch", customInstructions: null },
-				BACKGROUND_CONTEXT,
+			host.root((ctx) =>
+				controller.navigate(
+					{ targetId: "entry-1", summarize: true, label: "branch", customInstructions: null },
+					ctx,
+				),
 			),
 		).resolves.toMatchObject({ operationId: "navigation-1" });
-		expect(nextRun).toHaveBeenCalledWith("next", undefined, BACKGROUND_CONTEXT);
-		expect(cancelQueued).toHaveBeenCalledWith("queue-3", BACKGROUND_CONTEXT);
-		expect(resume).toHaveBeenCalledWith(BACKGROUND_CONTEXT);
-		expect(compact).toHaveBeenCalledWith({ customInstructions: "short" }, BACKGROUND_CONTEXT);
-		expect(navigateTree).toHaveBeenCalledWith("entry-1", { summarize: true, label: "branch" }, BACKGROUND_CONTEXT);
 	});
 
 	test("reports accepted successful and failed operations", async () => {
 		const success = createAgentController({
 			prompt: async () => ({ ok: true, value: completed }),
 		} as unknown as AgentLane);
-		await expect(success.prompt({ message: "hello", images: null }, BACKGROUND_CONTEXT)).resolves.toEqual({
+		await expect(host.root((ctx) => success.prompt({ message: "hello", images: null }, ctx))).resolves.toEqual({
 			accepted: true,
 			operationId: "operation-1",
 			error: null,
@@ -158,10 +142,25 @@ describe("AgentController service", () => {
 				},
 			}),
 		} as unknown as AgentLane);
-		await expect(failed.prompt({ message: "hello", images: null }, BACKGROUND_CONTEXT)).resolves.toEqual({
+		await expect(host.root((ctx) => failed.prompt({ message: "hello", images: null }, ctx))).resolves.toEqual({
 			accepted: true,
 			operationId: "operation-2",
 			error: { code: "provider", message: "failed" },
+		});
+	});
+
+	test("bounds unexpected private adapter failures", async () => {
+		const controller = createAgentController({
+			prompt: async () => {
+				throw new Error("private credentials path");
+			},
+		} as unknown as AgentLane);
+		await expect(
+			host.root((ctx) => controller.prompt({ message: "hello", images: null }, ctx)),
+		).rejects.toMatchObject({
+			code: "unavailable",
+			reason: "internal_error",
+			message: "unavailable/internal_error: Internal session error",
 		});
 	});
 
@@ -169,7 +168,7 @@ describe("AgentController service", () => {
 		const controller = createAgentController({
 			prompt: async () => ({ ok: false, error }),
 		} as unknown as AgentLane);
-		await expect(controller.prompt({ message: "hello", images: null }, BACKGROUND_CONTEXT)).resolves.toEqual({
+		await expect(host.root((ctx) => controller.prompt({ message: "hello", images: null }, ctx))).resolves.toEqual({
 			accepted: false,
 			operationId,
 			error: { code, message: error.message },

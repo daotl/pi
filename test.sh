@@ -70,6 +70,15 @@ for name in SystemRoot SYSTEMROOT WINDIR COMSPEC PATHEXT; do
 	[[ -z "$value" ]] || test_env+=("$name=$value")
 done
 
+# Trust extra certificates of proxies that inspect HTTPS (corporate proxies, sandboxes).
+# Network tests fail with self-signed certificate errors without it.
+value="${NODE_EXTRA_CA_CERTS-}"
+[[ -z "$value" ]] || test_env+=("NODE_EXTRA_CA_CERTS=$value")
+
+# Allow an explicitly built daemon outside the checkout's protected Cargo target directory.
+value="${PI_ENV_DAEMON-}"
+[[ -z "$value" ]] || test_env+=("PI_ENV_DAEMON=$value")
+
 # Preserve CI detection only for runner behavior and test reporting.
 for name in CI GITHUB_ACTIONS; do
 	value="${!name-}"

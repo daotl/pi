@@ -10,7 +10,7 @@ import type {
 	TelemetrySchemaSpanUnion,
 	TelemetrySpan,
 } from "@earendil-works/pi-telemetry";
-import { type Context, getTelemetryContext, withTelemetryContext } from "./context.ts";
+import { type Context, withTelemetry } from "./context.ts";
 
 export type {
 	AttributeValue,
@@ -141,8 +141,8 @@ export function startAiSpan<Name extends AiSpanName, const Attributes extends Ai
 	callback: (span: AiTelemetrySpan<Name>, context: Context) => Result | Promise<Result>,
 	context: Context,
 ): Promise<Result> {
-	return getTelemetryContext(context).startSpan({ name, attributes }, (span) =>
-		callback(span as AiTelemetrySpan<Name>, withTelemetryContext(span, context)),
+	return context.telemetry.startSpan({ name, attributes }, (span) =>
+		callback(span as AiTelemetrySpan<Name>, withTelemetry(span, context)),
 	);
 }
 
@@ -629,7 +629,7 @@ export function startHarnessSpan<
 	callback: (span: HarnessTelemetrySpan<Name>, context: Context) => Result | Promise<Result>,
 	context: Context,
 ): Promise<Result> {
-	return getTelemetryContext(context).startSpan({ name, attributes }, (span: TelemetrySpan) =>
-		callback(span as HarnessTelemetrySpan<Name>, withTelemetryContext(span, context)),
+	return context.telemetry.startSpan({ name, attributes }, (span: TelemetrySpan) =>
+		callback(span as HarnessTelemetrySpan<Name>, withTelemetry(span, context)),
 	);
 }

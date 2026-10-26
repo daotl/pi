@@ -479,33 +479,23 @@ describe("SettingsManager", () => {
 	});
 
 	describe("TUI mode", () => {
-		it("defaults to regular and persists fullscreen mode", async () => {
+		it.each(["regular", "fullscreen"] as const)("persists explicit %s mode", async (mode) => {
 			const manager = SettingsManager.create(projectDir, agentDir);
 
-			expect(manager.getTuiMode()).toBe("regular");
-
-			manager.setTuiMode("fullscreen");
+			manager.setTuiMode(mode);
 			await manager.flush();
 
-			expect(manager.getTuiMode()).toBe("fullscreen");
+			expect(SettingsManager.create(projectDir, agentDir).getTuiMode()).toBe(mode);
 			const savedSettings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
-			expect(savedSettings.tuiMode).toBe("fullscreen");
+			expect(savedSettings.tuiMode).toBe(mode);
 		});
 
-		it("falls back to regular for unsupported values", () => {
+		it("ignores unsupported values", () => {
 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ tuiMode: "other" }));
 
 			const manager = SettingsManager.create(projectDir, agentDir);
 
-			expect(manager.getTuiMode()).toBe("regular");
-		});
-
-		it("does not recognize the old uiMode setting", () => {
-			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ uiMode: "fullscreen" }));
-
-			const manager = SettingsManager.create(projectDir, agentDir);
-
-			expect(manager.getTuiMode()).toBe("regular");
+			expect(manager.getTuiMode()).toBe(SettingsManager.inMemory().getTuiMode());
 		});
 	});
 

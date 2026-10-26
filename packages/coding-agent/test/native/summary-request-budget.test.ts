@@ -1,6 +1,13 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { createProvider, fauxAssistantMessage, type ImageContent, normalizeContext } from "@earendil-works/pi-ai";
+import {
+	createProvider,
+	fauxAssistantMessage,
+	type ImageContent,
+	type Message,
+	normalizeContext,
+} from "@earendil-works/pi-ai";
 import { googleGenerativeAIApi } from "@earendil-works/pi-ai/api/google-generative-ai.lazy";
+import { clampMaxTokensToInput } from "@earendil-works/pi-ai/api/simple-options";
 import { estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
 import { afterEach, expect, it, vi } from "vitest";
 import {
@@ -272,7 +279,7 @@ it("preserves structured tool history for an arbitrary custom stream within its 
 	fixtures.push(current);
 	const selected = current.session.model;
 	if (!selected) throw new Error("Missing model");
-	const model = { ...selected, contextWindow: 10000 };
+	const model = { ...selected, maxTokens: 4096 };
 	const messages: AgentMessage[] = [
 		{ role: "user", content: "inspect", timestamp: 0 },
 		{
@@ -293,27 +300,28 @@ it("preserves structured tool history for an arbitrary custom stream within its 
 			timestamp: 1,
 		},
 	];
-	const contexts: AgentMessage[][] = [];
+	const contexts: Message[][] = [];
 	const requestedCaps: Array<number | undefined> = [];
 	const native = current.session.agent.streamFunction;
-	await generateSummaryWithUsage(
-		messages,
-		model,
-		4096,
-		"offline",
-		undefined,
-		undefined,
-		undefined,
-		undefined,
-		(requestModel, context, options) => {
-			contexts.push(structuredClone(context.messages));
-			requestedCaps.push(options?.maxTokens);
-			return native(requestModel, context, options);
-		},
-	);
+	const stream: typeof native = (requestModel, context, options) => {
+		contexts.push(structuredClone(context.messages));
+		requestedCaps.push(options?.maxTokens);
+		return native(requestModel, context, options);
+	};
+	await generateSummaryWithUsage(messages, model, 4096, "offline", undefined, undefined, undefined, undefined, stream);
+	const inputTokens = contexts[0].reduce((total, message) => total + estimateMessageTokens(message), 0);
+	const configuredCap = Math.floor(0.8 * 4096);
+	// Size the physical window from the complete request, including its generated instruction.
+	model.contextWindow = inputTokens + configuredCap;
+	contexts.length = 0;
+	requestedCaps.length = 0;
+	await generateSummaryWithUsage(messages, model, 4096, "offline", undefined, undefined, undefined, undefined, stream);
 	expect(contexts).toHaveLength(1);
 	expect(contexts[0].some((message) => message.role === "toolResult")).toBe(true);
-	expect(requestedCaps).toEqual([Math.floor(0.8 * 4096)]);
+	expect(requestedCaps).toEqual([configuredCap]);
+	expect(contexts[0].reduce((total, message) => total + estimateMessageTokens(message), 0) + configuredCap).toBe(
+		model.contextWindow,
+	);
 });
 
 it("rejects an oversized converted request before native dispatch when bounded history still cannot fit", async () => {
@@ -358,18 +366,56 @@ it("reselects complete native branch groups to leave useful adapter output headr
 	fixtures.push(current);
 	const selected = current.session.model;
 	if (!selected) throw new Error("Missing model");
-	await current.session.setModel({ ...selected, contextWindow: 10000 });
+	await current.session.setModel({ ...selected, maxTokens: 4096 });
 	current.manager.appendMessage({ role: "system", content: "s".repeat(18000), timestamp: 0 });
 	const target = current.manager.appendMessage({ role: "user", content: "shared target", timestamp: 1 });
 	current.manager.appendMessage({ role: "user", content: `OLDER ${"a".repeat(5000)}`, timestamp: 2 });
 	current.manager.appendMessage({ role: "user", content: `NEWEST ${"b".repeat(1000)}`, timestamp: 3 });
 	current.session.refreshContext();
+	// Capture the complete policy-visible request, then choose a physical window
+	// between the newest-only and full-history request sizes.
+	const oldLeaf = current.manager.getLeafId();
+	if (!oldLeaf) throw new Error("Missing abandoned leaf");
+	const convert = current.session.agent.convertToLlm;
+	let visible: Message[] = [];
+	current.session.agent.convertToLlm = async (messages) => {
+		const converted = await convert(messages);
+		visible = structuredClone(converted);
+		return converted;
+	};
+	await current.session.navigateTree(target, { summarize: true });
+	const instruction = JSON.parse(current.summaries[0].body).messages.at(-1).content;
+	const newestInputTokens = visible
+		.filter((message) => message.role !== "user" || !JSON.stringify(message.content).includes("OLDER"))
+		.reduce(
+			(total, message) => total + estimateMessageTokens(message),
+			estimateMessageTokens({ role: "user", content: instruction, timestamp: 0 }),
+		);
+	const instructionTokens = estimateMessageTokens({ role: "user", content: instruction, timestamp: 0 });
+	const fullInputTokens = visible.reduce(
+		(total, message) => total + estimateMessageTokens(message),
+		instructionTokens,
+	);
+	const adapterSafetyTokens = selected.contextWindow - clampMaxTokensToInput(selected, 0, Number.POSITIVE_INFINITY);
+	const model = {
+		...selected,
+		contextWindow: Math.ceil((newestInputTokens + fullInputTokens) / 2) + adapterSafetyTokens,
+		maxTokens: 4096,
+	};
+	current.manager.branch(oldLeaf);
+	current.session.refreshContext();
+	await current.session.setModel(model);
+	current.summaries.length = 0;
 	const before = structuredClone(current.manager.getEntries());
 	const result = await current.session.navigateTree(target, { summarize: true });
 	expect(result.summaryEntry?.summary).toContain("safe checkpoint");
 	expect(current.summaries).toHaveLength(1);
 	const wire = JSON.parse(current.summaries[0].body);
 	expect(wire.max_completion_tokens ?? wire.max_tokens).toBeGreaterThan(1);
+	expect(current.summaries[0].body).toContain("s".repeat(18000));
+	expect(visible.reduce((total, message) => total + estimateMessageTokens(message), instructionTokens)).toBe(
+		newestInputTokens,
+	);
 	expect(current.summaries[0].body).toContain("NEWEST");
 	expect(current.summaries[0].body).not.toContain("OLDER");
 	for (const entry of before) expect(current.manager.getEntry(entry.id)).toEqual(entry);
@@ -640,6 +686,25 @@ it.each([0, 1, 2])(
 			instructionTokens +
 			estimateMessageTokens(toolCall) +
 			estimateMessageTokens({ role: "user", content: "inspect", timestamp: 0 });
+		const toolTokens = model.contextWindow - remaining - fixed;
+		const countToolText = (characters: number) =>
+			estimateMessageTokens({
+				role: "toolResult",
+				toolCallId: "exact",
+				toolName: "read",
+				content: [{ type: "text", text: "x".repeat(characters) }],
+				isError: false,
+				timestamp: 1,
+			});
+		let lower = 0;
+		let upper = 1;
+		while (countToolText(upper) < toolTokens) upper *= 2;
+		while (lower < upper) {
+			const middle = Math.floor((lower + upper) / 2);
+			if (countToolText(middle) < toolTokens) lower = middle + 1;
+			else upper = middle;
+		}
+		expect(countToolText(lower)).toBe(toolTokens);
 		agent.convertToLlm = async (messages) => {
 			const visible = (await convert(messages))
 				.filter((message) => message.role !== "system")
@@ -647,7 +712,7 @@ it.each([0, 1, 2])(
 					message.role === "toolResult"
 						? {
 								...message,
-								content: [{ type: "text" as const, text: "x".repeat((10000 - remaining - fixed) * 4) }],
+								content: [{ type: "text" as const, text: "x".repeat(lower) }],
 							}
 						: message,
 				);
@@ -687,6 +752,7 @@ it.each([0, 1, 2])(
 			undefined,
 			() => true,
 		);
+		expect(current.summaries).toHaveLength(2);
 		const wire = JSON.parse(current.summaries.at(-1)!.body);
 		expect(wire.max_completion_tokens ?? wire.max_tokens).toBeGreaterThan(1);
 		expect(JSON.stringify(wire)).toContain("[Tool result]");

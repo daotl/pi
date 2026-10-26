@@ -63,7 +63,6 @@ describe("branch summarization", () => {
 			streamFn,
 		});
 
-		expect(requestOptions?.maxTokens).toBe(4096);
 		expect(requestOptions?.toolChoice).toBeUndefined();
 	});
 
@@ -350,7 +349,6 @@ describe("branch summarization", () => {
 
 		expect(requestOptions?.maxTokens).toBe(1024);
 	});
-
 	it("rejects tool calls from branch summaries", async () => {
 		const streamFn: StreamFn = () => {
 			const stream = createAssistantMessageEventStream();

@@ -1,21 +1,13 @@
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
+import type { Link } from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT, type Context, type JsonlSessionMetadata } from "@earendil-works/pi-agent-core";
 import {
-	createServiceUnsubscribeCall,
-	decodeServiceControlCall,
-	type JsonValue,
-	parseServiceProviderUpdate,
-	type ServiceCall,
-	type ServiceProviderUpdate,
-} from "@earendil-works/chord";
-import {
-	BACKGROUND_CONTEXT,
-	type Context,
-	type JsonlSessionMetadata,
-	TODO_CONTEXT,
-} from "@earendil-works/pi-agent-core";
-import { type RoutedSessionAttachment, type RoutedSessionHandle, ServerError } from "@earendil-works/pi-server";
+	createRoutedLinkPair,
+	type RoutedSessionAttachment,
+	type RoutedSessionHandle,
+} from "@earendil-works/pi-server";
 import { Check } from "typebox/value";
 import type { CoordinatorConnection, CoordinatorConnectionEvent } from "./coordinator.ts";
 import { spawnInternalProcess } from "./process.ts";
@@ -27,7 +19,6 @@ import {
 	type SessionWorkerEvent,
 	SessionWorkerEventSchema,
 	type SessionWorkerOptions,
-	type WorkerOperationResponse,
 	type WorkerOperationScope,
 } from "./session-worker.ts";
 
@@ -67,19 +58,10 @@ interface PendingDemand {
 	reject(error: Error): void;
 }
 
-interface PendingWorkerOperation {
+interface WorkerFrameLink {
 	readonly worker: WorkerRecord;
 	readonly scope: WorkerOperationScope;
-	cleanup(): void;
-	resolve(result: JsonValue | undefined): void;
-	reject(error: Error): void;
-}
-
-interface WorkerServiceSubscription {
-	readonly worker: WorkerRecord;
-	readonly scope: WorkerOperationScope;
-	readonly listener: (update: ServiceProviderUpdate, context: Context) => void | Promise<void>;
-	deliveryTail: Promise<void>;
+	readonly link: Link;
 }
 
 interface PendingLaunch {
@@ -107,8 +89,7 @@ export class SessionWorkerManager {
 	readonly #workersByPeer = new Map<string, WorkerRecord>();
 	readonly #pending = new Map<string, PendingLaunch>();
 	readonly #pendingDemand = new Map<string, PendingDemand>();
-	readonly #pendingOperations = new Map<string, PendingWorkerOperation>();
-	readonly #serviceSubscriptions = new Map<string, WorkerServiceSubscription>();
+	readonly #links = new Map<string, WorkerFrameLink>();
 	readonly #removeListener: () => void;
 	readonly #onWorkerCountChanged: ((count: number) => void) | undefined;
 	#discoveryPeers?: Set<string>;
@@ -211,19 +192,36 @@ export class SessionWorkerManager {
 		}
 		const attachmentId = randomUUID();
 		worker.attachmentIds.add(attachmentId);
+		const scope = this.#operationScope(worker, attachmentId);
+		const [tunnel, control] = createRoutedLinkPair();
+		const key = scopeKey(scope);
+		this.#links.set(key, { worker, scope, link: control });
+		control.onClose(() => {
+			if (this.#links.get(key)?.link === control) this.#links.delete(key);
+		});
+		control.receive((frame) => {
+			if (this.#detached || !worker.attachmentIds.has(attachmentId) || this.#links.get(key)?.link !== control)
+				return;
+			void this.#coordinator
+				.send(worker.peerId, { type: "chord", scope, frame })
+				.catch(() => control.close("Worker control failed"));
+		});
 		try {
 			await this.#applyDemand(worker, attachmentId, true, true, context);
 		} catch (error) {
 			worker.attachmentIds.delete(attachmentId);
+			this.#links.delete(key);
+			control.close("Session attach failed");
 			throw error;
 		}
-		const scope = this.#operationScope(worker, attachmentId);
 		let released = false;
 		return {
-			invokeService: (call, publish, serviceContext) =>
-				this.#invokeService(worker, scope, call, publish, serviceContext),
+			link: tunnel,
 			release: async (releaseContext) => {
 				if (released) return;
+				control.close("Session attachment released");
+				this.#links.delete(key);
+				if (this.#detached || !worker.attachmentIds.has(attachmentId)) return;
 				released = true;
 				if (this.#detached || !worker.attachmentIds.has(attachmentId)) return;
 				try {
@@ -232,51 +230,9 @@ export class SessionWorkerManager {
 					if (!this.#detached && !this.#coordinator.wasReplaced) throw error;
 				} finally {
 					worker.attachmentIds.delete(attachmentId);
-					this.#removeServiceSubscriptions((entry) => entry.worker === worker && sameScope(entry.scope, scope));
 				}
 			},
 		};
-	}
-
-	async #invokeService(
-		worker: WorkerRecord,
-		scope: WorkerOperationScope,
-		call: ServiceCall,
-		publish: (subscriptionId: string, update: ServiceProviderUpdate, context: Context) => void | Promise<void>,
-		context: Context,
-	): Promise<JsonValue | undefined> {
-		const control = decodeServiceControlCall(call);
-		let addedSubscriptionKey: string | undefined;
-		if (control?.type === "subscribe") {
-			const key = scopedServiceSubscriptionKey(scope, control.subscriptionId);
-			if (this.#serviceSubscriptions.has(key)) throw new Error("Service subscription ID is already active");
-			this.#serviceSubscriptions.set(key, {
-				worker,
-				scope,
-				listener: (update, updateContext) => publish(control.subscriptionId, update, updateContext),
-				deliveryTail: Promise.resolve(),
-			});
-			addedSubscriptionKey = key;
-		}
-		let response: JsonValue | undefined;
-		try {
-			response = await this.#invoke(worker, scope, call, context);
-		} catch (error) {
-			if (addedSubscriptionKey !== undefined && control?.type === "subscribe") {
-				this.#serviceSubscriptions.delete(addedSubscriptionKey);
-				void this.#invoke(
-					worker,
-					scope,
-					createServiceUnsubscribeCall(control.subscriptionId),
-					BACKGROUND_CONTEXT,
-				).catch(() => {});
-			}
-			throw error;
-		}
-		if (control?.type === "unsubscribe") {
-			this.#serviceSubscriptions.delete(scopedServiceSubscriptionKey(scope, control.subscriptionId));
-		}
-		return response;
 	}
 
 	async #applyDemand(
@@ -317,48 +273,6 @@ export class SessionWorkerManager {
 		return applied;
 	}
 
-	/** Worker operations have no wall-clock timeout: completion, disconnect, replacement, or shutdown settles them. */
-	#invoke(
-		worker: WorkerRecord,
-		scope: WorkerOperationScope,
-		call: ServiceCall,
-		context: Context,
-	): Promise<JsonValue | undefined> {
-		try {
-			this.#operationScope(worker, scope.attachmentId);
-		} catch (error) {
-			return Promise.reject(error);
-		}
-		if (context.abortSignal?.aborted) return Promise.reject(abortError(context.abortSignal));
-		const requestId = randomUUID();
-		let resolve!: (result: JsonValue | undefined) => void;
-		let reject!: (error: Error) => void;
-		const result = new Promise<JsonValue | undefined>((resolvePromise, rejectPromise) => {
-			resolve = resolvePromise;
-			reject = rejectPromise;
-		});
-		const signal = context.abortSignal;
-		const onAbort = (): void => {
-			if (signal === undefined || !this.#pendingOperations.has(requestId)) return;
-			void this.#coordinator.send(worker.peerId, { type: "operation_cancel", requestId, scope }).catch(() => {});
-			this.#rejectOperation(requestId, abortError(signal));
-		};
-		if (signal !== undefined) signal.addEventListener("abort", onAbort, { once: true });
-		this.#pendingOperations.set(requestId, {
-			worker,
-			scope,
-			cleanup: () => signal?.removeEventListener("abort", onAbort),
-			resolve,
-			reject,
-		});
-		void this.#coordinator
-			.send(worker.peerId, { type: "operation", requestId, scope, call })
-			.catch((error: unknown) =>
-				this.#rejectOperation(requestId, error instanceof Error ? error : new Error(String(error))),
-			);
-		return result;
-	}
-
 	#operationScope(worker: WorkerRecord, attachmentId: string): WorkerOperationScope {
 		if (this.#detached || this.#shuttingDown || worker.stopping) {
 			throw new Error("Experimental Session worker is stopping");
@@ -379,7 +293,7 @@ export class SessionWorkerManager {
 	}
 
 	async #stopWorkerInternal(worker: WorkerRecord): Promise<void> {
-		this.#rejectWorkerOperations(worker, new Error("Session worker is stopping"));
+		this.#closeWorkerLinks(worker, "Session worker is stopping");
 		worker.stopping = true;
 		worker.expectedStop = true;
 		void this.#coordinator.send(worker.peerId, { type: "shutdown" }).catch(() => {});
@@ -443,9 +357,7 @@ export class SessionWorkerManager {
 			clearTimeout(pending.timer);
 			pending.reject(new Error("Experimental server was replaced"));
 		}
-		for (const requestId of [...this.#pendingOperations.keys()]) {
-			this.#rejectOperation(requestId, new Error("Experimental server was replaced during a worker operation"));
-		}
+		for (const entry of this.#links.values()) entry.link.close("Experimental server was replaced");
 		this.#detachState();
 	}
 
@@ -530,20 +442,7 @@ export class SessionWorkerManager {
 			if (pending) this.#failPending(pending.sessionKey, new Error("Session worker disconnected during startup"));
 			return;
 		}
-		if (event.type !== "message") return;
-		if (!Check(SessionWorkerEventSchema, event.payload)) {
-			if (
-				typeof event.payload === "object" &&
-				event.payload !== null &&
-				"type" in event.payload &&
-				event.payload.type === "operation_response"
-			) {
-				const worker = this.#workersByPeer.get(event.from);
-				if (worker)
-					this.#rejectWorkerOperations(worker, new Error("Session worker returned an invalid operation response"));
-			}
-			return;
-		}
+		if (event.type !== "message" || !Check(SessionWorkerEventSchema, event.payload)) return;
 		const message: SessionWorkerEvent = event.payload;
 		if (message.type === "worker_failed") {
 			const pending = this.#pending.get(message.sessionKey);
@@ -570,83 +469,19 @@ export class SessionWorkerManager {
 			else pending.reject(new Error(`Session worker rejected demand: ${message.message}`));
 			return;
 		}
-		if (message.type === "operation_response") {
-			this.#handleOperationResponse(event.from, message.token, message.sessionKey, message.response);
-			return;
-		}
-		if (message.type === "service_update") {
-			this.#handleServiceEvent(
-				event.from,
-				message.token,
-				message.sessionKey,
-				message.scope,
-				message.subscriptionId,
-				message.update,
-			);
+		if (message.type === "chord") {
+			const entry = this.#links.get(scopeKey(message.scope));
+			if (
+				entry?.worker.peerId === event.from &&
+				entry.worker.token === message.token &&
+				entry.worker.metadata.path === message.sessionKey
+			) {
+				if (message.frame.t === "bye") entry.link.close(message.frame.reason);
+				else entry.link.send(message.frame);
+			}
 			return;
 		}
 		this.#recordReadyWorker(event.from, message);
-	}
-
-	#handleOperationResponse(
-		peerId: string,
-		token: string,
-		sessionKey: string,
-		response: WorkerOperationResponse,
-	): void {
-		const pending = this.#pendingOperations.get(response.requestId);
-		if (!pending) return;
-		if (
-			pending.worker.peerId !== peerId ||
-			pending.worker.token !== token ||
-			pending.worker.metadata.path !== sessionKey ||
-			response.scope.serverConnectionId !== pending.scope.serverConnectionId ||
-			response.scope.attachmentId !== pending.scope.attachmentId
-		) {
-			this.#rejectOperation(
-				response.requestId,
-				new Error("Session worker returned a mismatched operation response"),
-			);
-			return;
-		}
-		this.#pendingOperations.delete(response.requestId);
-		pending.cleanup();
-		if (response.type === "operation_error") {
-			pending.reject(
-				response.code === undefined
-					? new Error(`Session worker operation failed: ${response.message}`)
-					: new ServerError(response.code, response.message),
-			);
-		} else {
-			pending.resolve(response.result);
-		}
-	}
-
-	#handleServiceEvent(
-		peerId: string,
-		token: string,
-		sessionKey: string,
-		scope: WorkerOperationScope,
-		subscriptionId: string,
-		update: unknown,
-	): void {
-		const entry = this.#serviceSubscriptions.get(scopedServiceSubscriptionKey(scope, subscriptionId));
-		if (
-			entry === undefined ||
-			entry.worker.peerId !== peerId ||
-			entry.worker.token !== token ||
-			entry.worker.metadata.path !== sessionKey ||
-			!sameScope(entry.scope, scope)
-		) {
-			return;
-		}
-		let parsed: ServiceProviderUpdate;
-		try {
-			parsed = parseServiceProviderUpdate(update);
-		} catch {
-			return;
-		}
-		entry.deliveryTail = entry.deliveryTail.then(() => entry.listener(parsed, TODO_CONTEXT)).catch(() => {});
 	}
 
 	#recordReadyWorker(peerId: string, message: Extract<SessionWorkerEvent, { type: "worker_ready" }>): void {
@@ -740,20 +575,6 @@ export class SessionWorkerManager {
 		pending.reject(error);
 	}
 
-	#rejectOperation(requestId: string, error: Error): void {
-		const pending = this.#pendingOperations.get(requestId);
-		if (!pending) return;
-		this.#pendingOperations.delete(requestId);
-		pending.cleanup();
-		pending.reject(error);
-	}
-
-	#rejectWorkerOperations(worker: WorkerRecord, error: Error): void {
-		for (const [requestId, pending] of this.#pendingOperations) {
-			if (pending.worker === worker) this.#rejectOperation(requestId, error);
-		}
-	}
-
 	async #reconcileDemandTimeout(requestId: string): Promise<void> {
 		const pending = this.#pendingDemand.get(requestId);
 		if (!pending) return;
@@ -787,8 +608,7 @@ export class SessionWorkerManager {
 
 	#removeWorker(worker: WorkerRecord, error: Error | undefined): void {
 		if (this.#workersByPeer.get(worker.peerId) !== worker) return;
-		this.#rejectWorkerOperations(worker, new Error("Session worker disconnected during an operation"));
-		this.#removeServiceSubscriptions((entry) => entry.worker === worker);
+		this.#closeWorkerLinks(worker, "Session worker disconnected");
 		for (const pending of [...this.#pendingDemand.values()]) {
 			if (pending.worker === worker) {
 				this.#rejectDemand(pending.requestId, new Error("Session worker disconnected during demand update"));
@@ -801,12 +621,13 @@ export class SessionWorkerManager {
 		this.#notifyWorkerCountChanged();
 	}
 
-	#removeServiceSubscriptions(matches: (entry: WorkerServiceSubscription) => boolean): void {
-		for (const [key, entry] of this.#serviceSubscriptions) {
-			if (matches(entry)) this.#serviceSubscriptions.delete(key);
+	#closeWorkerLinks(worker: WorkerRecord, reason: string): void {
+		for (const [key, entry] of this.#links) {
+			if (entry.worker !== worker) continue;
+			this.#links.delete(key);
+			entry.link.close(reason);
 		}
 	}
-
 	#notifyWorkerCountChanged(): void {
 		this.#onWorkerCountChanged?.(this.#workersBySession.size + this.#pending.size);
 	}
@@ -822,16 +643,14 @@ export class SessionWorkerManager {
 
 	#detachState(): void {
 		this.#removeListener();
-		for (const requestId of [...this.#pendingOperations.keys()]) {
-			this.#rejectOperation(requestId, new Error("Experimental server detached during a worker operation"));
-		}
-		for (const pending of [...this.#pendingDemand.values()]) {
-			this.#pendingDemand.delete(pending.requestId);
+		for (const entry of this.#links.values()) entry.link.close("Experimental server detached");
+		this.#links.clear();
+		for (const pending of this.#pendingDemand.values()) {
 			clearTimeout(pending.timer);
 			pending.resolve();
 		}
+		this.#pendingDemand.clear();
 		this.#pending.clear();
-		this.#serviceSubscriptions.clear();
 		this.#workersByPeer.clear();
 		this.#workersBySession.clear();
 		this.workerPids.clear();
@@ -845,15 +664,6 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
 	return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
-function sameScope(left: WorkerOperationScope, right: WorkerOperationScope): boolean {
-	return left.serverConnectionId === right.serverConnectionId && left.attachmentId === right.attachmentId;
-}
-
-function scopedServiceSubscriptionKey(scope: WorkerOperationScope, subscriptionId: string): string {
-	return `${scope.serverConnectionId}\0${scope.attachmentId}\0${subscriptionId}`;
-}
-
-function abortError(signal: AbortSignal): Error {
-	const reason: unknown = signal.reason;
-	return reason instanceof Error ? reason : new DOMException("The operation was aborted", "AbortError");
+function scopeKey(scope: WorkerOperationScope): string {
+	return `${scope.serverConnectionId}\0${scope.attachmentId}`;
 }

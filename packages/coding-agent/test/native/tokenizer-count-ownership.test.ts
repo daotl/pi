@@ -1,9 +1,11 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeAll, expect, it } from "vitest";
+import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
 import type { AgentSessionEvent } from "../../src/core/agent-session.ts";
 import { estimateProjectedContextTokens } from "../../src/core/compaction/compaction.ts";
 import { FooterComponent } from "../../src/modes/interactive/components/footer.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
+import { ProgramStatusReporter } from "../../src/modes/interactive/program-status-reporter.ts";
 import { initTheme } from "../../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../../src/utils/ansi.ts";
 import { createNativeTokenizerFixture, type NativeTokenizerFixture } from "./tokenizer-fixture.ts";
@@ -136,16 +138,21 @@ it.each(["setter", "overrides"] as const)(
 it("refreshes the footer when an asynchronous exact count finishes without another entry", async () => {
 	const current = await fixture();
 	const component = footer(current);
+	const terminal = new VirtualTerminal(120, 24);
 	const uiContext = {
 		isInitialized: true,
 		footer: component,
 		settingsManager: current.owner.settingsManager,
 		defaultEditor: {},
+		programStatus: new ProgramStatusReporter(
+			() => terminal,
+			() => current.manager.getSessionName(),
+		),
 		clearStatusIndicator: () => {},
 		rebuildChatFromMessages: () => {},
 		flushCompactionQueue: async () => {},
 		fireDueScheduledMessages: () => {},
-		ui: { requestRender: () => {}, terminal: { setProgress: () => {} } },
+		ui: { requestRender: () => {}, terminal },
 	};
 	// This established prototype seam executes the real event consumer without launching a TUI.
 	const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (

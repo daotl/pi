@@ -1,18 +1,7 @@
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
-import {
-	createRemoteServiceBinding,
-	type MutableReplicatedState,
-	RemoteServiceProvider,
-	type RemoteServiceTransport,
-	replicatedState,
-} from "@earendil-works/chord";
+import { createHost, type MutableReplicatedState, type Readable, replicatedState } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import {
-	FACET_BUNDLE_ARTIFACT_FORMAT,
-	FACET_BUNDLE_ARTIFACT_FORMAT_VERSION,
-	type FacetBundleArtifact,
-} from "@earendil-works/chord/node";
 import {
 	type AgentLane,
 	type LaneSnapshot,
@@ -20,10 +9,16 @@ import {
 	type LaneWatchEvent,
 	reduceLaneSnapshot,
 } from "@earendil-works/pi-agent-core";
+import { createRoutedLinkPair } from "@earendil-works/pi-server";
 import { ProcessTerminal, TuiMainScreen } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import { type ClientTuiServer, ExperimentalClientTui } from "../src/experimental/client-tui.ts";
 import { createPresentationFacetData } from "../src/experimental/plugins/bundled.ts";
+import {
+	FACET_BUNDLE_ARTIFACT_FORMAT,
+	FACET_BUNDLE_ARTIFACT_FORMAT_VERSION,
+	type FacetBundleArtifact,
+} from "../src/experimental/plugins/package.ts";
 import { AgentController } from "../src/experimental/services/agent-controller.ts";
 import { createAgentController } from "../src/experimental/services/agent-controller-provider.ts";
 import type {
@@ -49,22 +44,21 @@ function session(sessionId: string, createdAt: number): SessionSummary {
 	return { serverId, sessionId, createdAt };
 }
 
-function createLoopbackServiceTransport(provider: RemoteServiceProvider): RemoteServiceTransport {
-	return {
-		invoke: (call, context) => provider.invoke(call, context),
-		subscribe: async (serviceId, mode, listener) => {
-			const subscription = provider.subscribe(serviceId, mode, (update) => listener(update, BACKGROUND_CONTEXT));
-			return {
-				snapshot: subscription.snapshot,
-				activate: () => subscription.activate(),
-				close: () => subscription.close(),
-			};
-		},
-	};
-}
-
 function publishReplacement<T extends object>(state: MutableReplicatedState<T>, value: T): void {
 	state.replace(BACKGROUND_CONTEXT, value);
+}
+
+function readable<T extends object>(state: MutableReplicatedState<T>): Readable<T> {
+	return {
+		get value() {
+			return state.value;
+		},
+		subscribe: (listener) => state.subscribe(listener),
+		events: (listener) =>
+			state.subscribe((value, _context, delivery) =>
+				listener({ type: delivery.kind === "hydrate" ? "snap" : "reset", value }),
+			),
+	};
 }
 
 function laneSnapshot(): LaneSnapshot {
@@ -126,12 +120,12 @@ describe("experimental client TUI", () => {
 				});
 				return created;
 			});
-			const select = vi.fn(async (model: { provider: string; modelId: string }) => {
+			const select = vi.fn(async (model: { provider: string; modelId: string }, _context: unknown) => {
 				modelsState.change(BACKGROUND_CONTEXT, (draft) => {
 					draft.configuration.model = model;
 				});
 			});
-			const selectThinking = vi.fn(async (thinkingLevel: "off" | "high") => {
+			const selectThinking = vi.fn(async (thinkingLevel: "off" | "high", _context: unknown) => {
 				modelsState.change(BACKGROUND_CONTEXT, (draft) => {
 					draft.configuration.thinkingLevel = thinkingLevel;
 				});
@@ -217,14 +211,14 @@ describe("experimental client TUI", () => {
 			});
 
 			const reloadSource =
-				'"use strict";\nconst { defineFacet, defineService } = require("@earendil-works/chord");\nconst Models = defineService("pi.models");\nmodule.exports = { __esModule: true, default: defineFacet({ id: "test-tui-facet", setup(env) { env.use(Models); } }) };\n';
+				'import { defineFacet } from "@earendil-works/chord"; export default defineFacet(() => {});\n';
 			const reloadArtifact: FacetBundleArtifact = {
 				format: FACET_BUNDLE_ARTIFACT_FORMAT,
 				formatVersion: FACET_BUNDLE_ARTIFACT_FORMAT_VERSION,
 				plugin: { id: "test-tui-plugin" },
 				entryName: "tui",
 				entry: {
-					file: "tui.cjs",
+					file: "tui.mjs",
 					integrity: `sha256-${createHash("sha256").update(reloadSource).digest("base64")}`,
 					externalImports: ["@earendil-works/chord"],
 				},
@@ -234,13 +228,15 @@ describe("experimental client TUI", () => {
 			const prepareSessionPlugins = vi.fn(async () => reloadData);
 			const reloadPresentationPlugins = vi.fn(async () => reloadData);
 			const reloadSessionPlugins = vi.fn(async () => {});
-			const serverProvider = new RemoteServiceProvider([SessionDirectory, SessionManagement, PresentationPlugins]);
-			serverProvider.provide(SessionDirectory, { state: directoryState });
-			serverProvider.provide(PresentationPlugins, {
+			const serverProvider = createHost({ name: "server", self: "server" });
+			serverProvider.serve(SessionDirectory, () => ({ variant: "active", state: readable(directoryState) }));
+			serverProvider.serve(PresentationPlugins, () => ({
+				variant: "active",
 				prepareSession: prepareSessionPlugins,
 				reload: reloadPresentationPlugins,
-			});
-			serverProvider.provide(SessionManagement, {
+			}));
+			serverProvider.serve(SessionManagement, () => ({
+				variant: "active",
 				create,
 				async remove() {},
 				async attach(sessionId) {
@@ -249,79 +245,46 @@ describe("experimental client TUI", () => {
 				async detach() {
 					publishReplacement(attachment, { status: "detached" });
 				},
-			});
-			const sessionProvider = new RemoteServiceProvider([Models, AgentController, SessionPlugins, Transcript]);
-			sessionProvider.provide(SessionPlugins, { reload: reloadSessionPlugins });
-			sessionProvider.provide(Models, {
-				state: modelsState,
+			}));
+			const sessionProvider = createHost({ name: "session", self: "worker" });
+			sessionProvider.serve(SessionPlugins, () => ({ variant: "active", reload: reloadSessionPlugins }));
+			sessionProvider.serve(Models, () => ({
+				variant: "active",
+				state: readable(modelsState),
 				async cycleThinking() {},
-				async getThinkingLevels() {
-					return ["off", "high"];
-				},
+				getThinkingLevels: () => ["off", "high"],
 				async refresh() {},
 				select,
-				selectThinking,
+				selectThinking: (level, ctx) => selectThinking(level as "off" | "high", ctx),
+			}));
+			sessionProvider.serve(AgentController, () => ({
+				variant: "active",
+				...createAgentController({ prompt } as unknown as AgentLane),
+			}));
+			sessionProvider.serve(Transcript, () => ({ variant: "active", state: readable(transcriptState) }));
+			const host = createHost({ name: "presentation", kind: "client", self: "presentation" });
+			const [serverLink, serverRemote] = createRoutedLinkPair();
+			const [sessionLink, sessionRemote] = createRoutedLinkPair();
+			serverProvider.accept(serverLink, { principal: "presentation", kind: "client" });
+			sessionProvider.accept(sessionLink, { principal: "presentation", kind: "client" });
+			host.route("server", { authorize: () => true, resolve: async () => serverRemote, principal: () => "server" });
+			host.route("session", {
+				authorize: () => true,
+				resolve: async () => sessionRemote,
+				principal: () => "session",
 			});
-			sessionProvider.provide(AgentController, createAgentController({ prompt } as unknown as AgentLane));
-			sessionProvider.provide(Transcript, { state: transcriptState });
-
-			const serverNamespace = createRemoteServiceBinding({
-				services: [SessionDirectory, SessionManagement, PresentationPlugins],
-				transport: createLoopbackServiceTransport(serverProvider),
-				bound: false,
-			});
-			const serverNamespaceReady = serverNamespace.ready.bind(serverNamespace);
-			const serverServices: ServerServiceSource = Object.assign(serverNamespace, {
-				acceptsUnavailableServices: false,
-				connection: connectionState,
-				async catalogue() {
-					return serverProvider.catalogue;
-				},
-				open() {
-					return {
-						use: serverNamespace.use.bind(serverNamespace),
-						observe: serverNamespace.observe.bind(serverNamespace),
-						async ready() {
-							await serverNamespace.rebind(true, BACKGROUND_CONTEXT);
-							await serverNamespaceReady(BACKGROUND_CONTEXT);
-						},
-						async dispose() {},
-					};
-				},
-				async ready() {
-					await serverNamespace.rebind(true, BACKGROUND_CONTEXT);
-					await serverNamespaceReady(BACKGROUND_CONTEXT);
-				},
-			});
-			const sessionNamespace = createRemoteServiceBinding({
-				services: [Models, AgentController, SessionPlugins, Transcript],
-				transport: createLoopbackServiceTransport(sessionProvider),
-				bound: false,
-			});
-			const sessionServices: SessionServiceSource = Object.assign(sessionNamespace, {
-				acceptsUnavailableServices: true,
+			const serverServices: ServerServiceSource = { host, connection: connectionState, async dispose() {} };
+			const sessionServices: SessionServiceSource = {
+				host,
 				attachment,
-				async catalogue() {
-					return [];
-				},
-				open() {
-					return {
-						use: sessionNamespace.use.bind(sessionNamespace),
-						observe: sessionNamespace.observe.bind(sessionNamespace),
-						ready: sessionNamespace.ready.bind(sessionNamespace),
-						async dispose() {},
-					};
-				},
-				async whenAttached(sessionId: string) {
-					await sessionNamespace.rebind(true, BACKGROUND_CONTEXT);
-					await sessionNamespace.ready(BACKGROUND_CONTEXT);
+				async whenAttached(sessionId) {
 					publishReplacement(attachment, { status: "attached", sessionId });
 				},
 				async whenDetached() {
-					await sessionNamespace.rebind(false, BACKGROUND_CONTEXT);
 					publishReplacement(attachment, { status: "detached" });
 				},
-			});
+				async dispose() {},
+			};
 			const server: ClientTuiServer = {
 				serverId,
 				radius: true,
@@ -365,7 +328,7 @@ describe("experimental client TUI", () => {
 
 				component.handleInput("hello");
 				component.handleInput("\r");
-				await vi.waitFor(() => expect(prompt).toHaveBeenCalledWith("hello", undefined, BACKGROUND_CONTEXT));
+				await vi.waitFor(() => expect(prompt).toHaveBeenCalledWith("hello", undefined, expect.anything()));
 				await vi.waitFor(() => expect(component.render(80).join("\n")).toContain("Working..."));
 				finishPrompt();
 				await vi.waitFor(() => expect(component.render(80).join("\n")).toContain("remote answer"));
@@ -438,12 +401,7 @@ describe("experimental client TUI", () => {
 				expect(requestRender).toHaveBeenCalledTimes(rendersAfterClose);
 			} finally {
 				await component.close();
-				await Promise.all([
-					serverNamespace.dispose(BACKGROUND_CONTEXT),
-					sessionNamespace.dispose(BACKGROUND_CONTEXT),
-				]);
-				serverProvider.dispose();
-				sessionProvider.dispose();
+				await Promise.all([host.close(), serverProvider.close(), sessionProvider.close()]);
 			}
 		},
 	);

@@ -183,7 +183,7 @@ describe("streamHarnessAssistant", () => {
 			deferred: { window: "1h" },
 			reasoning: "high",
 			signal: controller.signal,
-			telemetryContext: NOOP_TELEMETRY_CONTEXT,
+			telemetry: NOOP_TELEMETRY_CONTEXT,
 		});
 		expect(responseMetadata).toEqual({ status: 201, headers: { "request-id": "r1" } });
 		expect(starts).toHaveLength(1);

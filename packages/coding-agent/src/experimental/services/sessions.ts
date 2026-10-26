@@ -1,5 +1,6 @@
-import { type Context, defineService, type ReplicatedState } from "@earendil-works/chord";
+import { type Ctx as Context, hostNamed, method, type Readable, remote } from "@earendil-works/chord";
 import type { ServerId } from "@earendil-works/pi-protocol";
+import { Type } from "typebox";
 
 export interface SessionAddress {
 	serverId: ServerId;
@@ -20,10 +21,21 @@ export interface SessionDirectoryState {
 }
 
 export interface SessionDirectory {
-	readonly state: ReplicatedState<SessionDirectoryState>;
+	readonly state: Readable<SessionDirectoryState>;
 }
 
-export const SessionDirectory = defineService<SessionDirectory>("pi.session-directory");
+export const SessionSummarySchema = Type.Unsafe<SessionSummary>(
+	Type.Object({ serverId: Type.String(), sessionId: Type.String(), createdAt: Type.Number() }),
+);
+export const SessionDirectoryStateSchema = Type.Unsafe<SessionDirectoryState>(
+	Type.Object({ revision: Type.Number(), sessions: Type.Array(SessionSummarySchema) }),
+);
+export const SessionDirectory = remote("pi.session-directory", {
+	version: 1,
+	input: Type.Object({}),
+	host: hostNamed("server"),
+	variants: { active: { state: { state: SessionDirectoryStateSchema } } },
+});
 
 export interface SessionManagement {
 	create(options: SessionCreateOptions, context: Context): Promise<SessionSummary>;
@@ -32,4 +44,18 @@ export interface SessionManagement {
 	detach(context: Context): Promise<void>;
 }
 
-export const SessionManagement = defineService<SessionManagement>("pi.session-management");
+export const SessionManagement = remote("pi.session-management", {
+	version: 1,
+	input: Type.Object({}),
+	host: hostNamed("server"),
+	variants: {
+		active: {
+			methods: {
+				create: method(Type.Object({ id: Type.Optional(Type.String()) }), SessionSummarySchema),
+				remove: method(Type.String()),
+				attach: method(Type.String()),
+				detach: method(),
+			},
+		},
+	},
+});

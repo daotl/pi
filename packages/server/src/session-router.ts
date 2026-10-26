@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { JsonValue, ServiceCall, ServiceProviderUpdate } from "@earendil-works/chord";
+import type { Frame } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, type Context, type SessionMetadata } from "@earendil-works/pi-agent-core";
 import type { RpcTarget, SessionTarget } from "@earendil-works/pi-protocol";
 import { ServerDrainingError, SessionNotAttachedError } from "./errors.ts";
@@ -11,7 +11,6 @@ interface ClientAttachment {
 	readonly id: string;
 	readonly client: object;
 	readonly session: HostedSession;
-	readonly operations: Set<Promise<unknown>>;
 	acquiring?: Promise<RoutedSessionAttachment>;
 	lease?: RoutedSessionAttachment;
 	releasing?: Promise<void>;
@@ -28,6 +27,7 @@ interface SessionRouterOptions<TMetadata extends SessionMetadata> {
 	serverId: string;
 	isClosing: () => boolean;
 	publishAttachment(client: object, attachment: SessionTarget | undefined, context: Context): Promise<void>;
+	publishFrame(client: object, target: SessionTarget, frame: Frame): Promise<void>;
 	reportError: (error: unknown) => void;
 }
 
@@ -44,17 +44,12 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 		this.options = options;
 	}
 
-	async executeServiceCall(
-		call: ServiceCall,
-		target: RpcTarget,
-		client: object,
-		publish: (subscriptionId: string, update: ServiceProviderUpdate, context: Context) => Promise<void>,
-		context: Context,
-	): Promise<JsonValue | undefined> {
-		const admitted = await this.runForClient(client, () =>
-			this.startServiceCall(client, target, call, publish, context),
-		);
-		return admitted.result;
+	forwardFrame(frame: Frame, target: RpcTarget, client: object): Promise<void> {
+		return this.runForClient(client, async () => {
+			const attachment = this.requireAttachment(client, target);
+			if (frame.t === "bye") attachment.lease!.link.close(frame.reason);
+			else attachment.lease!.link.send(frame);
+		});
 	}
 
 	attachClient(client: object, sessionId: string, context: Context): Promise<void> {
@@ -160,7 +155,7 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 	private async attachClientNow(client: object, sessionId: string, context: Context): Promise<void> {
 		if (this.options.isClosing() || this.disconnectedClients.has(client)) throw new ServerDrainingError();
 		const current = this.attachmentsByClient.get(client);
-		if (current?.session.id === sessionId) return;
+		if (current?.session.id === sessionId && current.lease?.link.closed === false) return;
 		const hosted = await this.acquire(sessionId, context);
 		if (this.options.isClosing() || this.disconnectedClients.has(client)) throw new ServerDrainingError();
 		if (current) await this.releaseAttachment(current, context, false);
@@ -168,7 +163,6 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 			id: randomUUID(),
 			client,
 			session: hosted,
-			operations: new Set(),
 		};
 		hosted.attachments.add(attachment);
 		try {
@@ -194,31 +188,15 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 			{ serverId: this.options.serverId, sessionId, attachmentId: attachment.id },
 			context,
 		);
-	}
-
-	private async startServiceCall(
-		client: object,
-		target: RpcTarget,
-		call: ServiceCall,
-		publish: (subscriptionId: string, update: ServiceProviderUpdate, context: Context) => Promise<void>,
-		context: Context,
-	): Promise<{ result: Promise<JsonValue | undefined> }> {
-		const attachment = this.requireAttachment(client, target);
-		const result = attachment.lease!.invokeService(
-			call,
-			(subscriptionId, update, updateContext) => publish(subscriptionId, update, updateContext),
-			context,
-		);
-		this.trackOperation(attachment, result);
-		return { result };
-	}
-
-	private trackOperation(attachment: ClientAttachment, result: Promise<unknown>): void {
-		attachment.operations.add(result);
-		const remove = (): void => {
-			attachment.operations.delete(result);
-		};
-		void result.then(remove, remove);
+		const target: SessionTarget = { serverId: this.options.serverId, sessionId, attachmentId: attachment.id };
+		attachment.lease.link.receive((frame) => {
+			if (this.attachmentsByClient.get(client) !== attachment) return;
+			void this.options.publishFrame(client, target, frame).catch(this.options.reportError);
+		});
+		attachment.lease.link.onClose((reason) => {
+			if (this.attachmentsByClient.get(client) !== attachment) return;
+			void this.options.publishFrame(client, target, { t: "bye", reason }).catch(this.options.reportError);
+		});
 	}
 
 	private requireAttachment(client: object, target: RpcTarget): ClientAttachment {
@@ -235,10 +213,12 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 		attachment.releasing ??= (async () => {
 			const errors: unknown[] = [];
 			try {
-				await Promise.allSettled(attachment.operations);
 				try {
 					const lease = attachment.lease ?? (await attachment.acquiring);
-					if (lease) await lease.release(context);
+					if (lease) {
+						lease.link.close("attachment released");
+						await lease.release(context);
+					}
 				} catch (error) {
 					errors.push(error);
 				}

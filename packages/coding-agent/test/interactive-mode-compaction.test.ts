@@ -37,6 +37,8 @@ describe("InteractiveMode compaction events", () => {
 			isInitialized: true,
 			footer: { invalidate: vi.fn() },
 			autoCompactionEscapeHandler: undefined as (() => void) | undefined,
+			programStatus: { handleEvent: vi.fn() },
+			editor: {},
 			retryEscapeHandler: undefined as (() => void) | undefined,
 			defaultEditor: { onEscape: defaultEscape as () => void },
 			settingsManager: { getShowTerminalProgress: () => true },
@@ -121,6 +123,7 @@ describe("InteractiveMode compaction events", () => {
 		const fakeThis = {
 			isInitialized: true,
 			footer: { invalidate: vi.fn() },
+			programStatus: { handleEvent: vi.fn() },
 			activeStatusIndicator: undefined,
 			workingVisible: true,
 			showWorkingStatusIndicator: vi.fn(),
@@ -197,6 +200,7 @@ describe("InteractiveMode compaction events", () => {
 		manager.appendCompaction("newest marker", kept, 200, undefined, true, newerUsage, 1);
 		manager.appendMessage(fauxAssistantMessage("retained answer"));
 		let boundaryCommitted = false;
+		const transformedMessages: Array<{ markdown: string; messageId?: string; timestamp?: string }> = [];
 		const settings = {
 			quietStartup: true,
 			retry: { enabled: false },
@@ -209,6 +213,10 @@ describe("InteractiveMode compaction events", () => {
 			settings,
 			extensionFactories: [
 				(pi) => {
+					pi.registerMarkdownTransformer((markdown, context) => {
+						transformedMessages.push({ markdown, messageId: context.messageId, timestamp: context.timestamp });
+						return markdown;
+					});
 					pi.on("session_before_compact", () => ({
 						compaction: {
 							summary: "manual marker",
@@ -365,6 +373,15 @@ describe("InteractiveMode compaction events", () => {
 			await observedTerminal.waitForRender();
 			const viewport = observedTerminal.getScrollBuffer().join("\n");
 			for (const label of expected) expect(viewport).toContain(label);
+			if (phase !== "reopen") {
+				const retained = observedManager.getEntry(kept);
+				if (!retained) throw new Error("Missing retained message");
+				expect(transformedMessages.filter(({ markdown }) => markdown === "retained marker")).toContainEqual({
+					markdown: "retained marker",
+					messageId: kept,
+					timestamp: retained.timestamp,
+				});
+			}
 		} finally {
 			reopenedMode?.stop();
 			await reopenedRuntime?.dispose();

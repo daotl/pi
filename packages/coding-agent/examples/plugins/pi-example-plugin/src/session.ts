@@ -1,12 +1,17 @@
 import { defineFacet } from "@earendil-works/chord";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { ExampleFacetService } from "./contract.ts";
 
-export default defineFacet({
-	id: "@earendil-works/pi-example-plugin/session",
-	setup(env) {
-		const workerActivations = env.replicatedState({ count: 0 });
-		env.provide(ExampleFacetService, {
+let activations = 0;
+
+export default defineFacet(({ serve }) => {
+	serve(ExampleFacetService, (_input, _principal, self) => {
+		const workerActivations = self.state(
+			"workerActivations",
+			ExampleFacetService.def.variants.greeting.state.workerActivations,
+			{ init: () => ({ count: ++activations }) },
+		);
+		return {
+			variant: "greeting",
 			workerActivations,
 			async greet({ name }) {
 				return {
@@ -14,11 +19,6 @@ export default defineFacet({
 					workerActivations: workerActivations.value.count,
 				};
 			},
-		});
-		env.onActivate(() => {
-			workerActivations.change(BACKGROUND_CONTEXT, (draft) => {
-				draft.count += 1;
-			});
-		});
-	},
+		};
+	});
 });

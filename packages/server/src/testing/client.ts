@@ -1,12 +1,9 @@
 import { once } from "node:events";
 import { createConnection, type Socket } from "node:net";
-import type { JsonValue, ServiceCall } from "@earendil-works/chord";
 import {
 	type ClientMessage,
 	encodeClientMessage,
 	PROTOCOL_VERSION,
-	type ResponseEnvelope,
-	type RpcTarget,
 	type ServerMessage,
 	ServerMessageDecoder,
 } from "@earendil-works/pi-protocol";
@@ -30,8 +27,6 @@ export class ProtocolTestClient {
 	private readonly decoder = new ServerMessageDecoder();
 	private readonly waiters = new Set<MessageWaiter>();
 	private readonly closedDeferred = new Deferred<void>();
-	private requestSequence = 0;
-	private attachment: { sessionId: string; attachmentId: string } | undefined;
 	private closedValue = false;
 
 	constructor(channel: WireChannel) {
@@ -46,39 +41,6 @@ export class ProtocolTestClient {
 		const response = this.next((message) => message.type === "hello" || message.type === "hello_error");
 		void this.sendMessage({ type: "hello", version });
 		return response;
-	}
-
-	async requestService(
-		target: RpcTarget,
-		call: ServiceCall,
-		id = `request-${++this.requestSequence}`,
-	): Promise<ResponseEnvelope> {
-		const response = this.next(
-			(message): message is ResponseEnvelope => message.type === "response" && message.id === id,
-		);
-		await this.sendMessage({ type: "request", id, target, call: call as unknown as JsonValue });
-		return (await response) as ResponseEnvelope;
-	}
-
-	attach(serverId: string, sessionId: string): Promise<ResponseEnvelope> {
-		return this.requestService(
-			{ serverId },
-			{ serviceId: "pi.session-management", member: "attach", args: [sessionId] },
-		);
-	}
-
-	requestSessionService(
-		serverId: string,
-		sessionId: string,
-		call: ServiceCall,
-		id?: string,
-	): Promise<ResponseEnvelope> {
-		const attachment = this.attachment;
-		const target: RpcTarget =
-			attachment === undefined || attachment.sessionId !== sessionId
-				? { serverId, sessionId, attachmentId: "missing-attachment" }
-				: { serverId, ...attachment };
-		return this.requestService(target, call, id);
 	}
 
 	sendMessage(message: ClientMessage): Promise<void> {
@@ -115,15 +77,6 @@ export class ProtocolTestClient {
 	receive(chunk: Uint8Array): void {
 		try {
 			for (const message of this.decoder.push(chunk)) {
-				if (message.type === "attachment") {
-					this.attachment =
-						message.attachment === null
-							? undefined
-							: {
-									sessionId: message.attachment.sessionId,
-									attachmentId: message.attachment.attachmentId,
-								};
-				}
 				this.messages.push(message);
 				for (const waiter of this.waiters) {
 					if (!waiter.predicate(message)) continue;

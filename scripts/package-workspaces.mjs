@@ -1,7 +1,7 @@
 import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
-const SKIPPED_DIRECTORIES = new Set(["dist", "node_modules"]);
+const SKIPPED_DIRECTORIES = new Set([".artifacts", "binaries", "coverage", "dist", "node_modules", "out"]);
 
 export function findPackageDirectories(root = "packages") {
 	const packageDirectories = [];
@@ -15,6 +15,7 @@ export function findPackageDirectories(root = "packages") {
 			if (!entry.isDirectory() || SKIPPED_DIRECTORIES.has(entry.name)) {
 				continue;
 			}
+			if (entry.name === "target" && basename(directory) === "daemon") continue;
 			visit(join(directory, entry.name));
 		}
 	}

@@ -118,6 +118,11 @@ describe("model catalog protocol with the current client", () => {
 			if (new URL(request.url).origin !== "https://openrouter.ai") {
 				throw new Error(`Unexpected fixture network target: ${request.url}`);
 			}
+			if (request.method === "GET" && new URL(request.url).pathname === "/api/v1/models/user") {
+				expect(request.headers.get("authorization")).toBe("Bearer test-key");
+				return Response.json({ data: [{ id: modelId }] });
+			}
+			if (request.method !== "POST") throw new Error(`Unexpected fixture request: ${request.method} ${request.url}`);
 			providerUrl = new URL(request.url);
 			throw new Error("Provider request captured");
 		});

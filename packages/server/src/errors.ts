@@ -1,7 +1,7 @@
-import type { RemoteServiceErrorCode } from "@earendil-works/chord";
+import type { ChordErrorCode } from "@earendil-works/chord";
 
 type ServerOperationErrorCode =
-	| RemoteServiceErrorCode
+	| ChordErrorCode
 	| "wrong_server"
 	| "session_not_found"
 	| "session_ambiguous"

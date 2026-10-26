@@ -1,399 +1,184 @@
 import {
-	type Context,
-	createRemoteServiceBinding,
+	createHost,
+	type Host,
+	type Link,
 	type MutableReplicatedState,
-	type RemoteServiceBinding,
-	type RemoteServiceSource,
-	type RemoteServices,
-	type RemoteServiceTransport,
 	type ReplicatedState,
 	replicatedState,
-	type Service,
-	type ServiceCatalogueEntry,
 } from "@earendil-works/chord";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { type Client, createClientServiceTransport } from "@earendil-works/pi-client";
-import type { SessionTarget } from "@earendil-works/pi-protocol";
+import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
+import { type Client, createClientChordLink } from "@earendil-works/pi-client";
+import { SessionPlugins } from "./plugins.ts";
 
 export type ServerConnectionState =
 	| { status: "connecting"; attempt: number }
 	| { status: "connected"; since: string }
 	| { status: "disconnected"; since: string; reason: string; retryAt: string | null };
-
 export type SessionAttachmentState =
 	| { status: "detached" }
 	| { status: "attaching" | "attached" | "degraded"; sessionId: string };
-
-export interface ServerServiceSource extends RemoteServiceSource {
+export interface ServerServiceSource {
+	readonly host: Host;
 	readonly connection: ReplicatedState<ServerConnectionState>;
 	dispose(context: Context): Promise<void>;
 }
-
-export interface SessionServiceSource extends RemoteServiceSource {
+export interface SessionServiceSource {
+	readonly host: Host;
 	readonly attachment: ReplicatedState<SessionAttachmentState>;
-	/** Wait for the exact current attachment generation to finish hydrating. */
 	whenAttached(sessionId: string, context: Context): Promise<void>;
-	/** Wait for every binding to finish releasing the previous attachment. */
 	whenDetached(context: Context): Promise<void>;
 	dispose(context: Context): Promise<void>;
 }
-
 export interface ServiceSourceOptions {
 	readonly onError?: (error: Error) => void;
 }
 
-class RoutedServiceBinding implements RemoteServices {
-	readonly #services: RemoteServiceBinding;
-	readonly #getBound: () => boolean;
-	readonly #onActivate: (context: Context) => Promise<void>;
-	readonly #remove: () => void;
-	#activated = false;
-	#activationComplete = false;
-
-	constructor(options: {
-		readonly services: readonly { readonly id: string }[];
-		readonly transport: RemoteServiceTransport;
-		readonly getBound: () => boolean;
-		readonly assertAccess: () => void;
-		readonly onError: (error: Error) => void;
-		readonly onActivate?: (context: Context) => Promise<void>;
-		readonly remove: () => void;
-	}) {
-		this.#services = createRemoteServiceBinding({
-			services: options.services,
-			transport: options.transport,
-			bound: false,
-			assertAccess: options.assertAccess,
-			onError: options.onError,
-		});
-		this.#getBound = options.getBound;
-		this.#onActivate = options.onActivate ?? (() => Promise.resolve());
-		this.#remove = options.remove;
-	}
-
-	use<T>(service: Service<T>): T {
-		return this.#services.use(service);
-	}
-
-	observe<T>(service: Service<T>, handler: (service: T, context: Context) => void | Promise<void>): () => void {
-		return this.#services.observe(service, handler);
-	}
-
-	async ready(context: Context): Promise<void> {
-		if (!this.#activated) {
-			this.#activated = true;
-			await this.#services.rebind(this.#getBound(), context);
-		}
-		await this.serviceReady(context);
-		if (!this.#activationComplete) {
-			await this.#onActivate(context);
-			this.#activationComplete = true;
-		}
-	}
-
-	serviceReady(context: Context): Promise<void> {
-		return this.#services.ready(context);
-	}
-
-	updateBound(bound: boolean, context: Context): Promise<void> {
-		return this.#activated ? this.#services.rebind(bound, context) : Promise.resolve();
-	}
-
-	async dispose(context: Context): Promise<void> {
-		this.#remove();
-		await this.#services.dispose(context);
-	}
+interface ClientHosts {
+	readonly host: Host;
+	readonly removeConnectionListener: () => void;
+	references: number;
 }
-
-class ServerServiceSourceImpl implements ServerServiceSource {
-	readonly acceptsUnavailableServices = false;
-	readonly connection: ReplicatedState<ServerConnectionState>;
-	readonly #client: Client;
-	readonly #transport: RemoteServiceTransport;
-	readonly #bindings = new Set<RoutedServiceBinding>();
-	readonly #removeConnectionListener: () => void;
-	readonly #onError: (error: Error) => void;
-	#transition = Promise.resolve();
-	#connectionAttempt: number;
-	#disposed = false;
-
-	constructor(client: Client, options: ServiceSourceOptions) {
-		this.#client = client;
-		this.#transport = createClientServiceTransport(client, () => ({ serverId: client.serverId }));
-		this.#onError = options.onError ?? (() => {});
-		this.#connectionAttempt = client.connectionState === "connecting" ? 1 : 0;
-		const connectionState = replicatedState<ServerConnectionState>(
-			toServerConnectionState(client, this.#connectionAttempt),
-		);
-		this.connection = connectionState;
-		this.#removeConnectionListener = client.onConnectionStateChange(({ state, error }) => {
-			if (state === "connecting") this.#connectionAttempt += 1;
-			publishReplacement(
-				connectionState,
-				toServerConnectionState(client, this.#connectionAttempt, error),
-				BACKGROUND_CONTEXT,
-			);
-			this.#transition = this.#transition
-				.then(async () => {
-					const results = await Promise.allSettled(
-						[...this.#bindings].map((binding) => binding.updateBound(state === "connected", BACKGROUND_CONTEXT)),
-					);
-					const failures = results.filter(
-						(result): result is PromiseRejectedResult => result.status === "rejected",
-					);
-					if (failures.length > 0) throw new AggregateError(failures.map(({ reason }) => reason));
-				})
-				.catch((transitionError: unknown) => this.#onError(toError(transitionError)));
+const clients = new WeakMap<Client, ClientHosts>();
+function acquireHost(client: Client, options: ServiceSourceOptions): ClientHosts {
+	let shared = clients.get(client);
+	if (shared === undefined) {
+		const host = createHost({
+			name: "presentation",
+			kind: "client",
+			self: "presentation",
+			onError: (error) => options.onError?.(error instanceof Error ? error : new Error(String(error))),
 		});
-	}
-
-	catalogue(context: Context) {
-		return this.#client.serviceCatalogue({ serverId: this.#client.serverId }, context.abortSignal);
-	}
-
-	open(options: {
-		readonly services: readonly { readonly id: string }[];
-		assertAccess(): void;
-		onError(error: Error): void;
-	}): RemoteServices {
-		if (this.#disposed) throw new Error("Server service source is disposed");
-		let binding!: RoutedServiceBinding;
-		binding = new RoutedServiceBinding({
-			services: options.services,
-			transport: this.#transport,
-			getBound: () => this.#client.connected,
-			assertAccess: options.assertAccess,
-			onError: options.onError,
-			remove: () => this.#bindings.delete(binding),
-		});
-		this.#bindings.add(binding);
-		return binding;
-	}
-
-	async dispose(context: Context): Promise<void> {
-		if (this.#disposed) return;
-		this.#disposed = true;
-		this.#removeConnectionListener();
-		await this.#transition;
-		const bindings = [...this.#bindings];
-		this.#bindings.clear();
-		const results = await Promise.allSettled(bindings.map((binding) => binding.dispose(context)));
-		throwFailures(results, "Failed to dispose server service source");
-	}
-}
-
-class SessionServiceSourceImpl implements SessionServiceSource {
-	readonly attachment: ReplicatedState<SessionAttachmentState>;
-	readonly #client: Client;
-	readonly #transport: RemoteServiceTransport;
-	readonly #attachmentState: MutableReplicatedState<SessionAttachmentState>;
-	readonly #bindings = new Set<RoutedServiceBinding>();
-	readonly #removeAttachmentListener: () => void;
-	readonly #onError: (error: Error) => void;
-	readonly #transitions = new Set<Promise<void>>();
-	#catalogue: readonly ServiceCatalogueEntry[] | undefined;
-	#attachmentRevision = 0;
-	#disposed = false;
-
-	get acceptsUnavailableServices(): boolean {
-		return this.#client.attachment === undefined && this.#catalogue === undefined;
-	}
-
-	constructor(client: Client, options: ServiceSourceOptions) {
-		this.#client = client;
-		this.#transport = createClientServiceTransport(client, () => client.attachment);
-		this.#onError = options.onError ?? (() => {});
-		this.#attachmentState = replicatedState<SessionAttachmentState>(
-			client.attachment === undefined
-				? { status: "detached" }
-				: { status: "attaching", sessionId: client.attachment.sessionId },
-		);
-		this.attachment = this.#attachmentState;
-		this.#removeAttachmentListener = client.onAttachmentChange((attachment) => {
-			const revision = ++this.#attachmentRevision;
-			if (attachment !== undefined) {
-				publishReplacement(
-					this.#attachmentState,
-					{ status: "attaching", sessionId: attachment.sessionId },
-					BACKGROUND_CONTEXT,
-				);
-				void this.#client.serviceCatalogue(attachment).then(
-					(catalogue) => {
-						if (this.#attachmentRevision === revision && sameAttachment(this.#client.attachment, attachment)) {
-							this.#catalogue = catalogue;
-						}
-					},
-					(error: unknown) => this.#onError(toError(error)),
-				);
-			}
-			const transition = this.#rebind(attachment !== undefined, BACKGROUND_CONTEXT);
-			this.#transitions.add(transition);
-			void transition.then(
-				() => {
-					this.#transitions.delete(transition);
-					if (this.#attachmentRevision !== revision || !sameAttachment(this.#client.attachment, attachment))
-						return;
-					publishReplacement(
-						this.#attachmentState,
-						attachment === undefined
-							? { status: "detached" }
-							: { status: "attached", sessionId: attachment.sessionId },
-						BACKGROUND_CONTEXT,
-					);
-				},
-				(error: unknown) => {
-					this.#transitions.delete(transition);
-					if (this.#attachmentRevision !== revision || !sameAttachment(this.#client.attachment, attachment))
-						return;
-					publishReplacement(
-						this.#attachmentState,
-						attachment === undefined
-							? { status: "detached" }
-							: { status: "degraded", sessionId: attachment.sessionId },
-						BACKGROUND_CONTEXT,
-					);
-					this.#onError(toError(error));
-				},
-			);
-		});
-	}
-
-	async catalogue(context: Context): Promise<readonly ServiceCatalogueEntry[]> {
-		const target = this.#client.attachment;
-		if (target === undefined) return this.#catalogue ?? [];
-		const catalogue = await this.#client.serviceCatalogue(target, context.abortSignal);
-		this.#catalogue = catalogue;
-		return catalogue;
-	}
-
-	open(options: {
-		readonly services: readonly { readonly id: string }[];
-		assertAccess(): void;
-		onError(error: Error): void;
-	}): RemoteServices {
-		if (this.#disposed) throw new Error("Session service source is disposed");
-		let binding!: RoutedServiceBinding;
-		binding = new RoutedServiceBinding({
-			services: options.services,
-			transport: this.#transport,
-			getBound: () => this.#client.attachment !== undefined,
-			onActivate: async (context) => {
-				const attachment = this.#client.attachment;
-				if (attachment === undefined) await this.#whenDetached(this.#attachmentRevision, context);
-				else await this.#whenAttached(attachment, this.#attachmentRevision, context);
+		let serverLink: Link | undefined;
+		let sessionLink: Link | undefined;
+		host.route("server", {
+			authorize: (_principal, name) => name === "server" && client.connected,
+			resolve: async () => {
+				if (serverLink === undefined || serverLink.closed)
+					serverLink = createClientChordLink(client, () => ({ serverId: client.serverId }));
+				return serverLink;
 			},
-			assertAccess: options.assertAccess,
-			onError: options.onError,
-			remove: () => this.#bindings.delete(binding),
+			principal: () => "server",
 		});
-		this.#bindings.add(binding);
-		return binding;
+		host.route("session", {
+			authorize: (_principal, name) => name === "session" && client.attachment !== undefined,
+			resolve: async () => {
+				if (sessionLink === undefined || sessionLink.closed)
+					sessionLink = createClientChordLink(client, () => client.attachment);
+				return sessionLink;
+			},
+			principal: () => "session",
+		});
+		shared = {
+			host,
+			references: 0,
+			removeConnectionListener: client.onConnectionStateChange(({ state }) => {
+				if (state !== "disconnected" || shared!.references > 0) return;
+				shared!.removeConnectionListener();
+				clients.delete(client);
+				void host.close();
+			}),
+		};
+		clients.set(client, shared);
 	}
-
-	async whenAttached(sessionId: string, context: Context): Promise<void> {
-		const attachment = this.#client.attachment;
-		if (attachment === undefined || attachment.sessionId !== sessionId) {
-			throw new Error(`Session ${sessionId} is not the current attachment`);
-		}
-		await this.#whenAttached(attachment, this.#attachmentRevision, context);
-	}
-
-	async whenDetached(context: Context): Promise<void> {
-		if (this.#client.attachment !== undefined) throw new Error("A Session is still attached");
-		await this.#whenDetached(this.#attachmentRevision, context);
-	}
-
-	async dispose(context: Context): Promise<void> {
-		if (this.#disposed) return;
-		this.#disposed = true;
-		this.#removeAttachmentListener();
-		await Promise.allSettled(this.#transitions);
-		const bindings = [...this.#bindings];
-		this.#bindings.clear();
-		const results = await Promise.allSettled(bindings.map((binding) => binding.dispose(context)));
-		throwFailures(results, "Failed to dispose Session service source");
-	}
-
-	async #rebind(bound: boolean, context: Context): Promise<void> {
-		const results = await Promise.allSettled(
-			[...this.#bindings].map((binding) => binding.updateBound(bound, context)),
-		);
-		throwFailures(results, "Failed to rebind Session services");
-	}
-
-	async #whenAttached(attachment: SessionTarget, revision: number, context: Context): Promise<void> {
-		try {
-			await Promise.all([...this.#bindings].map((binding) => binding.serviceReady(context)));
-		} catch (error) {
-			if (this.#attachmentRevision === revision && sameAttachment(this.#client.attachment, attachment)) {
-				publishReplacement(this.#attachmentState, { status: "degraded", sessionId: attachment.sessionId }, context);
-			}
-			throw error;
-		}
-		if (this.#attachmentRevision !== revision || !sameAttachment(this.#client.attachment, attachment)) {
-			throw new Error(`Session ${attachment.sessionId} was replaced while attaching`);
-		}
-		const state = this.#attachmentState.value;
-		if (state.status !== "attached" || state.sessionId !== attachment.sessionId) {
-			publishReplacement(this.#attachmentState, { status: "attached", sessionId: attachment.sessionId }, context);
-		}
-	}
-
-	async #whenDetached(revision: number, context: Context): Promise<void> {
-		await Promise.all([...this.#bindings].map((binding) => binding.serviceReady(context)));
-		if (this.#attachmentRevision !== revision || this.#client.attachment !== undefined) {
-			throw new Error("The Session attachment changed while detaching");
-		}
-		if (this.#attachmentState.value.status !== "detached") {
-			publishReplacement(this.#attachmentState, { status: "detached" }, context);
-		}
-	}
+	shared.references++;
+	return shared;
+}
+async function releaseHost(client: Client, shared: ClientHosts): Promise<void> {
+	shared.references--;
+	if (shared.references !== 0 || client.connected) return;
+	shared.removeConnectionListener();
+	clients.delete(client);
+	await shared.host.close();
 }
 
-/** Create the server-scoped remote service source for one presentation client. */
 export function createServerServiceSource(client: Client, options: ServiceSourceOptions = {}): ServerServiceSource {
-	return new ServerServiceSourceImpl(client, options);
+	const shared = acquireHost(client, options);
+	let attempt = client.connectionState === "connecting" ? 1 : 0;
+	const state = replicatedState<ServerConnectionState>(toServerConnectionState(client, attempt));
+	const remove = client.onConnectionStateChange(({ state: connection, error }) => {
+		if (connection === "connecting") attempt++;
+		state.replace(BACKGROUND_CONTEXT, toServerConnectionState(client, attempt, error));
+	});
+	let disposed = false;
+	return {
+		host: shared.host,
+		connection: state,
+		async dispose() {
+			if (disposed) return;
+			disposed = true;
+			remove();
+			await releaseHost(client, shared);
+		},
+	};
 }
 
-/** Create the selected-Session remote service source for one presentation client. */
 export function createSessionServiceSource(client: Client, options: ServiceSourceOptions = {}): SessionServiceSource {
-	return new SessionServiceSourceImpl(client, options);
-}
-
-function publishReplacement<T extends object>(state: MutableReplicatedState<T>, value: T, context: Context): void {
-	state.replace(context, value);
+	const shared = acquireHost(client, options);
+	const state: MutableReplicatedState<SessionAttachmentState> = replicatedState<SessionAttachmentState>(
+		client.attachment === undefined
+			? { status: "detached" }
+			: { status: "attaching", sessionId: client.attachment.sessionId },
+	);
+	let revision = 0;
+	let hydration = Promise.resolve();
+	let disposed = false;
+	const hydrate = (): void => {
+		const attachment = client.attachment;
+		const current = ++revision;
+		if (attachment === undefined) {
+			state.replace(BACKGROUND_CONTEXT, { status: "detached" });
+			hydration = Promise.resolve();
+			return;
+		}
+		state.replace(BACKGROUND_CONTEXT, { status: "attaching", sessionId: attachment.sessionId });
+		hydration = (async () => {
+			const reference = await shared.host.get(SessionPlugins, {});
+			reference.release();
+			if (current === revision && !disposed)
+				state.replace(BACKGROUND_CONTEXT, { status: "attached", sessionId: attachment.sessionId });
+		})();
+		void hydration.catch((error: unknown) => {
+			if (current !== revision || disposed) return;
+			state.replace(BACKGROUND_CONTEXT, { status: "degraded", sessionId: attachment.sessionId });
+			options.onError?.(error instanceof Error ? error : new Error(String(error)));
+		});
+	};
+	const remove = client.onAttachmentChange(hydrate);
+	if (client.attachment !== undefined) hydrate();
+	return {
+		host: shared.host,
+		attachment: state,
+		async whenAttached(sessionId, context) {
+			const attachment = client.attachment;
+			if (attachment === undefined || attachment.sessionId !== sessionId)
+				throw new Error(`Session ${sessionId} is not the current attachment`);
+			const current = revision;
+			await hydration;
+			context.abortSignal?.throwIfAborted();
+			if (current !== revision || client.attachment !== attachment)
+				throw new Error("Session attachment changed during hydration");
+		},
+		async whenDetached() {
+			if (client.attachment !== undefined) throw new Error("Session is still attached");
+			await hydration;
+		},
+		async dispose() {
+			if (disposed) return;
+			disposed = true;
+			revision++;
+			remove();
+			await releaseHost(client, shared);
+		},
+	};
 }
 
 function toServerConnectionState(client: Client, attempt: number, error?: Error): ServerConnectionState {
-	const since = new Date().toISOString();
-	switch (client.connectionState) {
-		case "connecting":
-			return { status: "connecting", attempt };
-		case "connected":
-			return { status: "connected", since };
-		case "disconnected":
-			return {
-				status: "disconnected",
-				since,
-				reason: error?.message ?? "Client is disconnected",
-				retryAt: null,
-			};
-	}
-}
-
-function sameAttachment(left: SessionTarget | undefined, right: SessionTarget | undefined): boolean {
-	if (left === undefined || right === undefined) return left === right;
-	return (
-		left.serverId === right.serverId && left.sessionId === right.sessionId && left.attachmentId === right.attachmentId
-	);
-}
-
-function throwFailures(results: readonly PromiseSettledResult<unknown>[], message: string): void {
-	const errors = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
-	if (errors.length === 1) throw errors[0];
-	if (errors.length > 1) throw new AggregateError(errors, message);
-}
-
-function toError(error: unknown): Error {
-	return error instanceof Error ? error : new Error(String(error));
+	if (client.connectionState === "connecting") return { status: "connecting", attempt };
+	if (client.connected) return { status: "connected", since: new Date().toISOString() };
+	return {
+		status: "disconnected",
+		since: new Date().toISOString(),
+		reason: error?.message ?? "Connection closed",
+		retryAt: null,
+	};
 }

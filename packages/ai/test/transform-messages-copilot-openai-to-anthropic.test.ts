@@ -66,6 +66,28 @@ async function captureAnthropicPayload(
 }
 
 describe("OpenAI to Anthropic session migration for Copilot Claude", () => {
+	it.each([false, true])("isolates opaque tool signatures for native replay=%s", (native) => {
+		const model = makeCopilotClaudeModel();
+		const signature = JSON.stringify({ type: "reasoning.encrypted", data: "opaque" });
+		const assistant = makeAssistantMessage([
+			{ type: "toolCall", id: "call|item", name: "bash", arguments: {}, thoughtSignature: signature },
+		]);
+		if (native) Object.assign(assistant, { api: model.api, provider: model.provider, model: model.id });
+		const stored = structuredClone(assistant);
+		const result = transformMessages([assistant], model, anthropicNormalizeToolCallId);
+		const replayed = result.find((message) => message.role === "assistant");
+		expect(replayed?.content).toEqual([
+			{
+				type: "toolCall",
+				id: "call_item",
+				name: "bash",
+				arguments: {},
+				...(native ? { thoughtSignature: signature } : {}),
+			},
+		]);
+		expect(assistant).toEqual(stored);
+	});
+
 	// Replay metadata is native only to an exact provider/API/model origin. Foreign
 	// visible reasoning remains ordinary text; redacted and opaque blocks are omitted.
 	it.each<Partial<Pick<AssistantMessage, "api" | "provider" | "model">>>([
