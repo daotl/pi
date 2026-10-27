@@ -944,13 +944,30 @@ export class RefImpl {
 	caller(name: string): (...given: unknown[]) => Promise<unknown> {
 		let caller = this.callers.get(name);
 		if (caller === undefined) {
-			const noArgs = takesNoArgs(this.contract, name);
 			caller = (...given) => {
-				// A method without arguments is called as `ref.name(ctx)`.
-				const [args, ctx] = (noArgs ? [undefined, given[0]] : given) as [unknown, Ctx | undefined];
 				if (this.object.host.inFactory > 0) {
 					throw new ChordError("not_ready", `${this.address}.${name} called inside a factory`);
 				}
+				if (this.status === "released" || this.status === "gone") return Promise.reject(this.terminalError());
+				const context = given.find((value): value is CtxImpl => value instanceof CtxImpl);
+				let variant = this.variant;
+				try {
+					context?.check(this.object.host);
+					if (context !== undefined && !context.holder) {
+						const installed = this.object.implementations.get(context.codeVersion);
+						if (installed !== undefined) variant = variantOf(this.viewOf(installed));
+					}
+				} catch (error) {
+					return Promise.reject(error);
+				}
+				if (this.status === "loading") {
+					return (context === undefined ? this.ready : raceSignal(this.ready, context.signal)).then(() =>
+						this.caller(name)(...given),
+					);
+				}
+				// Explicit roots decode against the same retained implementation ObjectImpl.call will dispatch.
+				const noArgs = takesNoArgs(this.contract, name, variant);
+				const [args, ctx] = (noArgs ? [undefined, given[0]] : given) as [unknown, Ctx | undefined];
 				if (ctx !== undefined && !(ctx instanceof CtxImpl)) {
 					return Promise.reject(invalid("foreign_ctx", "ctx must come from a Chord host"));
 				}
@@ -1190,28 +1207,42 @@ export class ObjectImpl {
 		return run;
 	}
 
-	/** Opens resources (dependencies first) and waits for references; settles all before failing. */
+	/** Opens resources after bounded, cancellable reference dependencies; joins started opens before failing. */
 	async open(resources: readonly ResourceImpl[], refs: readonly RefCore[], signal: AbortSignal): Promise<void> {
 		const opening = new Map<ResourceImpl, Promise<void>>();
+		const dependencies = new Map<RefCore, Promise<void>>();
+		for (const ref of new Set([
+			...refs,
+			...resources.flatMap((resource) =>
+				resource.deps.filter((dep): dep is RefCore => !(dep instanceof ResourceImpl)),
+			),
+		])) {
+			dependencies.set(
+				ref,
+				this.withinReadyTimeout(raceSignal(ref.ready, signal), () => [ref.address]),
+			);
+		}
 		const openOne = (resource: ResourceImpl): Promise<void> => {
 			let promise = opening.get(resource);
 			if (promise === undefined) {
 				promise = (async () => {
 					await Promise.all(
 						resource.deps.map((dep) =>
-							!(dep instanceof ResourceImpl) ? dep.ready : resources.includes(dep) ? openOne(dep) : undefined,
+							!(dep instanceof ResourceImpl)
+								? dependencies.get(dep)
+								: resources.includes(dep)
+									? openOne(dep)
+									: undefined,
 						),
 					);
+					if (signal.aborted) throw new ChordError("aborted", `${this.address} abandoned`);
 					await resource.open(signal, this.openOrder);
 				})();
 				opening.set(resource, promise);
 			}
 			return promise;
 		};
-		const ready = this.withinReadyTimeout(Promise.all(refs.map((ref) => ref.ready)), () =>
-			refs.filter((ref) => ref.status === "loading").map((ref) => ref.address),
-		);
-		const results = await Promise.allSettled([...resources.map(openOne), ready]);
+		const results = await Promise.allSettled([...resources.map(openOne), ...dependencies.values()]);
 		const failure = results.find((result) => result.status === "rejected");
 		if (failure !== undefined) throw failure.reason;
 	}
@@ -1586,7 +1617,8 @@ export class ObjectImpl {
 		const validated = ref.contract.scope === "remote" ? method : undefined;
 		// No arguments: the handler takes only ctx. No result (void): the caller gets undefined, whatever it returned.
 		const takesArgs = method === undefined || method.args !== undefined;
-		const returns = method === undefined || method.result !== undefined;
+		const returns =
+			wanted?.kind === "method" ? wanted.result !== undefined : method === undefined || method.result !== undefined;
 		let input: unknown;
 		if (takesArgs) {
 			// The additive rule assumes a consumer sends only what its own schema knows, and a provider sees only what its
@@ -1608,8 +1640,8 @@ export class ObjectImpl {
 		} finally {
 			child.close();
 		}
-		if (!returns) return undefined;
 		if (validated?.result) assertValid("result", `${this.address}.${name} result`, validated.result, result);
+		if (!returns) return undefined;
 		return result;
 	}
 

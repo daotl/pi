@@ -58,13 +58,14 @@ export function inlineLauncher(
 	wasm: CodemodeWasmModule | Promise<CodemodeWasmModule>,
 	interruptBudget: number = DEFAULT_INTERRUPT_BUDGET,
 ): VmLauncher {
-	return async (data, events) => {
+	return async (data, events, signal) => {
 		let module: CodemodeWasmModule;
 		try {
 			module = await wasm;
 		} catch (error) {
 			throw new Error(`Failed to load QuickJS: ${errorMessage(error)}`);
 		}
+		signal.throwIfAborted();
 		let stopped = false;
 		let settled = false;
 		let polls = 0;
@@ -72,6 +73,7 @@ export function inlineLauncher(
 		const session = await startVm({
 			data,
 			wasm: module,
+			signal,
 			maxStackSize: INLINE_MAX_STACK_SIZE,
 			interruptBudget,
 			shouldInterrupt: () => {

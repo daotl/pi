@@ -5,6 +5,7 @@ import {
 	bind,
 	contractFromDescription,
 	type InputOf,
+	isReceivedContract,
 	type LocalContract,
 	type LocalDef,
 	placedOn,
@@ -509,7 +510,8 @@ export class HostImpl implements Host, HostCore {
 	#elsewhere(type: AnyContract, input: unknown): { readonly at: string; readonly input: unknown } | undefined {
 		const placement = type.description.host;
 		if (type.scope !== "remote" || placement === undefined) return undefined;
-		const normalized = normalize(type.input, input, `${type.name} input`);
+		// A received token is declarative routing metadata. Never execute its defaults or validators.
+		const normalized = isReceivedContract(type) ? input : normalize(type.input, input, `${type.name} input`);
 		const at = resolveHost(type.name, placement, normalized);
 		return at === this.name ? undefined : { at, input: normalized };
 	}
@@ -551,9 +553,13 @@ export class HostImpl implements Host, HostCore {
 		from?: ObjectImpl,
 		candidate = false,
 	): RefCore {
-		const elsewhere = this.#elsewhere(type, input);
-		if (elsewhere !== undefined) return this.#acquireRemote(type, elsewhere.at, elsewhere.input, options, owner);
 		const service = this.#bindingService(type.name, candidate);
+		// Application tokens may route elsewhere (including another member of a served host family). Received
+		// holds addressed here must first bind the registered provider, then normalize only with its trusted schema.
+		if (!isReceivedContract(type)) {
+			const elsewhere = this.#elsewhere(type, input);
+			if (elsewhere !== undefined) return this.#acquireRemote(type, elsewhere.at, elsewhere.input, options, owner);
+		}
 		if (service === undefined) throw unknownType(type.name, this.name);
 		bind(service.contract, service.options.accepts, type);
 		const { address, normalized, principal } = this.#locate(service, input, options?.principal ?? this.principal);

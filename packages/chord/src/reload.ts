@@ -71,7 +71,7 @@ interface Candidate {
 /**
  * Computes the new derivation functions over the candidate values and validates every prospective value (migrated
  * cells and derivations) against every schema that will apply after the commit: the cell's new schema and the new
- * implementation's remote state-member schemas. A failure fails prepare; the commit then installs without re-checking.
+ * implementation's remote state-member schemas. Repeated immediately before publication, since live sources may change.
  */
 function dryRun(candidate: Candidate): void {
 	const { run, migrated, service, object } = candidate;
@@ -125,6 +125,9 @@ export async function runReload(
 	try {
 		await reload.prepare();
 		return reload.commit();
+	} catch (error) {
+		if (host.failed === undefined) await reload.rollback();
+		throw reloadError(error);
 	} finally {
 		endReload(host);
 	}
@@ -532,6 +535,13 @@ export class Reload {
 			object.pending.delete(run.decls);
 			await object.unwind(run).catch(report);
 		}
+		// A post-commit failed child can clean up, but cannot restore old resources or restart old tasks.
+		if (this.host.failed !== undefined) {
+			await this.host.close().catch(report);
+			this.host.pending = undefined;
+			this.host.gating = undefined;
+			return;
+		}
 		// Replaced exclusive resources are restored; one that cannot be is marked unavailable, never silently closed.
 		for (const [object, resource] of this.closed) {
 			if (resource.state !== "closed") continue;
@@ -559,12 +569,14 @@ export class Reload {
 	}
 
 	/**
-	 * Publishes the new code version in one synchronous step. Everything fallible ran in prepare (factories, opens,
-	 * migration and derivation checks against the prospective schemas, listener subscriptions), so this only installs.
-	 * Observers (state, shapes, registries, listener roots) are notified after the whole step. If an install still
-	 * throws, the code version is half-published: the host fails terminally and admits no more work.
+	 * Revalidates derivations before publishing synchronously. A preflight failure leaves publication untouched:
+	 * local/coordinator callers roll it back; a child already told to commit must fail closed instead. Observers run
+	 * after installation; an installation failure leaves the host terminally failed.
 	 */
 	commit(beforeStart?: () => void): ReloadReport {
+		for (const candidate of this.candidates.values()) {
+			if (candidate.object.status === "live") dryRun(candidate);
+		}
 		try {
 			return holdPublications(() => {
 				const report = this.#publish();

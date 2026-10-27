@@ -1,9 +1,9 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { access, chmod, type FileHandle, open, realpath, symlink } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FileError, getOrThrow, type ShellExecOptions } from "../src/env/index.ts";
@@ -661,52 +661,41 @@ describe("NodeExecutionEnv shell", () => {
 		["D:\\WinNT\\Sysnative\\bash.exe", "D:\\WinNT", "-s"],
 		["D:\\WinNT\\System32\\bash.exe", "", "-c"],
 		["E:\\Windows\\System32\\bash.exe", "D:\\WinNT", "-c"],
-	] as const)("selects command transport for %s (SystemRoot=%j)", async (shellPath, systemRoot, expectedArg) => {
-		if (process.platform === "win32") return;
-		const root = createTempDir();
-		const env = new NodeExecutionEnv({ cwd: root });
-		getOrThrow(
-			await env.writeFile(
-				shellPath,
-				'#!/bin/sh\nprintf \'args:%s\\n\' "$*" >&2\nexec /bin/bash "$@"\n',
-				BACKGROUND_CONTEXT,
-			),
-		);
-		await chmod(join(root, shellPath), 0o755);
-
-		const originalCwd = process.cwd();
-		const originalPath = process.env.PATH;
-		const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
-		try {
-			process.chdir(root);
-			process.env.PATH = `${root}${delimiter}${originalPath ?? ""}`;
-			vi.stubEnv("SystemRoot", systemRoot);
-			Object.defineProperty(process, "platform", {
-				configurable: true,
-				value: "win32",
-			});
-
-			const wslEnv = new NodeExecutionEnv({ cwd: root, shellPath });
-			const nameExpansion = "$" + "{name}";
-			const collected = await collectShellOutput(
-				wslEnv,
-				`name='World'; echo "Hello, ${nameExpansion}!"`,
-				undefined,
-				BACKGROUND_CONTEXT,
+	] as const)(
+		"selects command transport for %s (SystemRoot=%j)",
+		async (shellPath, systemRoot, expectedArg) => {
+			if (process.platform === "win32") return;
+			const root = createTempDir();
+			const env = new NodeExecutionEnv({ cwd: root });
+			getOrThrow(
+				await env.writeFile(
+					shellPath,
+					'#!/bin/sh\nprintf \'args:%s\\n\' "$*" >&2\nexec /bin/bash "$@"\n',
+					BACKGROUND_CONTEXT,
+				),
 			);
-			const result = getOrThrow(collected.result);
-			expect(collected.output).toContain("Hello, World!");
-			expect(collected.output).toContain(`args:${expectedArg}`);
-			expect(result.exitCode).toBe(0);
-		} finally {
-			process.chdir(originalCwd);
-			process.env.PATH = originalPath;
-			vi.unstubAllEnvs();
-			if (platformDescriptor) {
-				Object.defineProperty(process, "platform", platformDescriptor);
-			}
-		}
-	});
+			await chmod(join(root, shellPath), 0o755);
+
+			// Simulating Windows changes process-wide state. Keep that state in a bounded child, not the test worker.
+			const fixtureEnv = { PATH: process.env.PATH, HOME: process.env.HOME };
+			const output = await new Promise<string>((resolve, reject) =>
+				execFile(
+					process.execPath,
+					[
+						fileURLToPath(new URL("./fixtures/legacy-shell-transport.ts", import.meta.url)),
+						root,
+						shellPath,
+						systemRoot ?? "<unset>",
+						expectedArg,
+					],
+					{ encoding: "utf8", timeout: 15000, env: fixtureEnv },
+					(error, stdout) => (error ? reject(error) : resolve(stdout)),
+				),
+			);
+			expect(JSON.parse(output)).toMatchObject({ expectedArg });
+		},
+		20000,
+	);
 
 	it.skipIf(process.platform !== "win32")(
 		"settles after the shell exits when a detached descendant retains inherited stdio",

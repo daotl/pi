@@ -1,12 +1,26 @@
 import assert from "node:assert/strict";
-import type { ToolCall } from "@earendil-works/pi-ai";
+import {
+	createFauxCore,
+	fauxAssistantMessage,
+	type Message,
+	normalizeContext,
+	type ToolCall,
+} from "@earendil-works/pi-ai";
+import { parseToolCallArguments } from "@earendil-works/pi-ai/utils/json-parse";
 import { Type } from "typebox";
 import { onTestFinished, test } from "vitest";
 import { applyEnvelope, kinds } from "../../../src/harness/pico3/harness.ts";
 import type { JsonlStorage } from "../../../src/harness/pico3/jsonl.ts";
 import { Session } from "../../../src/harness/pico3/session.ts";
 import { defineSystemSection, sectionSeed, systemSections } from "../../../src/harness/pico3/system.ts";
-import { defineTask, Forbidden, type RequestMessage, type ToolDeclaration } from "../../../src/harness/pico3/types.ts";
+import {
+	defineTask,
+	Forbidden,
+	type Models,
+	type RequestMessage,
+	type ToolDeclaration,
+	toStored,
+} from "../../../src/harness/pico3/types.ts";
 import {
 	type CoreTx,
 	collectWatch,
@@ -67,6 +81,64 @@ test("invalid arguments → invalid_arguments, not invoked", async () => {
 	assert.equal(t.calls, 0);
 	assert.equal(dataOf(await resultOf(env)).diagnostics?.[0]?.code, "invalid_arguments");
 });
+
+// #14: an empty-schema tool must not turn malformed JSON into an executable {} call.
+test.each(["initial", "post-hook"] as const)(
+	"malformed arguments at %s preserve the parser diagnostic",
+	async (phase) => {
+		const parsed = parseToolCallArguments("[1]");
+		assert.ok(parsed.argumentsError);
+		let calls = 0;
+		const declaration: ToolDeclaration = {
+			name: "empty",
+			description: "",
+			parameters: Type.Object({}),
+			async execute() {
+				calls++;
+				return { content: [{ type: "text", text: "must not execute" }] };
+			},
+		};
+		const faux = createFauxCore({});
+		faux.setResponses([
+			fauxAssistantMessage(
+				{ type: "toolCall", id: "malformed", name: "empty", ...(phase === "initial" ? parsed : { arguments: {} }) },
+				{ stopReason: "toolUse" },
+			),
+			(context) => {
+				const result = context.messages.findLast((message) => message.role === "toolResult");
+				assert.equal(result?.isError, true);
+				assert.ok(JSON.stringify(result?.content).includes(JSON.stringify(parsed.argumentsError).slice(1, -1)));
+				return fauxAssistantMessage("diagnostic received");
+			},
+		]);
+		const models: Models = {
+			resolve: () => faux.getModel(),
+			stream: (model, request, context) => {
+				// Stored Pico messages use the model-message JSON wire shape.
+				const messages = request.messages as unknown as Message[];
+				return faux.stream(model, normalizeContext({ messages }), { signal: context.abortSignal });
+			},
+			fetchDeferred: (model, handle, context) =>
+				faux.fetchDeferred(model, handle, { signal: context.abortSignal }).result(),
+			cancelDeferred: (model, handle) => faux.cancelDeferred(model, handle),
+		};
+		const env = await open({
+			tools: [declaration],
+			models,
+			hooks:
+				phase === "post-hook"
+					? { tool: { beforeTool: (call) => ({ call: toStored({ ...call, ...parsed }) }) } }
+					: undefined,
+		});
+		onTestFinished(() => env.close());
+		await (await env.root.send({ content: "go" }, ctx)).wait(ctx);
+		assert.equal(calls, 0);
+		const result = await resultOf(env);
+		assert.equal(dataOf(result).diagnostics?.[0]?.code, "invalid_arguments");
+		assert.ok(contentOf(result).includes("Received arguments:"));
+		assert.equal(faux.state.callCount, 2);
+	},
+);
 
 test("beforeTool: block → blocked; rewrite arguments → invoked with rewritten; identity change → blocked; throw → blocked", async () => {
 	const cases: [string, (c: ToolCall) => unknown, string, number][] = [

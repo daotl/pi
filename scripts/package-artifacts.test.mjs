@@ -88,3 +88,12 @@ test("discovers source packages without treating generated release copies as wor
 	writePackage(join(packages, "session-backends/sqlite"), { name: "@pi-package-test/sqlite", version: "1.0.0" }, {});
 	assert.deepEqual(findPackageDirectories(packages), [source, join(source, "examples/plugin"), join(packages, "session-backends/sqlite")]);
 });
+
+test("rejects an env tarball without release daemon assets", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "pi-env-artifacts-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	writePackage(join(root, "packages/env"), { name: "@earendil-works/pi-env", version: "1.0.0", files: ["dist", "bin"] }, { "dist/index.js": "export {};" });
+	const verification = produceArtifactSet({ repoRoot: root, build: false, source: null, requireEnvReleaseAssets: false });
+	assert.equal(verification.getPackage("@earendil-works/pi-env").version, "1.0.0");
+	assert.throws(() => produceArtifactSet({ repoRoot: root, build: false, source: null }), /Missing pi-env release daemon assets:.*windows-arm64/);
+});

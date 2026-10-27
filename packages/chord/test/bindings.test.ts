@@ -238,9 +238,17 @@ describe("hydration over a link", () => {
 			broken: { state: { n: Type.Number() } },
 		},
 	});
+	const disposedVariants: string[] = [];
 
 	function serveMatrix(host: Host): void {
 		host.serve(Matrix, ({ variant }, _principal, self) => {
+			self.resource("cleanup", {
+				version: 1,
+				open: () => {},
+				close: () => {
+					disposedVariants.push(variant);
+				},
+			});
 			if (variant === "bare") return { variant: "bare", ping: () => "pong" };
 			if (variant === "broken") {
 				const source = self.state("source", Type.String(), "not a number");
@@ -281,6 +289,7 @@ describe("hydration over a link", () => {
 		const broken = browser.hold(Matrix, { variant: "broken" });
 		await assert.rejects(broken.ready, (error) => isChordError(error, "invalid"));
 		assert.equal(broken.status, "gone");
+		await until(() => disposedVariants.includes("broken"));
 		await browser.close();
 		await server.close();
 	});

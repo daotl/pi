@@ -5,7 +5,7 @@
 use crate::errors::Failure;
 use crate::exec::{Control, Groups};
 #[cfg(unix)]
-use crate::exec::{Message, kill_group};
+use crate::exec::Message;
 #[cfg(unix)]
 use crate::frame::{EVENT, Frame};
 use crate::output::Output;
@@ -32,6 +32,16 @@ pub struct Terminal {
 
 /// Running terminals by the id of their `pty` request.
 pub type Terminals = Arc<Mutex<HashMap<u32, Arc<Terminal>>>>;
+
+/// Kill job-control groups as well as the terminal's original shell group.
+pub fn kill_all(terminals: &Terminals) {
+    #[cfg(unix)]
+    for terminal in terminals.lock().unwrap().values() {
+        unix::kill_session(terminal.pid);
+    }
+    #[cfg(not(unix))]
+    let _ = terminals;
+}
 
 #[cfg_attr(not(unix), allow(dead_code))]
 pub struct PtyRequest {
@@ -166,7 +176,7 @@ pub fn run(
     groups: &Groups,
     terminals: &Terminals,
 ) -> Result<Value, Failure> {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -203,16 +213,18 @@ pub fn run(
     ));
 
     let stop = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicUsize::new(0));
     let reader = {
         let master = master.clone();
         let sender = sender.clone();
         let stop = stop.clone();
         let output = output.clone();
+        let paused = paused.clone();
         thread::spawn(move || {
             unix::read(&master, &stop, |bytes| {
                 let delivered = sender.send(Message::Data(0, bytes.to_vec())).is_ok();
                 // Like a full pipe: a program that writes faster than the link waits.
-                output.wait_for_room(&stop);
+                output.wait_for_room(&stop, &paused);
                 delivered
             });
             let _ = sender.send(Message::Eof(0));
@@ -246,13 +258,16 @@ pub fn run(
     let kill = |killed: &mut bool| {
         if !*killed {
             *killed = true;
-            kill_group(pid);
+            unix::kill_session(pid);
         }
     };
     if control.killed.load(Ordering::SeqCst) {
         kill(&mut killed);
     }
     loop {
+        if status.is_some() && !killed && paused.load(Ordering::SeqCst) > 0 {
+            idle_until = Some(Instant::now() + EXIT_GRACE);
+        }
         if status.is_some() && ended {
             break;
         }
@@ -267,6 +282,7 @@ pub fn run(
             }
             None => Duration::from_secs(3600),
         };
+        let wait = if status.is_some() { wait.min(Duration::from_millis(20)) } else { wait };
         match receiver.recv_timeout(wait) {
             Ok(Message::Data(_, bytes)) => {
                 output.bulk(
@@ -316,6 +332,37 @@ pub fn run(
 #[cfg(unix)]
 mod unix {
     use super::PtyRequest;
+
+    pub fn kill_session(pid: u32) {
+        // Stop the leader first so it cannot launch another job during enumeration.
+        // SAFETY: plain signal delivery to the tracked session leader.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGSTOP);
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let candidates: Vec<i32> = std::fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .collect();
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let candidates: Vec<i32> = std::process::Command::new("/bin/ps")
+            .args(["-A", "-o", "pid="])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).split_whitespace().filter_map(|pid| pid.parse().ok()).collect())
+            .unwrap_or_default();
+        for candidate in candidates {
+            // SAFETY: check live session membership; neither getsid nor kill dereferences pointers.
+            unsafe {
+                if libc::getsid(candidate) == pid as i32 {
+                    libc::kill(candidate, libc::SIGKILL);
+                }
+            }
+        }
+        crate::exec::kill_group(pid);
+    }
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

@@ -1218,7 +1218,10 @@ describe("TuiAltScreen", () => {
 		const imageId = 11272;
 		const imageLine = encodeKitty("AAAA", { columns: 2, rows: 3, imageId, moveCursor: false });
 		registerKittyImageMetadata({ imageId, columns: 2, rows: 3, widthPx: 100, heightPx: 100 });
-		tui.addChild({ render: () => ["before", imageLine, "   | side", "   | side"], invalidate: () => {} });
+		tui.addChild({
+			render: () => ["before", `${imageLine}anchor label`, "   | side", "   | side"],
+			invalidate: () => {},
+		});
 		tui.addChild({ render: () => ["after", "end"], invalidate: () => {} });
 		tui.start();
 		await terminal.waitForRender();
@@ -1229,6 +1232,8 @@ describe("TuiAltScreen", () => {
 				(event) => event.type === "write" && event.data.includes("i=11272") && event.data.includes("y=66,h=34,r=1"),
 			),
 		);
+		assert.ok(terminal.events.some((event) => event.type === "write" && event.data.includes("| side")));
+		assert.ok(!terminal.events.some((event) => event.type === "write" && event.data.includes("anchor label")));
 
 		tui.stop();
 	});

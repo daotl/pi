@@ -120,6 +120,7 @@ export function serveCodemodeRemote(
 
 	return new Promise<void>((resolve) => {
 		let channel: VmChannel | undefined;
+		const controller = new AbortController();
 		let ended = false;
 		let buffered: CodemodeRemoteMessage[] = [];
 		let bufferedChars = 0;
@@ -135,6 +136,7 @@ export function serveCodemodeRemote(
 		const end = (terminal: CodemodeRemoteMessage | undefined): void => {
 			if (ended) return;
 			ended = true;
+			controller.abort();
 			const batch = takeBuffer();
 			const delivered = terminal ? exchange([...batch, terminal]).catch(() => null) : Promise.resolve();
 			void delivered
@@ -178,10 +180,14 @@ export function serveCodemodeRemote(
 
 		const launch = inlineLauncher(options.wasm, budget);
 		Promise.resolve(
-			launch(data, {
-				message: onMessage,
-				failure: (error) => end({ type: "failure", error }),
-			}),
+			launch(
+				data,
+				{
+					message: onMessage,
+					failure: (error) => end({ type: "failure", error }),
+				},
+				controller.signal,
+			),
 		).then(
 			(started) => {
 				channel = started;

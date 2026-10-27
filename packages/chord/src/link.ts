@@ -231,8 +231,11 @@ async function inflate(bytes: Uint8Array): Promise<unknown> {
 }
 
 /** Parses a JSON frame; anything else is a protocol error. */
-function parseFrame(data: string): Frame {
-	const frame = unpackObject(JSON.parse(data)) as Frame;
+function parseFrame(data: string, acceptPacked = true): Frame {
+	const message: unknown = JSON.parse(data);
+	if (!acceptPacked && message !== null && typeof message === "object" && Object.hasOwn(message, "z"))
+		throw new TypeError("packed frames are not accepted");
+	const frame = unpackObject(message) as Frame;
 	if (frame === null || typeof frame !== "object" || typeof frame.t !== "string") throw new TypeError("not a frame");
 	return frame;
 }
@@ -354,7 +357,7 @@ const OPEN = 1;
 export interface WebSocketLinkOptions {
 	/** Deflate large payloads of outgoing frames (default false; the server's side of client sockets). */
 	readonly compress?: boolean;
-	/** Accept packed (binary) frames from the peer (default true; false for a server's untrusted clients). */
+	/** Accept packed frames (binary or text envelopes) from the peer (default true; false for untrusted clients). */
 	readonly acceptPacked?: boolean;
 }
 
@@ -377,7 +380,7 @@ export class WebSocketLink extends BaseLink {
 			try {
 				const data = event.data;
 				if (typeof data === "string") {
-					this.deliver(parseFrame(data));
+					this.deliver(parseFrame(data, acceptPacked));
 					return;
 				}
 				if (!acceptPacked) throw new TypeError("packed frames are not accepted");

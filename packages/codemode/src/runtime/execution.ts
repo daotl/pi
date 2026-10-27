@@ -79,7 +79,7 @@ export interface VmChannel {
  * Starts a VM for one execution. Rejections become `sandbox` errors with the rejection's message.
  * The VM may start reporting messages before the returned promise settles.
  */
-export type VmLauncher = (data: VmStartData, events: VmEvents) => VmChannel | Promise<VmChannel>;
+export type VmLauncher = (data: VmStartData, events: VmEvents, signal: AbortSignal) => VmChannel | Promise<VmChannel>;
 
 export function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -189,6 +189,7 @@ class Execution {
 	readonly promise: Promise<CodemodeResult>;
 	private resolveResult!: (result: CodemodeResult) => void;
 	private channel: VmChannel | undefined;
+	private readonly launchController = new AbortController();
 	/** Replies produced before the launcher returned the channel. */
 	private unsent: HostToWorkerMessage[] = [];
 	private readonly executors: ExecutionOptions["executors"];
@@ -242,7 +243,7 @@ class Execution {
 			message: (message) => this.receive(message),
 			failure: (error) => this.finish(error),
 		};
-		new Promise<VmChannel>((resolve) => resolve(options.launch(data, events))).then(
+		new Promise<VmChannel>((resolve) => resolve(options.launch(data, events, this.launchController.signal))).then(
 			(channel) => {
 				if (this.finished) {
 					void channel.stop().catch(() => undefined);
@@ -415,6 +416,7 @@ class Execution {
 	): void {
 		if (this.finished) return;
 		this.finished = true;
+		this.launchController.abort();
 		clearTimeout(this.timer);
 		this.signal?.removeEventListener("abort", this.onAbort);
 

@@ -55,6 +55,7 @@ import { NestedCallDoc, type ToolTaskInput } from "../harness/tool.ts";
 import type {
 	Extension,
 	NestedToolExecutionResult,
+	ToolDiagnostic,
 	ToolExecutionApi,
 	ToolExecutionResult,
 	ToolRegistration,
@@ -234,7 +235,10 @@ const OUTPUT_LIMITS = { maxBytes: 4 * 1024 * 1024, maxLines: 100_000 } as const;
 const DISCOVERY_GLOBALS = ["searchTools", "describeTool", "describeNamespace"] as const;
 const DEFAULT_SEARCH_LIMIT = 8;
 
-/** The code mode tool. Scripts call the conversation's callable tools as `tools.<name>(args)`. */
+/**
+ * The code mode tool. Scripts call the conversation's callable tools as `tools.<name>(args)`. Nested info/warn notices
+ * reach the model once, prefixed with their tool's name, including when finished calls are reconstructed during replay.
+ */
 export function createCodemodeTool(options: CodemodeToolOptions): ToolRegistration<typeof codemodeSchema> {
 	return defineTool({
 		name: CODEMODE_TOOL_NAME,
@@ -355,6 +359,8 @@ class CodemodeCall {
 	private generatedImages = 0;
 	/** The script's tool calls for `details`, by VM call ID. */
 	private readonly rows = new Map<number, CodemodeNestedCall>();
+	/** Reconstructed from nested results on live execution and replay; stored once with this call's outcome. */
+	private readonly diagnostics = new Map<number, ToolDiagnostic[]>();
 	/** Resolves once the VM's fingerprint is checked or recorded; nothing is delivered or admitted before. */
 	private gate!: Promise<void>;
 	private openGate!: () => void;
@@ -518,7 +524,11 @@ class CodemodeCall {
 
 	/** Store an outcome the call decided, and end the VM if it runs; returns the outcome. */
 	private async decide(decided: ToolExecutionResult): Promise<ToolExecutionResult> {
-		const result = { ...decided, details: this.details() as unknown as JsonValue };
+		const result = {
+			...decided,
+			diagnostics: [...this.diagnostics.values()].flat(),
+			details: this.details() as unknown as JsonValue,
+		};
 		await this.api.commit(async (tx) => {
 			const run = await tx.doc(CodemodeRunDoc, this.api.taskId);
 			run.result ??= copyJson(result as unknown as JsonValue, { omitUndefinedProperties: true }) as JsonObject;
@@ -532,7 +542,10 @@ class CodemodeCall {
 		const result = errorResult(`The script took a different path when resumed after a restart: ${message}`);
 		this.ended = result;
 		this.decide(result).then(
-			() => this.controller.abort(new Error(message)),
+			(decided) => {
+				this.ended = decided;
+				this.controller.abort(new Error(message));
+			},
 			(error: unknown) => this.fail(error),
 		);
 	}
@@ -562,6 +575,7 @@ class CodemodeCall {
 		const tool: ToolExecutionResult = {
 			output: formatted.content,
 			isError: !result.ok,
+			diagnostics: [...this.diagnostics.values()].flat(),
 			details: {
 				...details,
 				...(formatted.fullOutputPath === undefined ? {} : { fullOutputPath: formatted.fullOutputPath }),
@@ -839,6 +853,12 @@ class CodemodeCall {
 		} finally {
 			if (model) this.releaseModelSlot();
 		}
+		this.diagnostics.set(
+			call.id,
+			result.diagnostics
+				.filter((diagnostic) => diagnostic.severity !== "error")
+				.map((diagnostic) => ({ ...diagnostic, message: `${call.name}: ${diagnostic.message}` })),
+		);
 		if (call.name === GENERATE_IMAGES_TOOL) this.generatedImages += countImages(result.structuredOutput);
 		const structured = this.start.tools.find((tool) => tool.name === call.name)?.structured === true;
 		const outcome = outcomeOf(call.name, structured, result);

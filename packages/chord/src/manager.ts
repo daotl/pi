@@ -186,18 +186,22 @@ export function forkDriver(options: ForkDriverOptions): Driver {
 			}
 			const pid = child.pid ?? -1;
 			const killGroup = (): void => {
+				if (pid <= 0) return;
 				try {
 					process.kill(-pid, "SIGKILL");
 				} catch {
 					// No group left.
 				}
 			};
-			const exited = new Promise<Exit>((resolve) => {
-				child.once("exit", (code, signal) => {
-					// However the leader ended (graceful, crash, kill), nothing it spawned outlives it.
-					killGroup();
-					resolve({ code, signal });
-				});
+			const terminal = Promise.withResolvers<Exit>();
+			const exited = terminal.promise;
+			child.once("error", () => {
+				// Only a failed spawn has no exit event; send/kill errors on a live child must still join its exit.
+				if (pid <= 0) terminal.resolve({ code: null, signal: null });
+			});
+			child.once("exit", (code, signal) => {
+				killGroup();
+				terminal.resolve({ code, signal });
 			});
 			const listeners = new Set<(message: ControlMessage) => void>();
 			child.on("message", (message) => {
@@ -216,6 +220,7 @@ export function forkDriver(options: ForkDriverOptions): Driver {
 				exited,
 				send,
 				killTree: () => {
+					if (pid <= 0) return;
 					try {
 						process.kill(-pid, "SIGKILL");
 					} catch {
@@ -304,6 +309,7 @@ export function createHostManager(options: HostManagerOptions): HostManager {
 		status = "starting";
 		booting = true;
 		report = { activeCalls: 0, viewers: 0, durableTasks: 0 };
+		idleSince = undefined;
 		let current: Instance;
 		try {
 			current = options.driver.spawn();
@@ -336,6 +342,7 @@ export function createHostManager(options: HostManagerOptions): HostManager {
 				),
 			);
 			current.onControl((message) => {
+				if (instance !== current) return;
 				if (message.type === "ready") settle(resolve);
 				else if (message.type === "fatal")
 					settle(() =>

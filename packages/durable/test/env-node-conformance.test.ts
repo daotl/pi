@@ -2,9 +2,10 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { afterEach, describe, expect, it } from "vitest";
-import { getOrThrow, type WatchChange } from "../src/env/index.ts";
+import { getOrThrow, type WatchChange, type WatchTarget } from "../src/env/index.ts";
 import { NodeExecutionEnv } from "../src/env/node.ts";
 import { registerEnvConformance } from "../src/testing/index.ts";
 
@@ -58,6 +59,41 @@ registerEnvConformance(
 	},
 	windows ? { shell: [gitBash, "-c"], symlinks: false } : {},
 );
+
+describe("NodeExecutionEnv native overlapping watches", () => {
+	it.skipIf(windows).each([false, true])("unions recursive duplicate targets (reversed: %s)", async (reversed) => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-durable-env-overlap-"));
+		const env = new NodeExecutionEnv({ cwd, watch: { mode: "native" } });
+		const file = join(cwd, "skills/a/b/data");
+		try {
+			getOrThrow(await env.createDir("skills/a/b", undefined, context));
+			getOrThrow(await env.writeFile(file, "before", context));
+			const targets: WatchTarget[] = [{ path: "skills", recursive: true }, { path: "skills" }, { path: "skills/a" }];
+			if (reversed) targets.reverse();
+			const changes: WatchChange[] = [];
+			const watcher = getOrThrow(await env.watch(targets, (change) => changes.push(change), context));
+			try {
+				expect(watcher.mode).toBe("native");
+				// Past the one-time FSEvents settle scan: only native coverage can discover the next write.
+				await delay(800);
+				changes.length = 0;
+				getOrThrow(await env.writeFile(file, "after", context));
+				const deadline = Date.now() + 2000;
+				while (
+					!changes.some((change) => "paths" in change && change.paths.includes(file)) &&
+					Date.now() < deadline
+				) {
+					await delay(20);
+				}
+				expect(changes.some((change) => "paths" in change && change.paths.includes(file))).toBe(true);
+			} finally {
+				await watcher.close(context);
+			}
+		} finally {
+			await removeTempDir(cwd);
+		}
+	});
+});
 
 describe("NodeExecutionEnv watch limits", () => {
 	it("refuses a tree over the directory budget and stops with an error when one grows past it", async () => {

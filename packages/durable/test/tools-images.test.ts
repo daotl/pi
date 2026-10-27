@@ -3,13 +3,14 @@ import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ToolDiagnostic, ToolExecutionApi, ToolExecutionResult } from "@earendil-works/pi-durable";
 import { createNodePhotonImages } from "@earendil-works/pi-durable/images/node";
 import { createCodingTools } from "@earendil-works/pi-durable/tools";
 import { initSync, PhotonImage } from "@silvia-odwyer/photon/photon_rs.js";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getOrThrow } from "../src/env/index.ts";
 import { NodeExecutionEnv } from "../src/env/node.ts";
 import { exifOrientation } from "../src/images/exif.ts";
@@ -509,6 +510,50 @@ describe("toBase64", () => {
 });
 
 describe("createNodePhotonImages", () => {
+	it("copies pooled and unpooled Buffers and typed-array views without detaching caller bytes", async () => {
+		const data = gif();
+		const unpooled = Buffer.allocUnsafeSlow(data.length);
+		unpooled.set(data);
+		const backing = new Uint8Array(data.length + 4);
+		backing.set(data, 2);
+		for (const bytes of [Buffer.from(data), unpooled, backing.subarray(2, data.length + 2)]) {
+			const before = Uint8Array.from(bytes);
+			expect(await processor.prepare(bytes, "image/gif", DEFAULT_IMAGE_LIMITS)).toEqual({
+				data: toBase64(data),
+				mimeType: "image/gif",
+			});
+			expect(Uint8Array.from(bytes)).toEqual(before);
+		}
+		expect(backing).toEqual(new Uint8Array([0, 0, ...data, 0, 0]));
+	});
+
+	it("releases a failed postMessage request and reuses its worker", async () => {
+		const images = await createNodePhotonImages({ idleMs: 10 });
+		const bytes = Buffer.from(gif());
+		const before = Uint8Array.from(bytes);
+		let worker: Worker | undefined;
+		const post = vi.spyOn(Worker.prototype, "postMessage").mockImplementationOnce(function (this: Worker) {
+			worker = this;
+			throw new Error("postMessage failed");
+		});
+		try {
+			await expect(images.prepare(bytes, "image/gif", DEFAULT_IMAGE_LIMITS)).rejects.toThrow("postMessage failed");
+			expect(Uint8Array.from(bytes)).toEqual(before);
+			const exited = Promise.withResolvers<number>();
+			worker!.once("exit", exited.resolve);
+			expect(await images.prepare(bytes, "image/gif", DEFAULT_IMAGE_LIMITS)).toEqual({
+				data: toBase64(before),
+				mimeType: "image/gif",
+			});
+			// A stranded failed request would prevent the idle worker from exiting after the successful one.
+			await exited.promise;
+			expect(Uint8Array.from(bytes)).toEqual(before);
+		} finally {
+			post.mockRestore();
+			if (worker !== undefined) await worker.terminate();
+		}
+	});
+
 	it("prepares in a worker thread, leaving the event loop free", async () => {
 		const photo = noisyPng(3000, 2000);
 		const prepareOn = async (images: ImageProcessor): Promise<number> => {

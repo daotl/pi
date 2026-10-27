@@ -4,6 +4,7 @@ import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import type { CommittedEntryWrite, CommittedValueSetWrite } from "../../src/harness/session/commit.ts";
 import type { LegacyV3SessionHeader } from "../../src/harness/session/jsonl/codec.ts";
 import { LegacyV3Source } from "../../src/harness/session/jsonl/legacy-v3.ts";
+import { branchTip } from "../../src/harness/session/values.ts";
 import { type FileError, getOrThrow, ok, type Result, type TextLineReader } from "../../src/harness/types.ts";
 import { createTempDir } from "./session-test-utils.ts";
 
@@ -144,6 +145,50 @@ describe("streaming legacy v3 normalization", () => {
 		});
 		expect(reader.lineReads).toBe(6);
 		expect(await collect(source, (id) => selected.has(id))).toEqual(writes);
+	});
+
+	// #23: markers may precede later appends; invalid selections do not hide history.
+	it.each([null, "root"] as const)(
+		"replays interleaved checkpoints and final selection %j repeatably",
+		async (leafId) => {
+			const { path, read } = await fixture([
+				message("root", null),
+				{ type: "leaf", leafId: null },
+				message("sibling", null),
+				{ type: "leaf", leafId: "root" },
+				{ type: "leaf", leafId: "missing" },
+				{ type: "leaf", leafId: {} },
+				{ type: "leaf", leafId },
+			]);
+			const source = await read();
+			const writes = await collect(source);
+			const entries = writes.filter((write) => write.kind === "entry");
+			expect(entries.map((entry) => (entry.type === "message" ? entry.message : entry.type))).toEqual([
+				{ role: "user", content: "root", timestamp: NOW },
+				{ role: "user", content: "sibling", timestamp: NOW },
+			]);
+			const address = branchTip("main");
+			expect(
+				source.values.find((value) => value.namespace === address.namespace && value.key === address.key)?.value,
+			).toBe(leafId === null ? null : entries[0]!.id);
+			expect(await collect(source)).toEqual(writes);
+			getOrThrow(
+				await fileSystem.appendFile(path, `${JSON.stringify(message("later", "sibling"))}\n`, BACKGROUND_CONTEXT),
+			);
+			expect(await collect(source)).toEqual(writes);
+		},
+	);
+
+	it.each([undefined, 7, {}, "missing"])("ignores invalid final selection marker %j", async (leafId) => {
+		const { read } = await fixture([message("root", null), { type: "leaf", leafId }]);
+		const source = await read();
+		const writes = await collect(source);
+		const first = writes.find((write) => write.kind === "entry");
+		const address = branchTip("main");
+		expect(
+			source.values.find((value) => value.namespace === address.namespace && value.key === address.key)?.value,
+		).toBe(first!.id);
+		expect(await collect(source)).toEqual(writes);
 	});
 
 	it("ignores a torn tail and emits only the captured complete records after later appends", async () => {

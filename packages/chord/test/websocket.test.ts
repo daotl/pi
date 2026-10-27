@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import type { IncomingMessage } from "node:http";
+import { deflateRawSync } from "node:zlib";
 import { Type } from "typebox";
 import { describe, it } from "vitest";
 import { WebSocketServer } from "ws";
@@ -108,6 +109,31 @@ describe("WebSocket links", () => {
 });
 
 describe("WebSocket links: packed payloads", () => {
+	it("rejects packed text envelopes before delivering a call", () => {
+		const messages: ((event: { data: unknown }) => void)[] = [];
+		let closed = false;
+		let delivered = false;
+		const socket: WebSocketLike = {
+			readyState: 1,
+			send: () => {},
+			close: () => {
+				closed = true;
+			},
+			addEventListener(type, listener) {
+				if (type === "message") messages.push(listener);
+			},
+		};
+		const link = webSocketLink(socket, { acceptPacked: false });
+		link.receive(() => {
+			delivered = true;
+		});
+		const packed = deflateRawSync(JSON.stringify("x".repeat(4096))).toString("base64");
+		for (const receive of messages)
+			receive({ data: JSON.stringify({ t: "call", id: 1, hold: 1, member: "m", z: ["args", packed] }) });
+		assert.equal(closed, true);
+		assert.equal(delivered, false);
+	});
+
 	it("large snapshots and results reach the client as binary messages; clients may not send them", async () => {
 		const notes = Array.from({ length: 40 }, (_, i) => `${i}:${"x".repeat(4000)}`);
 		const server = createHost({ self: { kind: "host" }, name: "server", onError: () => {} });

@@ -49,6 +49,7 @@ export interface VmSession {
 export interface StartVmOptions {
 	data: VmStartData;
 	wasm: CodemodeWasmModule;
+	signal?: AbortSignal;
 	/**
 	 * QuickJS's guard on its own stack, which turns deep recursion into a catchable `RangeError`.
 	 * The wasm frames also use the host thread's native stack, so the guard must trip before that
@@ -177,6 +178,10 @@ export async function startVm(options: StartVmOptions): Promise<VmSession> {
 		wasi: clock ? deterministicWasi(clock) : discardOutput,
 		...(clock ? { timezoneOffset: 0, intrinsics: Intrinsics.ALL & ~Intrinsics.WEAK_REF } : {}),
 	});
+	if (options.signal?.aborted) {
+		vm.dispose();
+		options.signal.throwIfAborted();
+	}
 	if (clock) clock.creating = false;
 	let disposed = false;
 	/** Calls the script has issued, tools and globals; reported with every `idle`. */

@@ -715,3 +715,176 @@ describe("cross-host reload", () => {
 		never.open();
 	});
 });
+
+describe("cluster commit boundaries", () => {
+	it("back-to-back remote-only reloads release the child reload slot synchronously", async () => {
+		const { server, worker, modules } = setup();
+		onTestFinished(async () => {
+			await worker.close();
+			await server.close();
+		});
+		await tick();
+		const ref = server.hold(Greeter, { session: "S1" });
+		assert.equal(await ref.greet("start"), "v1 start");
+		modules.set("greeter", greeterFacet("v2"));
+		await server.reload([], { remote: { "session:": ["greeter"] } });
+		modules.set("greeter", greeterFacet("v3"));
+		await server.reload([], { remote: { "session:": ["greeter"] } });
+		assert.equal(await ref.greet("end"), "v3 end");
+		assert.equal(worker.codeVersion, server.codeVersion);
+	});
+
+	it("a terminal coordinator install failure never sends abort after commit", async () => {
+		const frames: Frame[] = [];
+		const server = createHost({ self: {}, name: "server", onError: () => {} });
+		const [down, up] = memoryLinkPair();
+		server.accept(
+			dropping(down, (frame) => {
+				frames.push(frame);
+				return false;
+			}),
+			{ kind: "host", name: "worker", principal: {} },
+		);
+		const worker = createHost({ self: {}, name: "worker", upstream: { link: up, principal: {} }, onError: () => {} });
+		onTestFinished(async () => {
+			await worker.close();
+			await server.close();
+		});
+		const own = local("commit.terminal", {
+			version: 1,
+			input: Type.Object({}),
+			members: { ping: method(undefined, Type.String()) },
+		});
+		const facet: Facet = {
+			name: "terminal",
+			setup(api) {
+				api.serve(own, () => ({ ping: () => "ok" }));
+			},
+		};
+		await server.install(facet);
+		const ref = await server.get(own, {});
+		await tick();
+		const internal = server as unknown as { objects: Map<string, { startTasks(): void }> };
+		for (const object of internal.objects.values())
+			object.startTasks = () => {
+				throw new Error("post-commit start failure");
+			};
+		await assert.rejects(server.reload([facet]), /post-commit start failure/);
+		await tick();
+		assert.deepEqual(
+			frames.filter((frame) => frame.t === "commit" || frame.t === "abort").map((frame) => frame.t),
+			["commit"],
+		);
+		assert.equal(worker.codeVersion, server.codeVersion);
+		await assert.rejects(ref.ping(), (error) => isChordError(error, "unavailable") && error.reason === "host_failed");
+	});
+
+	for (const fail of [false, true]) {
+		it(`child commit ${fail ? "fails closed on invalid" : "refreshes valid"} state changed after its vote`, async () => {
+			const server = createHost({ self: {}, name: "server", onError: () => {} });
+			const effects: string[] = [];
+			const gated = local("commit.gated", { version: 1, input: Type.Object({}) });
+			const changed = remote("commit.changed", {
+				version: 1,
+				input: Type.Object({}),
+				host: hostNamed("worker"),
+				variants: {
+					main: { state: { doubled: Type.Number() }, methods: { set: method(Type.Number()) } },
+				},
+			});
+			const childFacet = (candidate: boolean): Facet => ({
+				name: "changed",
+				setup(api) {
+					api.serve(changed, (_input, _principal, self) => {
+						const n = self.state("n", Type.Number(), 1);
+						return {
+							variant: "main",
+							doubled: self.derive([n], (value) => {
+								if (candidate && fail && value === 2) throw new Error("child commit preflight failed");
+								return value * 2;
+							}),
+							set(value, ctx) {
+								n.replace(ctx, value);
+							},
+						};
+					});
+					api.serve(gated, (_input, _principal, self) => {
+						self.resource("exclusive", {
+							version: candidate ? 2 : 1,
+							exclusive: true,
+							open: () => {
+								effects.push(candidate ? "open-new" : "open-old");
+							},
+							close: () => {
+								effects.push(candidate ? "close-new" : "close-old");
+							},
+						});
+						self.task(async () => {
+							effects.push(candidate ? "task-new" : "task-old");
+						});
+						return {};
+					});
+				},
+			});
+			const voted = Promise.withResolvers<void>(),
+				resume = Promise.withResolvers<void>();
+			const errors: unknown[] = [];
+			const [down, up] = memoryLinkPair();
+			server.accept(down, { kind: "host", name: "worker", principal: {} });
+			const worker = createHost({
+				self: {},
+				name: "worker",
+				loader: async () => [childFacet(true)],
+				upstream: {
+					link: dropping(up, (frame) => {
+						if (frame.t === "vote") voted.resolve();
+						return false;
+					}),
+					principal: {},
+				},
+				onError: (error) => {
+					errors.push(error);
+				},
+			});
+			onTestFinished(async () => {
+				resume.resolve();
+				await worker.close();
+				await server.close();
+			});
+			const blocked = local("commit.blocked", { version: 1, input: Type.Object({}) });
+			const parentFacet = (candidate: boolean): Facet => ({
+				name: "blocked",
+				setup(api) {
+					api.serve(blocked, (_input, _principal, self) => {
+						if (candidate) self.resource("wait", { version: 1, open: () => resume.promise });
+						return {};
+					});
+				},
+			});
+			await worker.install(childFacet(false));
+			await server.install(parentFacet(false));
+			const ref = await worker.get(changed, {});
+			await worker.get(gated, {});
+			await server.get(blocked, {});
+			await tick();
+			const reloading = server.reload([parentFacet(true)], { remote: { worker: ["changed"] } });
+			await voted.promise;
+			await ref.set(2);
+			const atVote = effects.length;
+			resume.resolve();
+			await reloading;
+			await tick();
+			if (fail) {
+				assert.equal(up.closed, true);
+				assert.ok(errors.some((error) => String(error).includes("child commit preflight failed")));
+				await worker.close();
+				assert.deepEqual(effects.slice(atVote), ["close-new"]);
+				await assert.rejects(ref.set(3), (error) => isChordError(error, "gone"));
+			} else {
+				assert.equal(ref.doubled.value, 4);
+				assert.equal(worker.codeVersion, server.codeVersion);
+				assert.deepEqual(errors, []);
+			}
+		});
+	}
+});

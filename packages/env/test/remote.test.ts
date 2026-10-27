@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import { getOrThrow, type ShellOutputInfo } from "@earendil-works/pi-durable/env";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { Connection, nodePlatform } from "../src/connection.ts";
 import { RemoteExecutionEnv } from "../src/remote-env.ts";
 import { daemon } from "./daemon.ts";
@@ -25,6 +25,25 @@ function environment(): { env: RemoteExecutionEnv; connection: Connection } {
 }
 
 describe("RemoteExecutionEnv", () => {
+	it("resolves drive-less Windows roots using the daemon cwd, not the client or environment drive", async () => {
+		const connection = new Connection({ command: [] });
+		vi.spyOn(connection, "info").mockResolvedValue({
+			protocol: 1,
+			version: "1",
+			os: "windows",
+			arch: "x86_64",
+			home: "D:\\home",
+			tmpdir: "D:\\tmp",
+			separator: "\\",
+			cwd: "D:\\daemon",
+			driveCwds: {},
+			pid: 1,
+		});
+		const env = new RemoteExecutionEnv({ connection, id: "windows", cwd: "E:\\workspace" });
+		expect(getOrThrow(await env.absolutePath("\\work\\a.txt", context))).toBe("D:\\work\\a.txt");
+		expect(getOrThrow(await env.absolutePath("C:\\explicit\\a.txt", context))).toBe("C:\\explicit\\a.txt");
+		expect(getOrThrow(await env.absolutePath("\\\\server\\share\\a.txt", context))).toBe("\\\\server\\share\\a.txt");
+	});
 	it("transfers only about a window of output a caller keeps, with exact counts", async () => {
 		const { env } = environment();
 		const total = 5_000_000;

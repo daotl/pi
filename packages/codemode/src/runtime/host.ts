@@ -18,13 +18,14 @@ function defaultWorkerUrl(): URL {
  * not poll the flag, so on Bun a worker can outlive the script's result.
  */
 function workerLauncher(options: CodemodeSandboxOptions): VmLauncher {
-	return async (data, events) => {
+	return async (data, events, signal) => {
 		let module: CodemodeWasmModule;
 		try {
 			module = await (options.wasm ?? loadQuickJSWasm());
 		} catch (error) {
 			throw new Error(`Failed to load QuickJS: ${errorMessage(error)}`);
 		}
+		signal.throwIfAborted();
 		const interrupt = new SharedArrayBuffer(4);
 		const workerData: WorkerData = { ...data, wasm: module, interrupt };
 		const releaseWorker = options.acquireWorker?.();

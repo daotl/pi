@@ -419,7 +419,7 @@ export class NodeFileWatcher implements FileWatcher {
 			}
 			if (snapshot.get(target.path)?.kind !== "directory") continue;
 			const recursiveRoot = target.recursive && !perDirectory;
-			wanted.set(target.path, recursiveRoot);
+			wanted.set(target.path, recursiveRoot || wanted.get(target.path) === true);
 			if (target.recursive && perDirectory) {
 				for (const [path, entry] of snapshot) {
 					if (entry.kind === "directory" && path !== target.path && isWithin(path, target.path)) {

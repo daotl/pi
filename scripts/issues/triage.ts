@@ -107,6 +107,7 @@ export class Triage {
 	private harness!: Harness;
 	private queue: number[] = [];
 	private active = 0;
+	private runningAttempts = new Set<string>();
 	/** Conversation ID to issue number, for the tools. */
 	private conversations = new Map<number, number>();
 
@@ -174,6 +175,7 @@ export class Triage {
 
 	async retriage(number: number): Promise<void> {
 		await this.update(number, (issue) => {
+			this.conversations.delete(issue.conversationId);
 			issue.status = "queued";
 			issue.attempt += 1;
 			issue.conversationId = 0;
@@ -207,13 +209,7 @@ export class Triage {
 			const number = this.queue.shift()!;
 			this.active++;
 			this.run(number)
-				.catch((error: unknown) => {
-					console.error(`#${number}:`, error);
-					return this.update(number, (issue) => {
-						issue.status = "failed";
-						issue.error = error instanceof Error ? error.message : String(error);
-					});
-				})
+				.catch((error: unknown) => console.error(`#${number}:`, error))
 				.finally(() => {
 					this.active--;
 					this.pump();
@@ -226,41 +222,55 @@ export class Triage {
 	}
 
 	private async run(number: number): Promise<void> {
-		const issue = this.options.corpus.get(number);
-		if (!issue) throw new Error("not in corpus");
 		const existing = (await this.state()).issues[number];
-		let conversation = existing?.conversationId
-			? await this.harness.conversation(existing.conversationId as ConversationId, context)
-			: undefined;
-		if (!conversation) {
-			conversation = await this.harness.createConversation(
-				{
-					ownership: { kind: "ownerless" },
-					agent: { model: this.options.model, thinkingLevel: this.options.thinkingLevel },
-				},
-				context,
-			);
-			this.conversations.set(conversation.id, number);
-			await this.update(number, (state) => {
-				state.conversationId = conversation!.id;
-			});
-		}
-		await this.update(number, (state) => {
-			state.status = "running";
-		});
 		const attempt = existing?.attempt ?? 0;
-		const submission = await conversation.submit(
-			{ type: "input", content: this.formatIssue(issue), requestId: `triage:${number}:${attempt}` },
-			context,
-		);
-		const settled = await submission.wait(context);
-		const after = (await this.state()).issues[number];
-		if (after?.status === "done") return;
-		const detail = settled.status === "unanswered" ? `${settled.reason ?? ""} ${settled.detail ?? ""}` : "";
-		await this.update(number, (state) => {
-			state.status = "failed";
-			state.error = `no triage submitted ${detail}`.trim();
-		});
+		const key = `${number}:${attempt}`;
+		if (this.runningAttempts.has(key)) return;
+		this.runningAttempts.add(key);
+		let conversationId = existing?.conversationId ?? 0;
+		const owns = (state: IssueState) => state.attempt === attempt && state.conversationId === conversationId;
+		try {
+			const issue = this.options.corpus.get(number);
+			if (!issue) throw new Error("not in corpus");
+			let conversation = conversationId
+				? await this.harness.conversation(conversationId as ConversationId, context)
+				: undefined;
+			if (!conversation) {
+				conversation = await this.harness.createConversation(
+					{ ownership: { kind: "ownerless" }, agent: { model: this.options.model, thinkingLevel: this.options.thinkingLevel } },
+					context,
+				);
+			}
+			let claimed = false;
+			await this.update(number, (state) => {
+				if (!owns(state)) return;
+				state.conversationId = conversation!.id;
+				state.status = "running";
+				claimed = true;
+			});
+			if (!claimed) return;
+			conversationId = conversation.id;
+			this.conversations.set(conversationId, number);
+			const submission = await conversation.submit(
+				{ type: "input", content: this.formatIssue(issue), requestId: `triage:${number}:${attempt}` }, context,
+			);
+			const settled = await submission.wait(context);
+			const detail = settled.status === "unanswered" ? `${settled.reason ?? ""} ${settled.detail ?? ""}` : "";
+			await this.update(number, (state) => {
+				if (!owns(state) || state.status === "done") return;
+				state.status = "failed";
+				state.error = `no triage submitted ${detail}`.trim();
+			});
+		} catch (error) {
+			await this.update(number, (state) => {
+				if (!owns(state) || state.status === "done") return;
+				state.status = "failed";
+				state.error = error instanceof Error ? error.message : String(error);
+			});
+		} finally {
+			this.runningAttempts.delete(key);
+			this.conversations.delete(conversationId);
+		}
 	}
 
 	private formatIssue(issue: Issue): string {
@@ -335,17 +345,20 @@ export class Triage {
 					...args,
 					duplicates: args.duplicates.filter((dup) => dup.number !== number).slice(0, 5),
 				};
+				let recorded = false;
 				await api.commit(
 					(tx) =>
 						mutate(tx, number, (state) => {
+							if (state.conversationId !== api.conversationId) return;
 							state.result = result;
 							state.status = "done";
 							state.error = "";
 							state.triagedAt = new Date().toISOString();
+							recorded = true;
 						}),
 					callContext,
 				);
-				return { output: [{ type: "text", text: "Recorded." }], control: { terminate: true } };
+				return { output: [{ type: "text", text: recorded ? "Recorded." : "Superseded triage attempt." }], control: { terminate: true } };
 			},
 		});
 

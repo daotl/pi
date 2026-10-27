@@ -261,8 +261,8 @@ export class RemoteBinding {
 			const error = fromWireError(frame.error!);
 			// Before the first hydration nobody could read anything: the binding fails instead of waiting forever.
 			if (!this.hydrated && this.stateOn) {
+				if (this.hold !== undefined) this.hold.channel.release(this.hold.id);
 				this.gone(error);
-				this.close();
 			} else this.host.report(error);
 			return;
 		}
@@ -331,6 +331,11 @@ export class RemoteBinding {
 		this.host.forgetBinding(this);
 	}
 
+	/** The current hold's shape, including after a reconnect; unlike ready, renewed for every hold. */
+	whenLive(): Promise<void> {
+		return this.#live.promise;
+	}
+
 	/** Calls `name` over the current hold, waiting for it while the binding (re)holds. */
 	async call(name: string, args: unknown, ctx: Ctx): Promise<unknown> {
 		for (;;) {
@@ -345,13 +350,14 @@ export class RemoteBinding {
 			}
 			// Send only what the consumer's own schema knows (the additive rule's premise; see ObjectImpl.call).
 			const sent = description.args === undefined ? undefined : Value.Clean(description.args, Value.Clone(args));
-			return hold.channel.call(
+			const result = await hold.channel.call(
 				hold.id,
 				name,
 				sent,
 				{ rootId: ctx.rootId, codeVersion: ctx.codeVersion },
 				ctx.signal,
 			);
+			return description.result === undefined ? undefined : result;
 		}
 	}
 
@@ -624,13 +630,26 @@ export class RemoteRef implements RefCore {
 	#caller(name: string): (...given: unknown[]) => Promise<unknown> {
 		let caller = this.#callers.get(name);
 		if (caller === undefined) {
-			const noArgs = takesNoArgs(this.contract, name);
 			caller = (...given) => {
-				// A method without arguments is called as `ref.name(ctx)`.
-				const [args, ctx] = (noArgs ? [undefined, given[0]] : given) as [unknown, Ctx | undefined];
 				const host = this.binding.host;
 				if (host.inFactory > 0)
 					throw new ChordError("not_ready", `${this.address}.${name} called inside a factory`);
+				if (this.ended) return Promise.reject(this.terminalError());
+				const context = given.find((value): value is CtxImpl => value instanceof CtxImpl);
+				try {
+					context?.check(host);
+				} catch (error) {
+					return Promise.reject(error);
+				}
+				if (this.binding.status === "loading") {
+					const ready = this.binding.whenLive();
+					return (context === undefined ? ready : raceSignal(ready, context.signal)).then(() =>
+						this.#caller(name)(...given),
+					);
+				}
+				// A method without arguments is called as `ref.name(ctx)`; use the applied variant.
+				const noArgs = takesNoArgs(this.contract, name, this.variant);
+				const [args, ctx] = (noArgs ? [undefined, given[0]] : given) as [unknown, Ctx | undefined];
 				// The same checks as a local reference's caller (RefImpl.caller and ObjectImpl.call): a ctx from another host
 				// or one not made by Chord would carry a root this host does not own over its link.
 				if (ctx !== undefined && !(ctx instanceof CtxImpl)) {

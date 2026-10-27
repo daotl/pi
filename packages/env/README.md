@@ -64,3 +64,11 @@ run through Git Bash as `NodeExecutionEnv` runs them there; argv commands run di
 the binary named by `PI_ENV_DAEMON` (CI tests the release builds this way). They run Durable's env conformance suite
 against `RemoteExecutionEnv` and compare random operation sequences and Durable's tools against `NodeExecutionEnv` on
 the same machine. `test/ssh-external.test.ts` runs the suite over a real SSH server when `PI_ENV_SSH_HOST` is set.
+
+Local artifact production (`npm run pack:packages`) requires the release daemon assets under `packages/env/bin/` before packing this package. The artifact packer rejects missing or empty binaries instead of certifying an import-only package that cannot start an environment. Prepare the artifacts produced by `.github/workflows/env-daemons.yml` for Linux, Android, and macOS (`x64` and `arm64`, `pi-env`) and Windows (`x64` and `arm64`, `pi-env.exe`). A host debug daemon supplied through `PI_ENV_DAEMON` is a test override, not a substitute for this release matrix.
+
+`npm run check:package-install` checks isolated installation, exports, SDK loading, and CLI identity only. It explicitly skips release-daemon completeness and reports that limit; it does not certify a deployable `pi-env` release. Production artifact commands retain the complete-asset check by default.
+
+Local release tests honor `PI_ENV_DAEMON`. Without that override, release scripts build the host daemon with the repository's Rust toolchain into a temporary external Cargo target, pass its path to `test.sh`, and remove that temporary target afterward. They do not overwrite an existing checkout target directory.
+
+Terminal close and connection shutdown terminate the daemon-owned terminal session's job-control processes, including HUP-ignoring background jobs. Closing the connection first ends daemon stdin so this cleanup can run; a bounded fallback terminates an unresponsive transport. POSIX session enumeration does not provide an atomic guarantee against descendants concurrently forking or deliberately leaving their session.

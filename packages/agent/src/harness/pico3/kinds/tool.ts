@@ -62,8 +62,9 @@ const synthetic = (text: string, code: string): ToolResult => ({
 	isError: true,
 	diagnostics: [{ severity: "error", message: text, code }],
 });
-/** Validate arguments with the tool's real schema (TypeBox 1.x). */
+/** Reject parser diagnostics before validating arguments with the tool's real schema (TypeBox 1.x). */
 export function invalid(declaration: AnyToolDeclaration, call: StoredToolCall): string | undefined {
+	if (call.argumentsError !== undefined) return call.argumentsError;
 	const errors = [...Errors(declaration.parameters as TSchema, call.arguments)];
 	return errors.length === 0 ? undefined : errors.map((e) => `${e.instancePath || "/"}: ${e.message}`).join("; ");
 }
@@ -144,11 +145,15 @@ export const tool: CoreKind<ToolInput, ToolCheckpoint, ToolTaskResult, never, { 
 						cp.call,
 					),
 				};
-			if (invalid(declaration, cp.call) !== undefined)
+			const bad = invalid(declaration, cp.call);
+			if (bad !== undefined)
 				return {
 					done: close(
 						task,
-						synthetic(`tool ${cp.call.name} was interrupted; arguments no longer validate`, "interrupted"),
+						synthetic(
+							`tool ${cp.call.name} was interrupted; arguments no longer validate: ${bad}`,
+							"interrupted",
+						),
 						declaration,
 						rt.now(),
 						cp.call,

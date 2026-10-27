@@ -22,7 +22,7 @@ export type NodePhotonImagesOptions = {
  * `createPhotonImages()` for Node and Bun, with Photon's WebAssembly read from the installed `@silvia-odwyer/photon`,
  * by default in a worker thread that keeps the process alive only while it prepares an image. A worker that cannot
  * start falls back to the calling thread. A single-file binary cannot resolve the package: read its own copy of
- * `photon_rs_bg.wasm` and call `createPhotonImages()`.
+ * `photon_rs_bg.wasm` and call `createPhotonImages()`. Preparing an image preserves the caller's bytes, including Buffers.
  */
 export async function createNodePhotonImages(options: NodePhotonImagesOptions = {}): Promise<ImageProcessor> {
 	if (options.worker === false) return inProcess();
@@ -106,9 +106,15 @@ class PhotonThread {
 		this.#idle = undefined;
 		// A pending image keeps the process alive, as one prepared on the calling thread would.
 		this.#worker.ref();
-		// A copy, transferred: the caller keeps its bytes.
-		const copy = bytes.slice();
-		this.#worker.postMessage({ id, bytes: copy, mimeType, limits } satisfies PrepareRequest, [copy.buffer]);
+		try {
+			// An owned Uint8Array, not Buffer.slice(), which aliases and may detach the caller's bytes.
+			const copy = Uint8Array.from(bytes);
+			this.#worker.postMessage({ id, bytes: copy, mimeType, limits } satisfies PrepareRequest, [copy.buffer]);
+		} catch (error) {
+			this.#pending.delete(id);
+			this.#settled();
+			throw error;
+		}
 		return request.promise;
 	}
 

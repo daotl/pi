@@ -49,8 +49,9 @@ impl Output {
     }
 
     /// Wait while more than the bulk limit is unsent, unless `stop` is set.
-    pub fn wait_for_room(&self, stop: &AtomicBool) {
+    pub fn wait_for_room(&self, stop: &AtomicBool, paused: &AtomicUsize) {
         let mut queues = self.queues.lock().unwrap();
+        paused.fetch_add(1, Ordering::SeqCst);
         while queues.bulk_bytes > BULK_LIMIT && !queues.closed && !stop.load(Ordering::SeqCst) {
             queues = self
                 .drained
@@ -58,6 +59,7 @@ impl Output {
                 .unwrap()
                 .0;
         }
+        paused.fetch_sub(1, Ordering::SeqCst);
     }
 
     pub fn close(&self) {

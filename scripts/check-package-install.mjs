@@ -9,14 +9,15 @@ import { codingAgentName, smokeTestCodingAgent } from "./coding-agent-smoke.mjs"
 
 const root = mkdtempSync(join(tmpdir(), "pi-package-install-"));
 try {
-	const artifactSet = produceArtifactSet({ build: false, outDir: join(root, "artifacts"), repoRoot: process.cwd() });
+	// This checks module installation and exports, not the separately built release daemon matrix.
+	const artifactSet = produceArtifactSet({ build: false, outDir: join(root, "artifacts"), repoRoot: process.cwd(), requireEnvReleaseAssets: false });
 	for (const pkg of artifactSet.packages) {
 		const directory = join(root, "consumers", packageConsumerDirectoryName(pkg.name));
 		installConsumer({ artifactSet, directory, packageNames: [pkg.name] });
 		smokeTestNpmConsumer({ artifactSet, directory, packageName: pkg.name });
 		if (pkg.name === codingAgentName) smokeTestCodingAgent(directory);
 	}
-	console.log(`Verified ${artifactSet.packages.length} isolated package consumers.`);
+	console.log(`Verified ${artifactSet.packages.length} isolated package consumers (installation/exports only; release daemon assets not verified).`);
 } finally {
 	rmSync(root, { force: true, recursive: true });
 }

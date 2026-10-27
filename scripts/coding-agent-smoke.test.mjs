@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -60,4 +60,22 @@ test("accepts a valid coding-agent package", (t) => {
 test("fails when the SDK imports an undeclared package despite a working CLI", (t) => {
 	const directory = createFixture(t, { importUndeclared: true });
 	assert.throws(() => smokeTestCodingAgent(directory), /Cannot find package '@earendil-works\/undeclared'/);
+});
+
+test("rejects a declared development-only dependency", (t) => {
+	const directory = createFixture(t);
+	const path = join(directory, "node_modules", codingAgentName, "package.json");
+	const manifest = JSON.parse(readFileSync(path, "utf8"));
+	manifest.dependencies = { "@earendil-works/pi-server": "1.0.0" };
+	writeFileSync(path, JSON.stringify(manifest));
+	assert.throws(() => smokeTestCodingAgent(directory), /Development-only dependency/);
+});
+
+test("rejects a resolvable source-only export", (t) => {
+	const directory = createFixture(t);
+	const path = join(directory, "node_modules", codingAgentName, "package.json");
+	const manifest = JSON.parse(readFileSync(path, "utf8"));
+	manifest.exports["./client"] = "./dist/index.js";
+	writeFileSync(path, JSON.stringify(manifest));
+	assert.throws(() => smokeTestCodingAgent(directory), /Source-only export resolves/);
 });

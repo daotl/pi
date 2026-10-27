@@ -26,6 +26,7 @@ import { join } from "node:path";
 import { findPackageDirectories } from "./package-workspaces.mjs";
 import { getPublicWorkspacePackages } from "./release-packages.mjs";
 import { hydrateModelCatalogBytes, updateModelCatalogPin } from "./update-model-catalog-pin.mjs";
+import { runReleaseTests } from "./package-artifacts.mjs";
 
 const RELEASE_TARGET = process.argv[2];
 const BUMP_TYPES = new Set(["major", "minor", "patch"]);
@@ -305,7 +306,7 @@ if (process.env.PI_RELEASE_SKIP_TESTS === "1") {
 	console.log("Skipping tests (PI_RELEASE_SKIP_TESTS=1)\n");
 } else {
 	console.log("Running tests...");
-	run("./test.sh");
+	runReleaseTests(process.cwd());
 	console.log();
 }
 

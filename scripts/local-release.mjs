@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { installConsumer, packageConsumerDirectoryName, smokeTestNpmConsumer } from "./local-package-install.mjs";
-import { produceArtifactSet } from "./package-artifacts.mjs";
+import { produceArtifactSet, runReleaseTests } from "./package-artifacts.mjs";
 import { codingAgentName, smokeTestCodingAgent } from "./coding-agent-smoke.mjs";
 import { execNpmSync } from "./npm-command.mjs";
 
@@ -109,7 +109,7 @@ const binaryDirectory = join(outDir, "bun");
 const nodeInstallDirectory = join(outDir, "node");
 const bunInstallDirectory = join(outDir, "bun-install");
 
-if (!options.skipTest) execFileSync("bash", ["./test.sh"], { cwd: repoRoot, stdio: "inherit" });
+if (!options.skipTest) runReleaseTests(repoRoot);
 
 let binaryPlatform;
 if (!options.skipInstall) {

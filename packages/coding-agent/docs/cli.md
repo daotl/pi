@@ -135,7 +135,7 @@ Default enabled tools are `read`, `bash`, `edit`, and `write`, unless `defaultTo
 pi --tools read,bash,codemode,'mcp__radius__*'
 ```
 
-The MCP resource tools (`list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`) count as MCP tools. To remove MCP tools, use `--exclude-tools 'mcp__*'` or [`--no-mcp`](#resource-options).
+The MCP resource tools are named `list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource`. `--exclude-tools 'mcp__*'` removes server tools only, not these resource tools. To remove all MCP tools while retaining connections, use `--exclude-tools 'mcp__*,list_mcp_resources,list_mcp_resource_templates,read_mcp_resource'`. Use [`--no-mcp`](#resource-options) to disable built-in MCP connections and tools entirely.
 
 | Built-in | Purpose |
 |---|---|
@@ -231,7 +231,7 @@ See [Configuration](configuration.md) for saved configuration, [Security](securi
 - `--append-system-prompt <text|path>`<br>
   Appends text or an existing file to the system prompt and is repeatable.
 - `--tui-mode <mode>`<br>
-  Uses `fullscreen` (default) or `regular` terminal mode.
+  Uses `regular` (default) or `fullscreen` terminal mode.
 - `--verbose`<br>
   Shows verbose interactive startup information, overriding `quietStartup`.
 - `-a`, `--approve`<br>

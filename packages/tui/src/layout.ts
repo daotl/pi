@@ -371,7 +371,15 @@ function paintBox(box: LayoutBox, screen: string[], totalWidth: number): void {
 			if (hiddenRows < metadata.rows) {
 				const visibleRows = Math.min(box.rect.height, metadata.rows - hiddenRows);
 				const cropped = cropKittyImageLine(imageLine, hiddenRows, visibleRows);
-				if (box.rect.x === 0 && box.rect.width >= totalWidth) screen[box.rect.y] = cropped;
+				const imageStart = cropped.indexOf("\x1b_G");
+				const imageColumn = box.rect.x + visibleWidth(cropped.slice(0, imageStart));
+				const controls = cropped.slice(imageStart).match(/^(?:\x1b_G[^\x1b]*\x1b\\)+/)?.[0];
+				if (controls) {
+					const row = screen[box.rect.y] ?? "";
+					const prefix = sliceByColumn(row, 0, imageColumn, true);
+					screen[box.rect.y] =
+						`${prefix}${" ".repeat(Math.max(0, imageColumn - visibleWidth(prefix)))}${controls}${sliceByColumn(row, imageColumn, totalWidth - imageColumn, true)}`;
+				}
 			}
 			break;
 		}

@@ -217,12 +217,13 @@ fn spawn_reader(
     sender: Sender<Message>,
     stop: Arc<AtomicBool>,
     output: Option<Arc<Output>>,
+    paused: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         sys::read_pipe(pipe, &stop, |bytes| {
             let delivered = sender.send(Message::Data(stream, bytes.to_vec())).is_ok();
             if let Some(output) = &output {
-                output.wait_for_room(&stop);
+                output.wait_for_room(&stop, &paused);
             }
             delivered
         });
@@ -298,6 +299,7 @@ pub fn run(
     } else {
         None
     };
+    let paused = Arc::new(AtomicUsize::new(0));
     let readers = [
         spawn_reader(
             0,
@@ -305,6 +307,7 @@ pub fn run(
             sender.clone(),
             stop.clone(),
             gate.clone(),
+            paused.clone(),
         ),
         spawn_reader(
             1,
@@ -312,6 +315,7 @@ pub fn run(
             sender.clone(),
             stop.clone(),
             gate,
+            paused.clone(),
         ),
     ];
     let waiter = sender.clone();
@@ -371,6 +375,9 @@ pub fn run(
     }
     loop {
         let now = Instant::now();
+        if status.is_some() && !killed && paused.load(Ordering::SeqCst) > 0 {
+            idle_until = Some(now + EXIT_STDIO_GRACE);
+        }
         // Node's timer stays armed until the command settles, including the grace period after exit.
         if !timed_out && deadline.is_some_and(|deadline| now >= deadline) {
             timed_out = true;
@@ -390,7 +397,11 @@ pub fn run(
         {
             deliver(pending);
         }
-        let mut wait = Duration::from_secs(3600);
+        let mut wait = if status.is_some() && pending.is_none() {
+            UNSENT_POLL
+        } else {
+            Duration::from_secs(3600)
+        };
         if let Some(deadline) = deadline.filter(|_| !timed_out) {
             wait = wait.min(deadline.saturating_duration_since(now));
         }

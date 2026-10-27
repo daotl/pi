@@ -39,6 +39,28 @@ const BACKENDS: Record<string, (options: CodemodeSandboxBaseOptions) => Codemode
 		}),
 };
 
+it("does not acquire a worker after cancellation while WASM loads", async () => {
+	const loaded = await loadQuickJSWasm();
+	const { promise: wasm, resolve } = Promise.withResolvers<typeof loaded>();
+	let acquired = 0;
+	const sandbox = new CodemodeSandbox({
+		wasm,
+		acquireWorker: () => {
+			acquired++;
+			return () => {};
+		},
+	});
+	const controller = new AbortController();
+	const running = sandbox.execute("return 1", { signal: controller.signal });
+	controller.abort();
+	expect(await running).toMatchObject({ ok: false, error: { kind: "aborted" } });
+	resolve(loaded);
+	await wasm;
+	await Promise.resolve();
+	expect(acquired).toBe(0);
+	await sandbox.close();
+});
+
 let backend = "worker";
 const sandboxes: CodemodeSandboxBase[] = [];
 

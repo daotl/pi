@@ -3,6 +3,7 @@ import type { ToolResultMessage } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ExtensionAPI } from "../../src/core/extensions/types.ts";
+import { SessionManager } from "../../src/core/session-manager.ts";
 import { createCodemodeExtension } from "../../src/extensions/codemode/index.ts";
 import { createToolSearchExtension } from "../../src/extensions/tool-search/index.ts";
 import { createHarness, type Harness } from "./harness.ts";
@@ -59,6 +60,45 @@ describe("AgentSession tool orchestration", () => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
 	});
 
+	// #22: invocation modifiers must survive every selected-branch restoration path.
+	it.each(["navigate", "swipe", "regenerate"] as const)(
+		"keeps invocation tool modifiers across repeated %s restoration and provider requests",
+		async (operation) => {
+			const manager = SessionManager.inMemory();
+			const policy = manager.appendMessage({
+				role: "system",
+				content: "",
+				toolsAdded: ["read", "write"].map((name) => ({ name, description: name, parameters: Type.Object({}) })),
+				timestamp: 0,
+			});
+			const anchor = manager.appendMessage({ role: "user", content: "question", timestamp: 1 });
+			manager.appendMessage(fauxAssistantMessage("first", { timestamp: 2 }));
+			manager.branch(anchor);
+			manager.appendMessage(fauxAssistantMessage("second", { timestamp: 3 }));
+			const harness = await createHarness({ sessionManager: manager, defaultToolModifiers: ["-write", "+grep"] });
+			harnesses.push(harness);
+			const { session } = harness;
+			expect(session.getActiveToolNames()).toEqual(["read", "grep"]);
+			const group = session.getSwipeGroup();
+			if (!group) throw new Error("Expected assistant swipe versions");
+			for (let pass = 0; pass < 2; pass++) {
+				if (operation === "navigate") await session.navigateTree(policy, { summarize: false });
+				else if (operation === "swipe")
+					expect(session.goToSwipeVersion({ ...group, currentIndex: -1 }, pass)).toBe(true);
+				else session.prepareSwipeRegeneration(group);
+				expect(session.getActiveToolNames()).toEqual(["read", "grep"]);
+				expect(session.getCallableToolNames()).toEqual(["read", "grep"]);
+				harness.setResponses([
+					(context) => {
+						expect(getCurrentTools(context.messages).map((tool) => tool.name)).toEqual(["read", "grep"]);
+						return fauxAssistantMessage("correct loadout");
+					},
+				]);
+				await session.prompt("check tools");
+				expect(session.getActiveToolNames()).toEqual(["read", "grep"]);
+			}
+		},
+	);
 	it("supports tools that call other tools under any name through the extension API", async () => {
 		const toolCalls: string[] = [];
 		const harness = await createHarness({

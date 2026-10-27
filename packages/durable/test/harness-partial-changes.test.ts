@@ -63,10 +63,11 @@ function setup() {
 			emit({ type: "toolcall_end", contentIndex: 1, toolCall: partial.content[1] as ToolCall, partial });
 		},
 		/** One partial commit, as the generation's throttle makes it; `fail` aborts it like a rejected commit. */
-		commit(fail = false) {
+		commit(fail = false, afterTake?: () => void) {
 			// As the generation copies it: `copyJson()` returns untyped JSON, here a message's JSON representation.
 			const message = copyJson(partial) as PartialMessage;
 			const taken = changes.take(message);
+			afterTake?.();
 			const change = tracker.beginChange();
 			changes.commit(change.state.generation, message, taken);
 			if (fail) {
@@ -197,6 +198,21 @@ describe("PartialChanges", () => {
 		stream.argument(',"b":2}');
 		stream.commit();
 		expect(stream.committed().arguments).toEqual({ a: "xy", b: 2 });
+	});
+
+	it.each([false, true])("keeps captured arguments when the call ends before commit (existing: %s)", (existing) => {
+		const stream = setup();
+		stream.argument('{"a":"x');
+		if (existing) stream.commit();
+		stream.argument('y"}');
+		stream.commit(false, () => {
+			stream.endBlocks();
+			// The queued commit owns its earlier snapshot, not a provider's final replacement.
+			stream.partial.content[1] = { type: "toolCall", id: "c1", name: "write", arguments: { a: "final" } };
+		});
+		expect(stream.committed().arguments).toEqual({ a: "xy" });
+		stream.commit();
+		expect(stream.committed().arguments).toEqual({ a: "final" });
 	});
 
 	it("commits the final arguments after the call ends, and drops text appends when a block ends", () => {

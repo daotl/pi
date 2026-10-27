@@ -8,6 +8,23 @@ import { execNpmSync } from "./npm-command.mjs";
 
 const manifestSchemaVersion = 1;
 
+/** Build the host test daemon outside the checkout; keep an explicit daemon override authoritative. */
+export function runReleaseTests(repoRoot) {
+	if (process.env.PI_ENV_DAEMON) {
+		execFileSync("bash", ["./test.sh"], { cwd: repoRoot, stdio: "inherit" });
+		return;
+	}
+	const target = mkdtempSync(join(tmpdir(), "pi-release-daemon-"));
+	try {
+		const env = { ...process.env, CARGO_TARGET_DIR: target };
+		execNpmSync(["run", "build:daemon", "--workspace", "packages/env"], { cwd: repoRoot, env, stdio: "inherit" });
+		env.PI_ENV_DAEMON = join(target, "debug", process.platform === "win32" ? "pi-env.exe" : "pi-env");
+		execFileSync("bash", ["./test.sh"], { cwd: repoRoot, env, stdio: "inherit" });
+	} finally {
+		rmSync(target, { recursive: true, force: true });
+	}
+}
+
 function isInsidePath(child, parent) {
 	const relativePath = relative(parent, child);
 	return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
@@ -19,7 +36,7 @@ function getGitSource(repoRoot) {
 	return { commit, dirty: status.length > 0 };
 }
 
-function packPackages(packages, tarballDirectory) {
+function packPackages(packages, tarballDirectory, requireEnvReleaseAssets) {
 	mkdirSync(tarballDirectory, { recursive: true });
 	const packedPackages = [];
 	for (const pkg of packages) {
@@ -34,6 +51,15 @@ function packPackages(packages, tarballDirectory) {
 		const packed = Array.isArray(parsed) ? (parsed.length === 1 ? parsed[0] : undefined) : parsed?.[pkg.name];
 		if (packed?.name !== pkg.name || typeof packed.filename !== "string") {
 			throw new Error(`npm pack returned an unexpected result for ${pkg.name}`);
+		}
+		if (requireEnvReleaseAssets && pkg.name === "@earendil-works/pi-env") {
+			const required = ["linux-x64", "linux-arm64", "android-arm64", "android-x64", "darwin-arm64", "darwin-x64", "windows-x64", "windows-arm64"]
+				.map((platform) => `bin/pi-env-${platform}/pi-env${platform.startsWith("windows-") ? ".exe" : ""}`);
+			const missing = required.filter((path) => !packed.files.some((file) => file.path === path && file.size > 0));
+			if (missing.length) {
+				rmSync(join(tarballDirectory, packed.filename), { force: true });
+				throw new Error(`Missing pi-env release daemon assets: ${missing.join(", ")}. Prepare packages/env/bin with the daemon artifacts from build-binaries.yml before packing.`);
+			}
 		}
 
 		const originalPath = join(tarballDirectory, packed.filename);
@@ -73,7 +99,7 @@ function prepareOutputDirectory(outDir, options) {
 	return outputDirectory;
 }
 
-export function produceArtifactSet({ repoRoot, outDir, build = true, offlineModelData = false, force = false, source }) {
+export function produceArtifactSet({ repoRoot, outDir, build = true, offlineModelData = false, force = false, source, requireEnvReleaseAssets = true }) {
 	const root = resolve(repoRoot);
 	const artifactDirectory = prepareOutputDirectory(outDir, { force, repoRoot: root });
 	if (build) {
@@ -82,7 +108,7 @@ export function produceArtifactSet({ repoRoot, outDir, build = true, offlineMode
 	}
 	const artifactSource = source === undefined ? getGitSource(root) : source;
 	const packages = getPublicWorkspacePackages(join(root, "packages"));
-	const packedPackages = packPackages(packages, join(artifactDirectory, "tarballs"));
+	const packedPackages = packPackages(packages, join(artifactDirectory, "tarballs"), requireEnvReleaseAssets);
 	const manifest = {
 		schemaVersion: manifestSchemaVersion,
 		source: artifactSource,

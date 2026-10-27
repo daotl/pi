@@ -496,12 +496,14 @@ fn serve(token: &str) -> io::Result<()> {
         let output = output.clone();
         let last_seen = last_seen.clone();
         let groups = server.groups.clone();
+        let terminals = server.terminals.clone();
         thread::spawn(move || {
             loop {
                 thread::sleep(PING_INTERVAL);
                 output.control(Frame::new(PING, 0, json!({})));
                 // A client that went silent (a phone that lost its network) leaves nothing running.
                 if now_ms().saturating_sub(last_seen.load(Ordering::Relaxed)) > SILENCE_LIMIT_MS {
+                    pty::kill_all(&terminals);
                     kill_all(&groups);
                     std::process::exit(0);
                 }
@@ -517,6 +519,7 @@ fn serve(token: &str) -> io::Result<()> {
     );
     let result = serve_frames(&server, &mut input);
     // However input ended, the client is gone: stop everything it started.
+    pty::kill_all(&server.terminals);
     kill_all(&server.groups);
     output.close();
     let _ = writer.join();

@@ -102,6 +102,43 @@ describe.skipIf(process.platform === "win32")("openTerminal", () => {
 		await expect(terminal.foreground()).rejects.toMatchObject({ code: "EBADF" });
 	}, 20_000);
 
+	it.each(["terminal", "connection"])("kills HUP-ignoring background jobs when closing the %s", async (mode) => {
+		const { connection, cwd } = connect();
+		const output = collector();
+		const terminal = await openTerminal(connection, {
+			cwd,
+			argv: ["/bin/sh", "-i"],
+			cols: 80,
+			rows: 24,
+			onData: output.onData,
+		});
+		terminal.write("sh -c 'trap \"\" HUP; echo $$ > job.pid; printf JOB-; printf STARTED; exec sleep 100' &\n");
+		await output.waitFor("JOB-STARTED");
+		const pid = Number(readFileSync(join(cwd, "job.pid"), "utf8"));
+		try {
+			if (mode === "terminal") terminal.close();
+			else connection.close();
+			await terminal.exited.catch(() => undefined);
+			// The connection rejects pending requests before the daemon consumes EOF and kills its session.
+			await expect
+				.poll(() => {
+					try {
+						process.kill(pid, 0);
+						return true;
+					} catch {
+						return false;
+					}
+				})
+				.toBe(false);
+		} finally {
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				/* Already reaped. */
+			}
+		}
+	});
+
 	it("delivers raw bytes, not decoded text", async () => {
 		const { connection, cwd } = connect();
 		const output = collector();

@@ -387,7 +387,8 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 				// Keep malformed URLs as ordinary paths, as Node does.
 			}
 		}
-		if (paths.isAbsolute(normalized)) return paths.resolve(normalized);
+		if (paths.isAbsolute(normalized))
+			return windows ? win32.resolve(info.cwd, normalized) : posix.resolve(normalized);
 		if (windows) {
 			// A drive-relative path on another drive: Node on Windows resolves it against that drive's working directory
 			// (`=D:`), else its own working directory if on that drive, else the drive's root.

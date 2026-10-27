@@ -54,3 +54,36 @@ it.each([undefined, "", "<final>"])(
 		]);
 	},
 );
+
+// #13: terminal parser diagnostics are authoritative, including their removal.
+it.each([undefined, "", "Tool arguments must be a JSON object\n\nReceived arguments:\n[1]"])(
+	"applies terminal argument error %j without retaining a stale snapshot error",
+	(argumentsError) => {
+		const frames: AssistantMessageFrame[] = [
+			{ type: "start", partial: { ...fauxAssistantMessage(""), content: [], stopReason: "pending" } },
+			{
+				type: "toolcall_start",
+				contentIndex: 0,
+				toolCall: { type: "toolCall", id: "call", name: "read", arguments: {}, argumentsError: "stale" },
+			},
+			{
+				type: "toolcall_end",
+				contentIndex: 0,
+				id: "call",
+				name: "read",
+				arguments: {},
+				...(argumentsError === undefined ? {} : { argumentsError }),
+			},
+		];
+		const tracked: { message?: AssistantMessage } = {};
+		for (const frame of frames) applyFrame(tracked, structuredClone(frame));
+		expect(tracked.message).toEqual(reduceAssistantMessageFrames(frames));
+		expect(tracked.message?.content[0]).toEqual({
+			type: "toolCall",
+			id: "call",
+			name: "read",
+			arguments: {},
+			...(argumentsError === undefined ? {} : { argumentsError }),
+		});
+	},
+);

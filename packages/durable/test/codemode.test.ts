@@ -1,8 +1,15 @@
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Context } from "@earendil-works/chord";
-import { type AssistantMessage, fauxAssistantMessage, fauxText, fauxToolCall, Type } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	fauxAssistantMessage,
+	fauxText,
+	fauxToolCall,
+	type TranscriptContext,
+	Type,
+} from "@earendil-works/pi-ai";
 import { type CodemodeRun, CodemodeSandbox } from "@earendil-works/pi-codemode";
 import {
 	defineTool,
@@ -24,6 +31,7 @@ import {
 import type { CodemodeNamespace } from "../src/codemode/describe.ts";
 import { NodeExecutionEnv } from "../src/env/node.ts";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
+import { createReadTool } from "../src/tools/read.ts";
 import { allEntries, type ChatSetup, chatSetup, openChat } from "./chat-support.ts";
 import { addHooks, addTool } from "./harness-support.ts";
 import { ControlledStorage, context } from "./session-support.ts";
@@ -224,6 +232,127 @@ describe("durable code mode", () => {
 		expect(chat.vm.starts).toBe(2);
 		expect(chat.holds.runs).toBe(2);
 		await harness.close(context);
+	});
+
+	it.each(["live", "journal", "decided"] as const)(
+		"keeps nested read diagnostics model-visible exactly once (%s)",
+		async (resume) => {
+			const chat = codemodeChat();
+			addTool(chat.setup.registry, createReadTool());
+			const cwd = await mkdtemp(join(tmpdir(), "pi-codemode-read-"));
+			directories.add(cwd);
+			await writeFile(
+				join(cwd, "large.txt"),
+				Array.from({ length: 2005 }, (_, index) => `line ${index + 1}`).join("\n"),
+			);
+			const env = new NodeExecutionEnv({ cwd });
+			const open = env.openBinaryReader.bind(env);
+			let reads = 0;
+			env.openBinaryReader = (...args) => {
+				reads++;
+				return open(...args);
+			};
+			const decided = deferred();
+			let holdResult = resume === "decided";
+			addHooks(chat.setup.registry, ToolTask, {
+				afterTool: async (call, _result, _api, callContext) => {
+					if (call.name !== "codemode" || !holdResult) return;
+					decided.resolve();
+					await aborted(callContext.abortSignal!);
+				},
+			});
+			let next: TranscriptContext | undefined;
+			chat.setup.faux.setResponses([
+				script(
+					`const data = await tools.read({ path: "large.txt" }); ${resume === "journal" ? "await tools.hold({});" : ""} return data;`,
+				),
+				(request) => {
+					next = request;
+					return DONE;
+				},
+			]);
+			const path = await sqlitePath();
+			let opened = await openChat(await openNodeSqliteStorage(path), chat.setup, { env });
+			const submission = await opened.root.submit({ type: "input", content: "go" }, context);
+			if (resume !== "live") {
+				await (resume === "journal" ? chat.holds.reached.promise : decided.promise);
+				await opened.harness.close(context);
+				chat.holds.block = false;
+				holdResult = false;
+				opened = await openChat(await openNodeSqliteStorage(path), chat.setup, { env });
+				opened.harness.resume();
+			}
+			await (await opened.harness.submission(submission.id, context))!.wait(context);
+			const entry = (await allEntries(opened.root)).find((candidate) => ToolResultEntry.is(candidate))!;
+			const notice = "read: Showing lines 1-2000 of 2005. Use offset=2001 to continue.";
+			expect(entry.data).toEqual({ diagnostics: [{ severity: "info", code: "truncated", message: notice }] });
+			const modelResult = next!.messages.find((message) => message.role === "toolResult");
+			const text =
+				modelResult?.content.flatMap((item) => (item.type === "text" ? [item.text] : [])).join("\n") ?? "";
+			expect(text.split(notice)).toHaveLength(2);
+			expect(text).toContain("line 2000");
+			expect(text).not.toContain("line 2001");
+			expect(reads).toBe(1);
+			expect(chat.vm.starts).toBe(resume === "journal" ? 2 : 1);
+			await opened.harness.close(context);
+		},
+	);
+
+	it("returns the same diagnostic-bearing divergence outcome before and after recovery", async () => {
+		const chat = codemodeChat();
+		addTool(
+			chat.setup.registry,
+			tool("notice", async () => ({
+				output: [],
+				diagnostics: [{ severity: "info", message: "notice" }],
+			})),
+		);
+		const decided = deferred();
+		let holdResult = true;
+		let firstDiagnostics: unknown;
+		addHooks(chat.setup.registry, ToolTask, {
+			afterTool: async (call, result, _api, callContext) => {
+				if (call.name !== "codemode" || !holdResult) return;
+				firstDiagnostics = result.diagnostics;
+				decided.resolve();
+				await aborted(callContext.abortSignal!);
+			},
+		});
+		chat.setup.faux.setResponses([script(`await tools.notice({}); await tools.hold({});`), DONE]);
+		const path = await sqlitePath();
+		let opened = await openChat(await openNodeSqliteStorage(path), chat.setup);
+		const id = (await opened.root.submit({ type: "input", content: "go" }, context)).id;
+		await chat.holds.reached.promise;
+		await opened.harness.close(context);
+		chat.holds.block = false;
+		opened = await openChat(await openNodeSqliteStorage(path), chat.setup);
+		const task = await scriptTask(opened.harness);
+		await opened.harness.commit(async (tx) => {
+			(await tx.doc(CodemodeJournalDoc, task)).entries[0]!.issuedAfter = 99;
+		}, context);
+		opened.harness.resume();
+		await decided.promise;
+		await opened.harness.close(context);
+		holdResult = false;
+		opened = await openChat(await openNodeSqliteStorage(path), chat.setup);
+		opened.harness.resume();
+		await (await opened.harness.submission(id, context))!.wait(context);
+		const entry = (await allEntries(opened.root)).find((candidate) => ToolResultEntry.is(candidate))!;
+		const diagnostics = [{ severity: "info", message: "notice: notice" }];
+		expect(firstDiagnostics).toEqual(diagnostics);
+		expect(entry.data).toEqual({ diagnostics });
+		const message = entry.model![0]!;
+		expect(message.role).toBe("toolResult");
+		if (message.role !== "toolResult") throw new Error("Expected tool result");
+		expect(message.isError).toBe(true);
+		expect(
+			message.content
+				.flatMap((item) => (item.type === "text" ? [item.text] : []))
+				.join("\n")
+				.split("notice: notice"),
+		).toHaveLength(2);
+		expect(chat.vm.starts).toBe(2);
+		await opened.harness.close(context);
 	});
 
 	it("replays results in the order they arrived, not the order the calls were made", async () => {

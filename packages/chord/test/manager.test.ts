@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, it } from "vitest";
+import { describe, it, onTestFinished, vi } from "vitest";
 import { createHost, ipcLink, isChordError } from "../src/index.ts";
 import { type ControlMessage, createHostManager, type Driver, forkDriver, processLock } from "../src/manager.ts";
 import { Echo } from "./fixtures/echo.ts";
@@ -179,5 +179,58 @@ describe("host manager (real child processes)", () => {
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		assert.equal(manager.status, "stopped");
 		assert.equal(exits.length, 1);
+	});
+});
+
+describe("manager failure boundaries", () => {
+	it("a failed OS spawn settles exit and rejects start without an unhandled error", async () => {
+		const previous = Object.getOwnPropertyDescriptor(process, "execPath")!;
+		Object.defineProperty(process, "execPath", { ...previous, value: join(scratch("missing-node"), "node") });
+		try {
+			const manager = createHostManager({ driver: forkDriver({ entry }) });
+			await assert.rejects(manager.start(), /child exited before ready/);
+			assert.equal(manager.status, "stopped");
+			await manager.stop();
+		} finally {
+			Object.defineProperty(process, "execPath", previous);
+		}
+	});
+
+	it("replacement readiness starts a fresh idle clock and ignores the old child's reports", async () => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		onTestFinished(() => {
+			vi.useRealTimers();
+		});
+		const controls: ((message: ControlMessage) => void)[] = [];
+		const fake: Driver = {
+			spawn() {
+				const exited = Promise.withResolvers<{ code: number; signal: null }>();
+				return {
+					pid: 0,
+					link: ipcLink({ connected: false, send: () => false, on: () => undefined, off: () => undefined }),
+					exited: exited.promise,
+					send: () => exited.resolve({ code: 0, signal: null }),
+					killTree: () => exited.resolve({ code: 0, signal: null }),
+					onControl: (listener) => {
+						controls.push(listener);
+					},
+				};
+			},
+		};
+		const manager = createHostManager({ driver: fake });
+		const first = manager.start();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		controls[0]!({ type: "ready" });
+		await first;
+		vi.setSystemTime(Date.now() + 60);
+		await manager.stop();
+		const second = manager.start();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		controls[1]!({ type: "ready" });
+		await second;
+		assert.ok(manager.liveness.idleFor < 30);
+		controls[0]!({ type: "status", activeCalls: 5 });
+		assert.equal(manager.liveness.activeCalls, 0);
+		await manager.stop();
 	});
 });

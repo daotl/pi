@@ -66,6 +66,8 @@ export function applyFrame(o: { message?: AssistantMessage }, frame: AssistantMe
 			b.id = frame.id;
 			b.name = frame.name;
 			b.arguments = frame.arguments;
+			delete b.argumentsError;
+			if (frame.argumentsError !== undefined) b.argumentsError = frame.argumentsError;
 			if (frame.thoughtSignature !== undefined) b.thoughtSignature = frame.thoughtSignature;
 			if (frame.namespace !== undefined) b.namespace = frame.namespace;
 			delete b.raw;

@@ -114,6 +114,14 @@ type DiscardedLegacyV3Entry =
 
 type LegacyV3Entry = RetainedLegacyV3Entry | DiscardedLegacyV3Entry;
 
+/** Storage-only selection checkpoint, not a transcript node. Invalid selections are ignored. */
+interface LegacyV3LeafCheckpoint {
+	type: "leaf";
+	leafId: string | null;
+}
+
+type LegacyV3Record = LegacyV3Entry | LegacyV3LeafCheckpoint;
+
 interface LegacyV3IndexBase {
 	id: string;
 	parentId: string | null;
@@ -145,7 +153,8 @@ interface LegacyV3Inventory {
 	entries: ReadonlyMap<string, LegacyV3IndexEntry>;
 	importedUsage: Usage;
 	name: string | undefined;
-	finalId: string | null;
+	selectedId: string | null;
+	recordCount: number;
 	nextSeq: number;
 }
 
@@ -193,10 +202,10 @@ export async function normalizeLegacyV3Header(
 	};
 }
 
-function parseLegacyV3Entry(line: string): LegacyV3Entry {
-	let entry: LegacyV3Entry;
+function parseLegacyV3Entry(line: string): LegacyV3Record {
+	let entry: LegacyV3Record;
 	try {
-		entry = JSON.parse(line) as LegacyV3Entry;
+		entry = JSON.parse(line) as LegacyV3Record;
 	} catch (error) {
 		throw new Error("Invalid legacy v3 JSONL record: not valid JSON", { cause: error });
 	}
@@ -211,7 +220,8 @@ function parseLegacyV3Entry(line: string): LegacyV3Entry {
 		recordType !== "thinking_level_change" &&
 		recordType !== "active_tools_change" &&
 		recordType !== "session_info" &&
-		recordType !== "label"
+		recordType !== "label" &&
+		recordType !== "leaf"
 	) {
 		throw new Error(`Unsupported legacy v3 record type: ${String(recordType)}`);
 	}
@@ -465,26 +475,33 @@ async function readLegacyV3Inventory(reader: TextLineReader, context: Context): 
 	let nextSeq = 1;
 	let importedUsage = emptyUsage();
 	let name: string | undefined;
-	let finalId: string | null = null;
+	let selectedId: string | null = null;
+	let recordCount = 0;
 	while (true) {
 		const line = fileValue(await reader.readLine(context), "Failed to read legacy v3 source");
 		if (line === undefined || !line.terminated) break;
-		const lineNumber = entries.size + 2;
+		const lineNumber = ++recordCount + 1;
 		const entry = parseLegacyV3Entry(line.text);
+		if (entry.type === "leaf") {
+			if (entry.leafId === null || (typeof entry.leafId === "string" && entries.has(entry.leafId))) {
+				selectedId = entry.leafId;
+			}
+			continue;
+		}
 		if (entries.has(entry.id)) throw new Error(`Duplicate legacy v3 entry id: ${entry.id}`);
 		const indexed = indexLegacyV3Entry(entry, lineNumber, nextSeq, entries);
 		entries.set(entry.id, indexed);
 		if (isRetainedEntry(indexed)) nextSeq++;
-		finalId = entry.id;
+		selectedId = entry.id;
 		if (entry.type === "session_info") name = entry.name;
 		const usage = legacyEntryUsage(entry);
 		if (usage !== undefined) importedUsage = addUsage(importedUsage, usage);
 	}
-	return { entries, nextSeq, importedUsage, name, finalId };
+	return { entries, nextSeq, importedUsage, name, selectedId, recordCount };
 }
 
 function normalizeLegacyV3Values(inventory: LegacyV3Inventory): CommittedValueSetWrite[] {
-	const { entries, name, finalId } = inventory;
+	const { entries, name, selectedId } = inventory;
 	const resolveLegacyId = createLegacyIdResolver(entries);
 	let nextSeq = inventory.nextSeq;
 	const values: CommittedValueSetWrite[] = [];
@@ -506,10 +523,10 @@ function normalizeLegacyV3Values(inventory: LegacyV3Inventory): CommittedValueSe
 	}
 
 	// branch tip
-	values.push({ ...setValue(branchTip("main"), resolveLegacyId(finalId)), seq: nextSeq++ });
+	values.push({ ...setValue(branchTip("main"), resolveLegacyId(selectedId)), seq: nextSeq++ });
 
 	// configuration
-	const configuration = selectedConfiguration(entries, finalId);
+	const configuration = selectedConfiguration(entries, selectedId);
 	if (configuration !== undefined) {
 		values.push({ ...setValue(laneConfig("main"), configuration), seq: nextSeq++ });
 		values.push({
@@ -533,6 +550,7 @@ export class LegacyV3Source {
 	private readonly fileSystem: FileSystem;
 	private readonly path: string;
 	private readonly entries: ReadonlyMap<string, LegacyV3IndexEntry>;
+	private readonly recordCount: number;
 	private readonly resolveLegacyId: ResolveLegacyId;
 
 	private constructor(
@@ -540,6 +558,7 @@ export class LegacyV3Source {
 		path: string,
 		header: JsonlStorageHeader,
 		entries: ReadonlyMap<string, LegacyV3IndexEntry>,
+		recordCount: number,
 		importedUsage: Usage,
 		values: readonly CommittedValueSetWrite[],
 		nextSeq: number,
@@ -548,6 +567,7 @@ export class LegacyV3Source {
 		this.path = path;
 		this.header = header;
 		this.entries = entries;
+		this.recordCount = recordCount;
 		this.resolveLegacyId = createLegacyIdResolver(entries);
 		this.importedUsage = importedUsage;
 		this.values = values;
@@ -577,6 +597,7 @@ export class LegacyV3Source {
 				path,
 				await normalizeLegacyV3Header(fileSystem, parsed.header, context),
 				inventory.entries,
+				inventory.recordCount,
 				inventory.importedUsage,
 				values,
 				inventory.nextSeq + values.length,
@@ -664,16 +685,20 @@ export class LegacyV3Source {
 			) {
 				throw new Error("Legacy v3 source header changed");
 			}
-			for (const indexed of this.entries.values()) {
+			const indexes = this.entries.values();
+			for (let record = 0; record < this.recordCount; record++) {
 				const line = fileValue(await reader.readLine(context), "Failed to reread legacy v3 source");
 				if (line === undefined || !line.terminated)
 					throw new Error("Legacy v3 source ended before captured entries");
 				const entry = parseLegacyV3Entry(line.text);
-				if (entry.id !== indexed.id || entry.type !== indexed.type) {
+				if (entry.type === "leaf") continue;
+				const indexed = indexes.next().value;
+				if (indexed === undefined || entry.id !== indexed.id || entry.type !== indexed.type) {
 					throw new Error("Legacy v3 source changed");
 				}
 				yield { entry, indexed };
 			}
+			if (!indexes.next().done) throw new Error("Legacy v3 source changed");
 		} finally {
 			await reader.close(context);
 		}

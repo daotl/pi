@@ -18,7 +18,7 @@ export function canonicalJson(value: unknown): string {
 	return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
 }
 
-/** Non-cryptographic 64-bit hash (two FNV-1a lanes). Contracts are trusted, so collisions are not an attack surface. */
+/** Non-cryptographic 64-bit description hash; binding also checks description equality. */
 export function hash64(text: string): string {
 	let a = 0x811c9dc5;
 	let b = 0x01000193 ^ 0x5bd1e995;
@@ -167,9 +167,14 @@ function objectFits(sub: Schema, sup: Schema): boolean {
 	for (const [key, property] of Object.entries(supProperties)) {
 		if (key in subProperties) {
 			if (!fits(subProperties[key], property)) return false;
+		} else if (
+			Object.entries(asSchema(sub.patternProperties)).some(
+				([pattern, schema]) => new RegExp(pattern, "u").test(key) && !fits(schema, property),
+			)
+		) {
+			// A record may supply an optional named field even when it has no explicit properties entry.
+			return false;
 		} else if (typeof sub.additionalProperties === "object" && !fits(sub.additionalProperties, property)) {
-			// The consumer may send this name with any value its `additionalProperties` allows. Open consumer objects
-			// are fine: unknown names are stripped with the consumer's own schema before the call (`RecordImpl.call`).
 			return false;
 		}
 	}

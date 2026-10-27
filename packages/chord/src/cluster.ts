@@ -95,12 +95,21 @@ export async function runClusterReload(
 			if (local) await reload.rollback();
 			throw failed.reason;
 		}
-		const report = reload.commit(() => {
-			for (const connection of participants) {
-				connection.send({ t: "commit", reload: id });
-				connection.peerCodeVersion = codeVersion;
+		let report: ReloadReport;
+		try {
+			report = reload.commit(() => {
+				for (const connection of participants) {
+					connection.send({ t: "commit", reload: id });
+					connection.peerCodeVersion = codeVersion;
+				}
+			});
+		} catch (error) {
+			if (host.failed === undefined) {
+				await reload.rollback();
+				for (const connection of participants) connection.send({ t: "abort", reload: id });
 			}
-		});
+			throw error;
+		}
 		host.rememberRemoteModules(options.remote, options.remoteRemove);
 		const children: Record<string, ReloadReport> = {};
 		for (const result of results.slice(1)) {
@@ -197,10 +206,15 @@ export class ChildReloads {
 			return;
 		}
 		if (operation.state !== "prepared") return;
-		this.#operation = undefined;
 		try {
 			operation.reload?.commit();
+		} catch (error) {
+			// The parent has already committed. Rolling back and serving the old code would silently split versions.
+			this.#host.fail(error);
+			connection.link.close("reload commit failed");
+			void operation.reload?.rollback().catch((cleanup: unknown) => this.#host.report(cleanup));
 		} finally {
+			this.#operation = undefined;
 			endReload(this.#host);
 		}
 	}

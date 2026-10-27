@@ -1,5 +1,6 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { SessionManager } from "../../../coding-agent/src/core/session-manager.ts";
 import { BACKGROUND_CONTEXT, type Context } from "../../src/harness/context.ts";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import {
@@ -87,6 +88,100 @@ describe("JSONL v3 migration", () => {
 		getOrThrow(await fileSystem.writeFile(path, content, BACKGROUND_CONTEXT));
 		return { path, content };
 	}
+
+	// #23: SessionManager legitimately writes leaf checkpoints under its unchanged v3 header.
+	it.each(["ancestor", "empty"] as const)(
+		"opens, forks, and upgrades a producer-written %s leaf without selecting abandoned history",
+		async (selection) => {
+			const directory = getOrThrow(await fileSystem.absolutePath("producer", BACKGROUND_CONTEXT));
+			const producer = SessionManager.create("/workspace", directory);
+			producer.appendModelChange("faux", "selected-model");
+			producer.appendThinkingLevelChange("high");
+			const root = producer.appendMessage({ role: "user", content: "selected root", timestamp: NOW });
+			if (selection === "ancestor") {
+				const removed = producer.appendMessage({ role: "user", content: "removed tail", timestamp: NOW + 1 });
+				producer.branch(root);
+				producer.appendModelChange("faux", "abandoned-model");
+				producer.appendThinkingLevelChange("off");
+				producer.appendMessage({ role: "user", content: "retained sibling", timestamp: NOW + 2 });
+				producer.branch(removed);
+				producer.removeEntriesWithDescendants([removed]);
+			} else {
+				producer.resetLeaf();
+				const removed = producer.appendMessage({ role: "user", content: "removed root", timestamp: NOW + 1 });
+				producer.removeMessage(removed);
+			}
+			const path = producer.getSessionFile()!;
+			const content = getOrThrow(await fileSystem.readTextFile(path, BACKGROUND_CONTEXT));
+			expect(JSON.parse(content.split("\n")[0]!)).toMatchObject({ version: 3 });
+			expect(JSON.parse(content.trimEnd().split("\n").at(-1)!)).toEqual({
+				type: "leaf",
+				leafId: selection === "ancestor" ? root : null,
+			});
+			const header = producer.getHeader()!;
+			const metadata: JsonlSessionMetadata = {
+				id: header.id,
+				cwd: header.cwd,
+				path,
+				createdAt: Date.parse(header.timestamp),
+				storageVersion: JSONL_STORAGE_VERSION,
+				modifiedAt: NOW,
+			};
+			const expectedConfig =
+				selection === "ancestor"
+					? { model: { provider: "faux", modelId: "selected-model" }, thinkingLevel: "high", activeToolNames: [] }
+					: undefined;
+			const assertSelection = async (session: Session) => {
+				const branch = await mainBranch(session);
+				const entries = await branch.findEntries({ order: "oldestFirst" }, BACKGROUND_CONTEXT);
+				expect(entries.map((entry) => (entry.type === "message" ? entry.message : entry.type))).toEqual(
+					selection === "ancestor" ? [{ role: "user", content: "selected root", timestamp: NOW }] : [],
+				);
+				expect(await mainTip(session)).toBe(selection === "ancestor" ? entries[0]!.id : null);
+				expect((await session.getValue(storedValues.laneConfig("main"), BACKGROUND_CONTEXT))?.value).toEqual(
+					expectedConfig,
+				);
+			};
+			const fork = await repo.fork(metadata, { scope: "tree", id: `checkpoint-${selection}` }, BACKGROUND_CONTEXT);
+			await assertSelection(fork);
+			expect(
+				(await fork.findEntries({ order: "asc" }, BACKGROUND_CONTEXT)).map((entry) =>
+					entry.type === "message" ? entry.message : entry.type,
+				),
+			).toEqual(producer.getEntries().flatMap((entry) => (entry.type === "message" ? [entry.message] : [])));
+			await fork.close(BACKGROUND_CONTEXT);
+			if (selection === "ancestor") {
+				const branchFork = await repo.fork(
+					metadata,
+					{ scope: "branch", branch: "main", id: "selected-branch" },
+					BACKGROUND_CONTEXT,
+				);
+				await assertSelection(branchFork);
+				await branchFork.close(BACKGROUND_CONTEXT);
+			}
+			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
+			await assertSelection(session);
+			expect(getOrThrow(await fileSystem.readTextFile(path, BACKGROUND_CONTEXT))).toBe(content);
+			const entries = await session.findEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+			await session.setName("upgraded checkpoint", BACKGROUND_CONTEXT);
+			await assertSelection(session);
+			await session.close(BACKGROUND_CONTEXT);
+			expect(
+				JSON.parse(getOrThrow(await fileSystem.readTextFile(path, BACKGROUND_CONTEXT)).split("\n")[0]!),
+			).toMatchObject({ v: 4 });
+			const reopened = await repo.open(metadata, BACKGROUND_CONTEXT);
+			await assertSelection(reopened);
+			expect(await reopened.findEntries({ order: "asc" }, BACKGROUND_CONTEXT)).toEqual(entries);
+			const branch = await mainBranch(reopened);
+			const previousTip = await branch.getTipId(BACKGROUND_CONTEXT);
+			const nextId = await branch.appendMessage(
+				{ role: "user", content: "next", timestamp: NOW + 3 },
+				BACKGROUND_CONTEXT,
+			);
+			expect((await reopened.getEntry(nextId, BACKGROUND_CONTEXT))?.parentId).toBe(previousTip);
+			await reopened.close(BACKGROUND_CONTEXT);
+		},
+	);
 
 	it("discovers legacy v3 session files without rewriting them", async () => {
 		const { path, content } = await writeLegacyV3Fixture([], {

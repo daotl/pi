@@ -326,7 +326,10 @@ export class Connection {
 			this.#ready = undefined;
 		}
 		session.child.stdin.end();
-		session.child.kill();
+		// EOF lets the daemon kill its terminal sessions before the transport exits.
+		const killTimer = setTimeout(() => session.child.kill(), 1000);
+		killTimer.unref();
+		session.child.once("exit", () => clearTimeout(killTimer));
 		const pending = [...session.pending.values()];
 		session.pending.clear();
 		for (const request of pending) request.reject(error);

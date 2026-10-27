@@ -120,6 +120,7 @@ export interface HarnessOptions {
 	finishTurn?: FinishTurn;
 	tools?: AgentTool[];
 	initialActiveToolNames?: string[];
+	defaultToolModifiers?: string[];
 	allowedToolNames?: string[];
 	excludedToolNames?: string[];
 	resourceLoader?: ResourceLoader;
@@ -250,6 +251,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		baseToolsOverride: toolMap,
 		initialActiveToolNames: options.initialActiveToolNames,
 		usesDefaultTools: options.initialActiveToolNames === undefined,
+		defaultToolModifiers: options.defaultToolModifiers,
 		allowedToolNames: options.allowedToolNames,
 		excludedToolNames: options.excludedToolNames,
 		extensionRunnerRef,

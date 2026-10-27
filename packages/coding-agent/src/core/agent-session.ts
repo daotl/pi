@@ -331,8 +331,8 @@ export interface AgentSessionConfig {
 	 */
 	usesDefaultTools?: boolean;
 	/**
-	 * `+name`/`-name` entries applied on top of the `defaultTools` setting, from `--tools`. Reload
-	 * applies them to the reloaded setting too, so a removed tool stays removed.
+	 * `+name`/`-name` entries applied on top of the `defaultTools` setting, from `--tools`. Resume,
+	 * branch restoration, and reload apply them too, so a removed tool stays removed.
 	 */
 	defaultToolModifiers?: string[];
 	/**
@@ -3445,7 +3445,7 @@ export class AgentSession {
 		this._restoreSystemPrompt = true;
 		this._runSystemPromptOptions = undefined;
 		// Tool restoration is runtime-only: do not publish an intermediate abandoned-policy snapshot.
-		this._restoreToolsFromTranscript([], false);
+		this._restoreToolsFromTranscript(this._defaultToolModifiers, false);
 		this._commitBaseSystemPrompt(this._rebuildSystemPrompt(this.getActiveToolNames()));
 		// Navigation uses the already-discovered resources and is not another startup lifecycle.
 		this._deferUntrustedSnapshot = false;

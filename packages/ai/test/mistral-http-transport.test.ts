@@ -1,6 +1,7 @@
+import { createServer, type ServerResponse } from "node:http";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { stream as streamMistral } from "../src/api/mistral-conversations.ts";
+import { stream as streamMistral, streamSimple as streamSimpleMistral } from "../src/api/mistral-conversations.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
 import type { Api, FetchFunction, Model, ProviderResponse } from "../src/types.ts";
 import { formatUserAgent } from "../src/utils/identity.ts";
@@ -34,6 +35,31 @@ function createTerminalEvent(finishReason = "stop") {
 		choices: [{ index: 0, finish_reason: finishReason, delta: {} }],
 		usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
 	};
+}
+
+async function withMistralServer(
+	handle: (response: ServerResponse) => void,
+	run: (model: Model<"mistral-conversations">) => Promise<void>,
+): Promise<void> {
+	const server = createServer((request, response) => {
+		request.resume();
+		handle(response);
+	});
+	try {
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("Missing Mistral loopback listener");
+		await run({
+			...getModel("mistral", "mistral-large-latest"),
+			baseUrl: `http://127.0.0.1:${address.port}`,
+		});
+	} finally {
+		server.closeAllConnections();
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+	}
 }
 
 describe("Mistral HTTP transport", () => {
@@ -444,86 +470,104 @@ describe("Mistral HTTP transport", () => {
 		expect(requestHeaders?.get("user-agent")).toBe("custom-agent");
 	});
 
-	it("aborts while waiting for an SSE chunk", async () => {
-		const model = getModel("mistral", "mistral-large-latest");
+	it.each([200, 403])("aborts while waiting for a native HTTP %i response body", async (status) => {
 		const context = normalizeContext({
 			messages: [{ role: "user", content: "hello", timestamp: 1 }],
 		});
 		const controller = new AbortController();
-		const fetch: FetchFunction = async () =>
-			new Response(
-				new ReadableStream({
-					start() {},
-				}),
-				{ headers: { "content-type": "text/event-stream" } },
+		const received = Promise.withResolvers<void>();
+		const watchdog = Promise.withResolvers<never>();
+		// Native HTTP cancellation must use the platform clock, not a synthetic response or fake timers.
+		const timer = setTimeout(() => watchdog.reject(new Error("Caller abort did not settle response body")), 2000);
+		try {
+			await withMistralServer(
+				(response) => {
+					response.writeHead(status, {
+						"content-type": status === 200 ? "text/event-stream" : "application/json",
+					});
+					response.flushHeaders();
+					if (status === 403) response.write('{"message":"');
+				},
+				async (model) => {
+					const result = streamMistral(model, context, {
+						apiKey: "loopback",
+						signal: controller.signal,
+						timeoutMs: 10000,
+						onResponse: () => received.resolve(),
+					}).result();
+					await Promise.race([received.promise, watchdog.promise]);
+					await new Promise<void>((resolve) => setImmediate(resolve));
+					controller.abort(new Error("caller cancelled"));
+					const message = await Promise.race([result, watchdog.promise]);
+					expect(message.stopReason).toBe("aborted");
+					expect(message.errorMessage).toContain("caller cancelled");
+				},
 			);
-
-		const result = streamMistral(model, context, {
-			apiKey: "test",
-			fetch,
-			signal: controller.signal,
-		}).result();
-		controller.abort();
-		const message = await result;
-
-		expect(message.stopReason).toBe("aborted");
+		} finally {
+			clearTimeout(timer);
+			controller.abort();
+		}
 	});
 
-	it("applies the request timeout while waiting for response headers", async () => {
-		const model = getModel("mistral", "mistral-large-latest");
+	it("applies the request timeout while waiting for native HTTP response headers", async () => {
 		const context = normalizeContext({
 			messages: [{ role: "user", content: "hello", timestamp: 1 }],
 		});
-		const fetch: FetchFunction = (_url, init) =>
-			new Promise<Response>((_resolve, reject) => {
-				init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
-			});
-
-		const message = await streamMistral(model, context, {
-			apiKey: "test",
-			fetch,
-			timeoutMs: 5,
-		}).result();
-
-		expect(message.stopReason).toBe("error");
-		expect(message.errorMessage).toBe("Mistral response headers timed out after 5ms");
+		await withMistralServer(
+			() => {},
+			async (model) => {
+				const message = await streamMistral(model, context, {
+					apiKey: "loopback",
+					timeoutMs: 100,
+				}).result();
+				expect(message.stopReason).toBe("error");
+				expect(message.errorMessage).toBe("Mistral response headers timed out after 100ms");
+			},
+		);
 	});
 
-	// Regression test for #10609: an active stream must not be cut off after timeoutMs.
-	it("does not abort an active stream that lasts longer than the request timeout", async () => {
-		const model = getModel("mistral", "mistral-large-latest");
+	// Regression test for #10609: native fetch keeps observing its request signal after headers arrive.
+	it.each([
+		{ name: "stream without a caller signal", run: streamMistral, withSignal: false },
+		{ name: "stream with a caller signal", run: streamMistral, withSignal: true },
+		{ name: "streamSimple without a caller signal", run: streamSimpleMistral, withSignal: false },
+		{ name: "streamSimple with a caller signal", run: streamSimpleMistral, withSignal: true },
+	])("does not abort an active native $name after the header deadline", async ({ run, withSignal }) => {
 		const context = normalizeContext({
 			messages: [{ role: "user", content: "hello", timestamp: 1 }],
 		});
-		const encoder = new TextEncoder();
+		let timer: NodeJS.Timeout | undefined;
+		let response: ServerResponse | undefined;
 		const thinkingEvent = {
-			choices: [{ index: 0, delta: { content: [{ type: "thinking", thinking: [{ type: "text", text: "x" }] }] } }],
+			choices: [{ delta: { content: [{ type: "thinking", thinking: [{ type: "text", text: "thinking" }] }] } }],
 		};
-		const fetch: FetchFunction = async () =>
-			new Response(
-				new ReadableStream({
-					async start(controller) {
-						for (let i = 0; i < 5; i++) {
-							controller.enqueue(encoder.encode(`data: ${JSON.stringify(thinkingEvent)}\n\n`));
-							await new Promise((resolve) => setTimeout(resolve, 10));
-						}
-						controller.enqueue(
-							encoder.encode(`data: ${JSON.stringify(createTerminalEvent())}\n\ndata: [DONE]\n\n`),
-						);
-						controller.close();
-					},
-				}),
-				{ headers: { "content-type": "text/event-stream" } },
+		// Exercise native fetch's real deadline after headers; fake timers do not model its body lifetime.
+		try {
+			await withMistralServer(
+				(outgoing) => {
+					response = outgoing;
+					response.writeHead(200, { "content-type": "text/event-stream" });
+					response.write(`data: ${JSON.stringify(thinkingEvent)}\n\n`);
+				},
+				async (model) => {
+					const message = await run(model, context, {
+						apiKey: "loopback",
+						signal: withSignal ? new AbortController().signal : undefined,
+						timeoutMs: 100,
+						onResponse: () => {
+							timer = setTimeout(
+								() => response?.end(`data: ${JSON.stringify(createTerminalEvent())}\n\ndata: [DONE]\n\n`),
+								350,
+							);
+						},
+					}).result();
+					expect(message.stopReason).toBe("stop");
+					expect(message.content).toEqual([{ type: "thinking", thinking: "thinking" }]);
+				},
 			);
-
-		const message = await streamMistral(model, context, {
-			apiKey: "test",
-			fetch,
-			timeoutMs: 20,
-		}).result();
-
-		expect(message.stopReason).toBe("stop");
-		expect(message.content).toEqual([{ type: "thinking", thinking: "xxxxx" }]);
+		} finally {
+			clearTimeout(timer);
+		}
 	});
 
 	it("preserves HTTP status and response bodies in errors", async () => {

@@ -265,11 +265,38 @@ export function local<const D extends LocalDef>(name: string, def: D): LocalCont
 	return finish<LocalContract<D>>({ scope: "local", name, version: def.version, input: def.input, def, description });
 }
 
+const receivedContracts = new WeakSet<AnyContract>();
+
+/** Whether the token was reconstructed from declarative peer metadata, not registered application code. */
+export const isReceivedContract = (contract: AnyContract): boolean => receivedContracts.has(contract);
+
 /**
- * A consumer token received over a link (only its description travels). Has no `def`, so it is only good for binding
- * and validation, never for TypeScript types.
+ * A consumer token received over a link. Descriptions are bounded to 64 levels, 16384 nodes and 256 KiB of text
+ * before hashing or compatibility. Input normalization uses registered provider schemas. Peer regex sources must
+ * match registered schemas; reference/combinator/custom-kind execution requires the identical trusted schema root.
+ * Adapters have no historical schemas, so unmatched executable old-version schemas are refused.
  */
 export function contractFromDescription(description: Description): AnyContract {
+	// Bound metadata before recursive hashing, compatibility checks, or schema traversal. This does not restrict
+	// schema keywords: peer schemas remain data, and only registered provider schemas normalize object inputs.
+	const pending: { value: unknown; depth: number }[] = [{ value: description, depth: 0 }];
+	let nodes = 0;
+	let characters = 0;
+	while (pending.length > 0) {
+		const { value, depth } = pending.pop()!;
+		if (++nodes > 16384 || depth > 64 || characters > 262144)
+			throw invalid("token", "contract description exceeds metadata limits");
+		if (typeof value === "string") characters += value.length;
+		else if (value !== null && typeof value === "object") {
+			for (const [key, child] of Object.entries(value)) {
+				characters += key.length;
+				pending.push({ value: child, depth: depth + 1 });
+				if (pending.length + nodes > 16384 || characters > 262144)
+					throw invalid("token", "contract description exceeds metadata limits");
+			}
+		}
+	}
+	if (characters > 262144) throw invalid("token", "contract description exceeds metadata limits");
 	const { name, scope, version, input, host } = description;
 	if (
 		typeof name !== "string" ||
@@ -280,9 +307,12 @@ export function contractFromDescription(description: Description): AnyContract {
 		throw new ChordError("invalid", "malformed contract token", { reason: "token" });
 	}
 	const base = { name, version, input, description, fingerprint: hash64(canonicalJson(description)) };
-	return scope === "remote"
-		? { ...base, scope, def: { version, input, host: host!, variants: {} } }
-		: { ...base, scope, def: { version, input } };
+	const contract: AnyContract =
+		scope === "remote"
+			? { ...base, scope, def: { version, input, host: host!, variants: {} } }
+			: { ...base, scope, def: { version, input } };
+	receivedContracts.add(contract);
+	return contract;
 }
 
 /** Returns why `provider` does not cover `consumer`, or undefined when it does. */
@@ -324,7 +354,113 @@ export type Accepts = Readonly<Record<number, Adapter>>;
 
 /** How a consumer token binds to a provider: directly or through an `accepts` adapter. Throws contract_mismatch. */
 export function bind(provider: AnyContract, accepts: Accepts | undefined, consumer: AnyContract): Adapter | undefined {
-	if (provider.fingerprint === consumer.fingerprint) return undefined;
+	if (isReceivedContract(consumer)) {
+		const pending: { offered: unknown; wanted: unknown; root?: { offered: unknown; wanted: unknown } }[] = [
+			{ offered: provider.input, wanted: consumer.input },
+		];
+		for (const [variant, members] of Object.entries(consumer.description.variants)) {
+			for (const [name, wanted] of Object.entries(members)) {
+				const offered = provider.description.variants[variant]?.[name];
+				if (wanted.kind === "state") {
+					pending.push({ offered: offered?.kind === "state" ? offered.schema : undefined, wanted: wanted.schema });
+				} else if (wanted.kind === "method") {
+					pending.push({ offered: offered?.kind === "method" ? offered.args : undefined, wanted: wanted.args });
+					pending.push({
+						offered: offered?.kind === "method" ? offered.result : undefined,
+						wanted: wanted.result,
+					});
+				}
+			}
+		}
+		for (const entry of pending) entry.root = { offered: entry.offered, wanted: entry.wanted };
+		while (pending.length > 0) {
+			const { offered, wanted, root } = pending.pop()!;
+			if (wanted === null || typeof wanted !== "object") continue;
+			const schema = wanted as Record<string, unknown>;
+			const trusted = offered !== null && typeof offered === "object" ? (offered as Record<string, unknown>) : {};
+			if (
+				(["$ref", "$dynamicRef", "$recursiveRef", "allOf", "anyOf", "oneOf", "not", "if", "then", "else"].some(
+					(key) => key in schema,
+				) ||
+					(typeof schema["~kind"] === "string" &&
+						![
+							"Object",
+							"Record",
+							"Array",
+							"Tuple",
+							"String",
+							"Number",
+							"Integer",
+							"Boolean",
+							"Null",
+							"Literal",
+							"Unknown",
+							"Any",
+							"Never",
+							"Optional",
+							"Readonly",
+						].includes(schema["~kind"]))) &&
+				canonicalJson(root?.wanted) !== canonicalJson(root?.offered)
+			)
+				throw invalid("token", "peer executable schemas must match the registered provider schema");
+			if ("pattern" in schema && canonicalJson(schema.pattern) !== canonicalJson(trusted.pattern))
+				throw invalid("token", "peer regular expressions must match the registered provider schema");
+			// Property/member names are data, not schema keywords; only descend through schema-bearing locations.
+			for (const key of [
+				"properties",
+				"patternProperties",
+				"$defs",
+				"definitions",
+				"dependentSchemas",
+				"dependencies",
+			]) {
+				const children = schema[key];
+				if (children === null || typeof children !== "object") continue;
+				const known = trusted[key];
+				const trustedChildren =
+					known !== null && typeof known === "object" ? (known as Record<string, unknown>) : {};
+				if (
+					key === "patternProperties" &&
+					canonicalJson(Object.keys(children).sort()) !== canonicalJson(Object.keys(trustedChildren).sort())
+				)
+					throw invalid("token", "peer regular expressions must match the registered provider schema");
+				for (const [name, child] of Object.entries(children))
+					pending.push({ offered: trustedChildren[name], wanted: child, root });
+			}
+			for (const key of [
+				"items",
+				"prefixItems",
+				"additionalItems",
+				"additionalProperties",
+				"unevaluatedItems",
+				"unevaluatedProperties",
+				"contains",
+				"propertyNames",
+				"not",
+				"if",
+				"then",
+				"else",
+				"allOf",
+				"anyOf",
+				"oneOf",
+				"parameters",
+				"returnType",
+			]) {
+				const children = schema[key];
+				if (Array.isArray(children)) {
+					const known = Array.isArray(trusted[key]) ? (trusted[key] as unknown[]) : [];
+					children.forEach((child, index) => {
+						pending.push({ offered: known[index], wanted: child, root });
+					});
+				} else pending.push({ offered: trusted[key], wanted: children, root });
+			}
+		}
+	}
+	if (
+		provider.fingerprint === consumer.fingerprint &&
+		canonicalJson(provider.description) === canonicalJson(consumer.description)
+	)
+		return undefined;
 	// A moved type is another type for its consumers: no adapter reaches across hosts.
 	if (!samePlacement(provider.description, consumer.description)) {
 		throw new ChordError(
@@ -374,13 +510,10 @@ export type Call<M> = M extends MethodSpec<infer A, infer R>
 		: (ctx?: Ctx) => Promise<Resolved<R>>
 	: never;
 
-/** Whether `contract`'s method `name` takes no arguments (it is called as `ref.name(ctx)`). */
-export function takesNoArgs(contract: AnyContract, name: string): boolean {
-	for (const members of Object.values(contract.description.variants)) {
-		const member = members[name];
-		if (member?.kind === "method") return member.args === undefined;
-	}
-	return false;
+/** Whether a method in the active variant takes only ctx. */
+export function takesNoArgs(contract: AnyContract, name: string, variant: string | undefined): boolean {
+	const member = contract.description.variants[variant ?? LOCAL_VARIANT]?.[name];
+	return member?.kind === "method" && member.args === undefined;
 }
 
 type VariantImplementation<K, V, P> = { readonly variant: K } & {

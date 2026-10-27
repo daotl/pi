@@ -2,7 +2,8 @@
 import assert from "node:assert/strict";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { describe, it } from "vitest";
+import { describe, it, onTestFinished, vi } from "vitest";
+import { contractFromDescription } from "../src/contract.ts";
 import {
 	type Ctx,
 	createHost,
@@ -17,6 +18,7 @@ import {
 	remote,
 } from "../src/index.ts";
 import { fits } from "../src/schema.ts";
+import type { Frame } from "../src/wire.ts";
 import { CountingLink } from "./fixtures/counting.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -682,5 +684,516 @@ describe("review: ctx races", () => {
 		assert.equal(link.count("sent", "call"), 0);
 		await worker.root((ctx) => target.hit(ctx));
 		assert.equal(hits, 1);
+	});
+});
+
+describe("review: contract and activation boundaries", () => {
+	it("unknown wire contracts never normalize peer schemas, and bounded metadata is checked before binding", async () => {
+		const host = createHost({ self: {}, name: "server", onError: () => {} });
+		const [down, raw] = memoryLinkPair();
+		host.accept(down, { principal: { guest: true } });
+		const gone = Promise.withResolvers<Extract<Frame, { t: "gone" }>>();
+		raw.receive((frame) => {
+			if (frame.t === "gone") gone.resolve(frame);
+		});
+		raw.send({
+			t: "hold",
+			id: 1,
+			at: "server",
+			input: `${"a".repeat(24)}!`,
+			token: {
+				name: "unknown",
+				scope: "remote",
+				version: 1,
+				host: { name: "server" },
+				input: { type: "string", pattern: "^(a+)+$" },
+				variants: { main: {} },
+			},
+		});
+		assert.equal((await gone.promise).error.reason, "unknown_type");
+		const token = remote("bounded", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: { main: {} },
+		});
+		let nested: object = {};
+		for (let i = 0; i < 70; i++) nested = { items: nested };
+		assert.throws(() => contractFromDescription({ ...token.description, input: nested }), /metadata limits/);
+		await host.close();
+	});
+
+	it("received inputs use provider defaults and reject peer-only regexes before compatibility", async () => {
+		const host = createHost({ self: {}, name: "server", onError: () => {} });
+		const provider = remote("trusted-input", {
+			version: 1,
+			input: Type.Object({ id: Type.Optional(Type.String({ default: "provider" })) }),
+			host: hostNamed("server"),
+			variants: { main: { methods: { id: method(undefined, Type.String()) } } },
+		});
+		host.serve(provider, (input) => ({ variant: "main", id: () => input.id ?? "missing" }));
+		const peer = contractFromDescription({
+			...provider.description,
+			input: Type.Object({ id: Type.Optional(Type.String({ default: "peer" })) }),
+		});
+		const ref = (await host.get(peer, {})) as unknown as { id(): Promise<string>; release(): void };
+		assert.equal(await ref.id(), "provider");
+		ref.release();
+		const hostile = contractFromDescription({
+			...provider.description,
+			input: { type: "string", pattern: "^(a+)+$" },
+		});
+		assert.throws(() => host.hold(hostile, `${"a".repeat(24)}!`), /peer regular expressions/);
+		await host.close();
+	});
+
+	it("ordinary pattern names and schema annotations do not become regex policies", async () => {
+		const server = createHost({ self: {}, name: "server", onError: () => {} });
+		const [down, up] = memoryLinkPair();
+		server.accept(down, { principal: {} });
+		const client = createHost({ self: {}, kind: "client", upstream: { link: up, principal: {} }, onError: () => {} });
+		const consumerArgs = Type.Object(
+			{ pattern: Type.String(), patternProperties: Type.Optional(Type.String()) },
+			{
+				examples: [{ pattern: "consumer annotation" }],
+			},
+		);
+		const providerArgs = Type.Object(
+			{
+				pattern: Type.String(),
+				patternProperties: Type.Optional(Type.String()),
+				added: Type.Optional(Type.Number()),
+			},
+			{
+				examples: [{ pattern: "provider annotation" }],
+			},
+		);
+		const consumer = remote("ordinary-pattern", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: {
+				main: { methods: { pattern: method(consumerArgs, Type.String()) } },
+			},
+		});
+		const provider = remote("ordinary-pattern", {
+			...consumer.def,
+			variants: {
+				main: { methods: { pattern: method(providerArgs, Type.String()) } },
+			},
+		});
+		server.serve(provider, () => ({ variant: "main", pattern: (args) => args.pattern }));
+		const ref = await client.get(consumer, {});
+		assert.equal(await ref.pattern({ pattern: "accepted" }), "accepted");
+		const hostile = contractFromDescription({
+			...provider.description,
+			input: Type.Object({ pattern: Type.String({ pattern: "^(a+)+$" }) }),
+		});
+		assert.throws(() => server.hold(hostile, { pattern: `${"a".repeat(24)}!` }), /peer regular expressions/);
+		await client.close();
+		await server.close();
+	});
+
+	for (const initial of ["first", "second"] as const) {
+		it(`mixed arity keeps a pinned ${initial} implementation across reload`, async () => {
+			const host = createHost({ self: {}, name: "server", onError: () => {} });
+			const token = remote("pinned-arity", {
+				version: 1,
+				input: Type.Object({}),
+				host: hostNamed("server"),
+				variants: {
+					first: { methods: { send: method(undefined, Type.String()) } },
+					second: { methods: { send: method(Type.String(), Type.String()) } },
+				},
+			});
+			const facet = (variant: "first" | "second"): Facet => ({
+				name: "pinned",
+				setup(api) {
+					api.serve(token, () =>
+						variant === "first"
+							? { variant, send: (ctx: Ctx) => `${ctx.rootId}:empty` }
+							: { variant, send: (text: string, ctx: Ctx) => `${ctx.rootId}:${text}` },
+					);
+				},
+			});
+			await host.install(facet(initial));
+			const ref = await host.get(token, {});
+			const send = ref.send as (value: string | Ctx, ctx?: Ctx) => Promise<string>;
+			const entered = Promise.withResolvers<void>(),
+				resume = Promise.withResolvers<void>();
+			const pinned = host.root(async (ctx) => {
+				const first = initial === "first" ? await send(ctx) : await send("text", ctx);
+				entered.resolve();
+				await resume.promise;
+				const second = initial === "first" ? await send(ctx) : await send("text", ctx);
+				assert.equal(second, first);
+				assert.equal(second, `${ctx.rootId}:${initial === "first" ? "empty" : "text"}`);
+			});
+			await entered.promise;
+			await host.reload([facet(initial === "first" ? "second" : "first")]);
+			resume.resolve();
+			await pinned;
+			await host.close();
+		});
+	}
+
+	it("loading references reject expired and foreign contexts before readiness, and released reconnecting views reject", async () => {
+		const server = createHost({ self: {}, name: "server", onError: () => {} });
+		const foreign = createHost({ self: {}, onError: () => {} });
+		const pending = Promise.withResolvers<void>();
+		const token = remote("loading-ctx", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: { main: { methods: { ping: method() } } },
+		});
+		server.serve(token, (_input, _principal, self) => {
+			self.resource("wait", { version: 1, open: () => pending.promise });
+			return { variant: "main", ping: () => {} };
+		});
+		const [down, up] = memoryLinkPair();
+		server.accept(down, { principal: {} });
+		const client = createHost({ self: {}, kind: "client", upstream: { link: up, principal: {} }, onError: () => {} });
+		for (const host of [server, client]) {
+			const ref = host.hold(token, {});
+			const expired = await host.root((ctx) => ctx);
+			await assert.rejects(
+				ref.ping(expired),
+				(error) => isChordError(error, "aborted") && error.reason === "expired",
+			);
+			await foreign.root(async (ctx) => {
+				await assert.rejects(
+					ref.ping(ctx),
+					(error) => isChordError(error, "invalid") && error.reason === "foreign_ctx",
+				);
+			});
+			ref.release();
+		}
+		pending.resolve();
+		const released = await client.get(token, {});
+		const retained = await client.get(token, {});
+		up.close();
+		await ticks();
+		released.release();
+		await assert.rejects(released.ping(), (error) => isChordError(error, "released"));
+		retained.release();
+		await client.close();
+		await foreign.close();
+		await server.close();
+	});
+
+	it("additive record results bind equally locally and over a link", async () => {
+		const server = createHost({ self: {}, name: "server", onError: () => {} });
+		const [down, up] = memoryLinkPair();
+		server.accept(down, { principal: {} });
+		const client = createHost({ self: {}, kind: "client", upstream: { link: up, principal: {} }, onError: () => {} });
+		const consumer = remote("record-result", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: {
+				main: {
+					methods: { read: method(undefined, Type.Record(Type.String(), Type.Object({ id: Type.String() }))) },
+				},
+			},
+		});
+		const provider = remote("record-result", {
+			...consumer.def,
+			variants: {
+				main: {
+					methods: {
+						read: method(
+							undefined,
+							Type.Record(Type.String(), Type.Object({ id: Type.String(), extra: Type.Number() })),
+						),
+					},
+				},
+			},
+		});
+		server.serve(provider, () => ({ variant: "main", read: () => ({ key: { id: "a", extra: 1 } }) }));
+		assert.deepEqual(await server.hold(consumer, {}).read(), { key: { id: "a", extra: 1 } });
+		assert.deepEqual(await client.hold(consumer, {}).read(), { key: { id: "a", extra: 1 } });
+		await client.close();
+		await server.close();
+	});
+
+	it("received schema DAGs and spoofed executable kinds require a trusted root, while registered unions work", async () => {
+		const server = createHost({ self: {}, name: "server", onError: () => {} });
+		const token = remote("schema-dag", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: { main: { methods: { call: method(Type.Unknown()) } } },
+		});
+		let invoked = 0;
+		server.serve(token, () => ({
+			variant: "main",
+			call: () => {
+				invoked++;
+			},
+		}));
+		const defs: Record<string, object> = { n0: {} };
+		for (let i = 1; i <= 14; i++)
+			defs[`n${i}`] = { allOf: [{ $ref: `#/$defs/n${i - 1}` }, { $ref: `#/$defs/n${i - 1}` }] };
+		for (const args of [
+			{ "~kind": "Union", anyOf: [{ $defs: defs, $ref: "#/$defs/n14" }] },
+			{ "~kind": "Cyclic", $defs: defs },
+		]) {
+			const peer = contractFromDescription({
+				...token.description,
+				variants: { main: { call: { kind: "method", args } } },
+			});
+			assert.throws(() => server.hold(peer, {}), /peer executable schemas/);
+		}
+		assert.equal(invoked, 0);
+		const trusted = remote("trusted-union", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: {
+				main: {
+					methods: {
+						echo: method(Type.Union([Type.String(), Type.Number()]), Type.Union([Type.String(), Type.Number()])),
+					},
+				},
+			},
+		});
+		server.serve(trusted, () => ({ variant: "main", echo: (value) => value }));
+		const [down, up] = memoryLinkPair();
+		server.accept(down, { principal: {} });
+		const client = createHost({ self: {}, kind: "client", upstream: { link: up, principal: {} }, onError: () => {} });
+		assert.equal(await client.hold(trusted, {}).echo("registered"), "registered");
+		assert.equal(await client.hold(trusted, {}).echo(7), 7);
+		await client.close();
+		await server.close();
+	});
+
+	it("resource dependencies time out and close unwinds activation without opening the resource", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		onTestFinished(() => {
+			vi.useRealTimers();
+		});
+		const [up, peer] = memoryLinkPair();
+		const host = createHost({
+			self: {},
+			name: "worker",
+			readyTimeout: 20,
+			upstream: { link: up, principal: {} },
+			onError: () => {},
+		});
+		const missing = remote("missing", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: { main: {} },
+		});
+		const own = local("waiting", { version: 1, input: Type.Object({}) });
+		let opened = false;
+		host.serve(own, (_input, _principal, self) => {
+			const dep = self.get(missing, {});
+			self.resource("r", {
+				version: 1,
+				deps: [dep],
+				open: () => {
+					opened = true;
+				},
+			});
+			return {};
+		});
+		const ref = host.hold(own, {});
+		const rejection = assert.rejects(
+			ref.ready,
+			(error) => isChordError(error, "unavailable") && error.reason === "ready_timeout",
+		);
+		await ticks();
+		await vi.advanceTimersByTimeAsync(20);
+		await rejection;
+		await host.close();
+		assert.equal(opened, false);
+		assert.equal(up.closed, true);
+		peer.close();
+	});
+
+	it("mixed arities follow the active variant locally, remotely, while loading, and after reload", async () => {
+		const server = createHost({ self: {}, name: "server", onError: () => {} });
+		const [down, up] = memoryLinkPair();
+		server.accept(down, { principal: {} });
+		const client = createHost({
+			self: {},
+			name: "client",
+			kind: "client",
+			upstream: { link: up, principal: {} },
+			onError: () => {},
+		});
+		const token = remote("mixed", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: {
+				first: { methods: { send: method(undefined, Type.String()) } },
+				second: { methods: { send: method(Type.String(), Type.String()) } },
+			},
+		});
+		const facet = (variant: "first" | "second"): Facet => ({
+			name: "mixed",
+			setup(api) {
+				api.serve(token, () =>
+					variant === "first" ? { variant, send: () => "empty" } : { variant, send: (text: string) => text },
+				);
+			},
+		});
+		await server.install(facet("second"));
+		const localRef = server.hold(token, {}),
+			remoteRef = client.hold(token, {});
+		const localSend = localRef.send as (value?: string | Ctx) => Promise<string>;
+		const remoteSend = remoteRef.send as (value?: string | Ctx) => Promise<string>;
+		assert.deepEqual(await Promise.all([localSend("local"), remoteSend("remote")]), ["local", "remote"]);
+		await server.reload([facet("first")]);
+		await ticks();
+		assert.equal(await server.root((ctx) => localSend(ctx)), "empty");
+		assert.equal(await client.root((ctx) => remoteSend(ctx)), "empty");
+		await server.reload([facet("second")]);
+		await ticks();
+		assert.equal(await localSend("again"), "again");
+		assert.equal(await remoteSend("again"), "again");
+		await client.close();
+		await server.close();
+	});
+
+	it("void consumers discard additive provider results locally and across a link", async () => {
+		const server = createHost({ self: {}, name: "server", onError: () => {} });
+		const [down, up] = memoryLinkPair();
+		server.accept(down, { principal: {} });
+		const client = createHost({ self: {}, kind: "client", upstream: { link: up, principal: {} }, onError: () => {} });
+		const consumer = remote("void", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: { main: { methods: { m: method() } } },
+		});
+		const provider = remote("void", {
+			...consumer.def,
+			variants: { main: { methods: { m: method(undefined, Type.Number()) } } },
+		});
+		server.serve(provider, () => ({ variant: "main", m: () => 7 }));
+		assert.equal(await server.hold(consumer, {}).m(), undefined);
+		assert.equal(await client.hold(consumer, {}).m(), undefined);
+		await client.close();
+		await server.close();
+	});
+
+	it("record values cannot violate named consumer fields during binding", () => {
+		const sub = Type.Record(Type.String(), Type.Number());
+		const sup = Type.Object({ b: Type.Optional(Type.String()) });
+		assert.equal(Value.Check(sub, { b: 1 }), true);
+		assert.equal(Value.Check(sup, { b: 1 }), false);
+		assert.equal(fits(sub, sup), false);
+		assert.equal(fits(Type.Record(Type.Literal("other"), Type.Number()), sup), true);
+	});
+
+	it("reload derivations read commit-time cells after another candidate waits", async () => {
+		const host = createHost({ self: {}, onError: () => {} });
+		const aType = local("derive-a", {
+			version: 1,
+			input: Type.Object({}),
+			members: { n: Type.Number(), doubled: Type.Number(), set: method(Type.Number()) },
+		});
+		const bType = local("derive-b", { version: 1, input: Type.Object({}) });
+		const opening = Promise.withResolvers<void>(),
+			proceed = Promise.withResolvers<void>();
+		const facet = (wait: boolean): Facet => ({
+			name: "derive",
+			setup(api) {
+				api.serve(aType, (_input, _principal, self) => {
+					const n = self.state("n", Type.Number(), 1);
+					return {
+						n,
+						doubled: self.derive([n], (value) => value * 2),
+						set(value, ctx) {
+							n.replace(ctx, value);
+						},
+					};
+				});
+				api.serve(bType, (_input, _principal, self) => {
+					if (wait)
+						self.resource("wait", {
+							version: 1,
+							open: () => {
+								opening.resolve();
+								return proceed.promise;
+							},
+						});
+					return {};
+				});
+			},
+		});
+		await host.install(facet(false));
+		const a = await host.get(aType, {});
+		await host.get(bType, {});
+		const reload = host.reload([facet(true)]);
+		await opening.promise;
+		await a.set(2);
+		proceed.resolve();
+		await reload;
+		assert.deepEqual([a.n.value, a.doubled.value], [2, 4]);
+		await host.close();
+	});
+
+	it("a derivation invalidated while prepare waits aborts before publication", async () => {
+		const host = createHost({ self: {}, name: "server", onError: () => {} });
+		const token = remote("derive-failure", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: {
+				main: { state: { doubled: Type.Number() }, methods: { set: method(Type.Number()) } },
+			},
+		});
+		const blocker = local("derive-blocker", { version: 1, input: Type.Object({}) });
+		const opened = Promise.withResolvers<void>(),
+			resume = Promise.withResolvers<void>();
+		const facet = (candidate: boolean): Facet => ({
+			name: "derive-failure",
+			setup(api) {
+				api.serve(token, (_input, _principal, self) => {
+					const n = self.state("n", Type.Number(), 1);
+					return {
+						variant: "main",
+						doubled: self.derive([n], (value) => {
+							if (candidate && value === 2) throw new Error("commit-time derivation failure");
+							return value * 2;
+						}),
+						set(value, ctx) {
+							n.replace(ctx, value);
+						},
+					};
+				});
+				api.serve(blocker, (_input, _principal, self) => {
+					if (candidate)
+						self.resource("wait", {
+							version: 1,
+							open: () => {
+								opened.resolve();
+								return resume.promise;
+							},
+						});
+					return {};
+				});
+			},
+		});
+		await host.install(facet(false));
+		const ref = await host.get(token, {});
+		await host.get(blocker, {});
+		const version = host.codeVersion;
+		const reload = host.reload([facet(true)]);
+		await opened.promise;
+		await ref.set(2);
+		resume.resolve();
+		await assert.rejects(reload, /commit-time derivation failure/);
+		assert.equal(host.codeVersion, version);
+		assert.equal(ref.doubled.value, 4);
+		await ref.set(3);
+		assert.equal(ref.doubled.value, 6);
+		await host.close();
 	});
 });

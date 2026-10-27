@@ -113,7 +113,8 @@ export class PartialChanges {
 	 * Write `message` with what `commit` took into `generation.message`: the message leaf by leaf with the plan, then the
 	 * argument changes. A tracked call whose block is new here gets its arguments from its changes, which then start at
 	 * its first piece; when the committed message lost a call whose changes were already committed (another writer reset
-	 * it), the call falls back to its snapshot from now on.
+	 * it), the call falls back to its snapshot from now on. A call that ended since `take()` still writes its captured
+	 * snapshot, independently of the provider's final arguments.
 	 */
 	commit(
 		generation: Draft<NonNullable<LiveState["generation"]>>,
@@ -124,7 +125,10 @@ export class PartialChanges {
 		const apply: [number, readonly JsonChange[]][] = [];
 		for (const [index, { changes, snapshot }] of commit.toolCalls) {
 			const call = this.#toolCalls.get(index);
-			if (call === undefined) continue;
+			if (call === undefined) {
+				apply.push([index, [{ kind: "set", path: [], value: snapshot }]]);
+				continue;
+			}
 			const block = message.content[index];
 			if (index >= committedBlocks && call.committed && block?.type === "toolCall") {
 				// The earlier changes are not in the committed message: commit the snapshot and stop tracking the call.

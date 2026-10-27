@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import type { Context } from "@earendil-works/chord";
+import { parseToolCallArguments } from "@earendil-works/pi-ai/utils/json-parse";
+import { Type } from "typebox";
 import { onTestFinished, test } from "vitest";
 import { kinds as kindsOf } from "../../../src/harness/pico3/harness.ts";
-import type { RequestMessage } from "../../../src/harness/pico3/types.ts";
+import { JsonlStorage } from "../../../src/harness/pico3/jsonl.ts";
+import type { ToolCheckpoint } from "../../../src/harness/pico3/kinds/tool.ts";
+import { type RequestMessage, type ToolDeclaration, toStored } from "../../../src/harness/pico3/types.ts";
 import {
 	contentOf,
 	ctx,
@@ -117,6 +121,56 @@ test("crash in tool@started with replay:safe → tool re-invoked; unsafe → syn
 		assert.equal(kinds(await env.entries()), "user system assistant tool_result assistant");
 		await env.close();
 	}
+});
+
+// #14: old persisted safe checkpoints can contain the parser's malformed-arguments sentinel.
+test("safe recovery rejects malformed arguments without executing and retains the original diagnostic", async () => {
+	const gate = new Gate();
+	let calls = 0;
+	const declaration: ToolDeclaration = {
+		name: "empty",
+		description: "",
+		parameters: Type.Object({}),
+		replay: "safe",
+		async execute(_args, _api, context) {
+			calls++;
+			await gate.wait(context);
+			return {};
+		},
+	};
+	let env = await open({ backend: "jsonl", tools: [declaration] });
+	onTestFinished(() => env.close());
+	const input = await env.root.send({ content: "tool:empty" }, ctx);
+	const task = await untilPhase(env, "pi.tool", "started");
+	await gate.arrivals(1);
+	await env.crash();
+	const parsed = parseToolCallArguments("[1]");
+	assert.ok(parsed.argumentsError);
+	const checkpoint = task.checkpoint as ToolCheckpoint;
+	const storage = await JsonlStorage.open(env.dir!, { fsync: false });
+	await storage.commit(
+		[
+			{
+				type: "task.patch",
+				patch: { id: task.id, checkpoint: toStored({ ...checkpoint, call: { ...checkpoint.call, ...parsed } }) },
+			},
+		],
+		ctx,
+	);
+	await storage.close(ctx);
+	gate.open();
+	const models = fake({ respond: echoScript });
+	env = await open({ dir: env.dir, backend: "jsonl", tools: [declaration], models });
+	await env.root.waitForIdle(ctx);
+	assert.equal(calls, 1, "recovery must not invoke the tool again");
+	assert.equal((await env.input(input.id))?.status, "done");
+	const result = (await env.entries()).find((entry) => entry.kind === "pi.tool_result")!;
+	const resultMessage = result.model![0];
+	assert.ok(resultMessage && typeof resultMessage === "object" && "isError" in resultMessage);
+	assert.equal(resultMessage.isError, true);
+	assert.ok(contentOf(result).includes(JSON.stringify(parsed.argumentsError).slice(1, -1)));
+	const requestResult = models.requests[0]!.find((message) => message.role === "toolResult");
+	assert.deepEqual(requestResult, result.model![0]);
 });
 
 test("crash in tool before `started` (blocked in beforeTool) → hook reruns, tool runs once", async () => {
