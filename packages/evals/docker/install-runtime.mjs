@@ -17,6 +17,8 @@ const artifactSet = produceArtifactSet({
 	build: false,
 	outDir: join(outputDirectory, "artifacts"),
 	repoRoot: repositoryRoot,
+	// This intermediate install image does not ship the cross-platform pi-env release assets.
+	requireEnvReleaseAssets: false,
 	// Docker build contexts may omit Git metadata; this artifact set is consumed only within this image build.
 	source: null,
 });

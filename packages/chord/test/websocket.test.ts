@@ -106,6 +106,52 @@ describe("WebSocket links", () => {
 			await new Promise<void>((resolve) => wss.close(() => resolve()));
 		}
 	});
+
+	it("a synchronous authenticator throw closes only the rejected socket; the next client can call", async () => {
+		const server = createHost({ self: {}, name: "server", onError: () => {} });
+		server.serve(Board, (_input, principal, self) => ({
+			variant: "main",
+			notes: self.state("notes", Type.Array(Type.String()), []),
+			add: () => {},
+			who: () => principal,
+		}));
+		const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+		const listening = Promise.withResolvers<void>();
+		wss.once("listening", listening.resolve);
+		await listening.promise;
+		acceptWebSockets(wss as never, server, {
+			principal(request: IncomingMessage) {
+				if (request.url === "/throw") throw new Error("invalid credentials");
+				return { guest: "survivor" };
+			},
+		});
+		const address = wss.address();
+		assert.ok(address !== null && typeof address === "object");
+		const url = `ws://127.0.0.1:${address.port}`;
+		try {
+			const refused = new WebSocket(`${url}/throw`);
+			const closed = Promise.withResolvers<CloseEvent>();
+			refused.addEventListener("close", closed.resolve);
+			await closed.promise;
+			assert.equal(refused.readyState, WebSocket.CLOSED);
+			const client = createHost({
+				self: {},
+				kind: "client",
+				onError: () => {},
+				upstream: { link: webSocketLink(new WebSocket(`${url}/ok`) as unknown as WebSocketLike), principal: {} },
+			});
+			try {
+				assert.deepEqual(await client.hold(Board, {}).who(), { guest: "survivor" });
+			} finally {
+				await client.close();
+			}
+		} finally {
+			await server.close();
+			const closed = Promise.withResolvers<void>();
+			wss.close(() => closed.resolve());
+			await closed.promise;
+		}
+	});
 });
 
 describe("WebSocket links: packed payloads", () => {

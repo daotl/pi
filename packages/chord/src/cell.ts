@@ -388,10 +388,11 @@ export class Derived<T> extends Source<T> {
 	install(next: T): void {
 		const before = this.#value;
 		this.#value = next;
-		const ops: Op[] =
-			before === undefined || next === undefined
-				? [["r", (next ?? null) as JsonValue]]
-				: diffRevisions(before as JsonValue, next as JsonValue);
+		if (before === undefined || next === undefined) {
+			if (before !== next) this.fanout.emit({ type: "reset", value: next });
+			return;
+		}
+		const ops = diffRevisions(before as JsonValue, next as JsonValue);
 		if (ops.length > 0) this.fanout.emit({ type: "ops", ops, value: next });
 	}
 }

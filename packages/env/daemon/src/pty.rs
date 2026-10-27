@@ -312,6 +312,9 @@ pub fn run(
         }
     }
     stop.store(true, Ordering::SeqCst);
+    // The leader may exit normally while HUP-ignoring jobs still own the terminal.
+    // Clean the session while it is still registered, without changing the leader's saved status.
+    unix::kill_session(pid);
     // Ending the input channel ends the writer thread.
     terminals.lock().unwrap().remove(&id);
     groups.lock().unwrap().remove(&pid);

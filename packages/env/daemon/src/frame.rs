@@ -82,9 +82,24 @@ pub fn read_frame(input: &mut impl Read) -> io::Result<Option<Frame>> {
 }
 
 pub fn write_frame(output: &mut impl Write, frame: &Frame) -> io::Result<()> {
-    let json = serde_json::to_vec(&frame.json).map_err(|_| invalid("unserializable JSON"))?;
+    write_frame_with_limit(output, frame, MAX_FRAME)
+}
+
+fn write_frame_with_limit(output: &mut impl Write, frame: &Frame, limit: usize) -> io::Result<()> {
+    let mut json = serde_json::to_vec(&frame.json).map_err(|_| invalid("unserializable JSON"))?;
+    let error;
+    let frame = if 9 + json.len() + frame.payload.len() > limit {
+        // Nothing has been written yet: fail this request, not the connection's only writer.
+        error = Frame::new(ERROR, frame.id, serde_json::json!({
+            "code": "E2BIG", "message": "response exceeds the frame limit"
+        }));
+        json = serde_json::to_vec(&error.json).map_err(|_| invalid("unserializable JSON"))?;
+        &error
+    } else {
+        frame
+    };
     let length = 9 + json.len() + frame.payload.len();
-    if length > MAX_FRAME {
+    if length > limit {
         return Err(invalid("frame too large"));
     }
     let mut header = Vec::with_capacity(13);
@@ -116,5 +131,19 @@ mod tests {
         assert_eq!(frame.json, json!({ "a": 1 }));
         assert_eq!(frame.payload, vec![0, 255, 10]);
         assert!(read_frame(&mut &[][..]).unwrap().is_none());
+    }
+
+    #[test]
+    fn oversized_response_is_an_error_without_losing_the_next_frame() {
+        let mut bytes = Vec::new();
+        write_frame_with_limit(&mut bytes, &Frame::new(RESULT, 7, json!({ "entry": "x".repeat(128) })), 128).unwrap();
+        write_frame(&mut bytes, &Frame::new(RESULT, 8, json!({ "alive": true }))).unwrap();
+        let mut input = bytes.as_slice();
+        let error = read_frame(&mut input).unwrap().unwrap();
+        assert_eq!((error.kind, error.id), (ERROR, 7));
+        assert_eq!(error.json["code"], "E2BIG");
+        let next = read_frame(&mut input).unwrap().unwrap();
+        assert_eq!((next.kind, next.id), (RESULT, 8));
+        assert_eq!(next.json, json!({ "alive": true }));
     }
 }

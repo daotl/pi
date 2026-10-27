@@ -1,9 +1,10 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import {
 	type AssistantImages,
+	type ClassifierContext,
 	type ClassifierResult,
 	createProvider,
 	fauxAssistantMessage,
@@ -17,7 +18,9 @@ import { describe, expect, it } from "vitest";
 import { createCodemodeExtension } from "../src/codemode/codemode.ts";
 import type { ExecutionEnv } from "../src/env/index.ts";
 import { NodeExecutionEnv } from "../src/env/node.ts";
+import { createReadTool } from "../src/tools/read.ts";
 import { allEntries, chatSetup, openChat } from "./chat-support.ts";
+import { addTool } from "./harness-support.ts";
 import { context } from "./session-support.ts";
 import { deferred } from "./task-support.ts";
 
@@ -36,6 +39,7 @@ const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwA
 function modelsChat() {
 	const setup = chatSetup();
 	const calls = { classify: 0, images: 0, inFlight: 0, maxInFlight: 0 };
+	const classified: ClassifierContext[] = [];
 	// \`atFour\`: hold classifier calls until four run, then a little longer, so a fifth would show up.
 	const gate = { open: deferred(), atFour: false };
 	gate.open.resolve();
@@ -50,7 +54,7 @@ function modelsChat() {
 					api: "test-classifier",
 					provider: "test",
 					baseUrl: "https://example.invalid",
-					input: ["text"],
+					input: ["text", "image"],
 					cost: COST,
 					headers: { authorization: "secret" },
 					type: "classifier",
@@ -72,6 +76,7 @@ function modelsChat() {
 				"test-classifier": {
 					classify: async (model, classifierContext): Promise<ClassifierResult> => {
 						calls.classify++;
+						classified.push(classifierContext);
 						if ((classifierContext.state as { fail?: boolean }).fail === true) {
 							return {
 								api: model.api,
@@ -118,7 +123,7 @@ function modelsChat() {
 		}),
 	);
 	setup.registry.install(createCodemodeExtension({ sandbox: new CodemodeSandbox() }));
-	return { setup, calls, gate };
+	return { setup, calls, classified, gate };
 }
 
 async function run(chat: ReturnType<typeof modelsChat>, code: string, env?: ExecutionEnv) {
@@ -140,6 +145,34 @@ async function run(chat: ReturnType<typeof modelsChat>, code: string, env?: Exec
 }
 
 describe("code mode models.*", () => {
+	it("shows a read PNG and passes the same image through code mode to a classifier", async () => {
+		const chat = modelsChat();
+		addTool(chat.setup.registry, createReadTool());
+		const directory = await mkdtemp(join(tmpdir(), "pi-codemode-read-image-"));
+		try {
+			await writeFile(join(directory, "screen.png"), Buffer.from(PNG, "base64"));
+			const { text, message } = await run(
+				chat,
+				`const screenshot = await tools.read({ path: "screen.png" });
+				image(screenshot);
+				const model = await models.getModelOfType("classifier", "test", "judge");
+				const result = await models.classify(model, {
+					state: {}, images: [screenshot],
+					questions: { good: { type: "bool", instructions: "Is the image good?", criteria: { true: "yes", false: "no" } } },
+				});
+				return result.answers.good.value;`,
+				new NodeExecutionEnv({ cwd: directory }),
+			);
+			const image = { type: "image", data: PNG, mimeType: "image/png" };
+			expect(message.content.filter((item) => item.type === "image")).toEqual([image]);
+			expect(chat.classified.map((request) => request.images)).toEqual([[image]]);
+			expect(text).toContain("true");
+			expect(text.split("read: Read image file [image/png].")).toHaveLength(2);
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
 	it("reads the model catalog without credentials in headers", async () => {
 		const chat = modelsChat();
 		const { text } = await run(

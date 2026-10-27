@@ -62,6 +62,62 @@ struct Serial {
 struct DirHandle {
     entries: ReadDir,
     path: String,
+    /// An entry consumed from ReadDir that belongs to the next encoded page.
+    pending: Option<Value>,
+}
+
+/// Count encoded JSON bytes without allocating a second copy of every directory entry.
+#[derive(Default)]
+struct JsonSize(usize);
+
+impl Write for JsonSize {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl DirHandle {
+    fn read_page(&mut self, max: usize, frame_limit: usize) -> Result<Value, Failure> {
+        let mut entries = Vec::new();
+        let mut done = false;
+        // Include the frame header and the longer (`false`) spelling of the page envelope.
+        let mut size = 9 + b"{\"entries\":[],\"done\":false}".len();
+        while entries.len() < max {
+            let entry = match self.pending.take() {
+                Some(entry) => entry,
+                None => match self.entries.next() {
+                    None => {
+                        done = true;
+                        break;
+                    }
+                    Some(Err(error)) => return Err(Failure::io(&error, "readdir", &self.path)),
+                    Some(Ok(entry)) => fs::dir_entry(&self.path, &entry.file_name()),
+                },
+            };
+            let mut encoded = JsonSize::default();
+            serde_json::to_writer(&mut encoded, &entry)
+                .map_err(|error| Failure::new("EIO", error.to_string()))?;
+            let next_size = size + encoded.0 + usize::from(!entries.is_empty());
+            if next_size > frame_limit {
+                self.pending = Some(entry);
+                if entries.is_empty() {
+                    return Err(Failure::new("E2BIG", "directory entry exceeds the frame limit"));
+                }
+                break;
+            }
+            size = next_size;
+            entries.push(entry);
+        }
+        let mut page = serde_json::Map::new();
+        page.insert("entries".into(), Value::Array(entries));
+        page.insert("done".into(), Value::Bool(done));
+        Ok(Value::Object(page))
+    }
 }
 
 enum Handle {
@@ -239,6 +295,7 @@ impl Server {
                 let handle = self.insert(Handle::Dir(Arc::new(Mutex::new(DirHandle {
                     entries,
                     path: path.to_string(),
+                    pending: None,
                 }))))?;
                 plain(Ok(json!({ "handle": handle })))
             }
@@ -280,19 +337,7 @@ impl Server {
             _ => return Err(Failure::new("EBADF", "not a directory handle")),
         };
         let mut dir = dir.lock().unwrap();
-        let mut entries = Vec::new();
-        let mut done = false;
-        while entries.len() < max {
-            match dir.entries.next() {
-                None => {
-                    done = true;
-                    break;
-                }
-                Some(Err(error)) => return Err(Failure::io(&error, "readdir", &dir.path)),
-                Some(Ok(entry)) => entries.push(fs::dir_entry(&dir.path, &entry.file_name())),
-            }
-        }
-        Ok(json!({ "entries": entries, "done": done }))
+        dir.read_page(max, frame::MAX_FRAME)
     }
 }
 
@@ -550,5 +595,67 @@ fn main() {
             eprintln!("usage: pi-env serve --token <hex>");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_pages_fit_encoded_frames_without_losing_the_carried_entry() {
+        let path = sys::mkdtemp(&format!("{}{}pi-env-readdir-", sys::tmpdir(), sys::PATH_SEPARATOR)).unwrap();
+        let names = ["first", "second", "third"];
+        for name in names {
+            std::fs::write(std::path::Path::new(&path).join(name), "").unwrap();
+        }
+        let expected: Vec<Value> = sys::read_dir(&path)
+            .unwrap()
+            .map(|entry| fs::dir_entry(&path, &entry.unwrap().file_name()))
+            .collect();
+        // The byte limit fits any one entry but cannot fit two, with no giant directory fixture.
+        let limit = expected.iter().map(|entry| {
+            9 + serde_json::to_vec(&json!({ "entries": [entry], "done": false })).unwrap().len()
+        }).max().unwrap();
+        let mut dir = DirHandle {
+            entries: sys::read_dir(&path).unwrap(),
+            path: path.clone(),
+            pending: None,
+        };
+        let mut actual = Vec::new();
+        let mut done = false;
+        for _ in 0..=names.len() {
+            let page = dir.read_page(usize::MAX, limit).unwrap();
+            assert!(9 + serde_json::to_vec(&page).unwrap().len() <= limit);
+            actual.extend(page["entries"].as_array().unwrap().iter().cloned());
+            done = page["done"].as_bool().unwrap();
+            if done {
+                break;
+            }
+        }
+        assert!(done);
+        let mut actual_names: Vec<_> = actual.iter().map(|entry| entry["name"].as_str().unwrap()).collect();
+        actual_names.sort();
+        assert_eq!(actual_names, names);
+        drop(dir);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn a_single_oversized_directory_entry_returns_a_request_error() {
+        let path = sys::mkdtemp(&format!("{}{}pi-env-readdir-", sys::tmpdir(), sys::PATH_SEPARATOR)).unwrap();
+        let entry = json!({ "name": "quotes\" and newline\n and unicode é", "error": { "code": "ENOENT" } });
+        let limit = 9 + serde_json::to_vec(&json!({ "entries": [&entry], "done": false })).unwrap().len();
+        let mut dir = DirHandle {
+            entries: sys::read_dir(&path).unwrap(),
+            path: path.clone(),
+            pending: Some(entry.clone()),
+        };
+        assert_eq!(dir.read_page(1, limit - 1).unwrap_err().code, "E2BIG");
+        let page = dir.read_page(1, limit).unwrap();
+        assert_eq!(page, json!({ "entries": [entry], "done": false }));
+        assert_eq!(dir.read_page(1, limit).unwrap(), json!({ "entries": [], "done": true }));
+        drop(dir);
+        std::fs::remove_dir_all(path).unwrap();
     }
 }

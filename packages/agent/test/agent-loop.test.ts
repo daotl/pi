@@ -29,6 +29,7 @@ import type {
 	AgentMessage,
 	AgentTool,
 	AgentToolCall,
+	AgentTurnContext,
 	StreamFn,
 } from "../src/types.ts";
 
@@ -2037,12 +2038,16 @@ describe.each(["start", "continue"] as const)("low-level %s stream failures", (k
 			const routed = { ...selected, id: "routed-model", provider: "routed-provider" };
 			const context: AgentContext = { messages: [createUserMessage("run")], tools: [] };
 			const completed = createAssistantMessage([{ type: "text", text: "first turn" }]);
+			const finished: AgentTurnContext[] = [];
 			const config: AgentLoopConfig = {
 				model: selected,
 				convertToLlm: identityConverter,
 				prepareRequest: phase === "request" ? async () => ({ model: routed }) : undefined,
 				prepareNextTurn: phase === "next-turn" ? async () => ({ model: routed }) : undefined,
-				finishTurn: ({ message }) => (message === completed ? { action: "continue" } : undefined),
+				finishTurn: (turn) => {
+					finished.push(turn);
+					return { action: "continue" };
+				},
 			};
 			let calls = 0;
 			let failedModel: Model<string> | undefined;
@@ -2068,6 +2073,11 @@ describe.each(["start", "continue"] as const)("low-level %s stream failures", (k
 				stopReason: "error",
 				errorMessage: "routed dispatch failure",
 			});
+			expect(finished.map((turn) => turn.message)).toEqual(
+				messages.filter((message) => message.role === "assistant"),
+			);
+			expect(finished.at(-1)).toMatchObject({ toolResults: [], canContinue: false, newMessages: messages });
+			expect(finished.at(-1)?.context.messages.at(-1)).toBe(messages.at(-1));
 		},
 	);
 	it.each(["normal", "initial preparation failure", "next-turn preparation failure"] as const)(
@@ -2078,6 +2088,7 @@ describe.each(["start", "continue"] as const)("low-level %s stream failures", (k
 			const final = createAssistantMessage([{ type: "text", text: "completed second turn" }]);
 			const context: AgentContext = { messages: kind === "continue" ? [prompt] : [], tools: [] };
 			const failure = new Error(scenario);
+			const finished: AgentTurnContext[] = [];
 			const config: AgentLoopConfig = {
 				model: createModel(),
 				convertToLlm: identityConverter,
@@ -2087,7 +2098,10 @@ describe.each(["start", "continue"] as const)("low-level %s stream failures", (k
 				prepareNextTurn: async () => {
 					if (scenario === "next-turn preparation failure") throw failure;
 				},
-				finishTurn: ({ message }) => (message === completed ? { action: "continue" } : undefined),
+				finishTurn: (turn) => {
+					finished.push(turn);
+					return turn.message === completed ? { action: "continue" } : undefined;
+				},
 			};
 			let requests = 0;
 			const streamFn: StreamFn = () => {
@@ -2143,6 +2157,16 @@ describe.each(["start", "continue"] as const)("low-level %s stream failures", (k
 				{ type: "agent_end", messages },
 			]);
 			expect(requests).toBe(scenario === "normal" ? 2 : scenario === "initial preparation failure" ? 0 : 1);
+			expect(finished.map((turn) => turn.message)).toEqual(
+				messages.filter((message) => message.role === "assistant"),
+			);
+			expect(finished.at(-1)).toMatchObject({
+				message: terminal,
+				toolResults: [],
+				canContinue: false,
+				newMessages: messages,
+			});
+			expect(finished.at(-1)?.context.messages.at(-1)).toBe(terminal);
 			if (scenario !== "normal") {
 				const runContext: AgentContext = { messages: kind === "continue" ? [prompt] : [], tools: [] };
 				requests = 0;
@@ -2159,12 +2183,18 @@ describe.each(["start", "continue"] as const)("low-level %s stream failures", (k
 		const controller = new AbortController();
 		const prompt = createUserMessage("run");
 		const context: AgentContext = { messages: kind === "continue" ? [prompt] : [], tools: [] };
+		const finished: AgentTurnContext[] = [];
 		const config: AgentLoopConfig = {
 			model: createModel(),
 			convertToLlm: identityConverter,
 			prepareRequest: async () => {
 				controller.abort();
 				throw new Error("Preparation cancelled");
+			},
+			finishTurn: (turn, signal) => {
+				finished.push(turn);
+				expect(signal).toBe(controller.signal);
+				return { action: "continue" };
 			},
 		};
 		let dispatches = 0;
@@ -2192,6 +2222,14 @@ describe.each(["start", "continue"] as const)("low-level %s stream failures", (k
 			{ type: "agent_end", messages },
 		]);
 		expect(dispatches).toBe(0);
+		expect(finished).toHaveLength(1);
+		expect(finished[0]).toMatchObject({
+			message: messages.at(-1),
+			toolResults: [],
+			canContinue: false,
+			newMessages: messages,
+		});
+		expect(finished[0]?.context.messages.at(-1)).toBe(messages.at(-1));
 	});
 
 	it.each([
@@ -2224,6 +2262,7 @@ describe.each(["start", "continue"] as const)("low-level %s stream failures", (k
 			};
 			const context: AgentContext = { messages: kind === "continue" ? [prompt] : [], tools: [] };
 			let activeContext = context;
+			const finished: AgentTurnContext[] = [];
 			const config: AgentLoopConfig = {
 				model: createModel(),
 				convertToLlm: identityConverter,
@@ -2239,7 +2278,10 @@ describe.each(["start", "continue"] as const)("low-level %s stream failures", (k
 					activeContext = { ...turnContext, messages: [...turnContext.messages] };
 					return { context: activeContext };
 				},
-				finishTurn: ({ message }) => (message === completed ? { action: "continue" } : undefined),
+				finishTurn: (turn) => {
+					finished.push(turn);
+					return { action: "continue" };
+				},
 			};
 			let requests = 0;
 			const streamFn: StreamFn = () => {
@@ -2271,6 +2313,9 @@ describe.each(["start", "continue"] as const)("low-level %s stream failures", (k
 			expect(activeContext.messages.at(-1)).toBe(messages.at(-1));
 			expect(activeContext.messages).not.toContain(initial);
 			expect(activeContext.messages).not.toContain(partial);
+			expect(finished.map((turn) => turn.message)).toEqual([completed, messages.at(-1)]);
+			expect(finished.at(-1)).toMatchObject({ toolResults: [], canContinue: false, newMessages: messages });
+			expect(finished.at(-1)?.context).toBe(activeContext);
 			expect(events).toEqual([
 				{ type: "agent_start" },
 				{ type: "turn_start" },
@@ -2290,6 +2335,135 @@ describe.each(["start", "continue"] as const)("low-level %s stream failures", (k
 				{ type: "turn_end", message: failure, toolResults: [] },
 				{ type: "agent_end", messages },
 			]);
+		},
+	);
+
+	it.each([
+		"steering",
+		"transform",
+		"convert",
+		"api-key",
+		"dispatch-throw",
+		"dispatch-reject",
+		"iterator",
+		"result-after-done",
+		"result-after-close",
+	] as const)("awaits finishTurn exactly once after %s failure before closing the turn", async (phase) => {
+		const prompt = createUserMessage("run");
+		const context: AgentContext = { messages: kind === "continue" ? [prompt] : [], tools: [] };
+		const failure = new Error(`${phase} failed`);
+		const fail = () => {
+			throw failure;
+		};
+		const finished: AgentTurnContext[] = [];
+		let releaseFinish: (() => void) | undefined;
+		const finishGate = new Promise<void>((resolve) => {
+			releaseFinish = resolve;
+		});
+		let finishEntered: (() => void) | undefined;
+		const entered = new Promise<void>((resolve) => {
+			finishEntered = resolve;
+		});
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: phase === "convert" ? fail : identityConverter,
+			transformContext: phase === "transform" ? async () => fail() : undefined,
+			getSteeringMessages: phase === "steering" ? async () => fail() : undefined,
+			getApiKey: phase === "api-key" ? fail : undefined,
+			finishTurn: async (turn) => {
+				finished.push(turn);
+				finishEntered?.();
+				await finishGate;
+				return { action: "continue" };
+			},
+		};
+		const streamFn: StreamFn = () => {
+			if (phase === "dispatch-throw") return fail();
+			if (phase === "dispatch-reject") return Promise.reject(failure);
+			const response = createAssistantMessageEventStream();
+			response[Symbol.asyncIterator] = async function* (): AsyncGenerator<AssistantMessageEvent> {
+				if (phase === "iterator") throw failure;
+				if (phase === "result-after-done") {
+					yield { type: "done", reason: "stop", message: createAssistantMessage([]) };
+				}
+			};
+			response.result = async () => fail();
+			return response;
+		};
+		const stream =
+			kind === "start"
+				? agentLoop([prompt], context, config, undefined, streamFn)
+				: agentLoopContinue(context, config, undefined, streamFn);
+		const events: AgentEvent[] = [];
+		const iteration = (async () => {
+			for await (const event of stream) events.push(event);
+		})();
+		await entered;
+		expect(events.some((event) => event.type === "turn_end")).toBe(false);
+		releaseFinish?.();
+		const [, messages] = await Promise.all([iteration, stream.result()]);
+		expect(finished).toHaveLength(1);
+		expect(finished[0]).toMatchObject({ toolResults: [], canContinue: false, newMessages: messages });
+		expect(finished[0]?.message).toBe(messages.at(-1));
+		expect(finished[0]?.context.messages.at(-1)).toBe(messages.at(-1));
+		expect(messages.at(-1)).toMatchObject({ stopReason: "error", errorMessage: failure.message });
+		expect(events.slice(-2)).toEqual([
+			{ type: "turn_end", message: messages.at(-1), toolResults: [] },
+			{ type: "agent_end", messages },
+		]);
+	});
+
+	it.each(["synthetic", "normal", "provider-error"] as const)(
+		"settles a rejected finishTurn on a %s response without invoking it again",
+		async (phase) => {
+			const prompt = createUserMessage("run");
+			const context: AgentContext = { messages: kind === "continue" ? [prompt] : [], tools: [] };
+			let finishCalls = 0;
+			const failure = new Error("Persistence failed");
+			const config: AgentLoopConfig = {
+				model: createModel(),
+				convertToLlm: identityConverter,
+				finishTurn: async () => {
+					finishCalls++;
+					throw failure;
+				},
+			};
+			const streamFn: StreamFn = () => {
+				if (phase === "synthetic") throw new Error("Dispatch failed");
+				const response = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (phase === "normal") {
+						response.push({ type: "done", reason: "stop", message: createAssistantMessage([]) });
+					} else {
+						response.push({ type: "error", reason: "error", error: createAssistantMessage([], "error") });
+					}
+				});
+				return response;
+			};
+			const stream =
+				kind === "start"
+					? agentLoop([prompt], context, config, undefined, streamFn)
+					: agentLoopContinue(context, config, undefined, streamFn);
+			const events: AgentEvent[] = [];
+			for await (const event of stream) events.push(event);
+			const messages = await stream.result();
+			expect(finishCalls).toBe(1);
+			expect(messages.at(-1)).toMatchObject({
+				stopReason: "error",
+				errorMessage: expect.stringContaining("Persistence failed"),
+			});
+			expect(events.slice(-2)).toEqual([
+				{ type: "turn_end", message: messages.at(-1), toolResults: [] },
+				{ type: "agent_end", messages },
+			]);
+			const runContext: AgentContext = { messages: kind === "continue" ? [prompt] : [], tools: [] };
+			finishCalls = 0;
+			const run =
+				kind === "start"
+					? runAgentLoop([prompt], runContext, config, () => {}, undefined, streamFn)
+					: runAgentLoopContinue(runContext, config, () => {}, undefined, streamFn);
+			await expect(run).rejects.toThrow(phase === "synthetic" ? "Dispatch failed" : "Persistence failed");
+			expect(finishCalls).toBe(phase === "synthetic" ? 0 : 1);
 		},
 	);
 });

@@ -18,7 +18,7 @@ import {
 	remote,
 } from "../src/index.ts";
 import { fits } from "../src/schema.ts";
-import type { Frame } from "../src/wire.ts";
+import { type Frame, isFrame } from "../src/wire.ts";
 import { CountingLink } from "./fixtures/counting.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -794,6 +794,404 @@ describe("review: contract and activation boundaries", () => {
 		await server.close();
 	});
 
+	it("remote arguments are cleaned with the consumer schema before JSON serialization", async () => {
+		const server = createHost({ self: {}, name: "server", onError: () => {} });
+		const [down, up] = memoryLinkPair();
+		server.accept(down, { principal: {} });
+		const link = new CountingLink(up);
+		const client = createHost({ self: {}, kind: "client", upstream: { link, principal: {} }, onError: () => {} });
+		const consumer = remote("pre-serialization", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: { main: { methods: { echo: method(Type.Object({ text: Type.String() }), Type.Unknown()) } } },
+		});
+		const provider = remote("pre-serialization", {
+			...consumer.def,
+			variants: {
+				main: {
+					methods: {
+						echo: method(
+							Type.Object({ text: Type.String(), private: Type.Optional(Type.String()) }),
+							Type.Unknown(),
+						),
+					},
+				},
+			},
+		});
+		try {
+			server.serve(provider, () => ({ variant: "main", echo: (args) => args }));
+			const ref = await client.get(consumer, {});
+			assert.deepEqual(await ref.echo({ text: "clean", private: "must not leak", junk: 1n } as never), {
+				text: "clean",
+			});
+			const call = link.sent.find((frame) => frame.t === "call");
+			assert.ok(call?.t === "call");
+			assert.deepEqual(call.args, { text: "clean" });
+			const shape = link.received.find((frame) => frame.t === "shape");
+			assert.ok(shape?.t === "shape");
+			assert.equal(isFrame(JSON.parse(JSON.stringify(shape))), true);
+			assert.equal(isFrame({ ...shape, callVariants: undefined }), false);
+			assert.equal(isFrame({ ...shape, callVariants: [{ codeVersion: 0, variant: "main" }] }), false);
+			assert.equal(isFrame({ ...shape, callVariants: Array(3).fill({ codeVersion: 1, variant: "main" }) }), false);
+		} finally {
+			await client.close();
+			await server.close();
+		}
+	});
+
+	for (const outcome of ["commit", "abort"] as const) {
+		it(`a pending-only remote type keeps its link open through prepare and ${outcome}`, async () => {
+			const server = createHost({ self: {}, name: "server", onError: () => {} });
+			const [down, up] = memoryLinkPair();
+			server.accept(down, { principal: {} });
+			const client = createHost({
+				self: {},
+				kind: "client",
+				upstream: { link: up, principal: {} },
+				onError: () => {},
+			});
+			const blocker = local("pending-projection-blocker", { version: 1, input: Type.Object({}) });
+			const pending = remote("pending-projection", {
+				version: 1,
+				input: Type.Object({}),
+				host: hostNamed("server"),
+				variants: { main: { methods: { read: method(undefined, Type.String()) } } },
+			});
+			const entered = latch(),
+				resume = latch();
+			let calls = 0;
+			const facet = (prepare: boolean): Facet => ({
+				name: "pending",
+				setup(api) {
+					api.serve(blocker, (_input, _principal, self) => {
+						if (prepare)
+							self.resource("wait", {
+								version: 1,
+								open: async () => {
+									entered.open();
+									await resume.promise;
+									if (outcome === "abort") throw new Error("stop pending prepare");
+								},
+							});
+						return {};
+					});
+					if (prepare)
+						api.serve(pending, () => ({
+							variant: "main",
+							read: () => {
+								calls++;
+								return "committed";
+							},
+						}));
+				},
+			});
+			let reloading: Promise<unknown> | undefined;
+			try {
+				await server.install(facet(false));
+				await server.get(blocker, {});
+				reloading = server.reload([facet(true)]);
+				reloading.catch(() => {});
+				await entered.promise;
+				let settled = false;
+				const acquiring = client.get(pending, {});
+				acquiring.then(
+					() => {
+						settled = true;
+					},
+					() => {
+						settled = true;
+					},
+				);
+				await ticks();
+				assert.equal(up.closed, false);
+				assert.equal(server.codeVersion, 1);
+				assert.equal(settled, false, "pending-only references wait for a committed projection");
+				assert.equal(calls, 0);
+				resume.open();
+				if (outcome === "commit") {
+					await reloading;
+					const ref = await acquiring;
+					assert.equal(await ref.read(), "committed");
+				} else {
+					await assert.rejects(reloading, /stop pending prepare/);
+					await assert.rejects(acquiring, (error) => isChordError(error, "gone"));
+					assert.equal(calls, 0);
+				}
+				assert.equal(up.closed, false);
+			} finally {
+				resume.open();
+				await reloading?.catch(() => {});
+				await client.close();
+				await server.close();
+			}
+		});
+	}
+
+	it("a fresh modern remote consumer hydrates while incompatible old code is retained", async () => {
+		const server = createHost({ self: {}, name: "server", onError: () => {} });
+		const [down, up] = memoryLinkPair();
+		server.accept(down, { kind: "host", name: "worker", principal: {} });
+		const worker = createHost({ self: {}, name: "worker", upstream: { link: up, principal: {} }, onError: () => {} });
+		const oldToken = remote("modern-consumer", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: { main: { methods: { read: method(undefined, Type.String()) } } },
+		});
+		const newToken = remote("modern-consumer", {
+			version: 2,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: { main: { methods: { fetch: method(undefined, Type.String()) } } },
+		});
+		const entered = latch(),
+			resume = latch();
+		try {
+			await server.install({
+				name: "modern",
+				setup(api) {
+					api.serve(oldToken, () => ({ variant: "main", read: () => "old" }));
+				},
+			});
+			const old = await worker.get(oldToken, {});
+			const pinned = worker.root(async (ctx) => {
+				assert.equal(await old.read(ctx), "old");
+				entered.open();
+				await resume.promise;
+				assert.equal(await old.read(ctx), "old");
+			});
+			await entered.promise;
+			await server.reload([
+				{
+					name: "modern",
+					setup(api) {
+						api.serve(newToken, () => ({ variant: "main", fetch: () => "new" }), {
+							accepts: { 1: (current) => ({ variant: "main", read: current.fetch }) },
+						});
+					},
+				},
+			]);
+			assert.equal(server.previousCodeVersion, 1);
+			const modern = await worker.get(newToken, {});
+			assert.equal(await modern.fetch(), "new");
+			assert.equal(await old.read(), "new");
+			resume.open();
+			await pinned;
+		} finally {
+			resume.open();
+			await worker.close();
+			await server.close();
+		}
+	});
+
+	it("fenced roots keep their first admitted projection through reconciliation and reload", async () => {
+		const loading = latch(),
+			entered = latch(),
+			resume = latch();
+		const token = remote("fenced-projection", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: {
+				old: { methods: { send: method(Type.Object({ text: Type.String() }), Type.String()) } },
+				new: {
+					methods: {
+						send: method(
+							Type.Object({ text: Type.String(), added: Type.Optional(Type.Number()) }),
+							Type.String(),
+						),
+					},
+				},
+			},
+		});
+		const facet = (variant: "old" | "new"): Facet => ({
+			name: "fenced",
+			setup(api) {
+				api.serve(token, () =>
+					variant === "old"
+						? { variant, send: (args) => `old:${args.text}` }
+						: { variant, send: (args) => `new:${args.text}` },
+				);
+			},
+		});
+		const server = createHost({
+			self: {},
+			name: "server",
+			onError: () => {},
+			loader: async () => {
+				await loading.promise;
+				return [facet("new")];
+			},
+		});
+		await server.install(facet("old"));
+		await server.reload([facet("old")]);
+		const reloading = server.reload(["fenced"]);
+		const [down, up] = memoryLinkPair();
+		server.accept(down, { kind: "host", name: "worker", principal: {} });
+		const link = new CountingLink(up);
+		const worker = createHost({ self: {}, name: "worker", upstream: { link, principal: {} }, onError: () => {} });
+		try {
+			const ref = await worker.get(token, {});
+			const send = ref.send as (args: unknown, ctx?: Ctx) => Promise<string>;
+			const pinned = worker.root(async (ctx) => {
+				assert.equal(await send({ text: "before", junk: 1n }, ctx), "old:before");
+				entered.open();
+				await resume.promise;
+				assert.equal(await send({ text: "after", junk: 2n }, ctx), "old:after");
+			});
+			await entered.promise;
+			loading.open();
+			await reloading;
+			await ticks();
+			resume.open();
+			await pinned;
+			assert.equal(await send({ text: "fresh", junk: 3n }), "new:fresh");
+		} finally {
+			loading.open();
+			resume.open();
+			await reloading;
+			await worker.close();
+			await server.close();
+		}
+	});
+
+	for (const initial of ["first", "second"] as const) {
+		for (const acquire of ["before", "after"] as const) {
+			it(`projects a ${initial} old root with consumer-only fields stripped, acquired ${acquire} reload`, async () => {
+				const server = createHost({ self: {}, name: "server", onError: () => {} });
+				const [down, up] = memoryLinkPair();
+				server.accept(down, { kind: "host", name: "worker", principal: {} });
+				const link = new CountingLink(up);
+				const worker = createHost({
+					self: {},
+					name: "worker",
+					upstream: { link, principal: {} },
+					onError: () => {},
+				});
+				const consumer = remote("pinned-projection", {
+					version: 1,
+					input: Type.Object({}),
+					host: hostNamed("server"),
+					variants: {
+						first: { methods: { send: method(undefined, Type.Unknown()) } },
+						second: { methods: { send: method(Type.Object({ text: Type.String() }), Type.Unknown()) } },
+					},
+				});
+				const provider = remote("pinned-projection", {
+					...consumer.def,
+					variants: {
+						first: { methods: { send: method(undefined, Type.Unknown()) } },
+						second: {
+							methods: {
+								send: method(
+									Type.Object({ text: Type.String(), private: Type.Optional(Type.String()) }),
+									Type.Unknown(),
+								),
+							},
+						},
+					},
+				});
+				const facet = (variant: "first" | "second"): Facet => ({
+					name: "projection",
+					setup(api) {
+						api.serve(provider, () =>
+							variant === "first" ? { variant, send: () => "empty" } : { variant, send: (args) => args },
+						);
+					},
+				});
+				const entered = latch(),
+					resume = latch();
+				try {
+					await server.install(facet(initial));
+					// Keep the provider object alive even when this worker has no pre-reload binding.
+					await server.get(provider, {}, { principal: {} });
+					let ref = acquire === "before" ? await worker.get(consumer, {}) : undefined;
+					const pinned = server.root(() =>
+						worker.root(async (ctx) => {
+							entered.open();
+							await resume.promise;
+							ref ??= await worker.get(consumer, {});
+							const send = ref.send as (value: unknown, ctx?: Ctx) => Promise<unknown>;
+							const result =
+								initial === "first"
+									? await send(ctx)
+									: await send({ text: "old", private: "hidden", junk: 1n }, ctx);
+							assert.deepEqual(result, initial === "first" ? "empty" : { text: "old" });
+						}),
+					);
+					await entered.promise;
+					const next = initial === "first" ? "second" : "first";
+					await server.reload([facet(next)]);
+					await ticks();
+					resume.open();
+					await pinned;
+					assert.ok(ref !== undefined);
+					const send = ref.send as (value?: unknown) => Promise<unknown>;
+					assert.deepEqual(
+						next === "first" ? await send() : await send({ text: "new", private: "hidden", junk: 2n }),
+						next === "first" ? "empty" : { text: "new" },
+					);
+					for (const frame of link.sent)
+						if (frame.t === "call" && frame.args !== undefined)
+							assert.deepEqual(Object.keys(frame.args as object), ["text"]);
+				} finally {
+					resume.open();
+					await worker.close();
+					await server.close();
+				}
+			});
+		}
+	}
+
+	it("pins distinct argument schemas of the same method across reload", async () => {
+		const server = createHost({ self: {}, name: "server", onError: () => {} });
+		const [down, up] = memoryLinkPair();
+		server.accept(down, { kind: "host", name: "worker", principal: {} });
+		const worker = createHost({ self: {}, name: "worker", upstream: { link: up, principal: {} }, onError: () => {} });
+		const token = remote("distinct-args", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: {
+				old: { methods: { send: method(Type.Object({ old: Type.String() }), Type.Unknown()) } },
+				new: { methods: { send: method(Type.Object({ fresh: Type.String() }), Type.Unknown()) } },
+			},
+		});
+		const facet = (variant: "old" | "new"): Facet => ({
+			name: "distinct",
+			setup(api) {
+				api.serve(token, () =>
+					variant === "old" ? { variant, send: (args) => args } : { variant, send: (args) => args },
+				);
+			},
+		});
+		const entered = latch(),
+			resume = latch();
+		try {
+			await server.install(facet("old"));
+			const ref = await worker.get(token, {});
+			const send = ref.send as (args: unknown, ctx?: Ctx) => Promise<unknown>;
+			const pinned = server.root(() =>
+				worker.root(async (ctx) => {
+					entered.open();
+					await resume.promise;
+					assert.deepEqual(await send({ old: "kept", fresh: 1n }, ctx), { old: "kept" });
+				}),
+			);
+			await entered.promise;
+			await server.reload([facet("new")]);
+			await ticks();
+			resume.open();
+			await pinned;
+			assert.deepEqual(await send({ fresh: "kept", old: 1n }), { fresh: "kept" });
+		} finally {
+			resume.open();
+			await worker.close();
+			await server.close();
+		}
+	});
+
 	for (const initial of ["first", "second"] as const) {
 		it(`mixed arity keeps a pinned ${initial} implementation across reload`, async () => {
 			const host = createHost({ self: {}, name: "server", onError: () => {} });
@@ -834,6 +1232,152 @@ describe("review: contract and activation boundaries", () => {
 			resume.resolve();
 			await pinned;
 			await host.close();
+		});
+	}
+
+	for (const initial of ["first", "second"] as const) {
+		for (const origin of ["worker", "provider"] as const) {
+			it(`remote mixed arity preserves the pinned ${initial} ${origin} root across coordinated reload`, async () => {
+				const server = createHost({ self: {}, name: "server", onError: () => {} });
+				const [down, up] = memoryLinkPair();
+				server.accept(down, { kind: "host", name: "worker", principal: {} });
+				const worker = createHost({
+					self: {},
+					name: "worker",
+					upstream: { link: up, principal: {} },
+					onError: () => {},
+				});
+				const token = remote("remote-pinned-arity", {
+					version: 1,
+					input: Type.Object({}),
+					host: hostNamed("server"),
+					variants: {
+						first: { methods: { send: method(undefined, Type.String()) } },
+						second: { methods: { send: method(Type.String(), Type.String()) } },
+					},
+				});
+				const Callback = remote("pinned-worker-callback", {
+					version: 1,
+					input: Type.Object({}),
+					host: hostNamed("worker"),
+					variants: { main: { methods: { run: method(undefined, Type.String()) } } },
+				});
+				const facet = (variant: "first" | "second"): Facet => ({
+					name: "remote-pinned",
+					setup(api) {
+						api.serve(token, () =>
+							variant === "first"
+								? { variant, send: (ctx: Ctx) => `${ctx.rootId}:empty` }
+								: { variant, send: (text: string, ctx: Ctx) => `${ctx.rootId}:${text}` },
+						);
+					},
+				});
+				const resume = latch();
+				try {
+					await server.install(facet(initial));
+					const ref = await worker.get(token, {});
+					const send = ref.send as (value: string | Ctx, ctx?: Ctx) => Promise<string>;
+					const entered = latch();
+					const run = async (ctx: Ctx): Promise<string> => {
+						const expected = `${ctx.rootId}:${initial === "first" ? "empty" : "text"}`;
+						assert.equal(initial === "first" ? await send(ctx) : await send("text", ctx), expected);
+						entered.open();
+						await resume.promise;
+						const result = initial === "first" ? await send(ctx) : await send("text", ctx);
+						assert.equal(result, expected);
+						return result;
+					};
+					worker.serve(Callback, () => ({ variant: "main", run }));
+					const callback = await server.get(Callback, {});
+					const pinned = origin === "worker" ? worker.root(run) : server.root((ctx) => callback.run(ctx));
+					await entered.promise;
+					const next = initial === "first" ? "second" : "first";
+					await server.reload([facet(next)]);
+					await ticks();
+					assert.equal(ref.variant, next);
+					assert.equal(
+						server.previousCodeVersion,
+						1,
+						"the remote root retains its provider implementation between calls",
+					);
+					resume.open();
+					await pinned;
+					await ticks();
+					assert.equal(
+						server.previousCodeVersion,
+						undefined,
+						"root_end releases the provider's idle foreign lease",
+					);
+					assert.equal(
+						worker.previousCodeVersion,
+						undefined,
+						"provider retirement permits child retirement without a cycle",
+					);
+					await worker.root(async (ctx) => {
+						assert.equal(
+							next === "first" ? await send(ctx) : await send("fresh", ctx),
+							`${ctx.rootId}:${next === "first" ? "empty" : "fresh"}`,
+						);
+					});
+				} finally {
+					resume.open();
+					await worker.close();
+					await server.close();
+				}
+			});
+		}
+	}
+
+	for (const methodFirst of [false, true]) {
+		it(`cross-kind members follow live variants and reload with ${methodFirst ? "method" : "state"} declared first`, async () => {
+			const server = createHost({ self: {}, name: "server", onError: () => {} });
+			const [down, up] = memoryLinkPair();
+			server.accept(down, { principal: {} });
+			const client = createHost({
+				self: {},
+				kind: "client",
+				upstream: { link: up, principal: {} },
+				onError: () => {},
+			});
+			const state = { state: { value: Type.Number() } };
+			const callable = { methods: { value: method(undefined, Type.String()) } };
+			const token = remote("cross-kind", {
+				version: 1,
+				input: Type.Object({}),
+				host: hostNamed("server"),
+				variants: methodFirst ? { callable, state } : { state, callable },
+			});
+			const facet = (variant: "state" | "callable"): Facet => ({
+				name: "cross-kind",
+				setup(api) {
+					api.serve(token, (_input, _principal, self) =>
+						variant === "state"
+							? { variant, value: self.state("value", Type.Number(), 42) }
+							: { variant, value: () => "method answer" },
+					);
+				},
+			});
+			try {
+				// Start with the second declaration to catch both old declaration-order failures.
+				const initial = methodFirst ? "state" : "callable";
+				await server.install(facet(initial));
+				const localRef = await server.get(token, {});
+				const remoteRef = await client.get(token, {});
+				for (const variant of [initial, initial === "state" ? "callable" : "state", initial] as const) {
+					if (localRef.variant !== variant) {
+						await server.reload([facet(variant)]);
+						await ticks();
+					}
+					for (const ref of [localRef, remoteRef]) {
+						assert.equal(ref.variant, variant);
+						if (ref.variant === "state") assert.equal(ref.value.value, 42);
+						else if (ref.variant === "callable") assert.equal(await ref.value(), "method answer");
+					}
+				}
+			} finally {
+				await client.close();
+				await server.close();
+			}
 		});
 	}
 

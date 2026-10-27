@@ -198,7 +198,7 @@ if (result.stopReason !== "stop") return result.errorMessage;
 for (const block of result.output) if (block.type === "image") image(block);
 ```
 
-`input` can also contain `{ type: "image", data, mimeType }` blocks to edit or use as references. Pi adds the usage of a script's image calls to the `codemode` tool result, like classifier calls. Generated images are not saved to disk. [Codemode](codemode.md#generate-images) describes the full API.
+`input` can also contain `{ type: "image", data, mimeType }` blocks to edit or use as references. Pi adds the usage of a script's image calls to the `codemode` tool result, like classifier calls. Calling `image()` writes each output image to a private OS temporary file and reports its path. These files persist until removed by you or the operating system; remove sensitive outputs when no longer needed. Calling `models.generateImages()` alone returns image data without writing it. [Codemode](codemode.md#generate-images) describes the full API.
 
 Extensions generate images through `ctx.modelRegistry.generateImages()`, without codemode.
 

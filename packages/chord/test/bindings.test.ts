@@ -1,5 +1,5 @@
 // Entry 8: one shared binding per host and key; a hold implies the state of its variant (units: shape, then
-// snapshots); method-only references; origins of client holds; protocol version 4.
+// snapshots); method-only references; origins of client holds; versioned call projection metadata.
 import assert from "node:assert/strict";
 import { Type } from "typebox";
 import { describe, it } from "vitest";
@@ -294,6 +294,52 @@ describe("hydration over a link", () => {
 		await server.close();
 	});
 
+	it("derived undefined transitions reset both local and remote streams without becoming null", async () => {
+		const { server, browser, link } = setup();
+		const Maybe = remote("t.derived-undefined", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: { main: { state: { value: Type.Unknown() }, methods: { set: method(Type.Number()) } } },
+		});
+		server.serve(Maybe, (_input, _principal, self) => {
+			const source = self.state("source", Type.Number(), 1);
+			return {
+				variant: "main",
+				value: self.derive([source], (value) => (value < 0 ? undefined : value)),
+				set: (value, ctx) => source.replace(ctx, value),
+			};
+		});
+		try {
+			const localRef = await server.get(Maybe, {}, { principal: { user: "u" } });
+			const remoteRef = await browser.get(Maybe, {});
+			const localEvents: string[] = [],
+				remoteEvents: string[] = [];
+			const remoteValues: unknown[] = [];
+			localRef.value.events((event) => localEvents.push(event.type));
+			remoteRef.value.events((event) => remoteEvents.push(event.type));
+			remoteRef.value.subscribe((value) => remoteValues.push(value));
+			for (const value of [-1, -2, 2, 3]) {
+				await remoteRef.set(value);
+				await until(() => Object.is(remoteRef.value.value, value < 0 ? undefined : value));
+				assert.equal(localRef.value.value, remoteRef.value.value);
+			}
+			await tick();
+			assert.deepEqual(localEvents, ["snap", "reset", "reset", "ops"]);
+			assert.deepEqual(remoteEvents, localEvents);
+			assert.deepEqual(remoteValues, [1, undefined, 2, 3]);
+			assert.deepEqual(
+				stateFrames(link.received)
+					.filter((frame) => frame.m === "value")
+					.map((frame) => frame.as),
+				["snap", "reset", "reset", "ops"],
+			);
+		} finally {
+			await browser.close();
+			await server.close();
+		}
+	});
+
 	it("reading before the first hydration throws not_ready", async () => {
 		const { server, browser } = setup();
 		const notes = browser.hold(Notes, {});
@@ -447,8 +493,8 @@ describe("origins of client holds", () => {
 	});
 });
 
-describe("protocol version 4", () => {
-	it("a version 3 peer is refused; shapes carry no code version", async () => {
+describe("versioned call projections", () => {
+	it("a previous-protocol peer is refused; shape projections do not version state", async () => {
 		const { server, browser, link } = setup();
 		await browser.hold(Notes, {}).ready;
 		const shape = link.received.find((frame) => frame.t === "shape");
@@ -459,9 +505,8 @@ describe("protocol version 4", () => {
 		server.accept(down, { principal: { user: "old" } });
 		const closed = new Promise<string>((resolve) => (raw as Link).onClose(resolve));
 		raw.receive(() => {});
-		raw.send({ t: "hello", protocol: 3, name: "old", kind: "client", codeVersion: 0 });
+		raw.send({ t: "hello", protocol: PROTOCOL_VERSION - 1, name: "old", kind: "client", codeVersion: 0 });
 		assert.equal(await closed, `protocol-version ${PROTOCOL_VERSION}`);
-		assert.equal(PROTOCOL_VERSION, 4);
 		await browser.close();
 		await server.close();
 	});

@@ -37,6 +37,11 @@ const readSchema = Type.Object({
 	limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
 });
 
+const readOutputSchema = Type.Union([
+	Type.String(),
+	Type.Object({ type: Type.Literal("image"), data: Type.String(), mimeType: Type.String() }),
+]);
+
 export type ReadToolInput = Static<typeof readSchema>;
 
 export type ReadToolDetails = {
@@ -92,6 +97,7 @@ export function createReadTool(options: ReadToolOptions = {}): ToolRegistration<
 		name: "read",
 		description: `Read the contents of a file. Supports text files and images (${formats}). Images are sent as attachments. For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.`,
 		parameters: readSchema,
+		structuredOutputSchema: readOutputSchema,
 		async execute(args, api, context) {
 			const { path, offset, limit } = args;
 			const env = requireEnv(api);
@@ -187,7 +193,8 @@ async function readImage(
 	const diagnostics: ToolDiagnostic[] = [
 		{ severity: "info", code: "image", message: [`Read image file [${image.mimeType}].`, ...notes].join(" ") },
 	];
-	return { output: [{ type: "image", data: image.data, mimeType: image.mimeType }], diagnostics };
+	const content = { type: "image" as const, data: image.data, mimeType: image.mimeType };
+	return { output: [content], structuredOutput: content, diagnostics };
 }
 
 /** What the conversation's model takes: whether images, and within which limits. */
@@ -306,6 +313,7 @@ async function readText(
 
 	return {
 		output: outputText === "" ? [] : [{ type: "text" as const, text: outputText }],
+		structuredOutput: outputText,
 		...(details === undefined ? {} : { details }),
 		diagnostics,
 	};

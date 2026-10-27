@@ -511,7 +511,7 @@ describe("StreamingJsonParser ported test vectors", () => {
 		}
 	});
 
-	it("reads every JSONTestSuite document JSON.parse accepts exactly like it, and never throws on the rest", () => {
+	it("reads finite JSONTestSuite documents exactly and keeps other inputs finite", () => {
 		const suite = JSON.parse(readFileSync(new URL("./data/json-test-suite.json", import.meta.url), "utf8")) as {
 			files: Record<string, string>;
 		};
@@ -519,7 +519,10 @@ describe("StreamingJsonParser ported test vectors", () => {
 			const text = Buffer.from(base64, "base64").toString("utf8");
 			let expected: JsonValue | undefined;
 			try {
-				expected = JSON.parse(text) as JsonValue;
+				expected = JSON.parse(text, (_key, value: unknown) => {
+					if (typeof value === "number" && !Number.isFinite(value)) throw new Error("Non-finite JSON number");
+					return value;
+				}) as JsonValue;
 			} catch {
 				expected = undefined;
 			}
@@ -542,6 +545,41 @@ function expectJson(value: JsonValue | undefined, label: string): void {
 	expect([Object.prototype, Array.prototype], label).toContain(Object.getPrototypeOf(value));
 	for (const item of Object.values(value)) expectJson(item, label);
 }
+
+describe("StreamingJsonParser numeric boundaries", () => {
+	it.each(["1e309", "-1e309", "9".repeat(309)])("omits overflowing scalar %s from snapshots and changes", (token) => {
+		const text = `{"values":[${token},2],"nested":{"value":${token}},"ok":3}`;
+		for (const size of [1, 2, text.length]) {
+			const parser = new StreamingJsonParser();
+			const mirror = new Mirror();
+			for (let index = 0; index < text.length; index += size) {
+				const changes = parser.append(text.slice(index, index + size));
+				for (const change of changes) if (change.kind === "set") expectJson(change.value, text);
+				mirror.apply(changes);
+				expectJson(parser.snapshot(), text);
+				expectJson(mirror.value, text);
+			}
+			expect(parser.snapshot()).toEqual({ values: [2], nested: {}, ok: 3 });
+			expect(mirror.value).toEqual(parser.snapshot());
+		}
+	});
+
+	it("withholds overflowing pending numbers and resumes when the exponent becomes finite", () => {
+		const parser = new StreamingJsonParser();
+		parser.append('{"value":1.7976931348623159e');
+		expect(parser.snapshot()).toEqual({ value: Number("1.7976931348623159") });
+		parser.append("308");
+		expect(parser.snapshot()).toEqual({});
+		parser.append("}");
+		expect(parser.snapshot()).toEqual({});
+
+		const mantissa = new StreamingJsonParser();
+		mantissa.append(`{"value":${"9".repeat(309)}e-`);
+		expect(mantissa.snapshot()).toEqual({});
+		mantissa.append("308}");
+		expect(mantissa.snapshot()).toEqual({ value: 10 });
+	});
+});
 
 describe("StreamingJsonParser malformed text", () => {
 	const MALFORMED = [
@@ -818,6 +856,17 @@ describe("ToolCallArgumentsStream", () => {
 		expect(args.finish()).toEqual(parseToolCallArguments('  {"path":"a.ts","content":"xy'));
 		args.append('"}');
 		expect(args.finish()).toEqual({ arguments: { path: "a.ts", content: "xy" } });
+	});
+
+	it("never publishes overflow in partial arguments and marks the finished call malformed", () => {
+		const args = new ToolCallArgumentsStream();
+		expect(args.append('{"nested":{"value":1e')).toEqual({ nested: { value: 1 } });
+		expect(args.append("309")).toEqual({ nested: {} });
+		expect(args.append("}}")).toEqual({ nested: {} });
+		const result = args.finish();
+		expect(result.arguments).toEqual({});
+		expect(result.argumentsError).toContain("Tool arguments must contain only finite numbers");
+		expect(result.argumentsError?.endsWith(args.text)).toBe(true);
 	});
 
 	it("shows non-object roots as no arguments yet", () => {

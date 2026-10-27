@@ -99,6 +99,53 @@ describe("AgentSession tool orchestration", () => {
 			}
 		},
 	);
+
+	it.each(["added", "removed"] as const)(
+		"ignores soft-deleted tools %s deltas on resume and navigation through compaction",
+		async (change) => {
+			const manager = SessionManager.inMemory();
+			manager.appendMessage({
+				role: "system",
+				content: "",
+				toolsAdded: (change === "removed" ? ["read", "bash"] : ["read"]).map((name) => ({
+					name,
+					description: name,
+					parameters: Type.Object({}),
+				})),
+				timestamp: 0,
+			});
+			const deleted = manager.appendMessage({
+				role: "system",
+				content: "",
+				...(change === "added"
+					? { toolsAdded: [{ name: "bash", description: "bash", parameters: Type.Object({}) }] }
+					: { toolsRemoved: [{ name: "bash" }] }),
+				timestamp: 1,
+			});
+			manager.softDeleteUnits([{ entryId: deleted }]);
+			const retained = manager.appendMessage({ role: "user", content: "retained question", timestamp: 2 });
+			const checkpoint = manager.appendCompaction("saved summary", retained, 100);
+			manager.appendMessage({ role: "user", content: "later question", timestamp: 3 });
+			const harness = await createHarness({ sessionManager: manager });
+			harnesses.push(harness);
+			const expected = change === "removed" ? ["read", "bash"] : ["read"];
+			for (const navigate of [false, true]) {
+				if (navigate) await harness.session.navigateTree(checkpoint, { summarize: false });
+				expect(harness.session.getActiveToolNames()).toEqual(expected);
+				expect(harness.session.getCallableToolNames()).toEqual(expected);
+				let declared: string[] | undefined;
+				harness.setResponses([
+					(context) => {
+						declared = getCurrentTools(context.messages).map((tool) => tool.name);
+						return fauxAssistantMessage("visible policy restored");
+					},
+				]);
+				await harness.session.prompt("check visible tools");
+				expect(declared).toEqual(expected);
+			}
+		},
+	);
+
 	it("supports tools that call other tools under any name through the extension API", async () => {
 		const toolCalls: string[] = [];
 		const harness = await createHarness({

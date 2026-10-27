@@ -602,6 +602,7 @@ function editableContentKey(content: string | readonly EditableBlock[] | readonl
 				id: item.id,
 				name: item.name,
 				arguments: item.arguments,
+				argumentsError: item.argumentsError,
 				thoughtSignature: item.thoughtSignature,
 				namespace: item.namespace,
 				raw: item.raw,

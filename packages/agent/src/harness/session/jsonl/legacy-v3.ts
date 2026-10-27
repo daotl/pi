@@ -305,6 +305,8 @@ function* retainedTailStructure(
 	compaction: LegacyV3CompactionIndexEntry,
 	entriesById: ReadonlyMap<string, LegacyV3IndexEntry>,
 ): Iterable<LegacyV3IndexEntry> {
+	// A self-boundary records a summary with no retained messages.
+	if (compaction.firstKeptEntryId === compaction.id) return;
 	let currentId = compaction.parentId;
 	while (currentId !== null) {
 		// The scan guarantees that every parent exists earlier in the file, so cycles are impossible.

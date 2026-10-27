@@ -14,7 +14,7 @@ import {
 	type StatusListener,
 } from "./object.ts";
 import type { Ctx, Readable, RefStatus, Shape, StateEvent } from "./types.ts";
-import { fromWireError, type RootRef, type WireError } from "./wire.ts";
+import { type CallVariant, fromWireError, type RootRef, type WireError } from "./wire.ts";
 
 const noop = (): void => {};
 
@@ -39,12 +39,15 @@ export interface RemoteChannel {
 /** What a binding needs from its host. */
 export interface RemoteHost {
 	readonly inFactory: number;
+	readonly kind: "host" | "client";
 	report(error: unknown): void;
 	root<T>(fn: (ctx: Ctx) => T | Promise<T>, options?: { signal?: AbortSignal }): Promise<T>;
 	/** The binding has no views left: the host lingers it or closes it. */
 	bindingIdle(binding: RemoteBinding): void;
 	/** The binding ended or was closed: the host forgets it. */
 	forgetBinding(binding: RemoteBinding): void;
+	/** Pins an exceptional fenced root to the provider version selected at its first call on this channel. */
+	remoteAdmission(rootId: string, channel: RemoteChannel, current: number): number;
 }
 
 type Settle = { resolve: () => void; reject: (error: unknown) => void };
@@ -107,6 +110,10 @@ export class RemoteBinding {
 	#applied = false;
 	/** Waiting for the first hydration (`whenHydrated`). */
 	readonly #hydrationWaiters = new Set<Settle>();
+	/** Provider-authored method variants; updated on shape receipt, before state hydration. */
+	#callVariants: readonly CallVariant[] = [];
+	#projectionChanged = deferred();
+	#fencedCodeVersions: readonly number[] = [];
 
 	constructor(
 		host: RemoteHost,
@@ -242,8 +249,17 @@ export class RemoteBinding {
 	}
 
 	/** A unit begins: `listed` are the members whose snapshots follow. */
-	shaped(shape: Shape, listed: readonly string[]): void {
+	shaped(
+		shape: Shape,
+		listed: readonly string[],
+		callVariants: readonly CallVariant[],
+		fencedCodeVersions: readonly number[],
+	): void {
 		if (this.ended) return;
+		this.#callVariants = callVariants;
+		this.#fencedCodeVersions = fencedCodeVersions;
+		this.#projectionChanged.resolve();
+		this.#projectionChanged = deferred();
 		const previous = this.#pending;
 		const missing = new Set<string>(listed);
 		// A newer shape before the older one's snapshots (relays may reorder them): wait for both.
@@ -295,6 +311,7 @@ export class RemoteBinding {
 		this.hold = undefined;
 		this.#pending = undefined;
 		this.#live.reject(error);
+		this.#projectionChanged.reject(error);
 		this.#settleHydration(error);
 		for (const view of [...this.views]) view.end(error);
 		this.#listeners.clear();
@@ -323,6 +340,7 @@ export class RemoteBinding {
 			this.status = "ended";
 			const error = new ChordError("released", `reference ${this.key} released`);
 			this.#live.reject(error);
+			this.#projectionChanged.reject(error);
 			this.#settleHydration(error);
 			for (const view of [...this.views]) view.end(error);
 		}
@@ -343,21 +361,47 @@ export class RemoteBinding {
 			if (this.status !== "live" || this.hold === undefined) await raceSignal(this.#live.promise, ctx.signal);
 			const hold = this.hold;
 			if (hold === undefined || this.status !== "live") continue;
-			const variant = this.shape?.variant;
-			const description = variant === undefined ? undefined : this.contract.description.variants[variant]?.[name];
-			if (description?.kind !== "method") {
-				throw new ChordError("not_in_variant", `${this.key}: ${name} is not a method of variant ${variant}`);
+			// A host root uses the consumer-view variant of its retained provider implementation, not the live state
+			// shape. Clients carry no root: their calls use the latest variant, independently of their local code version.
+			const versions = this.#callVariants;
+			const latest = versions.reduce<CallVariant | undefined>(
+				(current, entry) => (current === undefined || entry.codeVersion > current.codeVersion ? entry : current),
+				undefined,
+			);
+			const codeVersion =
+				latest !== undefined &&
+				!versions.some((entry) => entry.codeVersion === ctx.codeVersion) &&
+				this.#fencedCodeVersions.includes(ctx.codeVersion)
+					? this.host.remoteAdmission(ctx.rootId, hold.channel, latest.codeVersion)
+					: ctx.codeVersion;
+			const projection =
+				this.host.kind === "client" ? latest : versions.find((entry) => entry.codeVersion === codeVersion);
+			if (projection === undefined) {
+				// Commit control precedes the new shape; new-code tasks must wait for its method metadata.
+				if (versions.every((entry) => entry.codeVersion < ctx.codeVersion)) {
+					await raceSignal(this.#projectionChanged.promise, ctx.signal);
+					continue;
+				}
+				throw new ChordError("superseded", `${this.key} has no implementation for code version ${ctx.codeVersion}`);
 			}
-			// Send only what the consumer's own schema knows (the additive rule's premise; see ObjectImpl.call).
-			const sent = description.args === undefined ? undefined : Value.Clean(description.args, Value.Clone(args));
-			const result = await hold.channel.call(
+			const method =
+				projection.variant === undefined
+					? undefined
+					: this.contract.description.variants[projection.variant]?.[name];
+			if (method?.kind !== "method")
+				throw new ChordError(
+					"not_in_variant",
+					`${this.key}: ${name} is not a method of variant ${projection.variant}`,
+				);
+			// Clean before the transport serializes: even an unknown bigint field must never cross the link.
+			const sent = method.args === undefined ? undefined : Value.Clean(method.args, Value.Clone(args));
+			return hold.channel.call(
 				hold.id,
 				name,
 				sent,
 				{ rootId: ctx.rootId, codeVersion: ctx.codeVersion },
 				ctx.signal,
 			);
-			return description.result === undefined ? undefined : result;
 		}
 	}
 
@@ -612,9 +656,13 @@ export class RemoteRef implements RefCore {
 	// ─── members ───
 
 	member(name: string): unknown {
-		const description = Object.values(this.contract.description.variants)
-			.map((members) => members[name])
-			.find((member) => member !== undefined);
+		const variants = this.contract.description.variants;
+		// Keep pre-hydration placeholders available, but never let declaration order choose a live member's kind.
+		const description =
+			(this.variant === undefined ? undefined : variants[this.variant]?.[name]) ??
+			Object.values(variants)
+				.map((members) => members[name])
+				.find((member) => member !== undefined);
 		if (description?.kind === "method") return this.#caller(name);
 		if (description?.kind === "state") {
 			let readable = this.#readables.get(name);
@@ -647,9 +695,12 @@ export class RemoteRef implements RefCore {
 						this.#caller(name)(...given),
 					);
 				}
-				// A method without arguments is called as `ref.name(ctx)`; use the applied variant.
-				const noArgs = takesNoArgs(this.contract, name, this.variant);
-				const [args, ctx] = (noArgs ? [undefined, given[0]] : given) as [unknown, Ctx | undefined];
+				// An explicit root disambiguates send(ctx) from send(args, ctx), even after its variant was replaced.
+				// Holders still use the current overload because each call starts a fresh root.
+				const pinned = context !== undefined && !context.holder;
+				const noArgs = pinned ? given[0] === context : takesNoArgs(this.contract, name, this.variant);
+				const args = noArgs ? undefined : given[0];
+				const ctx = (pinned ? context : noArgs ? given[0] : given[1]) as Ctx | undefined;
 				// The same checks as a local reference's caller (RefImpl.caller and ObjectImpl.call): a ctx from another host
 				// or one not made by Chord would carry a root this host does not own over its link.
 				if (ctx !== undefined && !(ctx instanceof CtxImpl)) {

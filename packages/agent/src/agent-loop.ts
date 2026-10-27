@@ -35,8 +35,9 @@ import type {
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
 type AgentLoopExecution = {
-	model: AgentLoopConfig["model"];
+	config: AgentLoopConfig;
 	context?: AgentContext;
+	finishTurnStarted: boolean;
 };
 
 /**
@@ -253,8 +254,8 @@ function createAgentStream(config: AgentLoopConfig, signal: AbortSignal | undefi
 	);
 	const completedMessages: AgentMessage[] = [];
 	let turnOpen = false;
+	const execution: AgentLoopExecution = { config, finishTurnStarted: false };
 	let partialMessage: AssistantMessage | undefined;
-	const execution: AgentLoopExecution = { model: config.model };
 
 	const emit = (event: AgentEvent): void => {
 		switch (event.type) {
@@ -276,15 +277,15 @@ function createAgentStream(config: AgentLoopConfig, signal: AbortSignal | undefi
 		stream.push(event);
 	};
 
-	const endWithError = (error: unknown): void => {
+	const endWithError = async (error: unknown): Promise<void> => {
 		const message: AssistantMessage = partialMessage
 			? { ...partialMessage }
 			: {
 					role: "assistant",
 					content: [{ type: "text", text: "" }],
-					api: execution.model.api,
-					provider: execution.model.provider,
-					model: execution.model.id,
+					api: execution.config.model.api,
+					provider: execution.config.model.provider,
+					model: execution.config.model.id,
 					usage: {
 						input: 0,
 						output: 0,
@@ -310,6 +311,25 @@ function createAgentStream(config: AgentLoopConfig, signal: AbortSignal | undefi
 		if (!turnOpen) emit({ type: "turn_start" });
 		if (!partialMessage) emit({ type: "message_start", message });
 		emit({ type: "message_end", message });
+		if (!execution.finishTurnStarted && execution.context) {
+			execution.finishTurnStarted = true;
+			try {
+				await execution.config.finishTurn?.(
+					{
+						message,
+						toolResults: [],
+						canContinue: false,
+						context: execution.context,
+						newMessages: completedMessages,
+					},
+					signal,
+				);
+			} catch (finishError) {
+				// Settlement must not recurse into a failing finalizer or leave the stream open.
+				const detail = finishError instanceof Error ? finishError.message : String(finishError);
+				message.errorMessage += `\n\nfinishTurn failed: ${detail}`;
+			}
+		}
 		emit({ type: "turn_end", message, toolResults: [] });
 		emit({ type: "agent_end", messages: completedMessages });
 		stream.end(completedMessages);
@@ -361,7 +381,7 @@ async function runLoop(
 									? undefined
 									: nextTurnSnapshot.thinkingLevel,
 					};
-					if (execution) execution.model = config.model;
+					if (execution) execution.config = config;
 				}
 				// Preparation can be long-running (for example, compaction). Pick up steering
 				// queued while it ran. Only poll again if the earlier poll returned nothing;
@@ -409,7 +429,7 @@ async function runLoop(
 								? undefined
 								: requestUpdate.thinkingLevel,
 				};
-				if (execution) execution.model = config.model;
+				if (execution) execution.config = config;
 			}
 			// Selection may be virtual; only the resolved request API determines prefill support.
 			if (config.returnPrefill && config.model.api !== "openai-completions") {
@@ -430,6 +450,7 @@ async function runLoop(
 			// assistant message instead of answering the tool results.
 			if (config.returnPrefill) {
 				config = { ...config, returnPrefill: false };
+				if (execution) execution.config = config;
 			}
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -440,8 +461,10 @@ async function runLoop(
 					context: currentContext,
 					newMessages,
 				};
+				if (execution) execution.finishTurnStarted = true;
 				await config.finishTurn?.(lastCompletedTurn, signal);
 				await emit({ type: "turn_end", message, toolResults: [] });
+				if (execution) execution.finishTurnStarted = false;
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}
@@ -475,8 +498,10 @@ async function runLoop(
 				context: currentContext,
 				newMessages,
 			};
+			if (execution) execution.finishTurnStarted = true;
 			const decision = await config.finishTurn?.(lastCompletedTurn, signal);
 			await emit({ type: "turn_end", message, toolResults });
+			if (execution) execution.finishTurnStarted = false;
 
 			if (decision?.action === "end") {
 				await emit({ type: "agent_end", messages: newMessages });

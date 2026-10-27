@@ -93,6 +93,111 @@ function parseOptions(directive: string): CodemodeSourceOptions {
 	return options;
 }
 
+/** Find directive comments, not matching text in strings, templates, regexps or block comments. */
+function misplacedOptionsLine(input: string): number | undefined {
+	let line = 1;
+	let index = 0;
+	let template = false;
+	let expressionStart = true;
+	const braces: boolean[] = [];
+	const parentheses: boolean[] = [];
+	let control = false;
+	let member = false;
+	while (index < input.length) {
+		const char = input[index];
+		if (char === "\n") line++;
+		if (char === "\\" && template) {
+			if (input[index + 1] === "\n") line++;
+			index += 2;
+			continue;
+		}
+		if (char === "`") {
+			template = !template;
+			expressionStart = false;
+			index++;
+			continue;
+		}
+		if (template) {
+			if (char === "$" && input[index + 1] === "{") {
+				braces.push(true);
+				template = false;
+				expressionStart = true;
+				index += 2;
+			} else index++;
+			continue;
+		}
+		if (char === "/" && input[index + 1] === "/") {
+			if (
+				line > 1 &&
+				input.startsWith(CODEMODE_OPTIONS_PREFIX, index) &&
+				input.slice(input.lastIndexOf("\n", index - 1) + 1, index).trim() === ""
+			)
+				return line;
+			while (index < input.length && input[index] !== "\n") index++;
+			continue;
+		}
+		if (char === "/" && input[index + 1] === "*") {
+			index += 2;
+			while (index < input.length && !(input[index] === "*" && input[index + 1] === "/")) {
+				if (input[index++] === "\n") line++;
+			}
+			index += 2;
+			continue;
+		}
+		if (char === '"' || char === "'" || (char === "/" && expressionStart)) {
+			const delimiter = char;
+			let characterClass = false;
+			index++;
+			while (index < input.length) {
+				const next = input[index++];
+				if (next === "\n") line++;
+				if (next === "\\") {
+					if (input[index++] === "\n") line++;
+				} else if (delimiter === "/" && next === "[") characterClass = true;
+				else if (delimiter === "/" && next === "]") characterClass = false;
+				else if (next === delimiter && !characterClass) break;
+			}
+			expressionStart = false;
+			continue;
+		}
+		if ((char === "+" || char === "-") && input[index + 1] === char) {
+			index += 2;
+			continue;
+		}
+		if (char === "(") {
+			parentheses.push(control);
+			control = false;
+			expressionStart = true;
+			index++;
+			continue;
+		}
+		if (char === ")") {
+			expressionStart = parentheses.pop() ?? false;
+			index++;
+			continue;
+		}
+		if (/[\w$]/.test(char)) {
+			const start = index++;
+			while (index < input.length && /[\w$]/.test(input[index])) index++;
+			expressionStart =
+				!member &&
+				/^(?:return|throw|case|delete|void|typeof|new|in|of|yield|await|instanceof)$/.test(
+					input.slice(start, index),
+				);
+			control = !member && /^(?:if|while|for|with|switch|catch)$/.test(input.slice(start, index));
+			member = false;
+			continue;
+		}
+		if (char === "{") braces.push(false);
+		if (char === "}" && braces.pop()) template = true;
+		if (!/\s/.test(char)) control = false;
+		if (!/\s/.test(char)) member = char === ".";
+		if (!/\s/.test(char)) expressionStart = !/[)\]}.]/.test(char);
+		index++;
+	}
+	return undefined;
+}
+
 /**
  * Split an optional first-line `// @options: {...}` from the script. Throws
  * {@link CodemodeSourceError} for empty input, invalid options, and an options line that is not the
@@ -104,17 +209,14 @@ export function parseCodemodeSource(input: string): ParsedCodemodeSource {
 			'Expected JavaScript source text (non-empty). Provide JS only, optionally with a first line `// @options: {"max_output_tokens": 1000}`.',
 		);
 	}
-	const lines = input.split("\n");
-	const misplaced = lines.findIndex(
-		(line, index) => index > 0 && line.trimStart().startsWith(CODEMODE_OPTIONS_PREFIX),
-	);
-	if (misplaced !== -1) {
+	const misplaced = misplacedOptionsLine(input);
+	if (misplaced !== undefined) {
 		throw new CodemodeSourceError(
-			`The ${CODEMODE_OPTIONS_PREFIX} line must be the first line of the input; found one on line ${misplaced + 1}`,
+			`The ${CODEMODE_OPTIONS_PREFIX} line must be the first line of the input; found one on line ${misplaced}`,
 		);
 	}
 	const newline = input.indexOf("\n");
-	const firstLine = lines[0].replace(/\r$/, "");
+	const firstLine = (newline === -1 ? input : input.slice(0, newline)).replace(/\r$/, "");
 	const trimmed = firstLine.trimStart();
 	if (!trimmed.startsWith(CODEMODE_OPTIONS_PREFIX)) return { code: input, options: {} };
 	const code = newline === -1 ? "" : input.slice(newline);

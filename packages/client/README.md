@@ -21,8 +21,8 @@ const client = await Client.connect({
   transportFactory,
 });
 const host = createHost({ name: "tui", self: "tui" });
-host.connect(createClientChordLink(client, () => ({ serverId: client.hello.serverId })), {
-  remote: "server",
+host.connect(createClientChordLink(client, () => ({ serverId: client.serverId })), {
+  principal: "tui",
 });
 ```
 

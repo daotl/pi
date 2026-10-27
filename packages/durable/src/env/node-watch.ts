@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { type FSWatcher, watch as fsWatch, type Stats } from "node:fs";
-import { lstat, readdir, readFile, stat, statfs } from "node:fs/promises";
-import { dirname, relative, sep } from "node:path";
+import { lstat, readdir, readFile, readlink, stat, statfs } from "node:fs/promises";
+import { dirname, isAbsolute, join, parse, relative, sep } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { FileError, type FileWatcher, type WatchChange, type WatchTarget } from "./index.ts";
 
@@ -40,8 +40,16 @@ type Snapshot = Map<string, Entry>;
 /** A native watcher and the identity of what it was installed on: a path replaced by another file needs a new one. */
 type Installed = { readonly watcher: FSWatcher; readonly dev: number; readonly ino: number };
 
-/** A scan: the snapshot, and targets that are symbolic links to files, whose files need their own watchers. */
-type Scan = { readonly snapshot: Snapshot; readonly linkedFiles: ReadonlySet<string> };
+/** Real directory coverage maps each replacement boundary back to the lexical targets that depend on it. */
+type ResolvedParent = { readonly entry: Entry; readonly targets: Map<string, Set<string>> };
+
+/** A scan keeps lexical link identities in the snapshot and followed directory identities for native coverage. */
+type Scan = {
+	readonly snapshot: Snapshot;
+	readonly linkedFiles: ReadonlySet<string>;
+	readonly linkedDirectories: ReadonlyMap<string, Entry>;
+	readonly resolvedParents: ReadonlyMap<string, ResolvedParent>;
+};
 
 const DEBOUNCE_MS = 50;
 /**
@@ -143,6 +151,7 @@ export class NodeFileWatcher implements FileWatcher {
 	readonly #maxDirectories: number;
 	readonly #watchers = new Map<string, Installed>();
 	readonly #events = new Set<string>();
+	#resolvedParents: ReadonlyMap<string, ResolvedParent> = new Map();
 	#mode: "native" | "polling";
 	#snapshot: Snapshot = new Map();
 	#timer: ReturnType<typeof setTimeout> | undefined;
@@ -214,6 +223,7 @@ export class NodeFileWatcher implements FileWatcher {
 		this.#settleTimer = undefined;
 		for (const { watcher } of this.#watchers.values()) watcher.close();
 		this.#watchers.clear();
+		this.#resolvedParents = new Map();
 	}
 
 	#deliver(change: WatchChange): void {
@@ -290,6 +300,7 @@ export class NodeFileWatcher implements FileWatcher {
 			const next = scan.snapshot;
 			if (report) for (const path of this.#diff(this.#snapshot, next)) changed.add(path);
 			this.#snapshot = next;
+			this.#resolvedParents = scan.resolvedParents;
 			if (this.#mode === "polling" || !this.#reconcileWatchers(scan)) break;
 			if (process.platform === "darwin") this.#scheduleSettle();
 			// Something written into a new directory before its watcher existed shows up in the next round.
@@ -317,6 +328,8 @@ export class NodeFileWatcher implements FileWatcher {
 	async #scan(): Promise<Scan> {
 		const snapshot: Snapshot = new Map();
 		const linkedFiles = new Set<string>();
+		const linkedDirectories = new Map<string, Entry>();
+		const resolvedParents = new Map<string, ResolvedParent>();
 		// Directories are counted once, but traversed once per target: overlapping targets differ in recursion and
 		// exclusions, and an entry recorded for one target must still be descended into for another.
 		const counted = new Set<string>();
@@ -382,7 +395,13 @@ export class NodeFileWatcher implements FileWatcher {
 				const stats = await lstat(ancestor).catch(() => undefined);
 				// Identity only: an ancestor's own timestamps change with every unrelated sibling.
 				if (stats !== undefined) snapshot.set(ancestor, { ...entryOf(stats), size: 0, mtimeMs: 0 });
+				if (stats?.isSymbolicLink()) {
+					const followed = await stat(ancestor).catch(() => undefined);
+					if (followed?.isDirectory()) linkedDirectories.set(ancestor, entryOf(followed));
+				}
 			}
+			// Resolve even dangling links: their real parents, unlike lexical parents, see later recreation.
+			if (this.#mode === "native") await this.#scanResolvedParents(target.path, resolvedParents);
 			// The target itself may be a symbolic link to what is watched; follow it. A missing target is watched for its
 			// creation; one that cannot be reached for lack of permission fails.
 			let stats: Stats;
@@ -401,17 +420,63 @@ export class NodeFileWatcher implements FileWatcher {
 				await scanDirectory(index, target, target.path);
 			}
 		}
-		return { snapshot, linkedFiles };
+		return { snapshot, linkedFiles, linkedDirectories, resolvedParents };
+	}
+
+	/** Walk link destinations component by component, retaining every real replacement boundary up to a missing path. */
+	async #scanResolvedParents(target: string, parents: Map<string, ResolvedParent>): Promise<void> {
+		let directory = parse(target).root;
+		let components = target.slice(directory.length).split(sep);
+		let links = 0;
+		while (components.length > 0) {
+			const component = components.shift();
+			if (component === undefined || component === "" || component === ".") continue;
+			if (component === "..") {
+				directory = dirname(directory);
+				continue;
+			}
+			const stats = await stat(directory).catch(() => undefined);
+			if (!stats?.isDirectory()) return;
+			const path = join(directory, component);
+			let parent = parents.get(directory);
+			if (parent === undefined) {
+				parent = { entry: entryOf(stats), targets: new Map() };
+				parents.set(directory, parent);
+			}
+			let targets = parent.targets.get(path);
+			if (targets === undefined) {
+				targets = new Set();
+				parent.targets.set(path, targets);
+			}
+			targets.add(target);
+			const entry = await lstat(path).catch(() => undefined);
+			if (entry?.isSymbolicLink()) {
+				// Match the OS's finite link traversal: cyclic and ever-expanding links must not hang watch setup.
+				if (++links > 40) return;
+				const destination = await readlink(path).catch(() => undefined);
+				if (destination === undefined) return;
+				const root = isAbsolute(destination) ? parse(destination).root : "";
+				if (root !== "") directory = root;
+				// Do not normalize `..` before resolving preceding links; it refers to their real directory.
+				components = [...destination.slice(root.length).split(sep), ...components];
+			} else if (entry?.isDirectory()) {
+				directory = path;
+			} else {
+				return;
+			}
+		}
 	}
 
 	/**
-	 * Watch every existing ancestor of each target, each target directory, each target that is a symbolic link to a file
-	 * (changes to that file are not events of the link's directory), and on Linux each directory below a recursive target
-	 * (elsewhere one recursive watcher per target). Returns whether a watcher was added.
+	 * Watch lexical ancestors and resolved replacement boundaries, each target directory, each target that links to
+	 * a file (changes to that file are not events of the link's directory), and on Linux each directory below a
+	 * recursive target (elsewhere one recursive watcher per target). Returns whether a watcher was added.
 	 */
-	#reconcileWatchers({ snapshot, linkedFiles }: Scan): boolean {
+	#reconcileWatchers({ snapshot, linkedFiles, linkedDirectories, resolvedParents }: Scan): boolean {
 		const wanted = new Map<string, boolean>();
 		for (const path of linkedFiles) wanted.set(path, false);
+		for (const path of linkedDirectories.keys()) wanted.set(path, false);
+		for (const path of resolvedParents.keys()) wanted.set(path, false);
 		const perDirectory = process.platform === "linux" || process.platform === "android";
 		for (const target of this.#targets) {
 			for (const ancestor of ancestorsOf(target.path)) {
@@ -429,7 +494,7 @@ export class NodeFileWatcher implements FileWatcher {
 			}
 		}
 		for (const [path, installed] of this.#watchers) {
-			const entry = snapshot.get(path);
+			const entry = resolvedParents.get(path)?.entry ?? linkedDirectories.get(path) ?? snapshot.get(path);
 			// Gone, or replaced: a watcher follows the directory it was installed on, not the path.
 			if (!wanted.has(path) || entry === undefined || entry.dev !== installed.dev || entry.ino !== installed.ino) {
 				installed.watcher.close();
@@ -438,15 +503,17 @@ export class NodeFileWatcher implements FileWatcher {
 		}
 		let added = false;
 		for (const [path, recursive] of wanted) {
-			const entry = snapshot.get(path);
+			const entry = resolvedParents.get(path)?.entry ?? linkedDirectories.get(path) ?? snapshot.get(path);
 			if (this.#watchers.has(path) || entry === undefined) continue;
 			const linked = linkedFiles.has(path);
 			try {
-				const watcher = fsWatch(path, { recursive, persistent: false }, (_event, filename) =>
-					linked
-						? this.#onLinkedFileEvent(path)
-						: this.#onEvent(path, filename === null ? undefined : String(filename)),
-				);
+				const watcher = fsWatch(path, { recursive, persistent: false }, (event, filename) => {
+					if (linked) this.#onLinkedFileEvent(path);
+					else this.#onEvent(path, filename === null ? undefined : String(filename));
+					// Renaming the resolved directory itself may name it rather than a child. Its lexical parents
+					// do not cover the real parent, so rescan even when that name is outside the target's scope.
+					if (event === "rename" && linkedDirectories.has(path)) this.#scheduleFlush();
+				});
 				// A watched directory that disappears or fails: rescan, which also replaces the watcher.
 				watcher.on("error", () => {
 					watcher.close();
@@ -471,6 +538,7 @@ export class NodeFileWatcher implements FileWatcher {
 		this.#mode = "polling";
 		for (const { watcher } of this.#watchers.values()) watcher.close();
 		this.#watchers.clear();
+		this.#resolvedParents = new Map();
 		this.#deliver({ overflow: true });
 		clearTimeout(this.#timer);
 		this.#timer = undefined;
@@ -481,10 +549,17 @@ export class NodeFileWatcher implements FileWatcher {
 		if (this.#closed) return;
 		const path =
 			filename === undefined ? directory : `${directory.endsWith(sep) ? directory : directory + sep}${filename}`;
+		// A real parent's event must retain the lexical target even when following its link currently fails.
+		let resolved = false;
+		for (const [boundary, targets] of this.#resolvedParents.get(directory)?.targets ?? []) {
+			if (filename !== undefined && !isWithin(boundary, path)) continue;
+			for (const target of targets) this.#events.add(target);
+			resolved = true;
+		}
 		// Events about unrelated siblings of an ancestor, or about excluded entries, are ignored.
 		const relevant = this.#inScope(path);
 		if (relevant) this.#events.add(this.#reported(path));
-		if (relevant || filename === undefined) this.#scheduleFlush();
+		if (resolved || relevant || filename === undefined) this.#scheduleFlush();
 	}
 
 	/** The file a target links to changed: report the target. */

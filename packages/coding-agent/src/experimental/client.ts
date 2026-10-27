@@ -87,23 +87,35 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 		const boundaryWaiters = new Map<string, () => void>();
 		let deliveryTail = Promise.resolve();
 		let hydrated = false;
+		let sequence = 0;
+		let deliveryError: Error | undefined;
 		const unsubscribe = match.transcript.state.subscribe((value) => {
 			if (!hydrated) {
 				hydrated = true;
+				sequence = value.events.at(-1)?.sequence ?? 0;
 				return;
 			}
-			if (value.event === null) return;
-			const event = value.event;
-			deliveryTail = deliveryTail.then(async () => {
-				if (event.type === "message_end" && event.runId !== undefined && event.message.role === "assistant") {
-					completedText.set(event.runId, messageText(event.message));
+			for (const item of value.events) {
+				if (item.sequence <= sequence) continue;
+				if (item.sequence !== sequence + 1) {
+					deliveryError = new Error("Transcript event replay window exceeded; reconnect before submitting again");
+					for (const resolve of boundaryWaiters.values()) resolve();
+					boundaryWaiters.clear();
+					return;
 				}
-				await options.onEvent?.(event);
-			});
-			if (event.type === "run_end" || event.type === "run_suspend") {
-				operationBoundaries.add(event.runId);
-				boundaryWaiters.get(event.runId)?.();
-				boundaryWaiters.delete(event.runId);
+				sequence = item.sequence;
+				const event = item.event;
+				deliveryTail = deliveryTail.then(async () => {
+					if (event.type === "message_end" && event.runId !== undefined && event.message.role === "assistant") {
+						completedText.set(event.runId, messageText(event.message));
+					}
+					await options.onEvent?.(event);
+				});
+				if (event.type === "run_end" || event.type === "run_suspend") {
+					operationBoundaries.add(event.runId);
+					boundaryWaiters.get(event.runId)?.();
+					boundaryWaiters.delete(event.runId);
+				}
 			}
 		});
 		if (match.transcript.state.value?.snapshot === null || match.transcript.state.value?.snapshot === undefined) {
@@ -119,10 +131,12 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 			// messages, so the response can arrive before its terminal event.
 			if (response.accepted) {
 				const operationId = response.operationId;
+				if (deliveryError) throw deliveryError;
 				if (!operationBoundaries.has(operationId)) {
 					await new Promise<void>((resolve) => boundaryWaiters.set(operationId, resolve));
 				}
 			}
+			if (deliveryError) throw deliveryError;
 		} finally {
 			unsubscribe();
 			await deliveryTail;

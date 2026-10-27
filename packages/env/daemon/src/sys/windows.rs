@@ -315,7 +315,7 @@ pub fn resolve_program(
             .or_else(|| std::env::var("PATH").ok())
             .unwrap_or_default();
         std::iter::once(std::path::PathBuf::from(cwd))
-            .chain(std::env::split_paths(&path_variable))
+            .chain(std::env::split_paths(&path_variable).map(|directory| Path::new(cwd).join(directory)))
             .flat_map(|directory| candidates(&directory.join(program)))
             .find(|path| path.is_file())
     };
@@ -661,5 +661,38 @@ mod tests {
             "\"C:\\dir with space\\\\\""
         );
         assert_eq!(quote_argument("a\\\\b c"), "\"a\\\\b c\"");
+    }
+
+    #[test]
+    fn resolves_path_entries_in_the_command_working_directory_and_spawns_them() {
+        use super::{mkdtemp, resolve_program};
+        use serde_json::json;
+        use std::path::Path;
+        use std::process::Command;
+
+        let root = mkdtemp(&format!("{}\\pi-env-program-", std::env::temp_dir().display())).unwrap();
+        let tools = Path::new(&root).join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        let source = Path::new(&std::env::var_os("SystemRoot").unwrap()).join("System32\\cmd.exe");
+        let program = "pi-env-cwd-regression";
+        let executable = tools.join(format!("{program}.exe"));
+        std::fs::copy(&source, &executable).unwrap();
+        for path in ["tools".to_string(), tools.to_string_lossy().into_owned()] {
+            let env = json!({ "Path": path, "PATHEXT": ".CMD" });
+            let resolved = resolve_program(program, &root, env.as_object().unwrap()).unwrap();
+            assert!(Path::new(&resolved).is_absolute());
+            assert_eq!(Path::new(&resolved), executable);
+            let status = Command::new(&resolved).current_dir(&root).args(["/D", "/C", "exit 23"]).status().unwrap();
+            assert_eq!(status.code(), Some(23));
+        }
+        let local = Path::new(&root).join(format!("{program}.exe"));
+        std::fs::copy(&source, &local).unwrap();
+        let env = json!({ "PATH": ";missing;" });
+        assert_eq!(Path::new(&resolve_program(program, &root, env.as_object().unwrap()).unwrap()), local);
+        std::fs::write(Path::new(&root).join("batch.cmd"), "exit /b 0").unwrap();
+        let error = resolve_program("batch.cmd", &root, env.as_object().unwrap()).unwrap_err();
+        assert_eq!(error.code, "spawn_error");
+        assert_eq!(error.message, "spawn batch.cmd EINVAL");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

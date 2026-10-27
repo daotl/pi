@@ -48,6 +48,24 @@ describe("parseToolCallArguments", () => {
 		expect(result.argumentsError?.endsWith(raw)).toBe(true);
 	});
 
+	it.each([
+		'{"value":1e309}',
+		'{"nested":{"values":[0,-1e309]}}',
+		'{"__proto__":{"value":1e309}}',
+		String.raw`{"note":"\url","value":1e309}`,
+	])("rejects non-finite numbers anywhere in finished arguments: %s", (raw) => {
+		const result = parseToolCallArguments(raw);
+		expect(result.arguments).toEqual({});
+		expect(result.argumentsError).toContain("Tool arguments must contain only finite numbers");
+		expect(result.argumentsError?.endsWith(raw)).toBe(true);
+	});
+
+	it("preserves finite boundary numbers, underflow, signed zero, and numeric strings", () => {
+		expect(parseToolCallArguments('{"values":[1.7976931348623157e308,5e-324,1e-999,-0,"1e309"]}')).toEqual({
+			arguments: { values: [Number.MAX_VALUE, Number.MIN_VALUE, 0, -0, "1e309"] },
+		});
+	});
+
 	it("rejects JSON that is not an object", () => {
 		expect(parseToolCallArguments("[1,2]")).toEqual({
 			arguments: {},

@@ -379,6 +379,14 @@ export interface ExtensionBindings {
 export type QueuedInputDisposition = "handled" | "queued";
 export type PromptDisposition = QueuedInputDisposition | "started";
 
+interface QueuedInputOptions {
+	source?: InputSource;
+	/** @internal Cancels queue admission until preflightResult reports acceptance. */
+	preflightSignal?: AbortSignal;
+	/** @internal Reports accepted input only; not called when queue preflight rejects. */
+	preflightResult?: (disposition: QueuedInputDisposition) => void;
+}
+
 /** Options for AgentSession.prompt() */
 export interface PromptOptions {
 	/** Whether to dispatch extension commands and expand skill commands and prompt templates (default: true) */
@@ -391,6 +399,8 @@ export interface PromptOptions {
 	source?: InputSource;
 	/** Internal hook used by RPC mode to observe how an accepted prompt was dispatched. Not called if the prompt is rejected. */
 	preflightResult?: (disposition: PromptDisposition) => void;
+	/** @internal Cancels a queued submission until its preflightResult reports acceptance. */
+	preflightSignal?: AbortSignal;
 	/** @internal Observe settlement-deferred execution failure after the original prompt returned. Settlement still propagates the original error, even if this observer throws. */
 	onDeferredError?: (error: unknown) => void;
 	/** @internal Called synchronously when prompt execution is deferred. Do not await completion from a settlement handler. */
@@ -3225,10 +3235,14 @@ export class AgentSession {
 	 */
 	private _restoreToolsFromTranscript(modifiers: readonly string[] = [], persist = true): void {
 		this._pendingToolNames.clear();
-		// Replay every branch system delta, including declarations preceding compaction.
+		// Replay visible branch system deltas, including declarations preceding compaction.
 		const systemMessages = this.sessionManager
 			.getBranch()
-			.flatMap((entry) => (entry.type === "message" && entry.message.role === "system" ? [entry.message] : []));
+			.flatMap((entry) =>
+				entry.deletedAt === undefined && entry.type === "message" && entry.message.role === "system"
+					? [entry.message]
+					: [],
+			);
 		if (systemMessages.length === 0) return;
 		const mentioned = new Set(
 			systemMessages.flatMap((message) =>
@@ -3573,6 +3587,7 @@ export class AgentSession {
 	private async _runAgentPrompt(
 		input: BeforeAgentStartTrigger | PreparedAgentPrompt,
 		preflightResult?: PromptOptions["preflightResult"],
+		preflightSignal?: AbortSignal,
 	): Promise<void> {
 		if (this._isAgentRunActive || this.agent.signal) {
 			throw new Error(
@@ -3590,6 +3605,7 @@ export class AgentSession {
 			this._flushPendingCustomMessages();
 			const prepared = "messageType" in input ? await this._prepareRun(input) : input;
 			if (!prepared) return;
+			preflightSignal?.throwIfAborted();
 			// Deferred output precedes starting input and cannot split a tool pair.
 			this._flushPendingBashMessages();
 			this._flushPendingCustomMessages();
@@ -4107,6 +4123,7 @@ export class AgentSession {
 		}
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
+		options?.preflightSignal?.throwIfAborted();
 		// Handle extension commands first (execute immediately, even during streaming)
 		// Extension commands manage their own LLM interaction via pi.sendMessage()
 		if (expandPromptTemplates && text.startsWith("/")) {
@@ -4131,6 +4148,7 @@ export class AgentSession {
 			options?.source ?? "interactive",
 			this.isStreaming ? options?.streamingBehavior : undefined,
 		);
+		options?.preflightSignal?.throwIfAborted();
 		if (!processedInput) {
 			preflightResult?.("handled");
 			return;
@@ -4146,6 +4164,7 @@ export class AgentSession {
 
 		// Preflight can yield to another run; queue or reject before publishing this prompt's loadout.
 		const dispatchToActiveRun = async (): Promise<void> => {
+			options?.preflightSignal?.throwIfAborted();
 			if (!this.isStreaming && !this.agent.signal) {
 				throw new Error(
 					"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
@@ -4193,6 +4212,7 @@ export class AgentSession {
 			}
 			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 		}
+		options?.preflightSignal?.throwIfAborted();
 		if (this.isStreaming || this.agent.signal || this.isCompacting) {
 			await dispatchToActiveRun();
 			return;
@@ -4202,7 +4222,8 @@ export class AgentSession {
 			{ messageType: "user", prompt: expandedText, images: currentImages },
 			dispatchToActiveRun,
 		);
-		if (prepared) await this._runAgentPrompt(prepared, preflightResult);
+		options?.preflightSignal?.throwIfAborted();
+		if (prepared) await this._runAgentPrompt(prepared, preflightResult, options?.preflightSignal);
 	}
 
 	/**
@@ -4269,8 +4290,9 @@ export class AgentSession {
 		text: string,
 		images: ImageContent[] | undefined,
 		behavior: "steer" | "followUp",
-		source: InputSource,
+		options?: QueuedInputOptions,
 	): Promise<QueuedInputDisposition> {
+		options?.preflightSignal?.throwIfAborted();
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
 		}
@@ -4278,10 +4300,14 @@ export class AgentSession {
 		const processedInput = await this._runInputHandlers(
 			text,
 			images,
-			source,
+			options?.source ?? "interactive",
 			this.isStreaming ? behavior : undefined,
 		);
-		if (!processedInput) return "handled";
+		options?.preflightSignal?.throwIfAborted();
+		if (!processedInput) {
+			options?.preflightResult?.("handled");
+			return "handled";
+		}
 
 		let expandedText = this._expandSkillCommand(processedInput.text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
@@ -4291,6 +4317,7 @@ export class AgentSession {
 		} else {
 			await this._queueFollowUp(expandedText, processedInput.images);
 		}
+		options?.preflightResult?.("queued");
 		return "queued";
 	}
 
@@ -4303,12 +4330,8 @@ export class AgentSession {
 	 * @param options Input source; defaults to interactive
 	 * @throws Error if text is an extension command
 	 */
-	async steer(
-		text: string,
-		images?: ImageContent[],
-		options?: { source?: InputSource },
-	): Promise<QueuedInputDisposition> {
-		return this._queueUserInput(text, images, "steer", options?.source ?? "interactive");
+	async steer(text: string, images?: ImageContent[], options?: QueuedInputOptions): Promise<QueuedInputDisposition> {
+		return this._queueUserInput(text, images, "steer", options);
 	}
 
 	/**
@@ -4322,9 +4345,9 @@ export class AgentSession {
 	async followUp(
 		text: string,
 		images?: ImageContent[],
-		options?: { source?: InputSource },
+		options?: QueuedInputOptions,
 	): Promise<QueuedInputDisposition> {
-		return this._queueUserInput(text, images, "followUp", options?.source ?? "interactive");
+		return this._queueUserInput(text, images, "followUp", options);
 	}
 
 	/**
@@ -6282,7 +6305,14 @@ export class AgentSession {
 		// Pending tools that are registered now become active.
 		nextActiveToolNames.push(...this._pendingToolNames);
 
-		this._setActiveTools([...new Set(nextActiveToolNames)]);
+		const activeToolNames = [...new Set(nextActiveToolNames)];
+		// Startup and reload select from the complete registry, not just the built-in defaults.
+		// Later refreshes retain explicit setActiveToolsByName() choices.
+		this._setActiveTools(
+			options?.includeAllExtensionTools
+				? applyToolModifiers(activeToolNames, this._defaultToolModifiers)
+				: activeToolNames,
+		);
 	}
 
 	/** Whether activating the tool declares it to the model. */
@@ -6291,9 +6321,13 @@ export class AgentSession {
 		return exposure === "direct" || exposure === "model-only";
 	}
 
-	/** Whether registering the tool activates it, which declares it to the model. */
+	/** Whether registration activates the tool; invocation removals do not constrain later explicit loadouts. */
 	private _isActivatedOnRegistration(name: string): boolean {
-		return this._isDeclarable(name) && this._toolDefinitions.get(name)?.definition.defaultActive !== false;
+		return (
+			this._isDeclarable(name) &&
+			this._toolDefinitions.get(name)?.definition.defaultActive !== false &&
+			this._defaultToolModifiers.findLast((modifier) => modifier.slice(1) === name)?.startsWith("-") !== true
+		);
 	}
 
 	private _buildRuntime(options: {

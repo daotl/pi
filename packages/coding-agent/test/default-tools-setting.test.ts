@@ -191,6 +191,63 @@ describe("defaultTools setting", () => {
 		toolLess.dispose();
 	});
 
+	it("keeps negative modifiers effective after extension and SDK activation on startup and reload", async () => {
+		const definition = (name: string) => ({
+			name,
+			label: name,
+			description: name,
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text" as const, text: "ok" }], details: {} }),
+		});
+		const session = await createSession(
+			["read"],
+			{ tools: ["-active_tool", "-sdk_tool", "-dynamic_tool"], customTools: [definition("sdk_tool")] },
+			[
+				(pi) => {
+					pi.registerTool(definition("active_tool"));
+					pi.on("session_start", () => pi.registerTool(definition("dynamic_tool")));
+				},
+			],
+		);
+		try {
+			expect(session.getActiveToolNames()).toEqual(["read"]);
+			await session.bindExtensions({ onError: () => {} });
+			expect(session.getActiveToolNames()).toEqual(["read"]);
+			expect(session.getCallableToolNames()).toEqual(["read"]);
+			await session.reload();
+			expect(session.getActiveToolNames()).toEqual(["read"]);
+			expect(session.getCallableToolNames()).toEqual(["read"]);
+			expect(session.getAllTools().map((tool) => tool.name)).toEqual(
+				expect.arrayContaining(["active_tool", "sdk_tool", "dynamic_tool"]),
+			);
+		} finally {
+			session.dispose();
+		}
+	});
+
+	it("does not undo an explicit loadout when later tools register", async () => {
+		const definition = (name: string) => ({
+			name,
+			label: name,
+			description: name,
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text" as const, text: "ok" }], details: {} }),
+		});
+		const session = await createSession(["read"], { tools: ["-active_tool"] }, [
+			(pi) => {
+				pi.registerTool(definition("active_tool"));
+				pi.on("session_start", () => pi.registerTool(definition("later_tool")));
+			},
+		]);
+		try {
+			session.setActiveToolsByName(["read", "active_tool"]);
+			await session.bindExtensions({});
+			expect(session.getActiveToolNames()).toEqual(["read", "active_tool", "later_tool"]);
+		} finally {
+			session.dispose();
+		}
+	});
+
 	it("rejects invalid tool modifier options", async () => {
 		await expect(createSession([], { tools: ["read", "+grep"] })).rejects.toThrow(
 			"Invalid tools option: tool names cannot be mixed with +name or -name entries",

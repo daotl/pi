@@ -900,7 +900,10 @@ export class InteractiveMode {
 
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
-	private compactionQueueDeliveryPending?: { messages: CompactionQueuedMessage[] };
+	private compactionQueueDeliveryPending?: {
+		messages: CompactionQueuedMessage[];
+		submitting?: { message: CompactionQueuedMessage; controller: AbortController };
+	};
 	// A /continue issued while compaction is running, deferred until the session
 	// is idle (compaction complete and any queued compaction messages drained).
 	private pendingCompactionContinue = false;
@@ -5377,6 +5380,9 @@ export class InteractiveMode {
 		return {
 			steering: [
 				...this.session.getSteeringMessages(),
+				...(this.compactionQueueDeliveryPending?.submitting?.message.mode === "steer"
+					? [this.compactionQueueDeliveryPending.submitting.message.text]
+					: []),
 				...(this.compactionQueueDeliveryPending?.messages ?? [])
 					.filter((msg) => msg.mode === "steer")
 					.map((msg) => msg.text),
@@ -5384,6 +5390,9 @@ export class InteractiveMode {
 			],
 			followUp: [
 				...this.session.getFollowUpMessages(),
+				...(this.compactionQueueDeliveryPending?.submitting?.message.mode === "followUp"
+					? [this.compactionQueueDeliveryPending.submitting.message.text]
+					: []),
 				...(this.compactionQueueDeliveryPending?.messages ?? [])
 					.filter((msg) => msg.mode === "followUp")
 					.map((msg) => msg.text),
@@ -5398,6 +5407,12 @@ export class InteractiveMode {
 	 */
 	private clearAllQueues(): { steering: string[]; followUp: string[] } {
 		const { steering, followUp } = this.session.clearQueue();
+		const submitting = this.compactionQueueDeliveryPending?.submitting;
+		if (submitting) {
+			(submitting.message.mode === "steer" ? steering : followUp).push(submitting.message.text);
+			submitting.controller.abort();
+			delete this.compactionQueueDeliveryPending!.submitting;
+		}
 		const reserved = this.compactionQueueDeliveryPending?.messages ?? [];
 		steering.push(...reserved.filter((msg) => msg.mode === "steer").map((msg) => msg.text));
 		followUp.push(...reserved.filter((msg) => msg.mode === "followUp").map((msg) => msg.text));
@@ -5478,18 +5493,19 @@ export class InteractiveMode {
 			return;
 		}
 
-		const delivery = { messages: this.compactionQueuedMessages };
+		const delivery: NonNullable<InteractiveMode["compactionQueueDeliveryPending"]> = {
+			messages: this.compactionQueuedMessages,
+		};
 		this.compactionQueueDeliveryPending = delivery;
 		const session = this.session;
 		this.compactionQueuedMessages = [];
 		this.updatePendingMessagesDisplay();
 		let queueRestored = false;
-		let submitting: CompactionQueuedMessage | undefined;
 
 		const restoreQueue = (error: unknown) => {
 			if (queueRestored || this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 			queueRestored = true;
-			const unsent = submitting ? [submitting, ...delivery.messages] : delivery.messages;
+			const unsent = delivery.submitting ? [delivery.submitting.message, ...delivery.messages] : delivery.messages;
 			const unsentCount = unsent.length;
 			this.compactionQueuedMessages = [...unsent, ...this.compactionQueuedMessages];
 			delivery.messages.length = 0;
@@ -5502,13 +5518,15 @@ export class InteractiveMode {
 		};
 		const deferred = Promise.withResolvers<void>();
 		const promptQueued = (message: CompactionQueuedMessage, promptOptions?: PromptOptions): Promise<void> => {
-			submitting = message;
+			const controller = new AbortController();
+			delivery.submitting = { message, controller };
 			this.updatePendingMessagesDisplay();
 			let completion: Promise<void> | undefined;
 			const submitted = session.prompt(message.text, {
 				...promptOptions,
+				preflightSignal: controller.signal,
 				preflightResult: (disposition) => {
-					if (submitting === message) submitting = undefined;
+					if (delivery.submitting?.message === message) delete delivery.submitting;
 					promptOptions?.preflightResult?.(disposition);
 				},
 				onDeferred: (pending) => {
@@ -5516,7 +5534,10 @@ export class InteractiveMode {
 					deferred.resolve();
 				},
 			});
-			return completion ?? submitted;
+			return (completion ?? submitted).catch((error: unknown) => {
+				if (controller.signal.aborted) return;
+				throw error;
+			});
 		};
 		const deliver = async () => {
 			try {
@@ -5524,16 +5545,24 @@ export class InteractiveMode {
 					// When retry is pending, queue messages for the retry turn
 					while (delivery.messages.length > 0) {
 						const message = delivery.messages.shift()!;
-						submitting = message;
 						if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 						if (this.isExtensionCommand(message.text)) {
 							await promptQueued(message);
-						} else if (message.mode === "followUp") {
-							await session.followUp(message.text);
 						} else {
-							await session.steer(message.text);
+							const controller = new AbortController();
+							delivery.submitting = { message, controller };
+							this.updatePendingMessagesDisplay();
+							try {
+								await session[message.mode](message.text, undefined, {
+									preflightSignal: controller.signal,
+									preflightResult: () => {
+										if (delivery.submitting?.message === message) delete delivery.submitting;
+									},
+								});
+							} catch (error) {
+								if (!controller.signal.aborted) throw error;
+							}
 						}
-						submitting = undefined;
 						if (this.compactionQueueDeliveryPending !== delivery || this.session !== session) return;
 					}
 					this.updatePendingMessagesDisplay();

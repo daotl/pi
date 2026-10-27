@@ -533,15 +533,20 @@ function isHexDigit(char: string): boolean {
 /** The value of a complete number or literal token; `undefined` for anything else, which is dropped. */
 function scalarValue(token: string): JsonValue | undefined {
 	for (const [literal, value] of LITERALS) if (token === literal) return value;
-	return NUMBER.test(token) ? Number(token) : undefined;
+	const value = NUMBER.test(token) ? Number(token) : undefined;
+	return value !== undefined && Number.isFinite(value) ? value : undefined;
 }
 
 /** The value an unterminated number or literal token shows. */
 function pendingScalarValue(token: string): JsonValue | undefined {
 	for (const [literal, value] of LITERALS) if (literal.startsWith(token)) return value;
-	if (NUMBER.test(token)) return Number(token);
+	if (NUMBER.test(token)) {
+		const value = Number(token);
+		return Number.isFinite(value) ? value : undefined;
+	}
 	const mantissa = NUMBER_WITHOUT_EXPONENT_DIGITS.exec(token);
-	return mantissa === null ? undefined : Number(mantissa[1]);
+	const value = mantissa === null ? undefined : Number(mantissa[1]);
+	return value !== undefined && Number.isFinite(value) ? value : undefined;
 }
 
 function setSlot(container: JsonContainer, slot: Slot, value: JsonValue): void {

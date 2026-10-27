@@ -4,8 +4,8 @@ import { Type } from "typebox";
 
 export interface TranscriptState {
 	snapshot: LaneTranscriptSnapshot | null;
-	/** The source event is retained for presentation side effects; hydration does not replay it. */
-	event: LaneWatchEvent | null;
+	/** Bounded replay window; sequence numbers expose any consumer overrun instead of silently losing events. */
+	events: Array<{ sequence: number; event: LaneWatchEvent }>;
 }
 
 /** Coherent main-lane state replicated through Chord's operation stream. */
@@ -16,11 +16,11 @@ export interface Transcript {
 export const TranscriptStateSchema = Type.Unsafe<TranscriptState>(
 	Type.Object({
 		snapshot: Type.Union([Type.Object({}), Type.Null()]),
-		event: Type.Union([Type.Object({}), Type.Null()]),
+		events: Type.Array(Type.Object({ sequence: Type.Integer(), event: Type.Object({}) })),
 	}),
 );
 export const Transcript = remote("pi.transcript", {
-	version: 1,
+	version: 2,
 	input: Type.Object({}),
 	host: hostNamed("session"),
 	variants: { active: { state: { state: TranscriptStateSchema } } },

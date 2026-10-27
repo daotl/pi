@@ -12,6 +12,7 @@ import chalk from "chalk";
 import { APP_NAME, CONFIG_DIR_NAME } from "../../config.ts";
 import { validateMcpServerConfig } from "../../core/mcp-servers.ts";
 import { ProjectTrustStore } from "../../core/trust-manager.ts";
+import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
 import {
 	addMcpServerConfig,
@@ -247,10 +248,18 @@ export async function runMcpCommand(args: string[], options: McpCommandOptions):
 				error("--timeout must be a positive number of seconds.");
 				return 1;
 			}
+			const signal = AbortSignal.timeout(timeout * 1000);
+			const cancelConnection = () => {
+				void connection.close().catch(() => undefined);
+			};
+			signal.addEventListener("abort", cancelConnection, { once: true });
 			try {
-				return await login(entry, connection, url, timeout * 1000, options, credentials, log, error);
+				return await login(entry, connection, url, timeout * 1000, signal, options, credentials, log, error);
 			} finally {
-				await connection.close();
+				signal.removeEventListener("abort", cancelConnection);
+				const closing = connection.close();
+				if (signal.aborted) void closing.catch(() => undefined);
+				else await closing;
 			}
 		}
 		default:
@@ -518,6 +527,7 @@ async function login(
 	connection: McpServerConnection,
 	url: string,
 	timeoutMs: number,
+	signal: AbortSignal,
 	options: McpCommandOptions,
 	credentials: McpOAuthCredentialStore,
 	log: (line: string) => void,
@@ -526,10 +536,15 @@ async function login(
 	const { name } = entry;
 	// Connecting first answers whether a sign-in is needed and records the server's challenge.
 	try {
-		await connection.getClient();
+		await raceWithAbortSignal(connection.getClient(), signal);
+		signal.throwIfAborted();
 		log(`Already signed in to MCP server "${name}" (${connection.tools.length} tools).`);
 		return 0;
 	} catch {
+		if (signal.aborted) {
+			error(`Sign-in to MCP server "${name}" timed out before connection completed.`);
+			return 1;
+		}
 		if (connection.state !== "needs-auth") {
 			error(`MCP server "${name}" failed to connect: ${connection.error ?? "unknown error"}`);
 			return 1;
@@ -551,7 +566,7 @@ async function login(
 				},
 				promptForRedirectUrl: (signal) => waitForRedirectUrl(signal, interactive),
 			},
-			signal: AbortSignal.timeout(timeoutMs),
+			signal,
 		});
 	} catch (signInError) {
 		error(
@@ -563,7 +578,8 @@ async function login(
 	}
 	connection.challenge = undefined;
 	try {
-		await connection.reconnect();
+		await raceWithAbortSignal(connection.reconnect(), signal);
+		signal.throwIfAborted();
 	} catch (connectError) {
 		error(`Signed in, but ${errorMessage(connectError)}`);
 		return 1;

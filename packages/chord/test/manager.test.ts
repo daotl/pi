@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { type ChildProcess, fork } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { describe, it, onTestFinished, vi } from "vitest";
 import { createHost, ipcLink, isChordError } from "../src/index.ts";
@@ -23,6 +26,42 @@ const alive = (pid: number): boolean => {
 const driver = (env: Record<string, string> = {}, lock?: string): Driver =>
 	forkDriver({ entry, env: { HOST_NAME: "w1", ...env }, init: { greeting: "hi" }, lock });
 
+const fileSockets = !["linux", "android", "win32"].includes(process.platform);
+const claimPath = (name: string): string =>
+	join(
+		`/tmp/chord2-${process.getuid?.() ?? 0}`,
+		`chord2-${createHash("sha256").update(name).digest("hex").slice(0, 32)}.sock.reclaim.sqlite`,
+	);
+function contender(name: string, pause = false) {
+	const child = fork(
+		fileURLToPath(new URL("./fixtures/lock-contender.ts", import.meta.url)),
+		[name, ...(pause ? ["pause"] : [])],
+		{ execArgv: [], stdio: ["ignore", "ignore", "inherit", "ipc"] },
+	);
+	const messages: unknown[] = [];
+	const waiters = new Map<string, () => void>();
+	child.on("message", (message) => {
+		messages.push(message);
+		if (typeof message === "string") waiters.get(message)?.();
+	});
+	return {
+		child,
+		wait(message: string): Promise<void> {
+			if (messages.includes(message)) return Promise.resolve();
+			const arrived = Promise.withResolvers<void>();
+			waiters.set(message, arrived.resolve);
+			return arrived.promise;
+		},
+	};
+}
+async function terminate(child: ChildProcess): Promise<void> {
+	if (child.exitCode !== null || child.signalCode !== null) return;
+	const exited = Promise.withResolvers<void>();
+	child.once("exit", () => exited.resolve());
+	child.kill("SIGKILL");
+	await exited.promise;
+}
+
 describe("processLock", () => {
 	// A socket path over 104 bytes failed with EINVAL on macOS when TMPDIR was deep (./test.sh below macOS's TMPDIR).
 	it("admits one holder when the temporary directory is too deep for a socket path", async () => {
@@ -40,6 +79,105 @@ describe("processLock", () => {
 			if (previous === undefined) delete process.env.TMPDIR;
 			else process.env.TMPDIR = previous;
 			rmSync(scratch("deep"), { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!fileSockets)(
+		"serializes two stale-socket contenders and recovers a crashed reclamation claim",
+		async () => {
+			const name = `stale-contenders-${process.pid}`;
+			const children: ChildProcess[] = [];
+			onTestFinished(async () => {
+				await Promise.all(children.map(terminate));
+				await (await processLock(name))();
+			});
+			const original = contender(name);
+			children.push(original.child);
+			await original.wait("acquired");
+			await terminate(original.child);
+			const first = contender(name, true);
+			children.push(first.child);
+			await first.wait("reclaiming");
+			const second = contender(name, true);
+			children.push(second.child);
+			await second.wait("locked");
+			first.child.send("continue");
+			await first.wait("acquired");
+			await assert.rejects(processLock(name), (error) => isChordError(error) && error.reason === "locked");
+			await terminate(first.child);
+			const crashedClaim = contender(name, true);
+			children.push(crashedClaim.child);
+			await crashedClaim.wait("reclaiming");
+			await terminate(crashedClaim.child);
+			const release = await processLock(name);
+			try {
+				// The acquisition-only SQLite lock is gone even while the lifetime socket is still held.
+				const probe = new DatabaseSync(claimPath(name), { timeout: 0 });
+				try {
+					probe.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE");
+				} finally {
+					probe.close();
+				}
+			} finally {
+				await release();
+			}
+			await (await processLock(name))();
+		},
+	);
+
+	it.skipIf(!fileSockets)("same-name SQLite claims fail closed while different names remain independent", async () => {
+		const name = `claim-busy-${process.pid}`;
+		// Initialize the persistent file using the public lock path, then hold only its native reclamation lock.
+		await (await processLock(name))();
+		const occupied = new DatabaseSync(claimPath(name), { timeout: 0 });
+		occupied.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE");
+		try {
+			await assert.rejects(processLock(name), (error) => isChordError(error) && error.reason === "locked");
+			await (await processLock(`${name}-independent`))();
+		} finally {
+			occupied.close();
+		}
+		await (await processLock(name))();
+	});
+});
+
+describe("host manager forced tree cleanup", () => {
+	it.skipIf(process.platform !== "win32")(
+		"a fatal start kills the child and its descendants before rejecting",
+		async () => {
+			const file = scratch("grandchild-failed-start");
+			const manager = createHostManager({
+				driver: driver({ FIXTURE_MODE: "fatal-tree", GRANDCHILD_FILE: file }),
+			});
+			try {
+				await assert.rejects(manager.start(), /fixture tree refuses to start/);
+				const grandchild = Number(readFileSync(file, "utf8"));
+				assert.ok(Number.isSafeInteger(grandchild) && grandchild > 0, "fixture acknowledged a real descendant");
+				assert.equal(alive(grandchild), false);
+			} finally {
+				await manager.stop();
+				rmSync(file, { force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform !== "win32")("replacement waits for Windows descendants to terminate", async () => {
+		const file = scratch("grandchild-replace");
+		const manager = createHostManager({
+			driver: driver({ FIXTURE_MODE: "ignore-shutdown", GRANDCHILD_FILE: file }),
+			grace: 100,
+		});
+		try {
+			const first = await manager.start();
+			const grandchild = Number(readFileSync(file, "utf8"));
+			assert.ok(alive(grandchild));
+			const second = await manager.replace();
+			assert.notEqual(first.pid, second.pid);
+			assert.equal(alive(first.pid), false);
+			assert.equal(alive(grandchild), false);
+		} finally {
+			await manager.stop();
+			rmSync(file, { force: true });
 		}
 	});
 });
@@ -154,7 +292,8 @@ describe("host manager (real child processes)", () => {
 		const grandchild = Number(readFileSync(file, "utf8"));
 		assert.ok(alive(grandchild));
 		await manager.stop();
-		assert.equal((await instance.exited).signal, "SIGKILL");
+		if (process.platform !== "win32") assert.equal((await instance.exited).signal, "SIGKILL");
+		assert.equal(alive(instance.pid), false);
 		for (let i = 0; i < 50 && alive(grandchild); i++) await new Promise((resolve) => setTimeout(resolve, 20));
 		assert.ok(!alive(grandchild));
 		rmSync(file, { force: true });

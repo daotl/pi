@@ -179,9 +179,6 @@ function generateHtml(sessionData: SessionData, themeName?: string): string {
 		.replace("{{HIGHLIGHT_JS}}", () => hljsJs);
 }
 
-/** Tools rendered directly by the HTML template (not pre-rendered via TUI→ANSI→HTML pipeline) */
-const TEMPLATE_RENDERED_TOOLS = new Set(["bash", "read", "write", "edit", "ls"]);
-
 /**
  * Pre-render custom tools to HTML using their TUI renderers.
  */
@@ -198,7 +195,7 @@ function preRenderCustomTools(
 		// Find tool calls in assistant messages
 		if (msg.role === "assistant" && Array.isArray(msg.content)) {
 			for (const block of msg.content) {
-				if (block.type === "toolCall" && !TEMPLATE_RENDERED_TOOLS.has(block.name)) {
+				if (block.type === "toolCall") {
 					const callHtml = toolRenderer.renderCall(block.id, block.name, block.arguments);
 					if (callHtml) {
 						renderedTools[block.id] = { callHtml };
@@ -210,23 +207,20 @@ function preRenderCustomTools(
 		// Find tool results
 		if (msg.role === "toolResult" && msg.toolCallId) {
 			const toolName = msg.toolName || "";
-			// Only render if we have a pre-rendered call OR it's not template-rendered
 			const existing = renderedTools[msg.toolCallId];
-			if (existing || !TEMPLATE_RENDERED_TOOLS.has(toolName)) {
-				const rendered = toolRenderer.renderResult(
-					msg.toolCallId,
-					toolName,
-					msg.content,
-					msg.details,
-					msg.isError || false,
-				);
-				if (rendered) {
-					renderedTools[msg.toolCallId] = {
-						...existing,
-						resultHtmlCollapsed: rendered.collapsed,
-						resultHtmlExpanded: rendered.expanded,
-					};
-				}
+			const rendered = toolRenderer.renderResult(
+				msg.toolCallId,
+				toolName,
+				msg.content,
+				msg.details,
+				msg.isError || false,
+			);
+			if (rendered) {
+				renderedTools[msg.toolCallId] = {
+					...existing,
+					resultHtmlCollapsed: rendered.collapsed,
+					resultHtmlExpanded: rendered.expanded,
+				};
 			}
 		}
 	}

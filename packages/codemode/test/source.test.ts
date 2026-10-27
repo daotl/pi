@@ -29,6 +29,58 @@ describe("parseCodemodeSource", () => {
 		expect(parseCodemodeSource('text("// @options: {}")').options).toEqual({});
 	});
 
+	it("keeps options-looking text inside literals and block comments", () => {
+		const inputs = [
+			'const source = `example\n// @options: {"timeout_ms": 1000}\n`; return source;',
+			'const source = "example\\\n// @options: {}"; return source;',
+			"/* example\n// @options: {}\n*/ return 1;",
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: source text intentionally contains template expressions.
+			"const source = `outer ${`inner\n// @options: {}\n`} end`; return source;",
+			'const pattern = /[`"]/; const source = `example\n// @options: {}\n`; return source;',
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: source text intentionally contains template expressions.
+			"const source = `value ${({ a: 1 }).a}\n// @options: {}\n`; return source;",
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: source text intentionally contains template expressions.
+			"const source = `value ${(() => { return { a: 1 }; })().a}\n// @options: {}\n`; return source;",
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: source text intentionally contains template expressions.
+			"const source = `outer ${`inner ${({ a: 1 }).a}\n// @options: {}\n`} end`; return source;",
+			"const pattern = /\\/\\/ @options: {}/; return pattern;",
+		];
+		for (const input of inputs) expect(parseCodemodeSource(input)).toEqual({ code: input, options: {} });
+	});
+
+	it("rejects actual options comments inside template expressions", () => {
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: testing a comment inside a template expression.
+		expect(() => parseCodemodeSource("const source = `value ${\n// @options: {}\n1}`")).toThrow(
+			"found one on line 2",
+		);
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: testing a comment inside a nested expression.
+		expect(() => parseCodemodeSource("const source = `value ${({ a: 1 }).a + (\n// @options: {}\n1)}`")).toThrow(
+			"found one on line 2",
+		);
+	});
+
+	it("rejects misplaced deadlines after postfix division and control-statement regexps", () => {
+		for (const prefix of [
+			"let n = 4; const ratio = n++ / 2;",
+			"let n = 4; const ratio = n-- / 2;",
+			"const obj = { if: () => 4 }; obj.if() / 2;",
+			"const obj = { while: () => 4 }; obj?.while() / 2;",
+			"const obj = { for: () => 4 }; obj['for']() / 2;",
+			"const obj = { if() { return 4; } }; obj.if() / 2;",
+			"const obj = { if: function() { return 4; } }; obj.if() / 2;",
+			"again: { break again; } const ratio = 4 / 2;",
+			"if (true) /`/.test('x');",
+			"while (false) /`/.test('x');",
+			"for (; false;) /`/.test('x');",
+		]) {
+			expect(() => parseCodemodeSource(`${prefix}\n// @options: {"timeout_ms": 1}\nreturn 1;`)).toThrow(
+				"found one on line 2",
+			);
+			const literal = `${prefix}\nconst source = \`example\n// @options: {}\n\`; return source;`;
+			expect(parseCodemodeSource(literal)).toEqual({ code: literal, options: {} });
+		}
+	});
+
 	// #10631: an options line after the first line used to be ignored, so its timeout never applied.
 	it("rejects an options line that is not the first line", () => {
 		const cases: [string, number][] = [

@@ -83,6 +83,8 @@ async function createSchedulingMode(options: HarnessOptions = {}) {
 		editor: { getText(): string };
 		queueCompactionMessage(text: string, mode: "steer" | "followUp"): void;
 		flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
+		getAllQueuedMessages(): { steering: string[]; followUp: string[] };
+		clearAllQueues(): { steering: string[]; followUp: string[] };
 		compactionQueuedMessages: Array<{ text: string; mode: "steer" | "followUp" }>;
 		scheduledMessages: ScheduledMessage[];
 		deferredScheduledActions: ScheduledMessage[];
@@ -2126,7 +2128,7 @@ it("discards settlement-deferred ownership when a public subscriber throws", asy
 	}
 });
 
-it("dequeues reserved batch rest through Alt+Up without cancelling its submitted first prompt", async () => {
+it("dequeues both pending first preflight and reserved rest through Alt+Up before either is admitted", async () => {
 	const compactEntered = Promise.withResolvers<void>();
 	const compactRelease = Promise.withResolvers<void>();
 	const preflightEntered = Promise.withResolvers<void>();
@@ -2181,26 +2183,77 @@ it("dequeues reserved batch rest through Alt+Up without cancelling its submitted
 		expect(ui.terminal.getViewport().join("\n")).toContain("Follow-up: reserved second");
 		ui.terminal.sendInput("\x1b[1;3A");
 		await ui.terminal.waitForRender();
-		expect(ui.internal.editor.getText()).toBe("reserved second");
-		expect(ui.terminal.getViewport().join("\n")).toContain("Restored 1 queued message to editor");
-		expect(ui.terminal.getViewport().join("\n")).not.toContain("Follow-up: reserved second");
+		expect(ui.internal.editor.getText()).toBe("submitted first\n\nreserved second");
+		expect(ui.internal.getAllQueuedMessages()).toEqual({ steering: [], followUp: [] });
 		preflightRelease.resolve();
-		await vi.waitFor(() => expect(requests).toEqual(["submitted first"]));
-		expect(ui.harness.session.isStreaming).toBe(true);
-		response.resolve();
+		await setImmediate();
 		await ui.harness.session.waitForIdle();
-		expect(requests).toEqual(["submitted first"]);
+		expect(requests).toEqual([]);
 		expect(ui.harness.session.messages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
 			"original context",
 			"seed",
-			"submitted first",
 		]);
-		expect(ui.internal.editor.getText()).toBe("reserved second");
+		expect(ui.internal.editor.getText()).toBe("submitted first\n\nreserved second");
 	} finally {
 		compactRelease.resolve();
 		preflightRelease.resolve();
 		response.resolve();
 		await compaction;
+		await ui.cleanup();
+	}
+});
+
+it("dequeues an unaccepted batch message and never dispatches it after its input handler returns", async () => {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const first = Promise.withResolvers<void>();
+	const ui = await createSchedulingMode({
+		extensionFactories: [
+			(pi) => {
+				pi.on("input", async (event) => {
+					if (event.text === "pending second") {
+						entered.resolve();
+						await release.promise;
+					}
+				});
+			},
+		],
+	});
+	const requests: string[] = [];
+	ui.harness.setResponses([
+		async (context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			await first.promise;
+			return fauxAssistantMessage("first answer");
+		},
+	]);
+	let delivery: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		ui.internal.queueCompactionMessage("accepted first", "followUp");
+		ui.internal.queueCompactionMessage("pending second", "followUp");
+		ui.internal.queueCompactionMessage("reserved third", "followUp");
+		delivery = ui.internal.flushCompactionQueue();
+		await entered.promise;
+		expect(ui.internal.getAllQueuedMessages().followUp).toEqual(["pending second", "reserved third"]);
+		expect(ui.internal.clearAllQueues().followUp).toEqual(["pending second", "reserved third"]);
+		release.resolve();
+		first.resolve();
+		await delivery;
+		await ui.harness.session.waitForIdle();
+		expect(requests).toEqual(["accepted first"]);
+		expect(
+			ui.harness.session.messages.filter((message) => message.role === "user").map(getMessageText),
+		).not.toContain("pending second");
+	} finally {
+		release.resolve();
+		first.resolve();
+		await delivery?.catch(() => {});
 		await ui.cleanup();
 	}
 });
@@ -2372,6 +2425,124 @@ it("restores only a later rejected input and reserved rest without replaying its
 		await ui.cleanup();
 	}
 });
+
+it.each(["steer", "followUp"] as const)(
+	"dequeues held retry %s input through Alt+Up before queue admission",
+	async (mode) => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const ui = await createSchedulingMode({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async (event) => {
+						if (event.text === "held retry input") {
+							entered.resolve();
+							await release.promise;
+						}
+					});
+				},
+			],
+		});
+		let delivery: Promise<void> | undefined;
+		try {
+			await ui.mode.init();
+			ui.internal.queueCompactionMessage("held retry input", mode);
+			ui.internal.queueCompactionMessage("reserved retry input", mode);
+			delivery = ui.internal.flushCompactionQueue({ willRetry: true });
+			await entered.promise;
+			const pending = mode === "steer" ? "steering" : "followUp";
+			expect(ui.internal.getAllQueuedMessages()[pending]).toEqual(["held retry input", "reserved retry input"]);
+			await ui.terminal.waitForRender();
+			expect(ui.terminal.getViewport().join("\n")).toContain("held retry input");
+			ui.terminal.sendInput("\x1b[1;3A");
+			await ui.terminal.waitForRender();
+			expect(ui.internal.editor.getText()).toBe("held retry input\n\nreserved retry input");
+			expect(ui.internal.getAllQueuedMessages()).toEqual({ steering: [], followUp: [] });
+			release.resolve();
+			await delivery;
+			expect(ui.harness.session.getSteeringMessages()).toEqual([]);
+			expect(ui.harness.session.getFollowUpMessages()).toEqual([]);
+			expect(ui.internal.compactionQueuedMessages).toEqual([]);
+			expect(ui.harness.faux.state.callCount).toBe(0);
+			expect(ui.harness.session.messages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
+				"original context",
+			]);
+			expect(ui.internal.editor.getText()).toBe("held retry input\n\nreserved retry input");
+		} finally {
+			release.resolve();
+			await delivery?.catch(() => {});
+			await ui.cleanup();
+		}
+	},
+);
+
+it.each(["steer", "followUp"] as const)(
+	"restores rejected retry %s input ahead of reserved and newer input without replaying accepted input",
+	async (mode) => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const ui = await createSchedulingMode({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async (event) => {
+						if (event.text === "rejected retry input") {
+							entered.resolve();
+							await release.promise;
+						}
+					});
+				},
+			],
+		});
+		const emitInput = ui.harness.session.extensionRunner.emitInput.bind(ui.harness.session.extensionRunner);
+		const input = vi.spyOn(ui.harness.session.extensionRunner, "emitInput").mockImplementation(async (...args) => {
+			const result = await emitInput(...args);
+			if (args[0] === "rejected retry input") throw new Error("retry input preflight rejected");
+			return result;
+		});
+		let delivery: Promise<void> | undefined;
+		try {
+			await ui.mode.init();
+			ui.internal.queueCompactionMessage("accepted retry input", mode);
+			ui.internal.queueCompactionMessage("rejected retry input", mode);
+			ui.internal.queueCompactionMessage("reserved retry input", mode);
+			delivery = ui.internal.flushCompactionQueue({ willRetry: true });
+			await entered.promise;
+			ui.internal.queueCompactionMessage("newer retry input", mode);
+			release.resolve();
+			await delivery;
+			expect(ui.internal.compactionQueuedMessages).toEqual([
+				{ text: "rejected retry input", mode },
+				{ text: "reserved retry input", mode },
+				{ text: "newer retry input", mode },
+			]);
+			const pending = mode === "steer" ? "steering" : "followUp";
+			expect(ui.internal.getAllQueuedMessages()[pending]).toEqual([
+				"accepted retry input",
+				"rejected retry input",
+				"reserved retry input",
+				"newer retry input",
+			]);
+			await ui.terminal.waitForRender();
+			expect(ui.terminal.getViewport().join("\n")).toContain("retry input preflight rejected");
+			input.mockRestore();
+			await ui.internal.flushCompactionQueue({ willRetry: true });
+			expect(ui.internal.getAllQueuedMessages()[pending]).toEqual([
+				"accepted retry input",
+				"rejected retry input",
+				"reserved retry input",
+				"newer retry input",
+			]);
+			expect(ui.internal.compactionQueuedMessages).toEqual([]);
+			expect(ui.harness.faux.state.callCount).toBe(0);
+		} finally {
+			release.resolve();
+			await delivery?.catch(() => {});
+			input.mockRestore();
+			ui.internal.clearAllQueues();
+			await ui.cleanup();
+		}
+	},
+);
 
 it("keeps retry batch commands immediate and preserves steering before follow-up delivery", async () => {
 	const response = Promise.withResolvers<void>();

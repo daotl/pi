@@ -249,6 +249,25 @@ describe("OpenAI Decisions", () => {
 		expect(result.errorMessage).not.toContain("<html>");
 	});
 
+	it.each([
+		{ hook: "onPayload", value: null },
+		{ hook: "onPayload", value: undefined },
+		{ hook: "onResponse", value: null },
+		{ hook: "onResponse", value: undefined },
+	] as const)("returns a classifier error when $hook rejects $value", async ({ hook, value }) => {
+		const fetch = vi.fn(async () => Response.json({ answers: wireAnswers }));
+		const result = await classify(model, context, {
+			apiKey: "secret",
+			fetch,
+			[hook]: () => Promise.reject(value),
+		});
+
+		expect(result.stopReason).toBe("error");
+		expect(result.answers).toEqual({});
+		expect(result.errorMessage).toBe(String(value));
+		expect(fetch).toHaveBeenCalledTimes(hook === "onPayload" ? 0 : 1);
+	});
+
 	it("still retries other server errors", async () => {
 		let attempt = 0;
 		const result = await classify(model, context, {

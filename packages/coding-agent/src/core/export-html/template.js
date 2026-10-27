@@ -1050,6 +1050,28 @@
         const name = call.name;
 
         const invalidArg = '<span class="tool-error">[invalid arg]</span>';
+        const rendered = renderedTools?.[call.id];
+        if (rendered?.callHtml || rendered?.resultHtmlCollapsed || rendered?.resultHtmlExpanded) {
+          if (rendered.callHtml) {
+            html += `<div class="tool-header ansi-rendered">${rendered.callHtml}</div>`;
+          } else {
+            html += `<div class="tool-header"><span class="tool-name">${escapeHtml(name)}</span></div>`;
+          }
+          if (rendered.resultHtmlCollapsed && rendered.resultHtmlExpanded && rendered.resultHtmlCollapsed !== rendered.resultHtmlExpanded) {
+            html += `<div class="tool-output expandable ansi-rendered" onclick="if(window.getSelection().toString())return;this.classList.toggle('expanded')">
+              <div class="output-preview">${rendered.resultHtmlCollapsed}</div>
+              <div class="output-full">${rendered.resultHtmlExpanded}</div>
+            </div>`;
+          } else if (rendered.resultHtmlExpanded || rendered.resultHtmlCollapsed) {
+            html += `<div class="tool-output ansi-rendered">${rendered.resultHtmlExpanded || rendered.resultHtmlCollapsed}</div>`;
+          } else if (result) {
+            const output = getResultText();
+            if (output) html += formatExpandableOutput(output, 10);
+          }
+          if (result) html += renderResultImages();
+          html += renderNestedCalls();
+          return html + '</div>';
+        }
 
         switch (name) {
           case 'bash': {
@@ -1137,38 +1159,11 @@
             break;
           }
           default: {
-            // Check for pre-rendered custom tool HTML
-            const rendered = renderedTools?.[call.id];
-            if (rendered?.callHtml || rendered?.resultHtmlCollapsed || rendered?.resultHtmlExpanded) {
-              // Custom tool with pre-rendered HTML from TUI renderer
-              if (rendered.callHtml) {
-                html += `<div class="tool-header ansi-rendered">${rendered.callHtml}</div>`;
-              } else {
-                html += `<div class="tool-header"><span class="tool-name">${escapeHtml(name)}</span></div>`;
-              }
-
-              if (rendered.resultHtmlCollapsed && rendered.resultHtmlExpanded && rendered.resultHtmlCollapsed !== rendered.resultHtmlExpanded) {
-                // Both collapsed and expanded differ - render expandable section
-                html += `<div class="tool-output expandable ansi-rendered" onclick="if(window.getSelection().toString())return;this.classList.toggle('expanded')">
-                  <div class="output-preview">${rendered.resultHtmlCollapsed}</div>
-                  <div class="output-full">${rendered.resultHtmlExpanded}</div>
-                </div>`;
-              } else if (rendered.resultHtmlExpanded) {
-                // Only expanded exists (or collapsed is identical) - show directly
-                html += `<div class="tool-output ansi-rendered">${rendered.resultHtmlExpanded}</div>`;
-              } else if (result) {
-                // No pre-rendered result HTML - fallback to JSON
-                const output = getResultText();
-                if (output) html += formatExpandableOutput(output, 10);
-              }
-            } else {
-              // Fallback to JSON display (existing behavior)
-              html += `<div class="tool-header"><span class="tool-name">${escapeHtml(name)}</span></div>`;
-              html += `<div class="tool-output"><pre>${escapeHtml(JSON.stringify(args, null, 2))}</pre></div>`;
-              if (result) {
-                const output = getResultText();
-                if (output) html += formatExpandableOutput(output, 10);
-              }
+            html += `<div class="tool-header"><span class="tool-name">${escapeHtml(name)}</span></div>`;
+            html += `<div class="tool-output"><pre>${escapeHtml(JSON.stringify(args, null, 2))}</pre></div>`;
+            if (result) {
+              const output = getResultText();
+              if (output) html += formatExpandableOutput(output, 10);
             }
           }
         }

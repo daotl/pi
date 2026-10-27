@@ -15,6 +15,9 @@ const lossyMessages: AgentMessage[] = [
 	fauxAssistantMessage([{ type: "text", text: "signed text", textSignature: "replay-id" }]),
 	fauxAssistantMessage([{ type: "toolCall", id: "call", name: "read", arguments: {}, raw: "<raw>" }]),
 	fauxAssistantMessage([{ type: "toolCall", id: "call", name: "read", arguments: {}, namespace: "dynamic" }]),
+	fauxAssistantMessage([
+		{ type: "toolCall", id: "call", name: "read", arguments: {}, argumentsError: 'Invalid JSON: {"path":' },
+	]),
 	fauxAssistantMessage([{ type: "thinking", thinking: "signed", thinkingSignature: "" }]),
 	fauxAssistantMessage([{ type: "text", text: " \t\n" }]),
 ];

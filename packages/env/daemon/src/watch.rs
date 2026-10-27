@@ -633,11 +633,16 @@ impl FileWatcher<'_> {
                 return true;
             }
         };
+        if event.need_rescan() {
+            // A metadata-equal snapshot cannot restore coverage after the OS has lost events.
+            self.send(json!({ "kind": "change", "overflow": true }));
+            return true;
+        }
         // Reads are not changes (libuv does not ask for them).
         if matches!(event.kind, EventKind::Access(_)) {
             return false;
         }
-        if event.need_rescan() || event.paths.is_empty() {
+        if event.paths.is_empty() {
             return true;
         }
         let mut flush = false;
@@ -774,5 +779,55 @@ pub fn run(id: u32, json: &Value, output: &Output, control: &Control) -> Result<
                 poll_at = Instant::now() + watcher.poll_interval;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_event_loss_reports_overflow_even_when_file_metadata_is_unchanged() {
+        let root = sys::mkdtemp(&format!("{}{}pi-env-rescan-", sys::tmpdir(), sys::PATH_SEPARATOR)).unwrap();
+        let path = Path::new(&root).join("watched.txt");
+        fs::write(&path, "unchanged").unwrap();
+        let output = Output::default();
+        let control = Control::default();
+        let (events_sender, _) = mpsc::channel();
+        let mut watcher = FileWatcher {
+            id: 7,
+            output: &output,
+            control: &control,
+            targets: vec![Target {
+                path: path.to_string_lossy().into_owned(),
+                recursive: false,
+                hidden: false,
+                names: HashSet::new(),
+            }],
+            mode: Mode::Native,
+            poll_interval: Duration::from_secs(1),
+            max_directories: DEFAULT_MAX_DIRECTORIES,
+            snapshot: Snapshot::new(),
+            native: None,
+            events_sender,
+            installed: HashMap::new(),
+            events: HashSet::new(),
+            settle_at: None,
+        };
+        watcher.snapshot = watcher.scan().unwrap_or_else(|error| panic!("{}", error.failure().message)).snapshot;
+        let next = watcher.scan().unwrap_or_else(|error| panic!("{}", error.failure().message));
+        assert!(watcher.diff(&watcher.snapshot, &next.snapshot).is_empty());
+        assert!(watcher.on_event(Ok(Event::new(EventKind::Other))));
+        assert!(watcher.on_event(Ok(Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan))));
+        // Observe the wire event before any native watcher installation can cause a platform fallback.
+        output.close();
+        let mut bytes = Vec::new();
+        output.run(&mut bytes);
+        let mut input = bytes.as_slice();
+        let event = crate::frame::read_frame(&mut input).unwrap().unwrap();
+        assert_eq!((event.kind, event.id), (EVENT, 7));
+        assert_eq!(event.json, json!({ "kind": "change", "overflow": true }));
+        assert!(crate::frame::read_frame(&mut input).unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 }

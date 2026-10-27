@@ -139,6 +139,43 @@ describe.skipIf(process.platform === "win32")("openTerminal", () => {
 		}
 	});
 
+	it("kills HUP-ignoring jobs on normal leader exit and preserves its exit code", async () => {
+		const { connection, cwd } = connect();
+		const output = collector();
+		const terminal = await openTerminal(connection, {
+			cwd,
+			argv: ["/bin/sh", "-i"],
+			cols: 80,
+			rows: 24,
+			onData: output.onData,
+		});
+		terminal.write("sh -c 'trap \"\" HUP; echo $$ > job.pid; printf JOB-; printf STARTED; exec sleep 100' &\n");
+		await output.waitFor("JOB-STARTED");
+		const pid = Number(readFileSync(join(cwd, "job.pid"), "utf8"));
+		try {
+			terminal.write("exit 7\n");
+			expect(await terminal.exited).toBe(7);
+			// No close/cancel: completion itself must relinquish a cleaned session.
+			await expect
+				.poll(() => {
+					try {
+						process.kill(pid, 0);
+						return true;
+					} catch {
+						return false;
+					}
+				})
+				.toBe(false);
+		} finally {
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				/* Already reaped. */
+			}
+			terminal.close();
+		}
+	});
+
 	it("delivers raw bytes, not decoded text", async () => {
 		const { connection, cwd } = connect();
 		const output = collector();

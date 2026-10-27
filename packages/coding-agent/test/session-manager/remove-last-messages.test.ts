@@ -1,8 +1,16 @@
+import {
+	BACKGROUND_CONTEXT,
+	type JsonlSessionMetadata,
+	JsonlSessionRepo,
+	type Session,
+} from "@earendil-works/pi-agent-core";
+import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import * as fs from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { buildSessionContext } from "../../../agent/src/harness/session/context.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 
 vi.mock("fs", async (importOriginal) => {
@@ -289,6 +297,70 @@ describe("SessionManager.removeLastMessages", () => {
 				firstKeptEntryId: count === 1 ? retained : checkpoint,
 				details: { source: "compaction" },
 			});
+		}
+	});
+
+	it("imports producer-written retain-none checkpoints through closed fork, first commit, and reopen", async () => {
+		const dir = fs.mkdtempSync(join(tmpdir(), "pi-retain-none-import-"));
+		tempDirs.push(dir);
+		const producer = SessionManager.create(dir, dir);
+		producer.appendMessage(userMessage("summarized question", 1));
+		producer.appendMessage(assistantMessage([{ type: "text", text: "summarized answer" }], 2));
+		const retained = producer.appendMessage(userMessage("deleted retained question", 3));
+		producer.appendMessage(assistantMessage([{ type: "text", text: "deleted retained answer" }], 4));
+		const checkpoint = producer.appendCompaction("saved summary", retained, 100, { source: "deletion" });
+		expect(producer.removeLastMessages(2)).toBe(2);
+		expect(producer.getEntry(checkpoint)).toMatchObject({ firstKeptEntryId: checkpoint });
+		const path = producer.getSessionFile()!;
+		const bytes = fs.readFileSync(path);
+		const header = producer.getHeader()!;
+		const metadata: JsonlSessionMetadata = {
+			id: header.id,
+			cwd: header.cwd,
+			path,
+			createdAt: Date.parse(header.timestamp),
+			modifiedAt: Date.parse(header.timestamp),
+			storageVersion: 3,
+		};
+		const fileSystem = new NodeExecutionEnv({ cwd: dir });
+		const repo = new JsonlSessionRepo({ fileSystem, sessionsRoot: dir });
+		const assertCheckpoint = async (session: Session) => {
+			const branch = await session.branch("main", BACKGROUND_CONTEXT);
+			if (!branch) throw new Error("Missing imported main branch");
+			const entries = await branch.findEntries({ order: "oldestFirst" }, BACKGROUND_CONTEXT);
+			expect(entries.at(-1)).toMatchObject({
+				type: "compaction",
+				summary: "saved summary",
+				retainedTail: [],
+				details: { source: "deletion" },
+			});
+			expect(await buildSessionContext(entries, undefined, BACKGROUND_CONTEXT)).toEqual([
+				expect.objectContaining({ role: "compactionSummary", summary: "saved summary" }),
+			]);
+			expect(
+				(await session.findEntries({ type: "message", order: "asc" }, BACKGROUND_CONTEXT)).map((entry) =>
+					entry.type === "message" && "content" in entry.message ? entry.message.content : undefined,
+				),
+			).toEqual(["summarized question", [{ type: "text", text: "summarized answer" }]]);
+		};
+		try {
+			const fork = await repo.fork(metadata, { scope: "tree", id: "retain-none-fork" }, BACKGROUND_CONTEXT);
+			await assertCheckpoint(fork);
+			await fork.close(BACKGROUND_CONTEXT);
+			expect(fs.readFileSync(path)).toEqual(bytes);
+			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
+			await assertCheckpoint(session);
+			expect(fs.readFileSync(path)).toEqual(bytes);
+			await session.setName("upgraded retain-none checkpoint", BACKGROUND_CONTEXT);
+			await assertCheckpoint(session);
+			await session.close(BACKGROUND_CONTEXT);
+			expect(JSON.parse(fs.readFileSync(path, "utf8").split("\n")[0])).toMatchObject({ v: 4 });
+			const reopened = await repo.open(metadata, BACKGROUND_CONTEXT);
+			await assertCheckpoint(reopened);
+			await reopened.close(BACKGROUND_CONTEXT);
+		} finally {
+			await repo.close(BACKGROUND_CONTEXT);
+			await fileSystem.cleanup(BACKGROUND_CONTEXT);
 		}
 	});
 

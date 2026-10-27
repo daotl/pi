@@ -923,8 +923,11 @@ export class RefImpl {
 	}
 
 	member(name: string): unknown {
-		const declared = this.describe(undefined, name);
 		const view = this.currentView();
+		// Before activation retain the declared placeholder; live members follow their actual variant.
+		const declared =
+			this.describe(view === undefined ? undefined : (variantOf(view) ?? LOCAL_VARIANT), name) ??
+			this.describe(undefined, name);
 		const value = view?.[name];
 		if (declared?.kind === "method" || (declared === undefined && typeof value === "function")) {
 			return this.caller(name);

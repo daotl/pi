@@ -1,4 +1,4 @@
-import { contractFromDescription, LOCAL_VARIANT, resolveHost } from "./contract.ts";
+import { bind, contractFromDescription, LOCAL_VARIANT, resolveHost } from "./contract.ts";
 import { type Encoder, encoder } from "./delta/index.ts";
 import { ChordError, invalid } from "./errors.ts";
 import type { HostImpl } from "./host.ts";
@@ -108,6 +108,8 @@ interface ServedLocal {
 	readonly again: boolean;
 	/** A unit was sent. */
 	unitSent: boolean;
+	/** Code version covered by the last sent unit's call projections. */
+	unitCodeVersion: number | undefined;
 	/** The members whose snapshot the consumer has, with their streams. */
 	readonly feeds: Map<string, Feed>;
 }
@@ -233,7 +235,7 @@ export class RelayRef {
 			this.#shaped = true;
 			if (this.frame.again !== true) this.urgent = new Set(frame.state);
 		}
-		this.origin.send({ ...frame, id: this.originId });
+		this.origin.send({ ...frame, id: this.originId, fencedCodeVersions: [...this.origin.fencedCodeVersions] });
 	}
 
 	/** A state frame from downstream. */
@@ -636,6 +638,13 @@ export class Connection implements RemoteChannel {
 		this.#syncWaiters.clear();
 	}
 
+	/** Even unchanged implementations acquire the committed code version; callers need its projection metadata. */
+	codeVersionChanged(): void {
+		for (const served of this.served.values()) {
+			if (served.kind === "local" && served.unitCodeVersion !== this.host.current.id) this.#unit(served);
+		}
+	}
+
 	/** Revokes the stamped principal: relays made under it close at once (also those still resolving a route). */
 	revoke(next: unknown | undefined): void {
 		this.generation++;
@@ -916,6 +925,7 @@ export class Connection implements RemoteChannel {
 			wantsState: frame.state !== false,
 			again: frame.again === true,
 			unitSent: false,
+			unitCodeVersion: undefined,
 			feeds: new Map(),
 		};
 		this.served.set(frame.id, served);
@@ -959,7 +969,27 @@ export class Connection implements RemoteChannel {
 		if (this.served.get(served.id) !== served) return;
 		const shape = served.ref.shape;
 		if (shape === undefined) return;
+		const callVariants = [];
+		for (const [codeVersion, installed] of served.ref.object.implementations) {
+			if (!this.host.hasCodeVersion(codeVersion)) continue;
+			if (codeVersion !== this.host.current.id) {
+				// A fresh modern consumer need not bind older provider code still retained for other roots.
+				// Check binding separately: an adapter throwing while producing its view must still surface.
+				try {
+					bind(installed.service.contract, installed.service.options.accepts, served.ref.contract);
+				} catch (error) {
+					if (error instanceof ChordError && error.code === "contract_mismatch") continue;
+					throw error;
+				}
+			}
+			const variant = variantOf(served.ref.viewOf(installed));
+			callVariants.push({ codeVersion, ...(variant === undefined ? {} : { variant }) });
+		}
+		// A type activated only in prepare has no committed implementation yet. Commit refreshes this hold;
+		// rollback disposes the object and sends gone. Never emit invalid empty metadata or admit pending code.
+		if (callVariants.length === 0) return;
 		served.unitSent = true;
+		served.unitCodeVersion = this.host.current.id;
 		const members = served.wantsState ? this.#stateMembers(served.ref, shape) : [];
 		const listed = members.filter((name) => !served.feeds.has(name));
 		const snaps: StateFrame[] = [];
@@ -976,6 +1006,8 @@ export class Connection implements RemoteChannel {
 			...(shape.variant === undefined ? {} : { variant: shape.variant }),
 			members: shape.members,
 			contract: shape.contract,
+			callVariants,
+			fencedCodeVersions: [...this.fencedCodeVersions],
 			state: snaps.map((frame) => frame.m),
 		});
 		for (const frame of snaps) this.send(frame);
@@ -1178,7 +1210,12 @@ export class Connection implements RemoteChannel {
 			binding.gone(fromWireError(frame.error));
 			return;
 		}
-		binding.shaped({ variant: frame.variant, members: frame.members, contract: frame.contract }, frame.state);
+		binding.shaped(
+			{ variant: frame.variant, members: frame.members, contract: frame.contract },
+			frame.state,
+			frame.callVariants,
+			frame.fencedCodeVersions,
+		);
 	}
 
 	#onResult(frame: Extract<Frame, { t: "result" }>): void {

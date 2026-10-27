@@ -1,7 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rename, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { afterEach, describe, expect, it } from "vitest";
@@ -93,6 +94,149 @@ describe("NodeExecutionEnv native overlapping watches", () => {
 			await removeTempDir(cwd);
 		}
 	});
+});
+
+describe("NodeExecutionEnv native watches through symlinked parents", () => {
+	it.skipIf(windows).each([
+		{ path: "AGENTS.md", exists: true },
+		{ path: "AGENTS.md", exists: false },
+		{ path: "nested/AGENTS.md", exists: false },
+	])(
+		"tracks $path (initially exists: $exists), rebuilds after retargeting, and stops on close",
+		async (target) => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-durable-env-link-"));
+			const real = mkdtempSync(join(tmpdir(), "pi-durable-env-real-"));
+			const env = new NodeExecutionEnv({ cwd, watch: { mode: "native" } });
+			const lexical = join(cwd, "link", target.path);
+			const first = join(real, "first");
+			const second = join(real, "second");
+			try {
+				getOrThrow(await env.createDir(first, undefined, context));
+				getOrThrow(await env.createDir(second, undefined, context));
+				if (target.exists) getOrThrow(await env.writeFile(join(first, target.path), "before", context));
+				await symlink(first, join(cwd, "link"));
+				const changes: WatchChange[] = [];
+				const watcher = getOrThrow(await env.watch([{ path: lexical }], (change) => changes.push(change), context));
+				const expectChange = async (action: () => Promise<void>): Promise<void> => {
+					changes.length = 0;
+					await action();
+					const deadline = Date.now() + 3000;
+					while (
+						!changes.some((change) => "paths" in change && change.paths.includes(lexical)) &&
+						Date.now() < deadline
+					) {
+						await delay(20);
+					}
+					expect(changes.some((change) => "paths" in change && change.paths.includes(lexical))).toBe(true);
+					expect(changes.some((change) => "error" in change || "overflow" in change)).toBe(false);
+					expect(watcher.mode).toBe("native");
+				};
+				try {
+					// Let the initial FSEvents settle scan finish before writing through the real path.
+					await delay(800);
+					await expectChange(async () => {
+						getOrThrow(await env.writeFile(join(first, target.path), "after initial setup", context));
+					});
+					await delay(800);
+					await expectChange(async () => {
+						await symlink(second, join(cwd, "next-link"));
+						await rename(join(cwd, "next-link"), join(cwd, "link"));
+					});
+					// Retargeting must rebuild native coverage, not rely on its one-time settle rescan.
+					await delay(800);
+					await expectChange(async () => {
+						getOrThrow(await env.writeFile(join(second, target.path), "after retargeting", context));
+					});
+					await delay(800);
+					await expectChange(async () => {
+						await rename(second, join(real, "old-second"));
+					});
+					// Let reconciliation discard the old inode before recreating the resolved directory.
+					await delay(900);
+					await expectChange(async () => {
+						getOrThrow(await env.createDir(second, undefined, context));
+					});
+					await delay(800);
+					await expectChange(async () => {
+						getOrThrow(await env.writeFile(join(second, target.path), "after directory replacement", context));
+					});
+					await watcher.close(context);
+					changes.length = 0;
+					getOrThrow(await env.writeFile(join(second, target.path), "after close", context));
+					await delay(600);
+					expect(changes).toEqual([]);
+				} finally {
+					await watcher.close(context);
+				}
+			} finally {
+				await removeTempDir(cwd);
+				await removeTempDir(real);
+			}
+		},
+		25_000,
+	);
+
+	it.skipIf(windows).each(["absolute", "relative", "nested-relative"])(
+		"tracks an initially dangling %s link after native watchers settle",
+		async (kind) => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-durable-env-dangling-link-"));
+			const real = mkdtempSync(join(tmpdir(), "pi-durable-env-dangling-real-"));
+			const env = new NodeExecutionEnv({ cwd, watch: { mode: "native" } });
+			const directory = join(real, "missing", "target");
+			const file = join(directory, "AGENTS.md");
+			const lexical = join(cwd, "link", "AGENTS.md");
+			try {
+				let destination = directory;
+				if (kind === "nested-relative") {
+					await symlink("missing/target", join(real, "indirect"));
+					destination = join(real, "indirect");
+				}
+				await symlink(kind === "absolute" ? destination : relative(cwd, destination), join(cwd, "link"));
+				const changes: WatchChange[] = [];
+				const watcher = getOrThrow(await env.watch([{ path: lexical }], (change) => changes.push(change), context));
+				const expectChange = async (action: () => Promise<void>): Promise<void> => {
+					changes.length = 0;
+					await action();
+					const deadline = Date.now() + 3000;
+					while (
+						!changes.some((change) => "paths" in change && change.paths.includes(lexical)) &&
+						Date.now() < deadline
+					) {
+						await delay(20);
+					}
+					expect(changes.some((change) => "paths" in change && change.paths.includes(lexical))).toBe(true);
+					expect(changes.some((change) => "error" in change || "overflow" in change)).toBe(false);
+					expect(watcher.mode).toBe("native");
+				};
+				try {
+					// No pending settle scan may discover creation on behalf of native coverage.
+					await delay(900);
+					await expectChange(async () => {
+						getOrThrow(await env.createDir(directory, undefined, context));
+					});
+					await delay(900);
+					await expectChange(async () => {
+						getOrThrow(await env.writeFile(file, "created after settling", context));
+					});
+					await delay(900);
+					await expectChange(async () => {
+						getOrThrow(await env.writeFile(file, "changed after settling", context));
+					});
+					await watcher.close(context);
+					changes.length = 0;
+					getOrThrow(await env.writeFile(file, "after close", context));
+					await delay(600);
+					expect(changes).toEqual([]);
+				} finally {
+					await watcher.close(context);
+				}
+			} finally {
+				await removeTempDir(cwd);
+				await removeTempDir(real);
+			}
+		},
+		15_000,
+	);
 });
 
 describe("NodeExecutionEnv watch limits", () => {

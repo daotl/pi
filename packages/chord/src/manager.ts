@@ -1,11 +1,12 @@
 // Host manager (Node only): runs a child host process and keeps at most one instance of it alive.
-import { type ChildProcess, fork } from "node:child_process";
+import { type ChildProcess, fork, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { unlinkSync } from "node:fs";
 import { lstat, mkdir, rm } from "node:fs/promises";
 import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { ChordError } from "./errors.ts";
 import { type IpcChannel, type IpcLink, ipcLink } from "./link.ts";
 
@@ -76,7 +77,8 @@ export interface ForkDriverOptions {
 /**
  * A process lock owned by the kernel for the holder's lifetime: an abstract socket (Linux, Android) or a named pipe
  * (Windows) vanishes with its process, so there is no stale state to take over and no race between two would-be
- * owners. Other platforms need a socket file, removed on exit; a leftover one nobody accepts on is taken over.
+ * owners. Other platforms need a socket file, removed on exit; a leftover one nobody accepts on is taken over under
+ * a SQLite write lock in a private per-user directory. The persistent claim file is never unlinked.
  * The child acquires it (before opening storage), so the lock follows the process that owns the data.
  */
 export async function processLock(name: string): Promise<() => Promise<void>> {
@@ -88,24 +90,47 @@ export async function processLock(name: string): Promise<() => Promise<void>> {
 			: file
 				? await lockSocketPath(`chord2-${key}.sock`)
 				: `\0chord2-${key}`;
-	const server = createServer((socket) => socket.end());
-	for (;;) {
+	// Every file-socket contender claims before even its first bind: an unguarded fresh bind can otherwise race
+	// a stale owner's unlink. SQLite's native file lock releases on close or process death without deleting its file.
+	const claim = file
+		? new DatabaseSync(await privateLockPath(`chord2-${key}.sock.reclaim.sqlite`), { timeout: 0 })
+		: undefined;
+	const locked = (): ChordError =>
+		new ChordError("unavailable", `lock ${name} is held by another process`, { reason: "locked" });
+	if (claim !== undefined) {
 		try {
-			await new Promise<void>((resolve, reject) => {
-				server.once("error", reject);
-				server.listen(address, () => {
-					server.removeListener("error", reject);
-					resolve();
-				});
-			});
-			break;
+			claim.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE");
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
-			if (!file || (await accepting(address))) {
-				throw new ChordError("unavailable", `lock ${name} is held by another process`, { reason: "locked" });
-			}
-			await rm(address, { force: true });
+			claim.close();
+			if (
+				error !== null &&
+				typeof error === "object" &&
+				(("errcode" in error && error.errcode === 5) || ("code" in error && error.code === "SQLITE_BUSY"))
+			)
+				throw locked();
+			throw error;
 		}
+	}
+	const server = createServer((socket) => socket.end());
+	try {
+		for (;;) {
+			try {
+				const listening = Promise.withResolvers<void>();
+				server.once("error", listening.reject);
+				server.listen(address, () => {
+					server.removeListener("error", listening.reject);
+					listening.resolve();
+				});
+				await listening.promise;
+				break;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
+				if (!file || (await accepting(address))) throw locked();
+				await rm(address, { force: true });
+			}
+		}
+	} finally {
+		claim?.close();
 	}
 	const removeFile = (): void => {
 		try {
@@ -133,6 +158,11 @@ const MAX_SOCKET_PATH_BYTES = 103;
 async function lockSocketPath(file: string): Promise<string> {
 	const preferred = join(tmpdir(), file);
 	if (Buffer.byteLength(preferred) <= MAX_SOCKET_PATH_BYTES) return preferred;
+	return privateLockPath(file);
+}
+
+/** Persistent claims and deep-path sockets share an owner-only directory, never the public temporary directory. */
+async function privateLockPath(file: string): Promise<string> {
 	const uid = process.getuid?.() ?? 0;
 	const directory = `/tmp/chord2-${uid}`;
 	await mkdir(directory, { mode: 0o700, recursive: true });
@@ -186,11 +216,44 @@ export function forkDriver(options: ForkDriverOptions): Driver {
 			}
 			const pid = child.pid ?? -1;
 			const killGroup = (): void => {
-				if (pid <= 0) return;
+				if (pid <= 0 || process.platform === "win32") return;
 				try {
 					process.kill(-pid, "SIGKILL");
 				} catch {
 					// No group left.
+				}
+			};
+			let treeTermination: Promise<void> | undefined;
+			const killTree = (): void => {
+				if (pid <= 0 || treeTermination !== undefined) return;
+				if (process.platform !== "win32") {
+					try {
+						process.kill(-pid, "SIGKILL");
+					} catch {
+						child.kill("SIGKILL");
+					}
+					return;
+				}
+				// taskkill must discover the descendants before their parent exits. Join it before reporting exit.
+				const terminated = Promise.withResolvers<void>();
+				treeTermination = terminated.promise;
+				const fallback = (): void => {
+					child.kill("SIGKILL");
+					terminated.resolve();
+				};
+				try {
+					const killer = spawn(
+						join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe"),
+						["/F", "/T", "/PID", String(pid)],
+						{ stdio: "ignore", windowsHide: true },
+					);
+					killer.once("error", fallback);
+					killer.once("close", (code) => {
+						if (code !== 0) fallback();
+						else terminated.resolve();
+					});
+				} catch {
+					fallback();
 				}
 			};
 			const terminal = Promise.withResolvers<Exit>();
@@ -201,7 +264,8 @@ export function forkDriver(options: ForkDriverOptions): Driver {
 			});
 			child.once("exit", (code, signal) => {
 				killGroup();
-				terminal.resolve({ code, signal });
+				if (treeTermination === undefined) terminal.resolve({ code, signal });
+				else void treeTermination.then(() => terminal.resolve({ code, signal }));
 			});
 			const listeners = new Set<(message: ControlMessage) => void>();
 			child.on("message", (message) => {
@@ -219,14 +283,7 @@ export function forkDriver(options: ForkDriverOptions): Driver {
 				link: ipcLink(child as unknown as IpcChannel),
 				exited,
 				send,
-				killTree: () => {
-					if (pid <= 0) return;
-					try {
-						process.kill(-pid, "SIGKILL");
-					} catch {
-						child.kill("SIGKILL");
-					}
-				},
+				killTree,
 				onControl: (listener) => listeners.add(listener),
 			};
 		},

@@ -12,7 +12,7 @@ import { Type } from "typebox";
 import { Transcript, TranscriptStateSchema } from "./transcript.ts";
 
 const TranscriptRuntime = local("pi.local.transcript-runtime", {
-	version: 1,
+	version: 2,
 	input: Type.Object({}),
 	members: { state: TranscriptStateSchema },
 });
@@ -33,7 +33,7 @@ export function createTranscriptServiceFacet(lane: AgentLane): Facet {
 						close: (watch) => watch.opened.unsubscribe(),
 					});
 					const state = self.state("transcript", TranscriptStateSchema, {
-						init: () => ({ snapshot: watch.value.opened.snapshot as LaneTranscriptSnapshot, event: null }),
+						init: () => ({ snapshot: watch.value.opened.snapshot as LaneTranscriptSnapshot, events: [] }),
 					});
 					let rebase: Promise<void> | undefined;
 					self.on(
@@ -54,14 +54,17 @@ export function createTranscriptServiceFacet(lane: AgentLane): Facet {
 							let needsRebase = false;
 							state.change(ctx, (draft) => {
 								needsRebase = reduceLaneSnapshot(draft.snapshot as unknown as LaneSnapshot, event) === "rebase";
-								draft.event = forwarded;
+								draft.events.push({ sequence: (draft.events.at(-1)?.sequence ?? 0) + 1, event: forwarded });
+								if (draft.events.length > 256) draft.events.splice(0, draft.events.length - 256);
 							});
 							if (needsRebase && rebase === undefined) {
 								rebase = (async () => {
 									const snapshot = await watch.value.opened.resnapshot(
 										withAbortSignal(ctx.signal, BACKGROUND_CONTEXT),
 									);
-									state.replace(ctx, { snapshot: snapshot as LaneTranscriptSnapshot, event: null });
+									state.change(ctx, (draft) => {
+										draft.snapshot = snapshot as LaneTranscriptSnapshot;
+									});
 								})();
 								try {
 									await rebase;

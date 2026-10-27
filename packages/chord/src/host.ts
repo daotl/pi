@@ -36,7 +36,7 @@ import {
 import { enqueue } from "./publish.ts";
 import type { Registry, RegistryTable, RegistryView } from "./registry.ts";
 import { type ReloadOptions, type ReloadReport, runReload } from "./reload.ts";
-import { RemoteBinding, RemoteRef } from "./remote.ts";
+import { RemoteBinding, type RemoteChannel, RemoteRef } from "./remote.ts";
 import { canonicalIdentity, canonicalJson, deepEqual, normalize } from "./schema.ts";
 import type { Ctx, GetOptions } from "./types.ts";
 import type { Frame } from "./wire.ts";
@@ -240,7 +240,7 @@ export interface CodeVersionState {
 	readonly id: number;
 	readonly services: Map<string, Service>;
 	tables: ReadonlyMap<string, RegistryTable<unknown>>;
-	/** Running roots with the number of their calls running here. */
+	/** Roots retaining this version, with active call counts; zero means a foreign root leased between calls. */
 	readonly roots: Map<string, number>;
 	/** Aborts every root of this code version (forced retirement). */
 	readonly abort: AbortController;
@@ -290,6 +290,8 @@ export class HostImpl implements Host, HostCore {
 	readonly #incarnation = Math.random().toString(36).slice(2, 8);
 	/** Links each root's calls went out on. */
 	readonly #rootLinks = new Map<string, Set<Connection>>();
+	/** Mirrors a provider's exceptional first-call admission of behind-child roots, shared across its holds. */
+	readonly #remoteAdmissions = new Map<string, Map<RemoteChannel, number>>();
 	current: CodeVersionState;
 	previous: CodeVersionState | undefined;
 	/** The code version a running reload will commit; new types activated during prepare install their implementation for it. */
@@ -629,10 +631,10 @@ export class HostImpl implements Host, HostCore {
 	}
 
 	/**
-	 * Runs `fn` inside root `rootId` of `codeVersion`. A root counts as running here (for retirement) while any of its
-	 * calls runs here. A root that started here ends when its last call here settles, even if it went out and came back
-	 * over a link meanwhile. A foreign root (started elsewhere, arriving `from` a link) keeps its leases on objects
-	 * until every link it came over announced its end (`root_end`) or closed, so its re-entry stays grandfathered.
+	 * Runs `fn` inside root `rootId` of `codeVersion`. A root that started here ends when its last call here settles,
+	 * even if it went out and came back over a link meanwhile. A foreign root (started elsewhere, arriving `from` a
+	 * link) retains its code version and object leases between calls until every incoming link announces `root_end`
+	 * or closes, so its next call can still use the retained implementation.
 	 */
 	async joinRoot<T>(
 		rootId: string,
@@ -669,8 +671,11 @@ export class HostImpl implements Host, HostCore {
 			const count = (codeVersion.roots.get(rootId) ?? 1) - 1;
 			if (count > 0) codeVersion.roots.set(rootId, count);
 			else {
-				codeVersion.roots.delete(rootId);
-				if (!this.#foreign.has(rootId)) this.endRoot(rootId);
+				if (this.#foreign.has(rootId)) codeVersion.roots.set(rootId, 0);
+				else {
+					codeVersion.roots.delete(rootId);
+					this.endRoot(rootId);
+				}
 				this.maybeRetire();
 				this.#retirementChanged();
 			}
@@ -687,14 +692,31 @@ export class HostImpl implements Host, HostCore {
 		links.add(connection);
 	}
 
+	remoteAdmission(rootId: string, channel: RemoteChannel, current: number): number {
+		let channels = this.#remoteAdmissions.get(rootId);
+		if (channels === undefined) {
+			channels = new Map();
+			this.#remoteAdmissions.set(rootId, channels);
+		}
+		const admitted = channels.get(channel) ?? current;
+		channels.set(channel, admitted);
+		return admitted;
+	}
+
 	/** A root ended (here, or announced by its origin): end its leases and tell the links it went out on. */
 	endRoot(rootId: string): void {
 		this.#local.delete(rootId);
 		this.#foreign.delete(rootId);
+		this.#remoteAdmissions.delete(rootId);
+		for (const codeVersion of this.codeVersions.values()) {
+			if (codeVersion.roots.get(rootId) === 0) codeVersion.roots.delete(rootId);
+		}
 		for (const object of this.#touches.get(rootId) ?? []) object.rootEnded(rootId);
 		this.#touches.delete(rootId);
 		for (const connection of this.#rootLinks.get(rootId) ?? []) connection.send({ t: "root_end", rootId });
 		this.#rootLinks.delete(rootId);
+		this.maybeRetire();
+		this.#retirementChanged();
 	}
 
 	/**
@@ -704,15 +726,15 @@ export class HostImpl implements Host, HostCore {
 	foreignRootEnded(rootId: string, from: Connection): void {
 		const links = this.#foreign.get(rootId);
 		if (links === undefined || !links.delete(from) || links.size > 0) return;
-		const running = [...this.codeVersions.values()].some((codeVersion) => codeVersion.roots.has(rootId));
+		const running = [...this.codeVersions.values()].some((codeVersion) => (codeVersion.roots.get(rootId) ?? 0) > 0);
 		// Still running here (a call in flight): the lease ends when it settles.
 		if (running) this.#foreign.delete(rootId);
 		else this.endRoot(rootId);
 	}
 
 	/**
-	 * Retires the previous code version once no local roots of it remain. A child also waits for its parent to retire
-	 * it: roots span hosts, and an old root on the server may still call in.
+	 * Retires the previous code version once no local or foreign roots retain it. A child also waits for its parent
+	 * to retire it: roots span hosts, and an old root on the server may still call in.
 	 */
 	maybeRetire(): void {
 		if (this.retirable()) this.retire();
@@ -1038,6 +1060,7 @@ export class HostImpl implements Host, HostCore {
 	/** The host's reload slot was freed: children that said hello meanwhile are synced or reconciled now. */
 	reloadEnded(): void {
 		this.reloading = false;
+		for (const connection of this.connections) connection.codeVersionChanged();
 		const deferred = [...this.#deferredHellos];
 		this.#deferredHellos.clear();
 		for (const [connection, codeVersion] of deferred) if (connection.open) this.peerHello(connection, codeVersion);
@@ -1058,6 +1081,10 @@ export class HostImpl implements Host, HostCore {
 		for (const [rootId, links] of [...this.#foreign])
 			if (links.has(connection)) this.foreignRootEnded(rootId, connection);
 		for (const links of this.#rootLinks.values()) links.delete(connection);
+		for (const [rootId, channels] of this.#remoteAdmissions) {
+			channels.delete(connection);
+			if (channels.size === 0) this.#remoteAdmissions.delete(rootId);
+		}
 		if (this.upstream === connection) {
 			this.upstream = undefined;
 			this.#childReloads.parentLost();

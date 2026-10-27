@@ -25,5 +25,16 @@ export default defineConfig({
     silent: 'passed-only',
     exclude: [...defaultExclude, ...e2eExclude],
     setupFiles: ['test/setup-e2e-guard.ts'],
+    // Both OAuth files require the registered callback port; run them after the parallel group, one file at a time.
+    projects: [
+      {
+        extends: true,
+        test: { name: 'parallel', exclude: [...defaultExclude, ...e2eExclude, 'test/openai-chatgpt-oauth.test.ts', 'test/openai-codex-oauth.test.ts'], sequence: { groupOrder: 0 } },
+      },
+      {
+        extends: true,
+        test: { name: 'fixed-port-oauth', include: ['test/openai-chatgpt-oauth.test.ts', 'test/openai-codex-oauth.test.ts'], fileParallelism: false, sequence: { groupOrder: 1 } },
+      },
+    ],
   }
 });

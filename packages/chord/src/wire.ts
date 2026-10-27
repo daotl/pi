@@ -21,7 +21,7 @@ import { CHORD_ERROR_CODES, ChordError } from "./errors.ts";
  * closes the link with reason `protocol-version <its version>`, so the other side learns it too
  * (`LinkOptions.onProtocolMismatch`).
  */
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 const Id = Type.Integer({ minimum: 1 });
 const Name = Type.String({ minLength: 1 });
@@ -31,6 +31,10 @@ const List = <T extends TSchema>(item: T) => Type.Immutable(Type.Array(item));
 
 const RootRefSchema = Type.Object({ rootId: Name, codeVersion: Type.Integer({ minimum: 1 }) });
 export type RootRef = Static<typeof RootRefSchema>;
+
+/** Consumer-view variants of the provider's current and retained implementations. */
+const CallVariantSchema = Type.Object({ codeVersion: Id, variant: Type.Optional(Type.String()) });
+export type CallVariant = Static<typeof CallVariantSchema>;
 
 const WireErrorSchema = Type.Object({
 	code: Type.Enum(CHORD_ERROR_CODES),
@@ -101,6 +105,10 @@ const FrameSchema = Type.Union([
 		variant: Type.Optional(Type.String()),
 		members: List(Type.String()),
 		contract: Type.String(),
+		/** Method projection metadata, independent of state hydration; at most current and previous code. */
+		callVariants: Type.Immutable(Type.Array(CallVariantSchema, { minItems: 1, maxItems: 2 })),
+		/** Versions this origin connection admits in current code at a root's first call. */
+		fencedCodeVersions: List(Id),
 		/** The state members whose snapshots follow this frame; the consumer applies the shape once they are here. */
 		state: List(Name),
 	}),

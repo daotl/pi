@@ -1,4 +1,5 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -60,6 +61,27 @@ describe("pi mcp", () => {
 			{ name: "fixture", state: "connected", tools: ["echo"] },
 			{ name: "parked", state: "disabled", tools: [] },
 		]);
+	});
+
+	it("cancels a stalled initialize at the whole-login deadline", async () => {
+		const server = createServer((request, response) => {
+			if (request.method === "POST") request.resume();
+			else response.end();
+		});
+		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+		try {
+			const address = server.address();
+			if (address === null || typeof address === "string") throw new Error("Expected loopback address");
+			const started = performance.now();
+			const result = await run(["login", "stalled", "--timeout", "0.05"], {
+				stalled: { url: `http://127.0.0.1:${address.port}/mcp`, timeout: 2 },
+			});
+			expect(result.exitCode).toBe(1);
+			expect(performance.now() - started).toBeLessThan(1_000);
+		} finally {
+			server.closeAllConnections();
+			await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+		}
 	});
 
 	it("rejects unknown servers and servers without OAuth for login and logout", async () => {

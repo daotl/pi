@@ -132,14 +132,14 @@ describe("experimental client TUI", () => {
 			});
 			const transcriptState = replicatedState<TranscriptState>({
 				snapshot: laneSnapshot() as LaneTranscriptSnapshot,
-				event: null,
+				events: [],
 			});
 			const emitTranscriptEvent = (event: LaneWatchEvent): void => {
 				transcriptState.change(BACKGROUND_CONTEXT, (draft) => {
 					if (reduceLaneSnapshot(draft.snapshot as unknown as LaneSnapshot, event) === "rebase") {
 						throw new Error("Test transcript event unexpectedly requires a rebase");
 					}
-					draft.event = event;
+					draft.events.push({ sequence: (draft.events.at(-1)?.sequence ?? 0) + 1, event });
 				});
 			};
 			let finishPrompt!: () => void;

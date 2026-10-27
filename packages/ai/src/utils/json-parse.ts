@@ -110,6 +110,16 @@ export function parseToolCallArguments(json: string | undefined): Pick<ToolCall,
 		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
 			throw new Error("Tool arguments must be a JSON object");
 		}
+		// JSON.parse accepts overflowing exponents as Infinity, even inside nested containers.
+		const pending: object[] = [parsed];
+		while (pending.length > 0) {
+			for (const value of Object.values(pending.pop()! as Record<string, unknown>)) {
+				if (typeof value === "number" && !Number.isFinite(value)) {
+					throw new Error("Tool arguments must contain only finite numbers");
+				}
+				if (typeof value === "object" && value !== null) pending.push(value);
+			}
+		}
 		return { arguments: parsed };
 	} catch (error) {
 		return {
