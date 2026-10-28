@@ -71,6 +71,101 @@ function client(server: Host, window: number, pendingCap?: number) {
 }
 
 describe("flow control with units", () => {
+	it("a fresh-root method completes after coordinated reload while ACKs and pending state stay paused", async () => {
+		const errors: unknown[] = [];
+		const server = createHost({ self: "host", name: "server", onError: (error) => errors.push(error) });
+		serveBlob(server, () => 2);
+		const [down, up] = memoryLinkPair();
+		server.accept(down, { principal: "worker", kind: "host", name: "worker", window: 1 });
+		const link = new CountingLink(up);
+		link.paused = true;
+		const worker = createHost({
+			self: "host",
+			name: "worker",
+			upstream: { link, principal: "server" },
+			onError: (error) => errors.push(error),
+		});
+		try {
+			const blob = await worker.get(Blob, { name: "reload" });
+			await blob.push("queued before reload");
+			const provider = [...(server as HostImpl).connections][0]!;
+			assert.ok(provider.waiting.slots > 0, "the provider's state window is saturated");
+			const stateBefore = stateFrames(link.received).length;
+			const report = await server.reload([]);
+			assert.equal(server.codeVersion, 2);
+			assert.equal(worker.codeVersion, 2);
+			assert.equal(report.children?.worker?.codeVersion, 2);
+			assert.equal(await worker.root((ctx) => blob.ping(ctx), { signal: AbortSignal.timeout(1000) }), "pong");
+			assert.equal(link.paused, true, "the method completed before acknowledgements resumed");
+			assert.equal(link.count("sent", "ack"), 0);
+			assert.equal(stateFrames(link.received).length, stateBefore, "method metadata must not flush queued state");
+			assert.equal(blob.lines.value.length, 2);
+			assert.ok(provider.waiting.slots > 0);
+			link.release();
+			await until(() => blob.lines.value.length === 3);
+			assert.equal(blob.lines.value.at(-1), "queued before reload");
+			assert.deepEqual(errors, []);
+		} finally {
+			link.release();
+			await worker.close();
+			await server.close();
+		}
+	});
+
+	it("reload call projections cross a relay while both state windows are stalled", async () => {
+		const errors: unknown[] = [];
+		const router = createHost({ self: "host", name: "router", onError: (error) => errors.push(error) });
+		const [providerDown, providerUp] = memoryLinkPair();
+		const providerLink = new CountingLink(providerDown);
+		providerLink.paused = true;
+		const server = createHost({
+			self: "host",
+			name: "server",
+			upstream: { link: providerUp, principal: "router" },
+			onError: (error) => errors.push(error),
+		});
+		serveBlob(server, () => 2);
+		router.accept(providerLink, { kind: "host", name: "server", principal: "server" });
+		router.route("server", { principal: () => "server", authorize: () => true, resolve: async () => providerLink });
+		const [down, up] = memoryLinkPair();
+		router.accept(down, { principal: "worker", kind: "host", name: "worker", window: 1 });
+		const workerLink = new CountingLink(up);
+		workerLink.paused = true;
+		const worker = createHost({
+			self: "host",
+			name: "worker",
+			upstream: { link: workerLink, principal: "router" },
+			onError: (error) => errors.push(error),
+		});
+		try {
+			const blob = await worker.get(Blob, { name: "relayed-reload" });
+			// Saturate the provider's default window as well as the relay's one-byte window.
+			await blob.push("x".repeat(300 * 1024));
+			await blob.push("queued at provider");
+			assert.ok((server as HostImpl).upstream!.waiting.slots > 0);
+			const before = stateFrames(workerLink.received).length;
+			await router.reload([]);
+			assert.equal(worker.codeVersion, 2);
+			assert.equal(server.codeVersion, 2);
+			assert.equal(await worker.root((ctx) => blob.ping(ctx), { signal: AbortSignal.timeout(1000) }), "pong");
+			assert.equal(providerLink.paused, true);
+			assert.equal(workerLink.paused, true);
+			assert.equal(stateFrames(workerLink.received).length, before);
+			assert.equal(blob.lines.value.length, 2);
+			providerLink.release();
+			workerLink.release();
+			await until(() => blob.lines.value.length === 4);
+			assert.equal(blob.lines.value.at(-1), "queued at provider");
+			assert.deepEqual(errors, []);
+		} finally {
+			providerLink.release();
+			workerLink.release();
+			await worker.close();
+			await router.close();
+			await server.close();
+		}
+	});
+
 	it("with large streams waiting behind a full window, a new get resolves at once and calls are answered", async () => {
 		const server = createHost({ self: { kind: "host" }, name: "server", onError: () => {} });
 		serveBlob(server, (name) => (name === "small" ? 1 : 500));

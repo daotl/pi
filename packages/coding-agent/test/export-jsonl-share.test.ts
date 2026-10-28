@@ -1,10 +1,16 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runInNewContext } from "node:vm";
 import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai/compat";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
+import { BACKGROUND_CONTEXT } from "../../agent/src/harness/context.ts";
+import { NodeExecutionEnv } from "../../agent/src/harness/env/nodejs.ts";
+import { JsonlStorage } from "../../agent/src/harness/session/jsonl/storage.ts";
+import { branchTip } from "../../agent/src/harness/session/values.ts";
+import { getExportTemplateDir } from "../src/config.ts";
 import { defineTool } from "../src/core/extensions/types.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -18,6 +24,72 @@ describe("JSONL share export", () => {
 	afterEach(() => {
 		for (const tempDir of tempDirs.splice(0)) {
 			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each(["a", null])("imports the downloaded selection %s rather than the abandoned tail", async (leafId) => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pi-download-checkpoint-"));
+		tempDirs.push(tempDir);
+		const source = readFileSync(join(getExportTemplateDir(), "template.js"), "utf8");
+		const start = source.indexOf("window.downloadSessionJson = function()");
+		const download = source.slice(start, source.indexOf("\n      }", start) + 8);
+		let blob: Blob | undefined;
+		const sandbox = {
+			window: {} as { downloadSessionJson?: () => void },
+			header: { type: "session", version: 3, id: "export", timestamp: new Date(1).toISOString(), cwd: tempDir },
+			entries: [
+				{
+					type: "message",
+					id: "a",
+					parentId: null,
+					timestamp: new Date(1).toISOString(),
+					message: userMsg("root"),
+				},
+				{
+					type: "message",
+					id: "b",
+					parentId: "a",
+					timestamp: new Date(2).toISOString(),
+					message: userMsg("abandoned tail"),
+				},
+			],
+			defaultLeafId: leafId,
+			Blob,
+			URL: {
+				createObjectURL: (value: Blob) => {
+					blob = value;
+					return "blob:download";
+				},
+				revokeObjectURL: () => {},
+			},
+			document: {
+				createElement: () => ({ click: () => {} }),
+				body: { appendChild: () => {}, removeChild: () => {} },
+			},
+		};
+		runInNewContext(download, sandbox);
+		sandbox.window.downloadSessionJson?.();
+		if (!blob) throw new Error("Download did not create a Blob");
+		const path = join(tempDir, "download.jsonl");
+		writeFileSync(path, await blob.text());
+		const storage = await JsonlStorage.open(
+			{ fileSystem: new NodeExecutionEnv({ cwd: tempDir }), path },
+			BACKGROUND_CONTEXT,
+		);
+		try {
+			const checkpoint = await storage.getValue(branchTip("main"), BACKGROUND_CONTEXT);
+			expect(checkpoint).toBeDefined();
+			const tip = checkpoint?.value;
+			if (leafId === null) expect(tip).toBeNull();
+			else {
+				const entries = await storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+				const selected = entries.find((entry) => entry.id === tip);
+				expect(selected?.type).toBe("message");
+				if (selected?.type !== "message") throw new Error("Selected entry is not a message");
+				expect(selected.message).toMatchObject({ role: "user", content: "root" });
+			}
+		} finally {
+			await storage.close(BACKGROUND_CONTEXT);
 		}
 	});
 

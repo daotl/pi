@@ -5,10 +5,58 @@ import { createContext, runInContext } from "node:vm";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { exportFromFile, exportSessionToHtml } from "../src/core/export-html/index.ts";
+import { createToolHtmlRenderer } from "../src/core/export-html/tool-renderer.ts";
 import { CURRENT_SESSION_VERSION, type SessionHeader, SessionManager } from "../src/core/session-manager.ts";
-import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { createShellRenderers } from "../src/core/tools/renderers/bash.ts";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
 
 describe("export HTML cost", () => {
+	it.each([42000, undefined])(
+		"uses only recorded duration %s while exporting historical bash results",
+		async (durationMs) => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-export-duration-"));
+			try {
+				initTheme("dark");
+				const manager = SessionManager.create(cwd, cwd);
+				manager.appendMessage({ role: "user", content: "run", timestamp: 1 });
+				manager.appendMessage({
+					...fauxAssistantMessage(""),
+					content: [{ type: "toolCall", id: "bash-1", name: "bash", arguments: { command: "echo done" } }],
+				});
+				manager.appendMessage({
+					role: "toolResult",
+					toolCallId: "bash-1",
+					toolName: "bash",
+					content: [{ type: "text", text: "done" }],
+					isError: false,
+					durationMs,
+					timestamp: 2,
+				});
+				const html = readFileSync(
+					await exportSessionToHtml(manager, undefined, {
+						outputPath: join(cwd, "out.html"),
+						toolRenderer: createToolHtmlRenderer({
+							getToolRenderers: (name) => (name === "bash" ? createShellRenderers("$") : undefined),
+							theme,
+							cwd,
+						}),
+					}),
+					"utf8",
+				);
+				const encoded = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1];
+				if (!encoded) throw new Error("Missing session payload");
+				const data = JSON.parse(Buffer.from(encoded, "base64").toString("utf8")) as {
+					renderedTools: Record<string, { resultHtmlExpanded?: string }>;
+				};
+				const text = data.renderedTools["bash-1"].resultHtmlExpanded ?? "";
+				if (durationMs !== undefined) expect(text).toContain("Took 42.0s");
+				else expect(text).not.toContain("Took");
+			} finally {
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("exports renderer overrides for built-in tool calls and results", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "pi-export-renderer-"));
 		try {

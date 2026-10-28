@@ -1191,7 +1191,7 @@
         if (defaultLeafId !== undefined) {
           lines.push(JSON.stringify({ type: 'leaf', leafId: defaultLeafId }));
         }
-        const jsonlContent = lines.join('\n');
+        const jsonlContent = lines.join('\n') + '\n';
 
         // Create download
         const blob = new Blob([jsonlContent], { type: 'application/x-ndjson' });

@@ -9,11 +9,11 @@ use crate::output::Output;
 use crate::sys;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, Metadata};
 use std::hash::Hasher;
 use std::io;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime};
@@ -216,6 +216,8 @@ fn any_unreliable(_targets: &[Target]) -> bool {
 struct Scan {
     snapshot: Snapshot,
     linked_files: HashSet<String>,
+    linked_directories: HashMap<String, Entry>,
+    resolved_parents: HashMap<String, ResolvedParent>,
     /// Directories counted against the limit, and directories traversed per target.
     counted: HashSet<String>,
     traversed: HashSet<(usize, String)>,
@@ -223,11 +225,75 @@ struct Scan {
     listed: HashMap<String, Kind>,
 }
 
+struct ResolvedParent {
+    entry: Entry,
+    /// Resolved child boundaries mapped to lexical target indices, including missing destinations.
+    targets: HashMap<String, HashSet<usize>>,
+}
+
+/// Resolve component by component: normalizing `..` first would skip preceding symlinks.
+fn scan_resolved_parents(target: &str, index: usize, parents: &mut HashMap<String, ResolvedParent>) {
+    let components = |path: &Path| -> VecDeque<PathBuf> {
+        path.components().map(|part| PathBuf::from(part.as_os_str())).collect()
+    };
+    let mut remaining = components(Path::new(target));
+    let mut directory = PathBuf::new();
+    let mut links = 0;
+    while let Some(component) = remaining.pop_front() {
+        match component.components().next() {
+            Some(Component::Prefix(_) | Component::RootDir) => {
+                directory.push(component);
+                continue;
+            }
+            Some(Component::CurDir) | None => continue,
+            Some(Component::ParentDir) => {
+                directory.pop();
+                continue;
+            }
+            Some(Component::Normal(_)) => {}
+        }
+        let Ok(metadata) = fs::metadata(&directory) else { return; };
+        if !metadata.is_dir() {
+            return;
+        }
+        let path = directory.join(component);
+        let name = directory.to_string_lossy().into_owned();
+        let entry = parents.entry(name).or_insert_with_key(|name| ResolvedParent {
+            entry: entry_of(name, &metadata, true, None),
+            targets: HashMap::new(),
+        });
+        entry.targets.entry(path.to_string_lossy().into_owned()).or_default().insert(index);
+        let Ok(metadata) = fs::symlink_metadata(&path) else { return; };
+        if metadata.file_type().is_symlink() {
+            links += 1;
+            if links > 40 {
+                return;
+            }
+            let Ok(destination) = fs::read_link(&path) else { return; };
+            if destination.is_absolute() {
+                directory.clear();
+            }
+            let mut destination = components(&destination);
+            destination.append(&mut remaining);
+            remaining = destination;
+        } else if metadata.is_dir() {
+            directory = path;
+        } else {
+            return;
+        }
+    }
+}
+
 struct Installed {
     dev: u64,
     ino: u64,
-    /// The watched path with links resolved, as FSEvents spells event paths (`/private/var` for `/var`).
-    canonical: Option<String>,
+    recursive: bool,
+}
+
+struct Alias {
+    /// The single native registration shared by all spellings of this identity.
+    canonical: String,
+    lexical: bool,
 }
 
 struct FileWatcher<'a> {
@@ -239,9 +305,11 @@ struct FileWatcher<'a> {
     poll_interval: Duration,
     max_directories: usize,
     snapshot: Snapshot,
+    resolved_parents: HashMap<String, ResolvedParent>,
     native: Option<RecommendedWatcher>,
     events_sender: Sender<notify::Result<Event>>,
     installed: HashMap<String, Installed>,
+    aliases: HashMap<String, Alias>,
     events: HashSet<String>,
     settle_at: Option<Instant>,
 }
@@ -355,6 +423,8 @@ impl FileWatcher<'_> {
         let mut scan = Scan {
             snapshot: Snapshot::new(),
             linked_files: HashSet::new(),
+            linked_directories: HashMap::new(),
+            resolved_parents: HashMap::new(),
             counted: HashSet::new(),
             traversed: HashSet::new(),
             listed: HashMap::new(),
@@ -371,8 +441,17 @@ impl FileWatcher<'_> {
                         mtime: (0, 0),
                         ..entry_of(&ancestor, &metadata, false, None)
                     };
+                    if self.mode == Mode::Native && metadata.file_type().is_symlink()
+                        && let Ok(followed) = fs::metadata(&ancestor)
+                        && followed.is_dir()
+                    {
+                        scan.linked_directories.insert(ancestor.clone(), entry_of(&ancestor, &followed, true, None));
+                    }
                     scan.snapshot.insert(ancestor, entry);
                 }
+            }
+            if self.mode == Mode::Native {
+                scan_resolved_parents(&target.path, index, &mut scan.resolved_parents);
             }
             // The target may be a symbolic link to what is watched; follow it. A missing target is watched for its
             // creation; one that cannot be reached for lack of permission fails.
@@ -439,8 +518,12 @@ impl FileWatcher<'_> {
             if report {
                 changed.extend(self.diff(&self.snapshot, &scan.snapshot));
             }
+            let added = self.mode == Mode::Native && self.reconcile(&scan);
             self.snapshot = scan.snapshot;
-            if self.mode == Mode::Polling || !self.reconcile(&scan.linked_files) {
+            if self.mode == Mode::Native {
+                self.resolved_parents = scan.resolved_parents;
+            }
+            if !added {
                 break;
             }
             if cfg!(target_os = "macos") {
@@ -452,56 +535,79 @@ impl FileWatcher<'_> {
         Ok(changed)
     }
 
-    /// Watch every existing ancestor of each target, each target directory, each target that links to a file, and on
-    /// Linux each directory below a recursive target (elsewhere one recursive watcher per target). Returns whether a
-    /// watcher was added.
-    fn reconcile(&mut self, linked_files: &HashSet<String>) -> bool {
+    /// Watch lexical ancestors, followed directories, and resolved replacement boundaries, plus each target.
+    /// Linux needs one watcher per descendant directory; elsewhere recursive roots cover their descendants.
+    fn reconcile(&mut self, scan: &Scan) -> bool {
         let per_directory = cfg!(any(target_os = "linux", target_os = "android"));
-        let mut wanted: HashMap<String, bool> = linked_files
+        let mut wanted: HashMap<String, bool> = scan.linked_files
             .iter()
             .map(|path| (path.clone(), false))
             .collect();
+        for path in scan.linked_directories.keys().chain(scan.resolved_parents.keys()) {
+            wanted.entry(path.clone()).or_insert(false);
+        }
         for target in &self.targets {
             for ancestor in ancestors(&target.path) {
-                if self
-                    .snapshot
-                    .get(&ancestor)
+                if scan.snapshot.get(&ancestor)
                     .is_some_and(|entry| entry.kind == Kind::Directory)
                 {
                     wanted.entry(ancestor).or_insert(false);
                 }
             }
-            if self
-                .snapshot
-                .get(&target.path)
+            if scan.snapshot.get(&target.path)
                 .is_none_or(|entry| entry.kind != Kind::Directory)
             {
                 continue;
             }
-            wanted.insert(target.path.clone(), target.recursive && !per_directory);
+            let recursive = target.recursive && !per_directory;
+            wanted.entry(target.path.clone()).and_modify(|existing| *existing |= recursive).or_insert(recursive);
             if target.recursive && per_directory {
-                for (path, entry) in &self.snapshot {
+                for (path, entry) in &scan.snapshot {
                     if entry.kind == Kind::Directory
                         && *path != target.path
                         && is_within(path, &target.path)
                     {
-                        wanted.insert(path.clone(), false);
+                        wanted.entry(path.clone()).or_insert(false);
                     }
                 }
             }
         }
-        // Gone, or replaced: a watcher follows the directory it was installed on, not the path.
-        let stale: Vec<String> = self
-            .installed
-            .iter()
-            .filter(|(path, installed)| {
-                !wanted.contains_key(*path)
-                    || self.snapshot.get(*path).is_none_or(|entry| {
-                        entry.dev != installed.dev || entry.ino != installed.ino
-                    })
+        let entry_for = |path: &String| {
+            scan.resolved_parents.get(path).map(|parent| &parent.entry)
+                .or_else(|| scan.linked_directories.get(path))
+                .or_else(|| scan.snapshot.get(path))
+        };
+        // Both FSEvents and inotify share registrations across aliases: a later nonrecursive watch can downgrade
+        // recursion, and unwatching one alias can remove another's descriptor. Register each identity only once.
+        let mut registrations: HashMap<(u64, u64), (String, bool)> = HashMap::new();
+        let mut aliases = HashMap::new();
+        for (path, recursive) in wanted {
+            let Some(entry) = entry_for(&path) else { continue; };
+            let Ok(canonical) = fs::canonicalize(&path) else { continue; };
+            let canonical = canonical.to_string_lossy().into_owned();
+            let identity = (entry.dev, entry.ino);
+            let registration = registrations.entry(identity).or_insert_with(|| (canonical.clone(), false));
+            // Stable selection for hard-linked file targets too, regardless of HashMap iteration order.
+            if canonical < registration.0 {
+                registration.0 = canonical;
+            }
+            registration.1 |= recursive;
+            let lexical = scan.snapshot.contains_key(&path);
+            aliases.insert(path, (identity, lexical));
+        }
+        let mut wanted = HashMap::new();
+        self.aliases = aliases.into_iter().map(|(path, (identity, lexical))| {
+            (path, Alias { canonical: registrations[&identity].0.clone(), lexical })
+        }).collect();
+        for ((dev, ino), (path, recursive)) in registrations {
+            wanted.insert(path, Installed { dev, ino, recursive });
+        }
+        // Retargeting an alias removes no registration still required by another target.
+        let stale: Vec<String> = self.installed.iter().filter(|(path, installed)| {
+            wanted.get(*path).is_none_or(|next| {
+                next.dev != installed.dev || next.ino != installed.ino || next.recursive != installed.recursive
             })
-            .map(|(path, _)| path.clone())
-            .collect();
+        }).map(|(path, _)| path.clone()).collect();
         for path in stale {
             self.installed.remove(&path);
             if let Some(native) = &mut self.native {
@@ -509,14 +615,10 @@ impl FileWatcher<'_> {
             }
         }
         let mut added = false;
-        for (path, recursive) in wanted {
-            let Some(entry) = self.snapshot.get(&path) else {
-                continue;
-            };
+        for (path, installed) in wanted {
             if self.installed.contains_key(&path) {
                 continue;
             }
-            let (dev, ino) = (entry.dev, entry.ino);
             if self.native.is_none() {
                 let sender = self.events_sender.clone();
                 match RecommendedWatcher::new(
@@ -530,25 +632,14 @@ impl FileWatcher<'_> {
                     }
                 }
             }
-            let mode = if recursive {
+            let mode = if installed.recursive {
                 RecursiveMode::Recursive
             } else {
                 RecursiveMode::NonRecursive
             };
             match self.native.as_mut().unwrap().watch(Path::new(&path), mode) {
                 Ok(()) => {
-                    let canonical = fs::canonicalize(&path)
-                        .ok()
-                        .map(|canonical| canonical.to_string_lossy().into_owned())
-                        .filter(|canonical| *canonical != path);
-                    self.installed.insert(
-                        path,
-                        Installed {
-                            dev,
-                            ino,
-                            canonical,
-                        },
-                    );
+                    self.installed.insert(path, installed);
                     added = true;
                 }
                 Err(error) => {
@@ -580,6 +671,8 @@ impl FileWatcher<'_> {
         self.mode = Mode::Polling;
         self.native = None;
         self.installed.clear();
+        self.resolved_parents.clear();
+        self.aliases.clear();
         self.send(json!({ "kind": "change", "overflow": true, "mode": "polling" }));
     }
 
@@ -604,22 +697,6 @@ impl FileWatcher<'_> {
         false
     }
 
-    /// An event path in the spelling of the watched path it is under.
-    fn watched_spelling(&self, path: &str) -> String {
-        let mut best: Option<(&str, &str)> = None;
-        for (watched, installed) in &self.installed {
-            if let Some(canonical) = &installed.canonical
-                && is_within(path, canonical)
-                && best.is_none_or(|(_, longest)| canonical.len() > longest.len())
-            {
-                best = Some((watched, canonical));
-            }
-        }
-        match best {
-            Some((watched, canonical)) => format!("{watched}{}", &path[canonical.len()..]),
-            None => path.to_string(),
-        }
-    }
 
     /// Note a native event; returns whether it calls for a rescan.
     fn on_event(&mut self, event: notify::Result<Event>) -> bool {
@@ -647,12 +724,37 @@ impl FileWatcher<'_> {
         }
         let mut flush = false;
         for path in &event.paths {
-            let path = self.watched_spelling(&path.to_string_lossy());
-            // Events about unrelated siblings of an ancestor, or about excluded entries, are ignored.
-            if self.in_scope(&path) {
-                let reported = self.reported(&path);
-                self.events.insert(reported);
-                flush = true;
+            let raw = path.to_string_lossy();
+            // Resolved boundary events must keep lexical spelling even while a link is dangling. Also inspect the
+            // canonical spelling of parents (/private/var on macOS), without cloning snapshots or file content.
+            for (directory, parent) in &self.resolved_parents {
+                let canonical = self.aliases.get(directory).map(|alias| alias.canonical.as_str());
+                for (boundary, targets) in &parent.targets {
+                    let relevant = is_within(boundary, &raw)
+                        || canonical.is_some_and(|canonical| {
+                            raw.strip_prefix(canonical).is_some_and(|suffix| {
+                                (suffix.is_empty() || suffix.starts_with(sys::PATH_SEPARATOR))
+                                    && is_within(boundary, &format!("{directory}{suffix}"))
+                            })
+                        });
+                    if relevant {
+                        for index in targets {
+                            self.events.insert(self.targets[*index].path.clone());
+                        }
+                        flush = true;
+                    }
+                }
+            }
+            // One native event can belong to multiple lexical targets. Keep every spelling, not just whichever
+            // alias happened to be installed last (or the longest canonical prefix).
+            for (lexical, alias) in &self.aliases {
+                if alias.lexical && is_within(&raw, &alias.canonical) {
+                    let path = format!("{lexical}{}", &raw[alias.canonical.len()..]);
+                    if self.in_scope(&path) {
+                        self.events.insert(self.reported(&path));
+                        flush = true;
+                    }
+                }
             }
         }
         flush
@@ -731,8 +833,10 @@ pub fn run(id: u32, json: &Value, output: &Output, control: &Control) -> Result<
             .as_u64()
             .map_or(DEFAULT_MAX_DIRECTORIES, |max| max as usize),
         snapshot: Snapshot::new(),
+        resolved_parents: HashMap::new(),
         native: None,
         events_sender,
+        aliases: HashMap::new(),
         installed: HashMap::new(),
         events: HashSet::new(),
         settle_at: None,
@@ -808,9 +912,11 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             max_directories: DEFAULT_MAX_DIRECTORIES,
             snapshot: Snapshot::new(),
+            resolved_parents: HashMap::new(),
             native: None,
             events_sender,
             installed: HashMap::new(),
+            aliases: HashMap::new(),
             events: HashSet::new(),
             settle_at: None,
         };
@@ -828,6 +934,42 @@ mod tests {
         assert_eq!((event.kind, event.id), (EVENT, 7));
         assert_eq!(event.json, json!({ "kind": "change", "overflow": true }));
         assert!(crate::frame::read_frame(&mut input).unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn resolves_nested_dangling_boundaries_without_normalizing_links_or_looping() {
+        use std::os::unix::fs::symlink;
+
+        let root = sys::mkdtemp(&format!("{}/pi-env-resolved-", sys::tmpdir())).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let workspace = root.join("workspace");
+        let real = root.join("real");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(real.join("inside")).unwrap();
+        symlink("real/inside", root.join("indirect")).unwrap();
+        symlink("../indirect/../missing/target", workspace.join("link")).unwrap();
+        let target = workspace.join("link/AGENTS.md");
+        let mut parents = HashMap::new();
+        for index in [0, 1] {
+            scan_resolved_parents(&target.to_string_lossy(), index, &mut parents);
+        }
+        // `indirect/..` means real, not the lexical parent of indirect. Both consumers retain coverage at the
+        // first missing destination, then resolution advances when that destination is created.
+        let boundary = real.join("missing").to_string_lossy().into_owned();
+        assert_eq!(parents[&real.to_string_lossy().into_owned()].targets[&boundary], HashSet::from([0, 1]));
+        fs::create_dir_all(real.join("missing/target")).unwrap();
+        parents.clear();
+        scan_resolved_parents(&target.to_string_lossy(), 0, &mut parents);
+        let directory = real.join("missing/target").to_string_lossy().into_owned();
+        assert!(parents[&directory].targets.contains_key(&format!("{directory}/AGENTS.md")));
+
+        symlink("cycle/longer", workspace.join("cycle")).unwrap();
+        parents.clear();
+        let started = Instant::now();
+        scan_resolved_parents(&workspace.join("cycle/AGENTS.md").to_string_lossy(), 0, &mut parents);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(parents.values().any(|parent| parent.targets.contains_key(&workspace.join("cycle").to_string_lossy().into_owned())));
         fs::remove_dir_all(root).unwrap();
     }
 }

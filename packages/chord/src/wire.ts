@@ -6,7 +6,7 @@ import { CHORD_ERROR_CODES, ChordError } from "./errors.ts";
 // JSON frames between two hosts (or a host and a client). Ids are chosen by the side that creates the hold, call or
 // subscription; every frame type has one direction, so ids never collide:
 //   consumer → provider: hold, release, call, cancel, sub, unsub, resync
-//   provider → consumer: shape, gone, result, state
+//   provider → consumer: shape, projections, gone, result, state
 // State is addressed by (hold id, member): a hold implies the state of its variant, sent as units (a shape followed by
 // a snapshot of each member the consumer lacks; see Connection).
 //   both: hello, ping, pong, bye, root_end, ack; parent → child: invalidate, prepare, commit, abort, retire;
@@ -19,9 +19,10 @@ import { CHORD_ERROR_CODES, ChordError } from "./errors.ts";
 /**
  * The link protocol version, announced in `hello`. Peers of different versions do not talk: the side that notices
  * closes the link with reason `protocol-version <its version>`, so the other side learns it too
- * (`LinkOptions.onProtocolMismatch`).
+ * (`LinkOptions.onProtocolMismatch`). Version 6 adds control-only method projections, independent of state units and
+ * their flow-control window.
  */
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 const Id = Type.Integer({ minimum: 1 });
 const Name = Type.String({ minLength: 1 });
@@ -113,6 +114,13 @@ const FrameSchema = Type.Union([
 		state: List(Name),
 	}),
 	Type.Object({ t: Type.Literal("gone"), id: Id, error: WireErrorSchema }),
+	/** Method metadata alone: never changes the shape or its pending state snapshots. */
+	Type.Object({
+		t: Type.Literal("projections"),
+		id: Id,
+		callVariants: Type.Immutable(Type.Array(CallVariantSchema, { minItems: 1, maxItems: 2 })),
+		fencedCodeVersions: List(Id),
+	}),
 	Type.Object({
 		t: Type.Literal("call"),
 		id: Id,

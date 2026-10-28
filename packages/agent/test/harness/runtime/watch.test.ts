@@ -1,4 +1,10 @@
-import { type AssistantMessageFrame, createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessageFrame,
+	AssistantMessageFrameReducer,
+	createModels,
+	fauxAssistantMessage,
+	fauxProvider,
+} from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type HarnessEvent, HarnessFault, type WatchHandle } from "../../../src/harness/agent-harness.ts";
 import { DEFAULT_COMPACTION_SETTINGS } from "../../../src/harness/compaction/compaction.ts";
@@ -264,6 +270,12 @@ describe("runtime lane watch", () => {
 			{ type: "start", partial },
 			{ type: "text_start", contentIndex: 0, content: { type: "text", text: "" } },
 			{ type: "text_delta", contentIndex: 0, delta: "partial" },
+			{
+				type: "toolcall_start",
+				contentIndex: 1,
+				toolCall: { type: "toolCall", id: "call", name: "write", arguments: {} },
+			},
+			{ type: "toolcall_delta", contentIndex: 1, delta: '{"path":"line\\' },
 		];
 		const frameOperationId = frameSession.idGenerator.next();
 		await commit(frameSession, [
@@ -302,7 +314,15 @@ describe("runtime lane watch", () => {
 		]);
 		const frameHarness = await attach(frameSession);
 		const frameWatch = await frameHarness.watch(BACKGROUND_CONTEXT);
-		expect(frameWatch.snapshot.operation?.streamingMessage?.content).toEqual([{ type: "text", text: "partial" }]);
+		expect(frameWatch.snapshot.operation?.streamingMessage?.content[0]).toEqual({ type: "text", text: "partial" });
+		const operation = frameWatch.snapshot.operation!;
+		expect(operation.streamingFrameState?.messageId).toBe("response");
+		const resumed = new AssistantMessageFrameReducer(
+			operation.streamingMessage,
+			operation.streamingFrameState!.checkpoint,
+		);
+		resumed.apply({ type: "toolcall_delta", contentIndex: 1, delta: 'nnext"}' });
+		expect(resumed.message?.content[1]).toMatchObject({ arguments: { path: "line\nnext" } });
 		frameWatch.unsubscribe();
 
 		const toolSession = await createSession();

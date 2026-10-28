@@ -1869,7 +1869,12 @@ class SelfImpl implements Self {
 		// A prepare rerun (recording mode) binds new references against the reload's pending contracts: a breaking provider
 		// change and its updated consumer reload together.
 		const candidate = this.#previous !== undefined;
-		const address = host.addressOf(type, input, options?.principal ?? host.principal, candidate);
+		const address = host.addressOf(
+			type,
+			input,
+			options?.principal === undefined ? host.principal : options.principal,
+			candidate,
+		);
 		const declared = this.#decls.refs.get(address);
 		if (declared !== undefined) {
 			if (declared.contract.fingerprint !== type.fingerprint) {

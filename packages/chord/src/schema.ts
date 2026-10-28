@@ -190,8 +190,9 @@ function objectFits(sub: Schema, sup: Schema): boolean {
 		if (sub.additionalProperties !== false && Object.keys(subPatterns).length === 0) return false;
 		for (const [pattern, property] of Object.entries(supPatterns)) {
 			const matcher = new RegExp(pattern, "u");
+			// Named properties also obey every matching pattern; JSON Schema combines these constraints.
 			for (const [key, subProperty] of Object.entries(subProperties)) {
-				if (!(key in supProperties) && matcher.test(key) && !fits(subProperty, property)) return false;
+				if (matcher.test(key) && !fits(subProperty, property)) return false;
 			}
 			if (
 				Object.keys(subPatterns).length > 0 &&

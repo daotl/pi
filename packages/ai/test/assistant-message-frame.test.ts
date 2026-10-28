@@ -6,6 +6,7 @@ import {
 	type AssistantMessageEvent,
 	type AssistantMessageFrame,
 	AssistantMessageFrameEncoder,
+	AssistantMessageFrameReducer,
 	type Model,
 	reduceAssistantMessageFrames,
 } from "../src/index.ts";
@@ -142,6 +143,49 @@ describe("assistant message frames", () => {
 			thoughtSignature: "thought",
 			namespace: "files",
 		});
+	});
+
+	it("resumes interleaved frame reduction from a snapshot without repairing the unfinished JSON prefix", () => {
+		const reducer = new AssistantMessageFrameReducer();
+		reducer.apply({ type: "start", partial: seed() });
+		reducer.apply({ type: "text_start", contentIndex: 0, content: { type: "text", text: "before" } });
+		reducer.apply({
+			type: "toolcall_start",
+			contentIndex: 1,
+			toolCall: { type: "toolCall", id: "call", name: "write", arguments: {} },
+		});
+		reducer.apply({ type: "toolcall_delta", contentIndex: 1, delta: '{"path":"line\\' });
+		const message = structuredClone(reducer.message);
+		const checkpoint = reducer.checkpoint();
+		const resumed = new AssistantMessageFrameReducer(message, checkpoint);
+		resumed.apply({ type: "toolcall_delta", contentIndex: 1, delta: 'nnext"}' });
+		resumed.apply({ type: "text_delta", contentIndex: 0, delta: " after" });
+		expect(resumed.message?.content).toEqual([
+			{ type: "text", text: "before after" },
+			{ type: "toolCall", id: "call", name: "write", arguments: { path: "line\nnext" } },
+		]);
+		expect(reducer.message).toEqual(message);
+		resumed.apply({
+			type: "toolcall_end",
+			contentIndex: 1,
+			id: "call",
+			name: "write",
+			arguments: {},
+			argumentsError: "malformed provider arguments",
+			raw: "{invalid",
+		});
+		expect(resumed.message?.content[1]).toEqual({
+			type: "toolCall",
+			id: "call",
+			name: "write",
+			arguments: {},
+			argumentsError: "malformed provider arguments",
+			raw: "{invalid",
+		});
+		const settled = new AssistantMessageFrameReducer(resumed.message, resumed.checkpoint());
+		expect(() => settled.apply({ type: "toolcall_delta", contentIndex: 1, delta: "late" })).toThrow(
+			"follows the end",
+		);
 	});
 
 	it("round-trips OpenAI Responses content supplied only by authoritative end events", async () => {

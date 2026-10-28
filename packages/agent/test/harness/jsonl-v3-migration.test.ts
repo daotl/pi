@@ -1,6 +1,7 @@
-import type { Usage } from "@earendil-works/pi-ai";
+import { type AssistantMessage, fauxAssistantMessage, type Usage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SessionManager } from "../../../coding-agent/src/core/session-manager.ts";
+import { getUsageTotals } from "../../../coding-agent/src/core/usage-totals.ts";
 import { BACKGROUND_CONTEXT, type Context } from "../../src/harness/context.ts";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import {
@@ -88,6 +89,109 @@ describe("JSONL v3 migration", () => {
 		getOrThrow(await fileSystem.writeFile(path, content, BACKGROUND_CONTEXT));
 		return { path, content };
 	}
+
+	it.each(["replace", "remove", "compaction", "branch-summary"] as const)(
+		"counts producer-written %s replay charges once across upgrade and reopen without dropping nodes",
+		async (operation) => {
+			const directory = getOrThrow(await fileSystem.absolutePath("charge-producer", BACKGROUND_CONTEXT));
+			const producer = SessionManager.create("/workspace", directory);
+			const usage: Usage = {
+				input: 11,
+				output: 7,
+				cacheRead: 3,
+				cacheWrite: 2,
+				totalTokens: 23,
+				cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 },
+			};
+			const message: AssistantMessage = { ...fauxAssistantMessage("original answer"), usage };
+			const root = producer.appendMessage({ role: "user", content: "root", timestamp: NOW });
+			const first = producer.appendMessage(message);
+			producer.appendMessage({ ...message, content: [{ type: "text", text: "distinct charge" }] });
+			if (operation === "replace") {
+				producer.replaceMessages([
+					{ entryId: first, message: { ...message, content: [{ type: "text", text: "edited" }] } },
+				]);
+			} else if (operation === "remove") {
+				producer.removeEntries([root]);
+			} else {
+				const summaryId =
+					operation === "compaction"
+						? producer.appendCompaction("checkpoint", first, 100, undefined, false, usage)
+						: producer.branchWithSummary(root, "branch checkpoint", undefined, false, usage);
+				const summary = producer.getEntry(summaryId);
+				if (!summary) throw new Error("Missing produced summary");
+				producer.appendTrailingEntries([summary]);
+			}
+			const expectedCharges = operation === "replace" || operation === "remove" ? 2 : 3;
+			expect(getUsageTotals(producer.getEntries())).toEqual({
+				input: 11 * expectedCharges,
+				output: 7 * expectedCharges,
+				cacheRead: 3 * expectedCharges,
+				cacheWrite: 2 * expectedCharges,
+				cost: 10 * expectedCharges,
+			});
+			const path = producer.getSessionFile()!;
+			const original = getOrThrow(await fileSystem.readTextFile(path, BACKGROUND_CONTEXT));
+			const options = { fileSystem, path, now: () => NOW };
+			const storage = await JsonlStorage.open(options, BACKGROUND_CONTEXT);
+			const entries = await storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+			expect(entries.map((entry) => (entry.type === "message" ? entry.message : entry.type))).toEqual(
+				producer.getEntries().map((entry) => (entry.type === "message" ? entry.message : entry.type)),
+			);
+			const expectedUsage: Usage = {
+				input: 11 * expectedCharges,
+				output: 7 * expectedCharges,
+				cacheRead: 3 * expectedCharges,
+				cacheWrite: 2 * expectedCharges,
+				totalTokens: 23 * expectedCharges,
+				cost: {
+					input: expectedCharges,
+					output: 2 * expectedCharges,
+					cacheRead: 3 * expectedCharges,
+					cacheWrite: 4 * expectedCharges,
+					total: 10 * expectedCharges,
+				},
+			};
+			expect((await storage.getStats(BACKGROUND_CONTEXT)).usage).toEqual(expectedUsage);
+			expect(getOrThrow(await fileSystem.readTextFile(path, BACKGROUND_CONTEXT))).toBe(original);
+			await storage.commit([storedValues.setValue(storedValues.sessionName, "converted")], BACKGROUND_CONTEXT);
+			expect((await storage.getStats(BACKGROUND_CONTEXT)).usage).toEqual(expectedUsage);
+			expect(await storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT)).toEqual(entries);
+			expect(await storage.scanUsage({ order: "asc" }, BACKGROUND_CONTEXT)).toEqual([
+				expect.objectContaining({ usage: expectedUsage, adjustment: true, details: { source: "v3-import" } }),
+			]);
+			await storage.close(BACKGROUND_CONTEXT);
+			const reopened = await JsonlStorage.open(options, BACKGROUND_CONTEXT);
+			expect((await reopened.getStats(BACKGROUND_CONTEXT)).usage).toEqual(expectedUsage);
+			expect(await reopened.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT)).toEqual(entries);
+			await reopened.close(BACKGROUND_CONTEXT);
+		},
+	);
+
+	it("does not consume a charge identity until a receipt reports usage", async () => {
+		const usage = fauxAssistantMessage("answer").usage;
+		const charged: Usage = { ...usage, input: 11, totalTokens: 11 };
+		const { path } = await writeLegacyV3Fixture([
+			{
+				type: "message",
+				id: "source",
+				parentId: null,
+				timestamp: new Date(NOW).toISOString(),
+				message: { role: "user", content: "no usage", timestamp: NOW },
+			},
+			{
+				type: "message",
+				id: "receipt",
+				parentId: "source",
+				usageSourceId: "source",
+				timestamp: new Date(NOW + 1).toISOString(),
+				message: { ...fauxAssistantMessage("answer"), usage: charged },
+			},
+		]);
+		const storage = await JsonlStorage.open({ fileSystem, path }, BACKGROUND_CONTEXT);
+		expect((await storage.getStats(BACKGROUND_CONTEXT)).usage).toEqual(charged);
+		await storage.close(BACKGROUND_CONTEXT);
+	});
 
 	// #23: SessionManager legitimately writes leaf checkpoints under its unchanged v3 header.
 	it.each(["ancestor", "empty"] as const)(

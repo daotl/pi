@@ -195,8 +195,40 @@ pub fn read_pipe(mut pipe: impl Pipe, stop: &AtomicBool, mut on_data: impl FnMut
     }
 }
 
-/// Readers poll `stop` every 100 ms.
-pub fn interrupt_reader(_reader: &std::thread::JoinHandle<()>) {}
+/// Write a script without retaining a blocked pipe after the command settles.
+pub fn write_stdin(mut pipe: std::process::ChildStdin, mut bytes: &[u8], stop: &AtomicBool) {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    let fd = pipe.as_raw_fd();
+    // SAFETY: fcntl on the pipe owned by this thread; do not write if nonblocking setup fails.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return;
+        }
+    }
+    while !bytes.is_empty() && !stop.load(Ordering::SeqCst) {
+        let mut poll = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+        // SAFETY: one valid pollfd; the bounded wait observes stop even if descendants retain stdin.
+        let ready = unsafe { libc::poll(&mut poll, 1, 100) };
+        if ready == 0 || (ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted) {
+            continue;
+        }
+        if ready < 0 {
+            return;
+        }
+        match pipe.write(&bytes[..bytes.len().min(64 * 1024)]) {
+            Ok(0) => return,
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// Pipe workers poll `stop` every 100 ms.
+pub fn interrupt_pipe(_worker: &std::thread::JoinHandle<()>) {}
 
 /// The program an argv command runs; `Command` searches `PATH` like `execvp`, as libuv does.
 pub fn resolve_program(

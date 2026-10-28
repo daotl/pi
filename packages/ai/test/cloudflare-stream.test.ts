@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { isContextClampingApiStreams } from "../src/api/context-clamp-provenance.ts";
+import { isHistoryPreservingApi } from "../src/api/history-provenance.ts";
+import { isDirectOpenAICompletionsApi, openAICompletionsApi } from "../src/api/openai-completions.lazy.ts";
 import { cloudflareStreams } from "../src/providers/cloudflare-stream.ts";
+import { fauxProvider } from "../src/providers/faux.ts";
+import { withOpenCodeSessionHeader } from "../src/providers/opencode-headers.ts";
 import type { Api, Model } from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
@@ -20,6 +25,21 @@ const model: Model<Api> = {
 const context = normalizeContext({ messages: [] });
 
 describe("Cloudflare provider streams", () => {
+	it.each([
+		["Cloudflare", cloudflareStreams],
+		["OpenCode", withOpenCodeSessionHeader],
+	] as const)("preserves only native output-clamp authority through %s", (_name, wrap) => {
+		const wrapped = wrap(openAICompletionsApi());
+		expect(isContextClampingApiStreams(wrapped)).toBe(true);
+		expect(isHistoryPreservingApi(wrapped)).toBe(false);
+		expect(isDirectOpenAICompletionsApi(wrapped)).toBe(false);
+		expect(isContextClampingApiStreams(wrap(fauxProvider().provider))).toBe(false);
+		const native = openAICompletionsApi();
+		const simple = native.streamSimple;
+		native.streamSimple = (...args) => simple(...args);
+		expect(isContextClampingApiStreams(wrap(native))).toBe(false);
+	});
+
 	it("materializes the model endpoint before dispatch", () => {
 		const captured: string[] = [];
 		const streams = cloudflareStreams({

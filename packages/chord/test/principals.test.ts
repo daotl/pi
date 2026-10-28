@@ -32,6 +32,148 @@ const Who = local("t.who", {
 });
 
 describe("principals", () => {
+	it("null guest roots and self.get references stay distinct from owner state and methods", async () => {
+		const host = createHost<string | null>({ self: "host", name: "server" });
+		const Access = remote("t.null-access-local", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: {
+				owner: { state: { secret: Type.String() }, methods: { owner: method(undefined, Type.String()) } },
+				guest: { state: { public: Type.String() }, methods: { who: method(undefined, Type.Null()) } },
+			},
+		});
+		host.serve(Access, (_input, principal, self) => {
+			if (principal === "host")
+				return {
+					variant: "owner",
+					secret: self.state("secret", Type.String(), "owner-secret"),
+					owner: () => "owner",
+				};
+			if (principal !== null) throw new Error("expected the null guest principal");
+			return { variant: "guest", public: self.state("public", Type.String(), "guest-state"), who: () => principal };
+		});
+		const Panel = local("t.null-panel", {
+			version: 1,
+			input: Type.Object({}),
+			members: { who: method(undefined, Type.Null()) },
+		});
+		host.serve(Panel, (_input, _principal, self) => {
+			self.get(Access, {});
+			const guest = self.get(Access, {}, { principal: null });
+			return {
+				who: async (ctx) => {
+					assert.equal(guest.variant, "guest");
+					if (guest.variant !== "guest") throw new Error("guest acquired owner privileges");
+					return guest.who(ctx);
+				},
+			};
+		});
+		try {
+			const owner = await host.get(Access, {});
+			assert.equal(owner.variant, "owner");
+			assert.equal(await host.root((ctx) => ctx.principal, { principal: null }), null);
+			await host.root(
+				async (ctx) => {
+					const guest = await ctx.get(Access, {});
+					assert.equal(guest.variant, "guest");
+					if (guest.variant !== "guest") throw new Error("guest acquired owner privileges");
+					assert.equal(guest.public.value, "guest-state");
+					assert.deepEqual([...guest.shape!.members].sort(), ["public", "who"]);
+					assert.equal(await guest.who(ctx), null);
+				},
+				{ principal: null },
+			);
+			assert.equal(await (await host.get(Panel, {})).who(), null);
+		} finally {
+			await host.close();
+		}
+	});
+
+	it("null remote bindings authorize and forward the guest separately from the host, including relays", async () => {
+		const Access = remote("t.null-access-remote", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("worker"),
+			variants: {
+				owner: { state: { secret: Type.String() }, methods: { owner: method(undefined, Type.String()) } },
+				guest: { state: { public: Type.String() }, methods: { who: method(undefined, Type.Null()) } },
+			},
+		});
+		const server = createHost<string | null>({ self: "host", name: "server" });
+		const [down, up] = memoryLinkPair();
+		const worker = createHost<string | null>({
+			self: "host",
+			name: "worker",
+			upstream: { link: up, principal: "host" },
+		});
+		worker.serve(Access, (_input, principal, self) => {
+			if (principal === "host")
+				return {
+					variant: "owner",
+					secret: self.state("secret", Type.String(), "owner-secret"),
+					owner: () => "owner",
+				};
+			if (principal !== null) throw new Error("expected the null guest principal");
+			return { variant: "guest", public: self.state("public", Type.String(), "guest-state"), who: () => principal };
+		});
+		const authorized: (string | null)[] = [];
+		server.route("worker", {
+			principal: () => "host",
+			authorize: (principal) => {
+				authorized.push(principal);
+				return true;
+			},
+			resolve: async () => down,
+		});
+		const [browserDown, browserUp] = memoryLinkPair();
+		server.accept(browserDown, { principal: null });
+		const browser = createHost<string | null>({
+			self: "host",
+			kind: "client",
+			name: "browser",
+			upstream: { link: browserUp, principal: "host" },
+		});
+		const Panel = local("t.null-remote-panel", {
+			version: 1,
+			input: Type.Object({}),
+			members: { who: method(undefined, Type.Null()) },
+		});
+		server.serve(Panel, (_input, _principal, self) => {
+			self.get(Access, {});
+			const guest = self.get(Access, {}, { principal: null });
+			return {
+				who: async (ctx) => {
+					if (guest.variant !== "guest") throw new Error("guest acquired owner privileges");
+					return guest.who(ctx);
+				},
+			};
+		});
+		try {
+			// Start the null route before a child connection exists: authorization must not use self.
+			const guest = await server.get(Access, {}, { principal: null });
+			assert.deepEqual(authorized, [null, null]);
+			const owner = await server.get(Access, {});
+			assert.equal(owner.variant, "owner");
+			if (owner.variant !== "owner") throw new Error("host lost owner variant");
+			assert.equal(owner.secret.value, "owner-secret");
+			assert.equal(await owner.owner(), "owner");
+			for (const ref of [guest, await browser.get(Access, {})]) {
+				assert.equal(ref.variant, "guest");
+				if (ref.variant !== "guest") throw new Error("guest acquired owner privileges");
+				assert.equal(ref.public.value, "guest-state");
+				assert.deepEqual([...ref.shape!.members].sort(), ["public", "who"]);
+				assert.equal(await ref.who(), null);
+			}
+			assert.deepEqual(authorized, [null, null, null, null]);
+			assert.equal(await (await server.get(Panel, {})).who(), null);
+		} finally {
+			await browser.close();
+			await server.close();
+			await worker.close();
+		}
+	});
+
 	it("factories, methods and contexts see the app's principal type", async () => {
 		const host = createHost<Principal>({ self: { kind: "host" }, principalKey });
 		const facet = defineFacet<Principal>((api) => {

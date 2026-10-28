@@ -4,6 +4,7 @@ import type {
 	AssistantMessage,
 	AssistantMessageEvent,
 	AssistantMessageFrame,
+	AssistantMessageFrameCheckpoint,
 	DeferredHandle,
 	ImageContent,
 	Message,
@@ -241,6 +242,8 @@ export interface LaneSnapshot {
 		retry?: { attempt: number; maxAttempts: number; nextAttemptAt: number };
 		deferred?: { handle: DeferredHandle; poll: number };
 		streamingMessage?: AssistantMessage;
+		/** Resumable decoder state for the exact in-flight response, captured with streamingMessage. */
+		streamingFrameState?: { messageId: string; sequence: number; checkpoint: AssistantMessageFrameCheckpoint };
 		runningTools: LaneSnapshotTool[];
 	};
 	queues: LaneQueuedItem[];
@@ -293,13 +296,22 @@ export type HarnessEventPayload =
 			success: boolean;
 			finalError?: string;
 	  }
-	| { type: "message_start"; runId?: string; message: AgentMessage }
+	| {
+			type: "message_start";
+			runId?: string;
+			message: AgentMessage;
+			entryId?: string;
+			frame?: AssistantMessageFrame;
+			frameSequence?: number;
+	  }
 	| {
 			type: "message_update";
 			runId: string;
 			message: AgentMessage;
 			event: AssistantMessageEvent;
 			frame?: AssistantMessageFrame;
+			frameSequence?: number;
+			entryId?: string;
 	  }
 	| { type: "message_end"; runId?: string; message: AgentMessage; entryId?: string }
 	| {

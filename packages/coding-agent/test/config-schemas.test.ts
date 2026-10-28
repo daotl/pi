@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { renderConfigSchemas } from "../scripts/generate-schemas.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import { ModelConfig } from "../src/core/model-config.ts";
+import { composeModelProvider } from "../src/core/provider-composer.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { SettingsSchema } from "../src/core/settings-schema.ts";
 import { validateThemeJson } from "../src/modes/interactive/theme/theme-schema.ts";
@@ -30,6 +31,40 @@ function schemaUrl(name: "models" | "settings" | "keybindings" | "theme"): strin
 }
 
 describe("generated configuration schemas", () => {
+	it("advertises the context window used by an omitted custom-model value", async () => {
+		const directory = createTemporaryDirectory();
+		const path = join(directory, "models.json");
+		writeFileSync(
+			path,
+			JSON.stringify({
+				providers: {
+					demo: {
+						api: "openai-completions",
+						apiKey: "test-key",
+						baseUrl: "https://example.invalid",
+						models: [{ id: "custom" }],
+					},
+				},
+			}),
+		);
+		const config = await ModelConfig.load(path);
+		const model = composeModelProvider("demo", undefined, config, undefined).getModels()[0];
+		const schema = JSON.parse(renderConfigSchemas().get("schemas/models.schema.json") ?? "") as {
+			properties: {
+				providers: {
+					patternProperties: Record<
+						string,
+						{ properties: { models: { items: { properties: { contextWindow: { default: number } } } } } }
+					>;
+				};
+			};
+		};
+		expect(model.contextWindow).toBe(262144);
+		expect(
+			schema.properties.providers.patternProperties["^.*$"].properties.models.items.properties.contextWindow.default,
+		).toBe(model.contextWindow);
+	});
+
 	it("matches the four committed artifacts", () => {
 		const rendered = renderConfigSchemas();
 		expect([...rendered.keys()]).toEqual([

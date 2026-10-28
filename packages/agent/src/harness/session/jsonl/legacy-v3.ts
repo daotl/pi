@@ -22,6 +22,7 @@ interface LegacyV3EntryBase {
 	id: string;
 	parentId: string | null;
 	timestamp: string;
+	usageSourceId?: string;
 }
 
 interface LegacyV3MessageEntry extends LegacyV3EntryBase {
@@ -474,6 +475,7 @@ function legacyEntryUsage(entry: LegacyV3Entry): Usage | undefined {
 
 async function readLegacyV3Inventory(reader: TextLineReader, context: Context): Promise<LegacyV3Inventory> {
 	const entries = new Map<string, LegacyV3IndexEntry>();
+	const seenCharges = new Set<string>();
 	let nextSeq = 1;
 	let importedUsage = emptyUsage();
 	let name: string | undefined;
@@ -497,7 +499,11 @@ async function readLegacyV3Inventory(reader: TextLineReader, context: Context): 
 		selectedId = entry.id;
 		if (entry.type === "session_info") name = entry.name;
 		const usage = legacyEntryUsage(entry);
-		if (usage !== undefined) importedUsage = addUsage(importedUsage, usage);
+		const chargeId = entry.usageSourceId ?? entry.id;
+		if (usage !== undefined && !seenCharges.has(chargeId)) {
+			seenCharges.add(chargeId);
+			importedUsage = addUsage(importedUsage, usage);
+		}
 	}
 	return { entries, nextSeq, importedUsage, name, selectedId, recordCount };
 }

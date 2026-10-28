@@ -4,10 +4,14 @@ import {
 	fauxAssistantMessage,
 	type ImageContent,
 	type Message,
+	type Model,
 	normalizeContext,
 } from "@earendil-works/pi-ai";
 import { googleGenerativeAIApi } from "@earendil-works/pi-ai/api/google-generative-ai.lazy";
 import { clampMaxTokensToInput } from "@earendil-works/pi-ai/api/simple-options";
+import { azureProvider } from "@earendil-works/pi-ai/providers/azure";
+import { cloudflareAIGatewayProvider } from "@earendil-works/pi-ai/providers/cloudflare-ai-gateway";
+import { opencodeProvider } from "@earendil-works/pi-ai/providers/opencode";
 import { estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
 import { afterEach, expect, it, vi } from "vitest";
 import {
@@ -842,3 +846,89 @@ it("budgets the native Google adapter without granting history or tokenizer auth
 	expect(current.session.modelRuntime.canAttributeRequestHistory(model)).toBe(false);
 	expect(current.session.modelRuntime.canAttributeRequestHistory(model, true)).toBe(false);
 });
+
+it.each([
+	["Azure", azureProvider],
+	["OpenCode", opencodeProvider],
+	["Cloudflare", cloudflareAIGatewayProvider],
+] as const)(
+	"preserves near-window summary headroom through the real %s factory without upload authority",
+	async (_name, factory) => {
+		const current = await createNativeTokenizerFixture();
+		fixtures.push(current);
+		const provider = factory();
+		const model: Model<"openai-completions"> = {
+			id: "summary-model",
+			name: "Summary",
+			provider: provider.id,
+			api: "openai-completions",
+			baseUrl: "https://wrapped-summary.invalid/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 10000,
+			maxTokens: 4096,
+		};
+		const runtime = current.session.modelRuntime;
+		runtime.registerNativeProvider(provider);
+		const requests: Array<{ max_tokens?: number; max_completion_tokens?: number; messages: unknown[] }> = [];
+		vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+			expect(String(input)).toBe("https://wrapped-summary.invalid/v1/chat/completions");
+			requests.push(JSON.parse(String(init?.body)));
+			const chunk = {
+				id: "wrapped-summary",
+				choices: [
+					{
+						index: 0,
+						delta: { role: "assistant", content: "safe wrapped checkpoint" },
+						finish_reason: "stop",
+					},
+				],
+				usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+			};
+			return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, {
+				headers: { "content-type": "text/event-stream" },
+			});
+		});
+		const result = await generateSummaryWithUsage(
+			[
+				{ role: "user", content: "inspect", timestamp: 0 },
+				{
+					...fauxAssistantMessage({ type: "toolCall", id: "wrapped-read", name: "read", arguments: {} }),
+					stopReason: "toolUse",
+				},
+				{
+					role: "toolResult",
+					toolCallId: "wrapped-read",
+					toolName: "read",
+					content: [{ type: "text", text: "x".repeat(25000) }],
+					isError: false,
+					timestamp: 1,
+				},
+			],
+			model,
+			4096,
+			"offline",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			(_requestModel, context, options) => provider.streamSimple(model, context, options),
+			{ AZURE_OPENAI_BASE_URL: model.baseUrl },
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			(requestModel) => runtime.usesAdapterOutputClamp(requestModel),
+		);
+		expect(result.text).toContain("safe wrapped checkpoint");
+		expect(requests).toHaveLength(1);
+		expect(requests[0].max_completion_tokens ?? requests[0].max_tokens).toBeGreaterThan(1);
+		expect(JSON.stringify(requests[0].messages)).toContain("[Tool result]");
+		expect(runtime.usesAdapterOutputClamp(model)).toBe(true);
+		expect(runtime.canAttributeRequestHistory(model)).toBe(false);
+		expect(runtime.canAttributeRequestHistory(model, true)).toBe(false);
+	},
+);

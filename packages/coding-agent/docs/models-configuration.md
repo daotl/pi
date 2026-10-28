@@ -49,7 +49,7 @@ Each `models` entry adds a model to the provider. An entry whose `id` matches an
 | `cost.tiers[].cacheRead` | number |  | Required. Cache-read cost in USD per million tokens. |
 | `cost.tiers[].cacheWrite` | number |  | Required. Cache-write cost in USD per million tokens. |
 | `promptCache` | object |  | Best-effort prompt cache lifetime in seconds for the short and long retention tiers. Pi warms only tiers with a known lifetime. |
-| `contextWindow` | number | `128000` | Context window in tokens. |
+| `contextWindow` | number | `262144` | Context window in tokens. |
 | `maxTokens` | number | `16384` | Maximum output tokens. |
 | `samplingParams` | object |  | Fields merged into every request body. Applies only to OpenAI-compatible APIs. |
 | `samplingParamsByThinkingLevel` | object |  | samplingParams per thinking level, merged over samplingParams. |

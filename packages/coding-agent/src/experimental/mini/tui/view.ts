@@ -205,6 +205,8 @@ class MiniTui {
 	stop(): void {
 		this.#mountedDispose?.();
 		this.#indicator?.dispose();
+		for (const component of this.#tools.values()) component.dispose();
+		this.#tools.clear();
 		this.#ui.stop();
 	}
 
@@ -278,6 +280,7 @@ class MiniTui {
 		if (diverged) {
 			// Compaction, navigation, or a fork rewrote the branch: repaint from scratch.
 			this.#chat.clear();
+			for (const component of this.#tools.values()) component.dispose();
 			this.#tools.clear();
 			this.#renderedEntryIds = [];
 			this.#streaming = undefined;

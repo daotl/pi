@@ -2,11 +2,12 @@
 // snapshots); method-only references; origins of client holds; versioned call projection metadata.
 import assert from "node:assert/strict";
 import { Type } from "typebox";
-import { describe, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { HostImpl } from "../src/host.ts";
 import {
 	type Ctx,
 	createHost,
+	type FacetApi,
 	type Frame,
 	type Host,
 	hostFamily,
@@ -494,6 +495,146 @@ describe("origins of client holds", () => {
 });
 
 describe("versioned call projections", () => {
+	it("same-version consumers reject conflicting named-field patterns at bind and call additive providers", async () => {
+		for (const conflicting of [true, false]) {
+			const consumer = remote("t.consumer-pattern", {
+				version: 1,
+				input: Type.Object({}),
+				host: hostNamed("server"),
+				variants: {
+					main: {
+						methods: {
+							send: method(Type.Object({ x: Type.String() }, { additionalProperties: false }), Type.String()),
+						},
+					},
+				},
+			});
+			const provider = remote(consumer.name, {
+				...consumer.def,
+				variants: {
+					main: {
+						methods: {
+							send: method(
+								Type.Object(
+									{ x: Type.String(), extra: Type.Optional(Type.Number()) },
+									{
+										patternProperties: {
+											"^x$": Type.String(),
+											x: conflicting ? Type.Number() : Type.String(),
+										},
+									},
+								),
+								Type.String(),
+							),
+						},
+					},
+				},
+			});
+			const server = createHost({ self: "host", name: "server" });
+			const handled: unknown[] = [];
+			server.serve(provider, () => ({
+				variant: "main",
+				send: (args) => {
+					handled.push(args);
+					return args.x;
+				},
+			}));
+			const [down, up] = memoryLinkPair();
+			server.accept(down, { kind: "host", name: "worker", principal: "worker" });
+			const worker = createHost({ self: "host", name: "worker", upstream: { link: up, principal: "server" } });
+			try {
+				if (conflicting) {
+					assert.throws(
+						() => server.hold(consumer, {}),
+						(error) => isChordError(error, "contract_mismatch"),
+					);
+					await assert.rejects(worker.get(consumer, {}), (error) => isChordError(error, "contract_mismatch"));
+					assert.deepEqual(handled, []);
+				} else {
+					const ref = await worker.get(consumer, {});
+					assert.equal(await ref.send({ x: "consumer input" }), "consumer input");
+					assert.deepEqual(handled, [{ x: "consumer input" }]);
+				}
+			} finally {
+				await worker.close();
+				await server.close();
+			}
+		}
+	});
+
+	it("control projections preserve a pending shape until its missing snapshot arrives", async () => {
+		const Switch = remote("t.pending-projections", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: {
+				before: { state: { n: Type.Number() }, methods: { ping: method(undefined, Type.String()) } },
+				after: {
+					state: { n: Type.Number(), added: Type.String() },
+					methods: { ping: method(undefined, Type.String()) },
+				},
+			},
+		});
+		const server = createHost({ self: "host", name: "server" });
+		const facets = [false, true].map((added) => ({
+			name: "switch",
+			setup: (api: FacetApi) => {
+				api.serve(Switch, (_input, _principal, self) => {
+					const n = self.state("n", Type.Number(), 7);
+					return added
+						? { variant: "after", n, added: self.state("added", Type.String(), "new value"), ping: () => "after" }
+						: { variant: "before", n, ping: () => "before" };
+				});
+			},
+		}));
+		await server.install(facets[0]!);
+		const [down, up] = memoryLinkPair();
+		server.accept(down, { kind: "host", name: "worker", principal: "worker" });
+		let deliver: ((frame: Frame) => void) | undefined;
+		let pending: Frame | undefined;
+		const link: Link = {
+			get closed() {
+				return up.closed;
+			},
+			send: (frame) => up.send(frame),
+			receive: (handler) => {
+				deliver = handler;
+				up.receive((frame) => {
+					if (frame.t === "state" && frame.m === "added" && frame.as === "snap") pending = frame;
+					else handler(frame);
+				});
+			},
+			onClose: (handler) => up.onClose(handler),
+			close: (reason) => up.close(reason),
+		};
+		const worker = createHost({ self: "host", name: "worker", upstream: { link, principal: "server" } });
+		try {
+			const ref = await worker.get(Switch, {});
+			const shapes: string[] = [];
+			ref.onShape((shape) => shapes.push(shape.variant!));
+			await server.reload([facets[1]!]);
+			await until(() => pending !== undefined);
+			expect(ref.variant).toBe("before");
+			assert.equal(ref.n.value, 7);
+			await server.reload([]);
+			assert.equal(await worker.root((ctx) => ref.ping(ctx), { signal: AbortSignal.timeout(1000) }), "after");
+			expect(ref.variant).toBe("before");
+			assert.deepEqual(shapes, []);
+			assert.ok(pending !== undefined && deliver !== undefined);
+			deliver(pending);
+			await until(() => ref.variant === "after");
+			const hydrated = ref;
+			assert.equal(hydrated.variant, "after");
+			if (hydrated.variant !== "after") throw new Error("pending shape did not hydrate");
+			assert.equal(hydrated.added.value, "new value");
+			assert.equal(hydrated.n.value, 7);
+			assert.deepEqual(shapes, ["after"]);
+		} finally {
+			await worker.close();
+			await server.close();
+		}
+	});
+
 	it("a previous-protocol peer is refused; shape projections do not version state", async () => {
 		const { server, browser, link } = setup();
 		await browser.hold(Notes, {}).ready;

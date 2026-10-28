@@ -63,7 +63,7 @@ export class ExperimentalChatView {
 		this.transcript.clear();
 		this.pendingMessages.clear();
 		this.status.clear();
-		this.#tools.clear();
+		this.#disposeTools();
 		this.#renderedEntryIds = [];
 		this.#streaming = undefined;
 		this.apply(snapshot);
@@ -71,6 +71,13 @@ export class ExperimentalChatView {
 
 	dispose(): void {
 		this.#indicator?.dispose();
+		this.#indicator = undefined;
+		this.#disposeTools();
+	}
+
+	#disposeTools(): void {
+		for (const component of this.#tools.values()) component.dispose();
+		this.#tools.clear();
 	}
 
 	#syncQueues(queues: LaneSnapshot["queues"]): void {
@@ -86,7 +93,7 @@ export class ExperimentalChatView {
 		const diverged = this.#renderedEntryIds.some((id, index) => transcript[index]?.id !== id);
 		if (diverged) {
 			this.transcript.clear();
-			this.#tools.clear();
+			this.#disposeTools();
 			this.#renderedEntryIds = [];
 			this.#streaming = undefined;
 		}

@@ -253,7 +253,7 @@ pub fn remove_file(path: &str) -> io::Result<()> {
     }
 }
 
-/// A pipe a reader thread reads with blocking calls; `interrupt_reader` cancels a blocked read.
+/// A pipe a reader thread reads with blocking calls; `interrupt_pipe` cancels a blocked read.
 pub trait Pipe: io::Read {}
 impl<T: io::Read> Pipe for T {}
 
@@ -272,11 +272,22 @@ pub fn read_pipe(mut pipe: impl Pipe, stop: &AtomicBool, mut on_data: impl FnMut
     }
 }
 
-/// Cancel a reader blocked in `ReadFile`, so it sees `stop` and closes its pipe.
-pub fn interrupt_reader(reader: &std::thread::JoinHandle<()>) {
+/// Feed stdin on its own thread, checking stop between bounded writes.
+pub fn write_stdin(mut pipe: std::process::ChildStdin, mut bytes: &[u8], stop: &AtomicBool) {
+    use std::io::Write;
+    while !bytes.is_empty() && !stop.load(Ordering::SeqCst) {
+        match pipe.write(&bytes[..bytes.len().min(64 * 1024)]) {
+            Ok(0) | Err(_) => return,
+            Ok(written) => bytes = &bytes[written..],
+        }
+    }
+}
+
+/// Cancel a pipe worker blocked in ReadFile or WriteFile, so it closes its pipe.
+pub fn interrupt_pipe(worker: &std::thread::JoinHandle<()>) {
     // SAFETY: the handle of a live or finished thread; cancelling no pending I/O is harmless.
     unsafe {
-        CancelSynchronousIo(reader.as_raw_handle() as _);
+        CancelSynchronousIo(worker.as_raw_handle() as _);
     }
 }
 

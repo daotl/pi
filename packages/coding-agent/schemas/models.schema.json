@@ -121,7 +121,7 @@
                   "contextWindow": {
                     "type": "number",
                     "exclusiveMinimum": 0,
-                    "default": 128000,
+                    "default": 262144,
                     "description": "Context window in tokens."
                   },
                   "maxTokens": {

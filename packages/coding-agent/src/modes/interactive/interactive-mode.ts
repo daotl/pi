@@ -5509,6 +5509,7 @@ export class InteractiveMode {
 			const unsentCount = unsent.length;
 			this.compactionQueuedMessages = [...unsent, ...this.compactionQueuedMessages];
 			delivery.messages.length = 0;
+			delete delivery.submitting;
 			this.updatePendingMessagesDisplay();
 			this.showError(
 				`Failed to send queued message${unsentCount > 1 ? "s" : ""}: ${
@@ -5621,6 +5622,7 @@ export class InteractiveMode {
 			} finally {
 				if (this.compactionQueueDeliveryPending === delivery && this.session === session) {
 					this.compactionQueueDeliveryPending = undefined;
+					this.updatePendingMessagesDisplay();
 					if (!queueRestored && !session.isCompacting && this.compactionQueuedMessages.length > 0) {
 						void this.flushCompactionQueue({ willRetry: options?.willRetry });
 					} else if (session.isIdle) {
@@ -8743,7 +8745,10 @@ export class InteractiveMode {
 		if (existing && "url" in existing.config && existing.config.auth?.provider === providerId) return;
 
 		let name = existing?.name ?? "radius";
-		if (!existing && servers.some((server) => server.name === name)) name = "radius-mcp";
+		if (!existing) {
+			const names = new Set(servers.map((server) => server.name));
+			for (let suffix = 1; names.has(name); suffix++) name = suffix === 1 ? "radius-mcp" : `radius-mcp-${suffix}`;
+		}
 		const config: McpHttpServerConfig =
 			existing && "url" in existing.config
 				? { ...existing.config, auth: { provider: providerId } }

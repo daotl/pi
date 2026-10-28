@@ -9,6 +9,7 @@ import { expect, it, type MockInstance, vi } from "vitest";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
 import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
 import { type AgentSessionServices, createAgentSessionFromServices } from "../../src/core/agent-session-services.ts";
+import { RADIUS_MCP_URL } from "../../src/core/radius.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import type { TreeSelectorComponent } from "../../src/modes/interactive/components/tree-selector.ts";
 import {
@@ -93,6 +94,7 @@ async function createSchedulingMode(options: HarnessOptions = {}) {
 		editorContainer: { children: unknown[] };
 		defaultEditor: { onEscape?: () => void; setText(text: string): void; getText(): string };
 		activeStatusIndicator?: { kind: string };
+		offerRadiusMcpServer(providerId: string, providerName: string): void;
 	};
 	return {
 		harness,
@@ -116,6 +118,37 @@ async function createSchedulingMode(options: HarnessOptions = {}) {
 		},
 	};
 }
+
+it("preserves both occupied Radius names when accepting MCP setup", async () => {
+	const ui = await createSchedulingMode();
+	vi.stubEnv("PI_CODING_AGENT_DIR", ui.harness.tempDir);
+	const path = join(ui.harness.tempDir, "mcp.json");
+	const original = { radius: { url: "https://one.example/mcp" }, "radius-mcp": { url: "https://two.example/mcp" } };
+	fs.writeFileSync(path, JSON.stringify({ mcpServers: original }));
+	try {
+		await ui.mode.init();
+		const reload = vi
+			.spyOn(ui.mode as unknown as { handleReloadCommand(): Promise<void> }, "handleReloadCommand")
+			.mockResolvedValue();
+		let selector: { handleInput(data: string): void } | undefined;
+		const selectors = ui.mode as unknown as {
+			showSelector(build: (done: () => void) => { component: { handleInput(data: string): void } }): void;
+		};
+		vi.spyOn(selectors, "showSelector").mockImplementation((build) => {
+			selector = build(() => {}).component;
+		});
+		ui.internal.offerRadiusMcpServer("radius", "Radius");
+		if (!selector) throw new Error("Radius selector did not open");
+		selector.handleInput("\r");
+		expect(JSON.parse(fs.readFileSync(path, "utf8"))).toEqual({
+			mcpServers: { ...original, "radius-mcp-2": { url: RADIUS_MCP_URL, auth: { provider: "radius" } } },
+		});
+		expect(reload).toHaveBeenCalledOnce();
+	} finally {
+		vi.unstubAllEnvs();
+		await ui.cleanup();
+	}
+});
 
 it("holds due work through shutdown abort settlement and resumes once after rejection", async () => {
 	const entered = Promise.withResolvers<void>();
@@ -2407,6 +2440,9 @@ it("restores only a later rejected input and reserved rest without replaying its
 			{ text: "reserved third", mode: "followUp" },
 			{ text: "newer fourth", mode: "followUp" },
 		]);
+		await ui.terminal.waitForRender();
+		const display = ui.terminal.getViewport().join("\n");
+		expect(display.match(/Steering: reject second/g)).toHaveLength(1);
 		await ui.internal.flushCompactionQueue();
 		await ui.harness.session.waitForIdle();
 		expect(requests).toEqual(["accept first", "reject second", "reserved third", "newer fourth"]);

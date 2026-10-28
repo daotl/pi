@@ -13,6 +13,7 @@ import { createRoutedLinkPair } from "@earendil-works/pi-server";
 import { ProcessTerminal, TuiMainScreen } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import { type ClientTuiServer, ExperimentalClientTui } from "../src/experimental/client-tui.ts";
+import { ExperimentalChatView } from "../src/experimental/client-tui-chat.ts";
 import { createPresentationFacetData } from "../src/experimental/plugins/bundled.ts";
 import {
 	FACET_BUNDLE_ARTIFACT_FORMAT,
@@ -91,6 +92,65 @@ function laneSnapshot(): LaneSnapshot {
 describe("experimental client TUI", () => {
 	beforeAll(() => initTheme("dark"));
 
+	test.each(["theme", "divergence", "dispose"] as const)(
+		"stops detached live tool clocks on %s without stopping a replacement view",
+		(transition) => {
+			vi.useFakeTimers();
+			const ui = new TuiMainScreen(new ProcessTerminal());
+			const render = vi.spyOn(ui, "requestRender").mockImplementation(() => {});
+			const view = new ExperimentalChatView(ui, process.cwd());
+			const snapshot = laneSnapshot();
+			snapshot.transcript.push({
+				id: "user-1",
+				parentId: null,
+				seq: 1,
+				timestamp: 1,
+				type: "message",
+				message: { role: "user", content: "run a command", timestamp: 1 },
+			});
+			snapshot.operation = {
+				id: "run-1",
+				kind: "run",
+				status: "open",
+				startedAt: 1,
+				fromTipId: null,
+				runningTools: [
+					{
+						status: "running",
+						toolCallId: "call-1",
+						toolName: "bash",
+						args: { command: "sleep 10" },
+						result: { content: [{ type: "text", text: "partial output" }], details: undefined },
+					},
+				],
+			};
+			try {
+				view.apply(snapshot);
+				expect(view.transcript.render(80).join("\n")).toContain("Elapsed");
+				const liveTimers = vi.getTimerCount();
+				if (transition === "theme") {
+					view.refreshTheme(snapshot);
+					expect(vi.getTimerCount()).toBe(liveTimers);
+					render.mockClear();
+					vi.advanceTimersByTime(1000);
+					expect(render).toHaveBeenCalled();
+				} else if (transition === "divergence") {
+					view.apply(laneSnapshot());
+					expect(vi.getTimerCount()).toBe(0);
+				}
+				view.dispose();
+				view.dispose();
+				expect(vi.getTimerCount()).toBe(0);
+				render.mockClear();
+				vi.advanceTimersByTime(3000);
+				expect(render).not.toHaveBeenCalled();
+			} finally {
+				view.dispose();
+				vi.useRealTimers();
+			}
+		},
+	);
+
 	test.each([
 		["new", { command: "client" as const }, "two", 1],
 		["continued", { command: "client" as const, continue: true }, "one", 0],
@@ -132,6 +192,8 @@ describe("experimental client TUI", () => {
 			});
 			const transcriptState = replicatedState<TranscriptState>({
 				snapshot: laneSnapshot() as LaneTranscriptSnapshot,
+				sequence: 0,
+				stream: null,
 				events: [],
 			});
 			const emitTranscriptEvent = (event: LaneWatchEvent): void => {
@@ -139,7 +201,8 @@ describe("experimental client TUI", () => {
 					if (reduceLaneSnapshot(draft.snapshot as unknown as LaneSnapshot, event) === "rebase") {
 						throw new Error("Test transcript event unexpectedly requires a rebase");
 					}
-					draft.events.push({ sequence: (draft.events.at(-1)?.sequence ?? 0) + 1, event });
+					if (event.type === "message_update") throw new Error("Fixture only publishes settled events");
+					draft.events.push({ sequence: ++draft.sequence, event });
 				});
 			};
 			let finishPrompt!: () => void;

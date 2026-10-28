@@ -6,7 +6,14 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { Agent, type AgentEvent, type AgentTool, prefillEchoComplete } from "../src/index.ts";
+import {
+	Agent,
+	type AgentContext,
+	type AgentEvent,
+	type AgentTool,
+	type PrepareNextTurnContext,
+	prefillEchoComplete,
+} from "../src/index.ts";
 
 const model: Model<"openai-completions"> = {
 	id: "selected",
@@ -26,6 +33,123 @@ function response(text: string): AssistantMessage {
 }
 
 describe("terminal prefill publication barrier", () => {
+	it.each([false, true])("awaits rejected terminal finalization without recursion (throws: %s)", async (throws) => {
+		const prefill = response("complete prefix");
+		const physicalModel = { ...model, provider: "physical", id: "physical-model" };
+		const terminal = { ...response("short"), provider: physicalModel.provider, model: physicalModel.id };
+		const requestContext: AgentContext = {
+			messages: [{ role: "user", content: "routed context", timestamp: 2 }, prefill],
+			tools: [],
+		};
+		const finalized: PrepareNextTurnContext[] = [];
+		const events: AgentEvent[] = [];
+		let release = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let started = () => {};
+		const finalizing = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		const agent = new Agent({
+			initialState: { model, messages: [{ role: "user", content: "start", timestamp: 1 }] },
+			prepareRequest: () => ({ model: physicalModel, context: requestContext }),
+			streamFn: () => {
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => stream.push({ type: "done", reason: "stop", message: terminal }));
+				return stream;
+			},
+			finishTurn: async (context) => {
+				finalized.push(context);
+				started();
+				await gate;
+				if (throws) throw new Error("persistence failed");
+			},
+		});
+		agent.subscribe((event) => {
+			events.push(event);
+		});
+		const running = agent.continue(prefill);
+		await Promise.race([running, finalizing]);
+		expect(finalized).toHaveLength(1);
+		expect(agent.state.isStreaming).toBe(true);
+		expect(events.some((event) => event.type === "turn_end" || event.type === "agent_end")).toBe(false);
+		expect(finalized).toHaveLength(1);
+		const finalization = finalized[0]!;
+		expect(finalization.context).toBe(requestContext);
+		expect(finalization.context.messages.at(-1)).toBe(finalization.message);
+		expect(finalization.newMessages).toEqual([finalization.message]);
+		expect(finalization.toolResults).toEqual([]);
+		expect(finalization.canContinue).toBe(false);
+		expect(finalization.message).toMatchObject({
+			stopReason: "error",
+			provider: "physical",
+			model: "physical-model",
+		});
+		release();
+		await running;
+		expect(finalized).toHaveLength(1);
+		const failure = agent.state.messages.at(-1);
+		expect(failure).toBe(finalization.message);
+		if (throws) expect(finalization.message.errorMessage).toContain("finishTurn failed: persistence failed");
+		const messageEnd = events.find((event) => event.type === "message_end" && event.message.role === "assistant");
+		expect(messageEnd?.type === "message_end" && messageEnd.message).toBe(failure);
+		expect(events.filter((event) => event.type === "turn_end")).toEqual([
+			{ type: "turn_end", message: failure, toolResults: [] },
+		]);
+		expect(events.at(-1)).toEqual({ type: "agent_end", messages: [failure] });
+	});
+
+	it("does not re-enter a normal finalizer whose rejection settles the run", async () => {
+		let finishes = 0;
+		const agent = new Agent({
+			initialState: { model },
+			streamFn: () => {
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => stream.push({ type: "done", reason: "stop", message: response("answer") }));
+				return stream;
+			},
+			finishTurn: async () => {
+				finishes++;
+				throw new Error("normal finalizer failed");
+			},
+		});
+		await agent.prompt("start");
+		expect(finishes).toBe(1);
+		expect(agent.state.messages.at(-1)).toMatchObject({
+			stopReason: "error",
+			errorMessage: "normal finalizer failed",
+		});
+	});
+
+	it("finalizes a routed prefill dispatch failure against the active context and model", async () => {
+		const prefill = response("complete prefix");
+		const physical = { ...model, provider: "routed-provider", id: "routed-model" };
+		const routed: AgentContext = { messages: [prefill], tools: [] };
+		const finished: PrepareNextTurnContext[] = [];
+		const agent = new Agent({
+			initialState: { model, messages: [{ role: "user", content: "start", timestamp: 1 }] },
+			prepareRequest: () => ({ model: physical, context: routed }),
+			streamFn: () => {
+				throw new Error("routed dispatch failed");
+			},
+			finishTurn: (turn) => {
+				finished.push(turn);
+			},
+		});
+		await agent.continue(prefill);
+		expect(finished).toHaveLength(1);
+		expect(finished[0]!.context).toBe(routed);
+		expect(finished[0]!.message).toBe(routed.messages.at(-1));
+		expect(agent.state.messages.at(-1)).toBe(finished[0]!.message);
+		expect(finished[0]!.message).toMatchObject({
+			provider: physical.provider,
+			model: physical.id,
+			stopReason: "error",
+			errorMessage: "routed dispatch failed",
+		});
+	});
+
 	it.each(["terminal-only", "matching-partial", "no-start"] as const)(
 		"rejects an incomplete terminal before a terminating tool executes (%s)",
 		async (delivery) => {
@@ -62,8 +186,12 @@ describe("terminal prefill publication barrier", () => {
 			};
 			let signal: AbortSignal | undefined;
 			const events: AgentEvent[] = [];
+			const finalized: PrepareNextTurnContext[] = [];
 			const agent = new Agent({
 				initialState: { model, tools: [tool], messages: [{ role: "user", content: "start", timestamp: 1 }] },
+				finishTurn: (turn) => {
+					finalized.push(turn);
+				},
 				streamFn: (_model, _context, options) => {
 					signal = options?.signal;
 					const stream = createAssistantMessageEventStream();
@@ -96,6 +224,12 @@ describe("terminal prefill publication barrier", () => {
 				usage: terminal.usage,
 				content: [{ type: "text", text: "" }],
 			});
+			expect(finalized).toHaveLength(1);
+			expect(finalized[0]!.message).toBe(agent.state.messages.at(-1));
+			expect(finalized[0]!.context.messages.at(-1)).toBe(finalized[0]!.message);
+			expect(finalized[0]!.newMessages).toEqual([finalized[0]!.message]);
+			expect(finalized[0]!.toolResults).toEqual([]);
+			expect(finalized[0]!.canContinue).toBe(false);
 			expect(signal?.aborted).toBe(true);
 			const assistantStarts = events.filter(
 				(event) => event.type === "message_start" && event.message.role === "assistant",

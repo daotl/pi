@@ -5,6 +5,7 @@ import type { ClientCommand } from "../cli/experimental/commands/client.ts";
 import { activateBuiltinClientServices, openClientRuntime } from "./client-runtime.ts";
 import type { AgentOperationResponse } from "./services/agent-controller.ts";
 import type { SessionAddress } from "./services/sessions.ts";
+import { TranscriptReplay } from "./services/transcript.ts";
 
 export type ClientResult =
 	| {
@@ -86,25 +87,19 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 		const operationBoundaries = new Set<string>();
 		const boundaryWaiters = new Map<string, () => void>();
 		let deliveryTail = Promise.resolve();
-		let hydrated = false;
-		let sequence = 0;
+		const replay = new TranscriptReplay();
 		let deliveryError: Error | undefined;
 		const unsubscribe = match.transcript.state.subscribe((value) => {
-			if (!hydrated) {
-				hydrated = true;
-				sequence = value.events.at(-1)?.sequence ?? 0;
+			let events: LaneWatchEvent[];
+			try {
+				events = replay.read(value);
+			} catch (error) {
+				deliveryError = error instanceof Error ? error : new Error(String(error));
+				for (const resolve of boundaryWaiters.values()) resolve();
+				boundaryWaiters.clear();
 				return;
 			}
-			for (const item of value.events) {
-				if (item.sequence <= sequence) continue;
-				if (item.sequence !== sequence + 1) {
-					deliveryError = new Error("Transcript event replay window exceeded; reconnect before submitting again");
-					for (const resolve of boundaryWaiters.values()) resolve();
-					boundaryWaiters.clear();
-					return;
-				}
-				sequence = item.sequence;
-				const event = item.event;
+			for (const event of events) {
 				deliveryTail = deliveryTail.then(async () => {
 					if (event.type === "message_end" && event.runId !== undefined && event.message.role === "assistant") {
 						completedText.set(event.runId, messageText(event.message));

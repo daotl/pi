@@ -4,13 +4,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import type { ToolResultMessage } from "@earendil-works/pi-ai/compat";
+import type { TUI } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { InMemoryAuthStorageBackend } from "../../src/core/auth-storage.ts";
 import { emitSessionShutdownEvent } from "../../src/core/extensions/runner.ts";
+import { KeybindingsManager } from "../../src/core/keybindings.ts";
 import { runMcpCommand } from "../../src/extensions/mcp/cli.ts";
 import type { McpOAuthConfig, McpServerEntry } from "../../src/extensions/mcp/config.ts";
 import { createMcpExtension } from "../../src/extensions/mcp/index.ts";
 import { McpOAuthCredentialStore } from "../../src/extensions/mcp/oauth.ts";
+import type { McpManagerView } from "../../src/extensions/mcp/ui.ts";
+import { initTheme, theme } from "../../src/modes/interactive/theme/theme.ts";
 import { createHarness, createTestUiContext, getMessageText, type Harness } from "./harness.ts";
 import { startOAuthMcpServer } from "./mcp-oauth-server.ts";
 
@@ -21,7 +25,7 @@ describe("AgentSession MCP OAuth", () => {
 		while (cleanups.length > 0) await cleanups.pop()?.();
 	});
 
-	async function setup(browser: "follow" | "paste", oauth?: McpOAuthConfig) {
+	async function setup(browser: "follow" | "paste", oauth?: McpOAuthConfig, tui = false) {
 		const server = await startOAuthMcpServer();
 		cleanups.push(server.close);
 		const backend = new InMemoryAuthStorageBackend();
@@ -33,6 +37,8 @@ describe("AgentSession MCP OAuth", () => {
 		const notifications: string[] = [];
 		const opened: URL[] = [];
 		let redirectLocation: Promise<string> | undefined;
+		let view: McpManagerView | undefined;
+		if (tui) initTheme("dark");
 		const harness: Harness = await createHarness({
 			initialActiveToolNames: [],
 			extensionFactories: [
@@ -56,8 +62,18 @@ describe("AgentSession MCP OAuth", () => {
 		});
 		cleanups.push(() => harness.cleanup());
 		await harness.session.bindExtensions({
+			...(tui ? { mode: "tui" as const } : {}),
 			uiContext: createTestUiContext({
 				notify: (message) => notifications.push(message),
+				custom: (factory) =>
+					new Promise((resolve) => {
+						view = factory(
+							{ requestRender: () => {} } as unknown as TUI,
+							theme,
+							new KeybindingsManager(),
+							resolve,
+						) as McpManagerView;
+					}),
 				// The paste prompt waits until sign-in completes unless the user pastes the redirect URL.
 				input: (_title, _placeholder, opts) =>
 					browser === "paste"
@@ -67,7 +83,7 @@ describe("AgentSession MCP OAuth", () => {
 							),
 			}),
 		});
-		return { harness, server, notifications, backend, opened };
+		return { harness, server, notifications, backend, opened, getView: () => view };
 	}
 
 	async function callWhoami(harness: Harness): Promise<ToolResultMessage> {
@@ -127,6 +143,30 @@ describe("AgentSession MCP OAuth", () => {
 		expect(notifications.at(-1)).toBe('Signed in to MCP server "issues" (1 tools).');
 		expect(getMessageText(await callWhoami(harness))).toBe(`token access-1`);
 		expect(server.log).toContain("token code");
+	});
+
+	it("returns from final reconnect on manager Escape and tracks its shutdown cleanup", async () => {
+		const { harness, server, notifications, getView } = await setup("follow", undefined, true);
+		await vi.waitFor(() => expect(server.log).toContain("401 none"));
+		server.stall.add("/mcp");
+		let returned = false;
+		const login = harness.session.prompt("/mcp login issues").then(() => {
+			returned = true;
+		});
+		await vi.waitFor(() => expect(server.stalled.some((entry) => entry.path === "/mcp")).toBe(true), {
+			timeout: 5000,
+		});
+		expect(server.log).toContain("token code");
+		const view = getView();
+		if (!view) throw new Error("Manager did not open");
+		expect(view.render(120).join("\n")).toContain("Connecting…");
+		expect(view.render(120).join("\n")).toContain("cancel");
+		view.handleInput("\x1b");
+		await vi.waitFor(() => expect(returned).toBe(true));
+		await login;
+		expect(notifications.at(-1)).toBe("Sign-in cancelled.");
+		expect(await shutdown(harness)).toBeLessThan(2000);
+		await vi.waitFor(() => expect(server.stalled.every((entry) => entry.request.socket.destroyed)).toBe(true));
 	});
 
 	/** Emit session_shutdown like quitting does; resolves to how long the handlers took. */

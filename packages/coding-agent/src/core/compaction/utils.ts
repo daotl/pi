@@ -6,6 +6,7 @@ import type { Agent, AgentMessage, StreamFn } from "@earendil-works/pi-agent-cor
 import { contentText, type Message, type Model } from "@earendil-works/pi-ai";
 import { isKnownApiProvider, streamSimple } from "@earendil-works/pi-ai/compat";
 
+import { CODEMODE_TOOL_NAME } from "../../extensions/codemode/tool.ts";
 /** Live authorization for reconstructing history before final provider payload policies. */
 export type RequestHistoryPolicy = (model: Model<string>, direct?: boolean) => boolean;
 
@@ -44,8 +45,11 @@ export function createFileOps(): FileOperations {
  */
 export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOperations): void {
 	if (message.role === "toolResult") {
-		// Calls made from codemode scripts are recorded on the script's result.
-		for (const call of message.nestedCalls?.calls ?? []) addFileOp(call.name, call.arguments, fileOps);
+		// Only codemode results describe attributable script calls; other tools' metadata is opaque.
+		if (message.toolName !== CODEMODE_TOOL_NAME) return;
+		for (const call of message.nestedCalls?.calls ?? []) {
+			if (call.status === "ok") addFileOp(call.name, call.arguments, fileOps);
+		}
 		return;
 	}
 	if (message.role !== "assistant") return;
@@ -56,6 +60,25 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
 		if (!("type" in block) || block.type !== "toolCall") continue;
 		if (!("arguments" in block) || !("name" in block)) continue;
 		addFileOp(block.name, block.arguments as Record<string, unknown> | undefined, fileOps);
+	}
+}
+
+/** Collect only replayable calls and nested results whose codemode parent survived request policy. */
+export function extractRequestFileOps(messages: Message[], fileOps: FileOperations): void {
+	const codemodeCalls = new Set<string>();
+	for (const message of messages) {
+		if (message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted") {
+			extractFileOpsFromMessage(message, fileOps);
+			for (const block of message.content) {
+				if (block.type === "toolCall" && block.name === CODEMODE_TOOL_NAME) codemodeCalls.add(block.id);
+			}
+		} else if (
+			message.role === "toolResult" &&
+			message.toolName === CODEMODE_TOOL_NAME &&
+			codemodeCalls.has(message.toolCallId)
+		) {
+			extractFileOpsFromMessage(message, fileOps);
+		}
 	}
 }
 

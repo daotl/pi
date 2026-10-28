@@ -184,11 +184,21 @@ export async function activateBuiltinClientServices(
 	server: ClientRuntimeServer,
 ): Promise<ActivatedClientRuntimeServer> {
 	const host = server.server.host;
-	const [directory, remoteManagement, plugins] = await Promise.all([
-		host.get(SessionDirectory, {}),
-		host.get(SessionManagement, {}),
-		host.get(PresentationPlugins, {}),
-	]);
+	const serverRefs: { release(): void }[] = [];
+	let directory: Ref<typeof SessionDirectory>;
+	let remoteManagement: Ref<typeof SessionManagement>;
+	let plugins: Ref<typeof PresentationPlugins>;
+	try {
+		directory = await host.get(SessionDirectory, {});
+		serverRefs.push(directory);
+		remoteManagement = await host.get(SessionManagement, {});
+		serverRefs.push(remoteManagement);
+		plugins = await host.get(PresentationPlugins, {});
+		serverRefs.push(plugins);
+	} catch (error) {
+		for (const reference of serverRefs) reference.release();
+		throw error;
+	}
 	let sessionRefs:
 		| { models: Ref<typeof Models>; agent: Ref<typeof AgentController>; transcript: Ref<typeof Transcript> }
 		| undefined;
@@ -202,26 +212,46 @@ export async function activateBuiltinClientServices(
 	const management: SessionManagement = {
 		create: (options, ctx) => remoteManagement.create(options, ctx),
 		async remove(sessionId, ctx) {
-			const removesCurrent = server.client.attachment?.sessionId === sessionId;
-			if (removesCurrent) releaseSession();
-			await remoteManagement.remove(sessionId, ctx);
-			if (removesCurrent) await server.session.whenDetached(withAbortSignal(ctx.signal, BACKGROUND_CONTEXT));
+			const attachment = server.client.attachment;
+			try {
+				await remoteManagement.remove(sessionId, ctx);
+				if (attachment?.sessionId === sessionId)
+					await server.session.whenDetached(withAbortSignal(ctx.signal, BACKGROUND_CONTEXT));
+			} finally {
+				if (server.client.attachment !== attachment) releaseSession();
+			}
 		},
 		async attach(sessionId, ctx) {
-			releaseSession();
-			await remoteManagement.attach(sessionId, ctx);
-			await server.session.whenAttached(sessionId, withAbortSignal(ctx.signal, BACKGROUND_CONTEXT));
-			const [models, agent, transcript] = await Promise.all([
-				host.get(Models, {}),
-				host.get(AgentController, {}),
-				host.get(Transcript, {}),
-			]);
-			sessionRefs = { models, agent, transcript };
+			const attachment = server.client.attachment;
+			const acquired: { release(): void }[] = [];
+			try {
+				await remoteManagement.attach(sessionId, ctx);
+				await server.session.whenAttached(sessionId, withAbortSignal(ctx.signal, BACKGROUND_CONTEXT));
+				const models = await host.get(Models, {});
+				acquired.push(models);
+				const agent = await host.get(AgentController, {});
+				acquired.push(agent);
+				const transcript = await host.get(Transcript, {});
+				acquired.push(transcript);
+				const previous = sessionRefs;
+				sessionRefs = { models, agent, transcript };
+				previous?.models.release();
+				previous?.agent.release();
+				previous?.transcript.release();
+			} catch (error) {
+				for (const reference of acquired) reference.release();
+				if (server.client.attachment !== attachment) releaseSession();
+				throw error;
+			}
 		},
 		async detach(ctx) {
-			releaseSession();
-			await remoteManagement.detach(ctx);
-			await server.session.whenDetached(withAbortSignal(ctx.signal, BACKGROUND_CONTEXT));
+			const attachment = server.client.attachment;
+			try {
+				await remoteManagement.detach(ctx);
+				await server.session.whenDetached(withAbortSignal(ctx.signal, BACKGROUND_CONTEXT));
+			} finally {
+				if (server.client.attachment !== attachment) releaseSession();
+			}
 		},
 	};
 	return {

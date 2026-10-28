@@ -1,9 +1,9 @@
 import {
 	type Api,
+	AssistantMessageFrameReducer,
 	type ImageContent,
 	type Model,
 	type Models,
-	reduceAssistantMessageFrames,
 	type Usage,
 } from "@earendil-works/pi-ai";
 import type { AgentMessage, ThinkingLevel } from "../../types.ts";
@@ -1754,12 +1754,20 @@ export class Lane<TContext extends object | undefined> implements AgentLane {
 		if (operation !== null) {
 			const runningTools: NonNullable<LaneSnapshot["operation"]>["runningTools"] = [];
 			let streamingMessage: NonNullable<LaneSnapshot["operation"]>["streamingMessage"];
+			let streamingFrameState: NonNullable<LaneSnapshot["operation"]>["streamingFrameState"];
 			let retry: NonNullable<LaneSnapshot["operation"]>["retry"];
 			let deferred: NonNullable<LaneSnapshot["operation"]>["deferred"];
-			const readStreamingMessage = async (responseEntryId: string) =>
-				reduceAssistantMessageFrames(
-					await readAssistantFrames(reader, operation.meta.operationId, responseEntryId, context),
-				);
+			const readStreamingMessage = async (responseEntryId: string) => {
+				const reducer = new AssistantMessageFrameReducer();
+				const frames = await readAssistantFrames(reader, operation.meta.operationId, responseEntryId, context);
+				for (const frame of frames) reducer.apply(frame);
+				streamingFrameState = {
+					messageId: responseEntryId,
+					sequence: frames.length,
+					checkpoint: reducer.checkpoint(),
+				};
+				return reducer.message;
+			};
 			const state = operation.state;
 			switch (state.at) {
 				case "assistant.retry_wait":
@@ -1863,6 +1871,7 @@ export class Lane<TContext extends object | undefined> implements AgentLane {
 				...(retry === undefined ? {} : { retry }),
 				...(deferred === undefined ? {} : { deferred }),
 				...(streamingMessage === undefined ? {} : { streamingMessage }),
+				...(streamingFrameState === undefined ? {} : { streamingFrameState }),
 				runningTools,
 			};
 		}

@@ -188,6 +188,8 @@ class MicroTui {
 	stop(): void {
 		this.#mountedDispose?.();
 		this.#indicator?.dispose();
+		for (const component of this.#tools.values()) component.dispose();
+		this.#tools.clear();
 		this.#ui.stop();
 	}
 	mount(component: Component, focus: Component, dispose?: () => void): void {
@@ -319,6 +321,7 @@ class MicroTui {
 	}
 	#rebuildTranscript(entries: MicroView["conversation"]["entries"]): void {
 		this.#chat.clear();
+		for (const component of this.#tools.values()) component.dispose();
 		this.#tools.clear();
 		this.#renderedEntryIds = [];
 		this.#streaming = undefined;

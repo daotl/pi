@@ -1,5 +1,6 @@
 import { resolveAzureBaseUrl, resolveDeploymentName } from "../api/azure-openai-config.ts";
 import { azureOpenAIResponsesApi } from "../api/azure-openai-responses.lazy.ts";
+import { isContextClampingApiStreams, markContextClampingApi } from "../api/context-clamp-provenance.ts";
 import { lazyStream } from "../api/lazy.ts";
 import { openAICompletionsApi } from "../api/openai-completions.lazy.ts";
 import { envApiKeyAuth } from "../auth/helpers.ts";
@@ -29,7 +30,7 @@ function withDeploymentName<T extends StreamOptions>(model: Model<Api>, options:
  * unconfigured endpoint errors on the stream instead of throwing out of `stream()`.
  */
 function azureStreams(streams: ProviderStreams): ProviderStreams {
-	return {
+	const wrapped: ProviderStreams = {
 		stream: (model, context, options) =>
 			lazyStream(model, async () =>
 				streams.stream(resolveAzureModel(model, options), context, withDeploymentName(model, options)),
@@ -39,6 +40,7 @@ function azureStreams(streams: ProviderStreams): ProviderStreams {
 				streams.streamSimple(resolveAzureModel(model, options), context, withDeploymentName(model, options)),
 			),
 	};
+	return isContextClampingApiStreams(streams) ? markContextClampingApi(wrapped) : wrapped;
 }
 
 export function azureProvider(): Provider<"azure-openai-responses" | "openai-completions"> {

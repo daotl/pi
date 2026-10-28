@@ -228,7 +228,7 @@ export class SessionImpl implements Session {
 		// Waits race it; none has to.
 		this.#failed.promise.catch(() => {});
 		this.#readOnly = readOnly;
-		this.#storage = new GuardedStorage(storage, this);
+		this.#storage = new GuardedStorage(storage, this, readOnly);
 		this.#timers = hostTimers(setTimer, (error) => this.report(error, { type: "host_error", callback: "setTimer" }));
 		// Cache bookkeeping must never change the outcome of the operation it follows: a clock or a retention setting
 		// that throws counts as now, and as the default.
@@ -1145,13 +1145,15 @@ type FailureLatch = {
 class GuardedStorage implements Storage {
 	readonly #storage: Storage;
 	readonly #latch: FailureLatch;
+	readonly #readOnly: boolean;
 	/** Backend calls underway, also those off the Session line, which close waits for before it closes the backend. */
 	readonly #underway = new Set<Promise<unknown>>();
 	#closing = false;
 
-	constructor(storage: Storage, latch: FailureLatch) {
+	constructor(storage: Storage, latch: FailureLatch, readOnly: boolean) {
 		this.#storage = storage;
 		this.#latch = latch;
+		this.#readOnly = readOnly;
 	}
 
 	/** Never exempt, whatever it throws: once admitted, whether a failed batch committed is unknown. */
@@ -1160,6 +1162,8 @@ class GuardedStorage implements Storage {
 	}
 
 	mintId<I extends Id<string>>(): Promise<I> {
+		// Allocation can persist independently of a commit. Refuse it outside the fatal backend-call guard.
+		if (this.#readOnly) return Promise.reject(new ReadOnlySession("ID allocation"));
 		return this.#call(undefined, () => this.#storage.mintId<I>());
 	}
 

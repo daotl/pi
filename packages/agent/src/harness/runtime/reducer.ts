@@ -70,6 +70,7 @@ export function reduceLaneSnapshot(
 			const operation = matchingOperation(snapshot, event.runId);
 			if (operation === undefined) return;
 			delete operation.streamingMessage;
+			delete operation.streamingFrameState;
 			operation.deferred = { handle: event.deferred, poll: event.poll };
 			return;
 		}
@@ -99,19 +100,28 @@ export function reduceLaneSnapshot(
 				return;
 			}
 			const operation = matchingOperation(snapshot, event.runId);
-			if (operation !== undefined) operation.streamingMessage = event.message;
+			if (operation !== undefined) {
+				operation.streamingMessage = event.message;
+				delete operation.streamingFrameState;
+			}
 			return;
 		}
 		case "message_update": {
 			if (event.message.role !== "assistant") return;
 			const operation = matchingOperation(snapshot, event.runId);
-			if (operation !== undefined) operation.streamingMessage = event.message;
+			if (operation !== undefined) {
+				operation.streamingMessage = event.message;
+				delete operation.streamingFrameState;
+			}
 			return;
 		}
 		case "message_end": {
 			if (event.runId === undefined) return;
 			const operation = matchingOperation(snapshot, event.runId);
-			if (operation !== undefined) delete operation.streamingMessage;
+			if (operation !== undefined) {
+				delete operation.streamingMessage;
+				delete operation.streamingFrameState;
+			}
 			return;
 		}
 		case "tool_start": {

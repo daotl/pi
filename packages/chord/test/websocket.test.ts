@@ -10,6 +10,7 @@ import {
 	hostNamed,
 	inflateMessage,
 	isChordError,
+	memoryLinkPair,
 	method,
 	remote,
 	type WebSocketLike,
@@ -29,6 +30,78 @@ const Board = remote("t.board", {
 });
 
 describe("WebSocket links", () => {
+	for (const relayed of [false, true]) {
+		it(`null-authenticated WebSocket guests cannot read or call owner privileges ${relayed ? "through a relay" : "locally"}`, async () => {
+			const Access = remote("t.websocket-null", {
+				version: 1,
+				input: Type.Object({}),
+				host: hostNamed(relayed ? "worker" : "server"),
+				variants: {
+					owner: { state: { secret: Type.String() }, methods: { owner: method(undefined, Type.String()) } },
+					guest: { state: { public: Type.String() }, methods: { who: method(undefined, Type.Null()) } },
+				},
+			});
+			const server = createHost<string | null>({ self: "host", name: "server" });
+			const worker = createHost<string | null>({ self: "host", name: "worker" });
+			const provider = relayed ? worker : server;
+			provider.serve(Access, (_input, principal, self) => {
+				if (principal === "host")
+					return {
+						variant: "owner",
+						secret: self.state("secret", Type.String(), "owner-secret"),
+						owner: () => "owner",
+					};
+				if (principal !== null) throw new Error("expected the null guest principal");
+				return {
+					variant: "guest",
+					public: self.state("public", Type.String(), "guest-state"),
+					who: () => principal,
+				};
+			});
+			if (relayed) {
+				const [down, up] = memoryLinkPair();
+				worker.connect(up, { principal: "host" });
+				server.route("worker", { principal: () => "host", authorize: () => true, resolve: async () => down });
+			}
+			const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+			await new Promise<void>((resolve) => wss.once("listening", resolve));
+			acceptWebSockets(wss as never, server, { principal: () => null });
+			const address = wss.address();
+			assert.ok(address !== null && typeof address === "object");
+			const browser = createHost<string | null>({
+				self: "host",
+				kind: "client",
+				name: "browser",
+				upstream: {
+					link: webSocketLink(new WebSocket(`ws://127.0.0.1:${address.port}`) as unknown as WebSocketLike),
+					principal: "host",
+				},
+			});
+			try {
+				const owner = await provider.get(Access, {});
+				assert.equal(owner.variant, "owner");
+				const guest = await browser.get(Access, {});
+				assert.equal(guest.variant, "guest");
+				if (guest.variant !== "guest") throw new Error("guest acquired owner privileges");
+				assert.equal(guest.public.value, "guest-state");
+				assert.equal(await guest.who(), null);
+				assert.deepEqual([...guest.shape!.members].sort(), ["public", "who"]);
+				const secret = Reflect.get(guest, "secret") as { readonly value: string };
+				assert.throws(
+					() => secret.value,
+					(error) => isChordError(error, "not_in_variant"),
+				);
+				const ownerCall = Reflect.get(guest, "owner") as () => Promise<string>;
+				await assert.rejects(ownerCall(), (error) => isChordError(error, "not_in_variant"));
+			} finally {
+				await browser.close();
+				await server.close();
+				await worker.close();
+				await new Promise<void>((resolve) => wss.close(() => resolve()));
+			}
+		});
+	}
+
 	it("serves a browser-style client over a real socket, stamped by the authenticator", async () => {
 		const server = createHost({ self: { kind: "host" }, name: "server", onError: () => {} });
 		server.serve(Board, (_input, principal, self) => {

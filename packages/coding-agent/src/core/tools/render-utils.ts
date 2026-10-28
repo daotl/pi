@@ -134,6 +134,14 @@ interface ToolTimerState {
 	interval?: ReturnType<typeof setInterval>;
 }
 
+/** Stop a detached row's clock even when no final result will reach its renderer. */
+export function disposeToolTimer(state: ToolTimerState): void {
+	if (state.interval !== undefined) {
+		clearInterval(state.interval);
+		state.interval = undefined;
+	}
+}
+
 /** Start the row's clock once execution starts. Call from `renderCall`. */
 export function startToolTimer(context: ToolRenderContext<ToolTimerState>): void {
 	const state = context.state;
@@ -150,15 +158,13 @@ export function startToolTimer(context: ToolRenderContext<ToolTimerState>): void
  */
 export function toolTimerText(context: ToolRenderContext<ToolTimerState>, isPartial: boolean): string | undefined {
 	const state = context.state;
-	if (state.startedAt !== undefined && isPartial && !state.interval) {
+	if (state.startedAt !== undefined && isPartial && !context.isError && !state.interval) {
 		state.interval = setInterval(() => context.invalidate(), 1000);
+		state.interval.unref();
 	}
 	if (!isPartial || context.isError) {
 		state.endedAt ??= Date.now();
-		if (state.interval) {
-			clearInterval(state.interval);
-			state.interval = undefined;
-		}
+		disposeToolTimer(state);
 	}
 	// A final result's recorded duration wins: it is monotonic and survives reloads. The renderer's own clock is the
 	// fallback for live progress and for results stored without one.

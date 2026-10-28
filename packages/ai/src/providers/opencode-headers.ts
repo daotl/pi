@@ -1,3 +1,4 @@
+import { isContextClampingApiStreams, markContextClampingApi } from "../api/context-clamp-provenance.ts";
 import type { ProviderHeaders, ProviderStreams, StreamOptions } from "../types.ts";
 
 const OPENCODE_SESSION_HEADER = "x-opencode-session";
@@ -17,9 +18,10 @@ function withSessionHeader<TOptions extends StreamOptions>(options: TOptions | u
 
 /** Adds OpenCode's required per-conversation routing header before API dispatch. */
 export function withOpenCodeSessionHeader(streams: ProviderStreams): ProviderStreams {
-	return {
+	const wrapped: ProviderStreams = {
 		...streams,
 		stream: (model, context, options) => streams.stream(model, context, withSessionHeader(options)),
 		streamSimple: (model, context, options) => streams.streamSimple(model, context, withSessionHeader(options)),
 	};
+	return isContextClampingApiStreams(streams) ? markContextClampingApi(wrapped) : wrapped;
 }

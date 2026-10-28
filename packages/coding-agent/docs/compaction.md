@@ -279,7 +279,7 @@ After navigation with summary:
 
 ### Request-Derived File Tracking
 
-Default compaction and branch summarization derive appended file-operation tags from successful-attempt policy-transformed and converted assistant tool calls. Error/aborted calls excluded by provider replay do not reappear through checkpoint metadata. Raw preparation details and internal nested-call records never restore a path removed from model-visible history.
+Default compaction and branch summarization derive appended file-operation tags from successful-attempt policy-transformed and converted assistant tool calls. Successful nested calls with retained arguments also contribute when their codemode parent call and result survive that request policy; unrelated tools' nested metadata remains opaque. Incomplete nested records can still contribute their known successful calls. Error/aborted assistant calls excluded by provider replay do not reappear through checkpoint metadata. Raw preparation details never restore a path removed from the authorized request history.
 
 Earlier summaries remain ordinary policy-visible context and may retain their own file tags; their raw `details` are not independently reinserted after filtering. Each new file list describes attributable tool operations in that request, not an unconditionally accumulated archive. Extensions retain control of their own details format.
 

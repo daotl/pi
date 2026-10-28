@@ -51,9 +51,11 @@ export function openAssistantResponse<TContext extends object | undefined>(
 ): AssistantResponseLifecycle {
 	const progress = openFrameProgress(lane, drive, responseEntryId);
 	const frameEncoder = new AssistantMessageFrameEncoder();
+	let frameSequence = 0;
 	const eventContext = {
 		lane: lane.name,
 		runId: drive.operationId,
+		entryId: responseEntryId,
 		...(recovery ? { recovery: true as const } : {}),
 	};
 	const close = async () => {
@@ -65,13 +67,31 @@ export function openAssistantResponse<TContext extends object | undefined>(
 			start(message, event, context) {
 				const frame = frameEncoder.encode(event);
 				if (frame !== undefined) progress.write(frame);
-				return lane.emitBatch([{ type: "message_start", ...eventContext, message }], context);
+				return lane.emitBatch(
+					[
+						{
+							type: "message_start",
+							...eventContext,
+							message,
+							...(frame === undefined ? {} : { frame, frameSequence: ++frameSequence }),
+						},
+					],
+					context,
+				);
 			},
 			update(message, event: AssistantMessageEvent, context) {
 				const frame = frameEncoder.encode(event);
 				if (frame !== undefined) progress.write(frame);
 				return lane.emitBatch(
-					[{ type: "message_update", ...eventContext, message, event, ...(frame === undefined ? {} : { frame }) }],
+					[
+						{
+							type: "message_update",
+							...eventContext,
+							message,
+							event,
+							...(frame === undefined ? {} : { frame, frameSequence: ++frameSequence }),
+						},
+					],
 					context,
 				);
 			},

@@ -248,20 +248,32 @@ pub fn run(
     control: &Control,
     groups: &Groups,
 ) -> Result<Value, Failure> {
+    run_with_shell(id, request, tmpdir, output, control, groups, sys::shell_config)
+}
+
+fn run_with_shell(
+    id: u32,
+    mut request: ExecRequest,
+    tmpdir: &str,
+    output: &Arc<Output>,
+    control: &Control,
+    groups: &Groups,
+    shell_config: impl FnOnce(Option<&str>) -> Result<sys::ShellConfig, Failure>,
+) -> Result<Value, Failure> {
     let (sender, receiver) = mpsc::channel();
     control.attach(sender.clone());
     if control.aborted.load(Ordering::SeqCst) {
         return Err(Failure::new("aborted", "aborted"));
     }
     // A string runs through the shell (as its last argument, or on stdin for legacy WSL bash); argv runs directly.
-    let (program, args, stdin_command) = match (&request.command, &request.argv) {
+    let (program, args, stdin_command) = match (request.command.take(), &request.argv) {
         (Some(command), _) => {
-            let shell = sys::shell_config(request.shell_path.as_deref())?;
+            let shell = shell_config(request.shell_path.as_deref())?;
             let mut args = shell.args;
             if shell.command_on_stdin {
-                (shell.program, args, Some(command.clone()))
+                (shell.program, args, Some(command))
             } else {
-                args.push(command.clone());
+                args.push(command);
                 (shell.program, args, None)
             }
         }
@@ -286,9 +298,6 @@ pub fn run(
     }
     let mut child = spawn(&request, &program, &args, stdin_command.is_some())
         .map_err(|error| Failure::new("spawn_error", error.to_string()))?;
-    if let (Some(command), Some(mut stdin)) = (stdin_command, child.stdin.take()) {
-        let _ = stdin.write_all(command.as_bytes());
-    }
     let pid = child.id();
     groups.lock().unwrap().insert(pid);
     let deadline = request.timeout.map(|timeout| Instant::now() + timeout);
@@ -318,6 +327,11 @@ pub fn run(
             paused.clone(),
         ),
     ];
+    // Readers and cancellation/deadline tracking must be live before a script can fill stdin.
+    let writer = stdin_command.zip(child.stdin.take()).map(|(command, stdin)| {
+        let stop = stop.clone();
+        thread::spawn(move || sys::write_stdin(stdin, command.as_bytes(), &stop))
+    });
     let waiter = sender.clone();
     thread::spawn(move || {
         let _ = waiter.send(match child.wait() {
@@ -448,8 +462,14 @@ pub fn run(
     }
     // Like Node destroying its streams: stop reading, so the pipes close even if a descendant still holds them.
     stop.store(true, Ordering::SeqCst);
-    for reader in &readers {
-        sys::interrupt_reader(reader);
+    // Repeat interruption until each worker exits: on Windows a worker can enter a synchronous I/O call between
+    // observing stop and the first CancelSynchronousIo. Joining prevents pipe handles or threads outliving exec.
+    for worker in readers.into_iter().chain(writer) {
+        while !worker.is_finished() {
+            sys::interrupt_pipe(&worker);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let _ = worker.join();
     }
     groups.lock().unwrap().remove(&pid);
     emit(&mut pending, 0, decoders[0].decode(&[], true));
@@ -491,4 +511,107 @@ pub fn run(
         result["spillPath"] = json!(path);
     }
     Ok(result)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdin_scripts_remain_cancellable_while_the_first_line_sleeps() {
+        for abort in [false, true] {
+            let control = Arc::new(Control::default());
+            let groups: Groups = Arc::default();
+            let output = Arc::new(Output::default());
+            let mut request = ExecRequest::from_json(&json!({
+                "command": format!("printf ready; sleep 3\n{}", "# pipe-filling tail\n".repeat(100_000)),
+                "cwd": sys::tmpdir(),
+                "timeoutMs": 80,
+            })).unwrap();
+            if abort {
+                request.timeout = None;
+            }
+            let cancel = if abort {
+                let control = control.clone();
+                let groups = groups.clone();
+                Some(thread::spawn(move || {
+                    let until = Instant::now() + Duration::from_secs(1);
+                    while groups.lock().unwrap().is_empty() && Instant::now() < until {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    control.cancel(false);
+                }))
+            } else {
+                None
+            };
+            let started = Instant::now();
+            // Exercise the real exec lifecycle with the legacy WSL stdin transport, using Unix bash -s. The
+            // first sleep is finite so a regression fails rather than leaving the test waiting indefinitely.
+            let failure = run_with_shell(1, request, &sys::tmpdir(), &output, &control, &groups, |_| {
+                Ok(sys::ShellConfig {
+                    program: "/bin/bash".into(),
+                    args: vec!["-s".into()],
+                    command_on_stdin: true,
+                })
+            }).unwrap_err();
+            if let Some(cancel) = cancel {
+                cancel.join().unwrap();
+            }
+            assert_eq!(failure.code, if abort { "aborted" } else { "timeout" });
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(groups.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn stdin_writer_closes_even_when_a_descendant_retains_the_read_end() {
+        let request = ExecRequest::from_json(&json!({
+            "command": format!("sleep 3 <&0 &\nexit 0\n{}", "# unread script tail\n".repeat(100_000)),
+            "cwd": sys::tmpdir(),
+            "timeoutMs": 2000,
+        })).unwrap();
+        let started = Instant::now();
+        let result = run_with_shell(3, request, &sys::tmpdir(), &Arc::new(Output::default()), &Control::default(), &Arc::default(), |_| {
+            Ok(sys::ShellConfig {
+                program: "/bin/bash".into(),
+                args: vec!["-s".into()],
+                command_on_stdin: true,
+            })
+        }).unwrap();
+        assert_eq!(result["exitCode"], 0);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stdin_scripts_drain_output_before_feeding_the_remaining_script() {
+        let request = ExecRequest::from_json(&json!({
+            "command": format!("(sleep 3; kill -KILL $$) </dev/null >/dev/null 2>&1 & guard=$!\nhead -c 262144 /dev/zero; printf complete\nkill \"$guard\"\n{}", "# script tail\n".repeat(100_000)),
+            "cwd": sys::tmpdir(),
+            "timeoutMs": 2000,
+        })).unwrap();
+        let output = Arc::new(Output::default());
+        let started = Instant::now();
+        let result = run_with_shell(2, request, &sys::tmpdir(), &output, &Control::default(), &Arc::default(), |_| {
+            Ok(sys::ShellConfig {
+                program: "/bin/bash".into(),
+                args: vec!["-s".into()],
+                command_on_stdin: true,
+            })
+        }).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(result["exitCode"], 0);
+        output.close();
+        let mut bytes = Vec::new();
+        output.run(&mut bytes);
+        let mut frames = bytes.as_slice();
+        let mut stdout = Vec::new();
+        while let Some(frame) = crate::frame::read_frame(&mut frames).unwrap() {
+            if frame.json["stream"] == "stdout" {
+                stdout.extend(frame.payload);
+            }
+        }
+        let mut expected = vec![0; 262144];
+        expected.extend_from_slice(b"complete");
+        assert_eq!(stdout, expected);
+    }
 }

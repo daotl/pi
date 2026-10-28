@@ -15,7 +15,11 @@ import type { ToolDefinition, ToolRenderContext, ToolRenderers } from "../../../
 /** What this component needs from a tool: how to draw it, without executing it. */
 export type { ToolRenderers };
 
-import { formatToolCallWithArgs, getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.ts";
+import {
+	disposeToolTimer,
+	formatToolCallWithArgs,
+	getTextOutput as getRenderedTextOutput,
+} from "../../../core/tools/render-utils.ts";
 import { ensurePngTranscoder } from "../../../utils/image-convert.ts";
 import { isMessageBackground, isMessageSeparator, theme } from "../theme/theme.ts";
 import { keyHint } from "./keybinding-hints.ts";
@@ -63,6 +67,7 @@ export class ToolExecutionComponent extends Container {
 		durationMs?: number;
 	};
 	private hideComponent = false;
+	private disposed = false;
 
 	constructor(
 		toolName: string,
@@ -103,6 +108,13 @@ export class ToolExecutionComponent extends Container {
 		this.updateDisplay();
 	}
 
+	/** Detach renderer-owned clocks when this row leaves its presentation. */
+	dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		disposeToolTimer(this.rendererState);
+	}
+
 	private getCallRenderer(): ToolDefinition<any, any>["renderCall"] | undefined {
 		return this.toolDefinition?.renderCall;
 	}
@@ -124,6 +136,7 @@ export class ToolExecutionComponent extends Container {
 			args: this.args,
 			toolCallId: this.toolCallId,
 			invalidate: () => {
+				if (this.disposed) return;
 				this.invalidate();
 				this.ui.requestRender();
 			},
@@ -227,6 +240,7 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	override invalidate(): void {
+		if (this.disposed) return;
 		super.invalidate();
 		this.updateDisplay();
 	}
@@ -293,6 +307,7 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private updateDisplay(): void {
+		if (this.disposed) return;
 		this.argsPending = false;
 		const bgFn = this.isPartial
 			? this.messageBg("toolPendingBg")

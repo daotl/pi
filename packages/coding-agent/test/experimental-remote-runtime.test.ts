@@ -546,6 +546,82 @@ describe("experimental durable server composition", () => {
 		}
 	});
 
+	test("keeps attached capabilities usable after a rejected Session switch", async () => {
+		const { runtime } = await makeServer();
+		const clientRuntime = await openClientRuntime({
+			command: "client",
+			connect: { transport: "unix", path: runtime.socketPath },
+		});
+		try {
+			const server = await activateBuiltinClientServices(clientRuntime.servers[0]!);
+			await server.server.host.root((ctx) => server.management.attach("demo-1", ctx));
+			const attachment = server.client.attachment;
+			const models = server.models;
+			const agent = server.agent;
+			const transcript = server.transcript;
+			await expect(
+				server.server.host.root((ctx) => server.management.attach("missing-session", ctx)),
+			).rejects.toBeDefined();
+			expect(server.client.attachment).toEqual(attachment);
+			expect(server.models).toBe(models);
+			expect(server.agent).toBe(agent);
+			expect(server.transcript).toBe(transcript);
+			await expect(server.server.host.root((ctx) => models.getThinkingLevels(ctx))).resolves.toContain("off");
+			await expect(server.server.host.root((ctx) => agent.cancelQueued("missing-entry", ctx))).resolves.toEqual({
+				outcome: "not_found",
+			});
+			expect(transcript.state.value.snapshot).toMatchObject({ lane: "main", operation: null });
+		} finally {
+			await clientRuntime.dispose();
+		}
+	});
+
+	test("releases partially acquired replacement capabilities when hydration fails", async ({ onTestFinished }) => {
+		const { runtime } = await makeServer();
+		const clientRuntime = await openClientRuntime({
+			command: "client",
+			connect: { transport: "unix", path: runtime.socketPath },
+		});
+		try {
+			const runtimeServer = clientRuntime.servers[0]!;
+			const releaseCounts: Array<() => number> = [];
+			const get = runtimeServer.server.host.get.bind(runtimeServer.server.host);
+			let rejectReplacement = false;
+			const failingGet = vi
+				.spyOn(runtimeServer.server.host, "get")
+				.mockImplementation(async (contract, input, options) => {
+					if (
+						rejectReplacement &&
+						contract.name === AgentController.name &&
+						runtimeServer.client.attachment?.sessionId === "demo-2"
+					)
+						throw new Error("replacement agent acquisition failed");
+					const reference = await get(contract, input, options);
+					if (contract.name === Models.name) {
+						const release = vi.spyOn(reference, "release");
+						onTestFinished(() => release.mockRestore());
+						releaseCounts.push(() => release.mock.calls.length);
+					}
+					return reference;
+				});
+			onTestFinished(() => failingGet.mockRestore());
+			const server = await activateBuiltinClientServices(runtimeServer);
+			await server.server.host.root((ctx) => server.management.attach("demo-1", ctx));
+			rejectReplacement = true;
+			await expect(server.server.host.root((ctx) => server.management.attach("demo-2", ctx))).rejects.toThrow(
+				"replacement agent acquisition failed",
+			);
+			expect(server.client.attachment?.sessionId).toBe("demo-2");
+			expect(releaseCounts.map((count) => count())).toEqual([1, 1]);
+			expect(() => server.models).toThrow("No Session is attached");
+			rejectReplacement = false;
+			await server.server.host.root((ctx) => server.management.attach("demo-2", ctx));
+			await expect(server.server.host.root((ctx) => server.models.getThinkingLevels(ctx))).resolves.toContain("off");
+		} finally {
+			await clientRuntime.dispose();
+		}
+	});
+
 	test("fences superseded attachment hydration by attachment generation", async ({ onTestFinished }) => {
 		const { runtime } = await makeServer();
 		const client = await Client.connect({

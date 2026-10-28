@@ -5,8 +5,13 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { registerStorageConformance } from "@earendil-works/pi-durable/testing";
 import { IDBKeyRange as FakeIDBKeyRange, IDBFactory } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
+import { defineDoc } from "../src/documents.ts";
+import { ReadOnlySession } from "../src/errors.ts";
 import { idFromNumber } from "../src/ids.ts";
+import { SessionImpl } from "../src/session/session.ts";
+import type { Transaction } from "../src/session/transaction.ts";
 import { IndexedDbStorage } from "../src/storage/indexeddb.ts";
+import { defineTask } from "../src/tasks.ts";
 import type {
 	ConversationId,
 	DocumentCreate,
@@ -150,6 +155,96 @@ it("persists minted IDs across reopen", async () => {
 		await reopened.close(context);
 	}
 });
+
+it.each(["conversation", "fork", "entry", "task", "submission", "document"] as const)(
+	"rejects read-only %s allocation without advancing persisted IDs or failing the Session",
+	async (allocation) => {
+		const indexedDB = new IDBFactory();
+		const name = `read-only-${allocation}`;
+		const ExistingDoc = defineDoc<{ count: number }>({
+			kind: "test.existing",
+			version: 1,
+			scope: "session",
+			checkpointWhen: () => false,
+			initial: () => ({ count: 1 }),
+		});
+		const MissingDoc = defineDoc<{ count: number }>({
+			kind: "test.missing",
+			version: 1,
+			scope: "session",
+			checkpointWhen: () => false,
+			initial: () => ({ count: 0 }),
+		});
+		const WorkTask = defineTask<null, { phase: "ready" }, null>({
+			name: "test.task",
+			version: 1,
+			initial: () => ({ phase: "ready" }),
+			phases: { ready: async () => {} },
+			abort: async () => {},
+		});
+		const writer = new SessionImpl(await IndexedDbStorage.open(name, { indexedDB }));
+		const seeded = await writer.commitWith(async (tx) => {
+			await tx.createRootConversation();
+			const entry = await tx.appendEntry(ROOT_CONVERSATION_ID, { kind: "existing", data: "kept" });
+			const task = await tx.createTask(WorkTask, null, {
+				ownership: { kind: "conversation" },
+				conversationId: ROOT_CONVERSATION_ID,
+			});
+			const submission = await tx.createSubmission({
+				conversationId: ROOT_CONVERSATION_ID,
+				type: "input",
+				status: "queued",
+				requestId: "existing",
+			});
+			await tx.doc(ExistingDoc);
+			return { entry, task, submission };
+		}, context);
+		await writer.close(context);
+		const storage = await IndexedDbStorage.open(name, { indexedDB });
+		const viewer = new SessionImpl(storage, Date.now, undefined, undefined, true);
+		try {
+			const before = await storage.mintId<EntryId>();
+			const attempts: Record<typeof allocation, (tx: Transaction) => Promise<unknown>> = {
+				conversation: (tx) => tx.createConversation({ ownership: { kind: "ownerless" } }),
+				fork: (tx) =>
+					tx.forkConversation(ROOT_CONVERSATION_ID, seeded.entry.id, { ownership: { kind: "ownerless" } }),
+				entry: (tx) => tx.appendEntry(ROOT_CONVERSATION_ID, { kind: "rejected" }),
+				task: (tx) =>
+					tx.createTask(WorkTask, null, {
+						ownership: { kind: "conversation" },
+						conversationId: ROOT_CONVERSATION_ID,
+					}),
+				submission: (tx) =>
+					tx.createSubmission({ conversationId: ROOT_CONVERSATION_ID, type: "input", status: "queued" }),
+				document: (tx) => tx.doc(MissingDoc),
+			};
+			await expect(viewer.commitWith(attempts[allocation], context)).rejects.toBeInstanceOf(ReadOnlySession);
+			expect(await storage.mintId<EntryId>()).toBe(before + 1);
+			await expect(
+				viewer.commitWith(
+					async (tx) => ({
+						conversation: await tx.conversation(ROOT_CONVERSATION_ID),
+						entry: await tx.entry(seeded.entry.id),
+						task: await tx.task(seeded.task),
+						submission: await tx.submission(seeded.submission.id),
+						document: { ...(await tx.doc(ExistingDoc)) },
+					}),
+					context,
+				),
+			).resolves.toMatchObject({
+				conversation: { id: ROOT_CONVERSATION_ID },
+				entry: seeded.entry,
+				task: pendingTask(seeded.task),
+				submission: seeded.submission,
+				document: { count: 1 },
+			});
+			expect(viewer.failure).toBeUndefined();
+		} finally {
+			await viewer.close(context);
+		}
+		await expect(viewer.closed).resolves.toEqual({ reason: "closed" });
+	},
+);
 
 it("rolls back table writes when a later document copy fails", async () => {
 	const indexedDB = new IDBFactory();

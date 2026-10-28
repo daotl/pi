@@ -13,7 +13,13 @@ import {
 	type Transport,
 	toToolDeclaration,
 } from "@earendil-works/pi-ai";
-import { runAgentLoop, runAgentLoopContinue, stripTrailingHarnessMessages } from "./agent-loop.ts";
+import {
+	type AgentLoopExecution,
+	finishAgentLoopFailure,
+	runAgentLoop,
+	runAgentLoopContinue,
+	stripTrailingHarnessMessages,
+} from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -697,29 +703,40 @@ export class Agent {
 		messages: AgentMessage[],
 		options: { skipInitialSteeringPoll?: boolean } = {},
 	): Promise<void> {
+		const execution: AgentLoopExecution = { config: this.createLoopConfig(options), finishTurnStarted: false };
 		await this.runWithLifecycle(async (signal) => {
 			await runAgentLoop(
 				messages,
 				this.createContextSnapshot(),
-				this.createLoopConfig(options),
+				execution.config,
 				(event) => this.processEvents(event),
 				signal,
 				this.streamFunction,
+				execution,
 			);
-		});
+		}, execution);
 	}
 
 	private async runContinuation(prefill?: AgentMessage): Promise<void> {
+		const config = prefill
+			? { ...this.createLoopConfig({ skipInitialSteeringPoll: true }), returnPrefill: true }
+			: this.createLoopConfig();
+		const execution: AgentLoopExecution = { config, finishTurnStarted: false };
 		await this.runWithLifecycle(async (signal) => {
 			const context = this.createContextSnapshot();
-			const config = prefill
-				? { ...this.createLoopConfig({ skipInitialSteeringPoll: true }), returnPrefill: true }
-				: this.createLoopConfig();
+			const config = execution.config;
 			if (prefill) {
 				context.messages.push(prefill);
 			}
-			await runAgentLoopContinue(context, config, (event) => this.processEvents(event), signal, this.streamFunction);
-		});
+			await runAgentLoopContinue(
+				context,
+				config,
+				(event) => this.processEvents(event),
+				signal,
+				this.streamFunction,
+				execution,
+			);
+		}, execution);
 	}
 
 	private createContextSnapshot(): AgentContext {
@@ -770,7 +787,10 @@ export class Agent {
 		};
 	}
 
-	private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
+	private async runWithLifecycle(
+		executor: (signal: AbortSignal) => Promise<void>,
+		execution: AgentLoopExecution,
+	): Promise<void> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing.");
 		}
@@ -791,18 +811,18 @@ export class Agent {
 		} catch (error) {
 			const aborted = abortController.signal.aborted;
 			if (!aborted) abortController.abort();
-			await this.handleRunFailure(error, aborted);
+			await this.handleRunFailure(error, aborted, execution);
 		} finally {
 			this.finishRun();
 		}
 	}
 
-	private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {
+	private async handleRunFailure(error: unknown, aborted: boolean, execution: AgentLoopExecution): Promise<void> {
 		const failureMessage = {
 			role: "assistant",
-			api: this._state.model.api,
-			provider: this._state.model.provider,
-			model: this._state.model.id,
+			api: execution.config.model.api,
+			provider: execution.config.model.provider,
+			model: execution.config.model.id,
 			usage: EMPTY_USAGE,
 			timestamp: Date.now(),
 			...(error instanceof TerminalResponseError ? error.terminalMessage : undefined),
@@ -810,12 +830,25 @@ export class Agent {
 			stopReason: aborted ? "aborted" : "error",
 			errorMessage: error instanceof Error ? error.message : String(error),
 		} satisfies AgentMessage;
+		if (execution.context) {
+			if (
+				this._state.streamingMessage?.role === "assistant" ||
+				(execution.config.returnPrefill && execution.context.messages.at(-1)?.role === "assistant")
+			) {
+				execution.context.messages[execution.context.messages.length - 1] = failureMessage;
+			} else {
+				execution.context.messages.push(failureMessage);
+			}
+		}
+		const newMessages = execution.newMessages ?? [];
+		newMessages.push(failureMessage);
 		if (this._state.streamingMessage?.role !== "assistant") {
 			await this.processEvents({ type: "message_start", message: failureMessage });
 		}
 		await this.processEvents({ type: "message_end", message: failureMessage });
+		await finishAgentLoopFailure(execution, failureMessage, newMessages, this.signal);
 		await this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] });
-		await this.processEvents({ type: "agent_end", messages: [failureMessage] });
+		await this.processEvents({ type: "agent_end", messages: newMessages });
 	}
 
 	private finishRun(): void {

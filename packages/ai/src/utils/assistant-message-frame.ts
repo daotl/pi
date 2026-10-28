@@ -401,28 +401,60 @@ function activeBlock(
 	return { block, state };
 }
 
-/**
- * Replay compact frames without mutating them. Returns `undefined` when the
- * iterable contains no start frame.
- */
-export function reduceAssistantMessageFrames(frames: Iterable<AssistantMessageFrame>): AssistantMessage | undefined {
-	let message: AssistantMessage | undefined;
-	let frameBeforeStart: AssistantMessageFrame["type"] | undefined;
-	const states = new Map<number, ReducerBlockState>();
+/** Decoder state stored beside, never instead of, the authoritative partial message. */
+export interface AssistantMessageFrameCheckpoint {
+	blocks: Array<{ contentIndex: number; state: ReducerBlockState }>;
+	frameBeforeStart?: AssistantMessageFrame["type"];
+}
 
-	for (const frame of frames) {
+/** Incremental frame fold; checkpoints preserve unfinished tool JSON exactly across hydration. */
+export class AssistantMessageFrameReducer {
+	private value: AssistantMessage | undefined;
+	private frameBeforeStart: AssistantMessageFrame["type"] | undefined;
+	private readonly states: Map<number, ReducerBlockState>;
+	private readonly dirtyArguments = new Set<number>();
+
+	constructor(message?: AssistantMessage, checkpoint?: AssistantMessageFrameCheckpoint) {
+		this.value = message === undefined ? undefined : structuredClone(message);
+		this.states = new Map<number, ReducerBlockState>(
+			checkpoint?.blocks.map(({ contentIndex, state }) => [contentIndex, { ...state }]) ?? [],
+		);
+		this.frameBeforeStart = checkpoint?.frameBeforeStart;
+	}
+
+	checkpoint(): AssistantMessageFrameCheckpoint {
+		return {
+			blocks: [...this.states].map(([contentIndex, state]) => ({ contentIndex, state: { ...state } })),
+			...(this.frameBeforeStart === undefined ? {} : { frameBeforeStart: this.frameBeforeStart }),
+		};
+	}
+
+	get message(): AssistantMessage | undefined {
+		for (const contentIndex of this.dirtyArguments) {
+			const state = this.states.get(contentIndex);
+			const block = this.value?.content[contentIndex];
+			if (state?.kind !== "toolCall" || state.ended || state.json.length === 0) continue;
+			if (block?.type !== "toolCall") throw new Error("Unreachable tool-call frame state");
+			block.arguments = parseStreamingJson<ToolCall["arguments"]>(state.json);
+		}
+		this.dirtyArguments.clear();
+		return this.value;
+	}
+
+	apply(frame: AssistantMessageFrame): void {
 		if (frame.type === "start") {
-			if (message) throw new Error("Assistant message frame sequence contains more than one start frame");
-			if (frameBeforeStart !== undefined)
-				throw new Error(`${frameBeforeStart} frame appears before the start frame`);
-			message = structuredClone(frame.partial);
-			continue;
+			if (this.value) throw new Error("Assistant message frame sequence contains more than one start frame");
+			if (this.frameBeforeStart !== undefined)
+				throw new Error(`${this.frameBeforeStart} frame appears before the start frame`);
+			this.value = structuredClone(frame.partial);
+			return;
 		}
+		const message = this.value;
 		if (!message) {
-			frameBeforeStart ??= frame.type;
-			continue;
+			this.frameBeforeStart ??= frame.type;
+			return;
 		}
-
+		const states = this.states;
 		switch (frame.type) {
 			case "text_start":
 				if (frame.content.type !== "text") {
@@ -497,12 +529,14 @@ export function reduceAssistantMessageFrames(frames: Iterable<AssistantMessageFr
 					throw new Error("Unreachable tool-call frame state");
 				}
 				state.json += frame.delta;
+				this.dirtyArguments.add(frame.contentIndex);
 				if (frame.rawDelta !== undefined) block.raw = (block.raw ?? "") + frame.rawDelta;
 				break;
 			}
 			case "toolcall_end": {
 				const { block, state } = activeBlock(message, states, frame.contentIndex, "toolCall", frame.type);
-				if (block.type !== "toolCall") throw new Error("Unreachable tool-call frame state");
+				if (block.type !== "toolCall" || state.kind !== "toolCall")
+					throw new Error("Unreachable tool-call frame state");
 				block.id = frame.id;
 				block.name = frame.name;
 				block.arguments = structuredClone(frame.arguments);
@@ -515,18 +549,16 @@ export function reduceAssistantMessageFrames(frames: Iterable<AssistantMessageFr
 				if (frame.namespace !== undefined) block.namespace = frame.namespace;
 				if (frame.raw !== undefined) block.raw = frame.raw;
 				state.ended = true;
+				state.json = "";
 				break;
 			}
 		}
 	}
+}
 
-	if (!message) return undefined;
-	for (const [contentIndex, state] of states) {
-		if (state.kind !== "toolCall" || state.ended || state.json.length === 0) continue;
-		const block = message.content[contentIndex];
-		if (block?.type !== "toolCall") throw new Error("Unreachable tool-call frame state");
-		block.arguments = parseStreamingJson<ToolCall["arguments"]>(state.json);
-	}
-
-	return message;
+/** Replay compact frames without mutating them; a stream without a start returns `undefined`. */
+export function reduceAssistantMessageFrames(frames: Iterable<AssistantMessageFrame>): AssistantMessage | undefined {
+	const reducer = new AssistantMessageFrameReducer();
+	for (const frame of frames) reducer.apply(frame);
+	return reducer.message;
 }

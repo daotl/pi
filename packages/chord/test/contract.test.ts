@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { Type } from "typebox";
+import { Value } from "typebox/value";
 import { describe, it } from "vitest";
 import { bind, coverage, hostFamily, hostNamed, isChordError, local, method, opaque, remote } from "../src/index.ts";
 import { canonicalIdentity, fits, normalize } from "../src/schema.ts";
@@ -30,6 +31,35 @@ describe("contracts", () => {
 			() => normalize(chatV1.input, { session: 1 }, "input"),
 			(error) => isChordError(error, "invalid") && error.reason === "input",
 		);
+	});
+
+	it("named properties must fit every matching provider pattern without rejecting additive methods", () => {
+		const consumerArgs = Type.Object({ x: Type.String() }, { additionalProperties: false });
+		const conflictingArgs = Type.Object(
+			{ x: Type.String() },
+			{ patternProperties: { "^x$": Type.String(), x: Type.Number() } },
+		);
+		assert.equal(Value.Check(consumerArgs, { x: "text" }), true);
+		assert.equal(Value.Check(conflictingArgs, { x: "text" }), false);
+		assert.equal(fits(consumerArgs, conflictingArgs), false);
+		const contract = (args: typeof consumerArgs) =>
+			remote("t.named-patterns", {
+				version: 1,
+				input: Type.Object({}),
+				host: hostNamed("server"),
+				variants: { main: { methods: { send: method(args) } } },
+			});
+		const consumer = contract(consumerArgs);
+		assert.throws(
+			() => bind(contract(conflictingArgs), undefined, consumer),
+			(error) => isChordError(error, "contract_mismatch") && /arguments/.test(error.message),
+		);
+		const additiveArgs = Type.Object(
+			{ x: Type.String(), added: Type.Optional(Type.Number()) },
+			{ patternProperties: { "^x$": Type.String(), x: Type.String() } },
+		);
+		assert.equal(fits(consumerArgs, additiveArgs), true);
+		assert.equal(bind(contract(additiveArgs), undefined, consumer), undefined);
 	});
 
 	it("fingerprints are stable and description-based", () => {

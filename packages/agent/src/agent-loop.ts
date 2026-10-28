@@ -34,11 +34,33 @@ import type {
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
-type AgentLoopExecution = {
+/** @internal Shared settlement state for streamed and stateful loop callers. */
+export type AgentLoopExecution = {
 	config: AgentLoopConfig;
 	context?: AgentContext;
+	newMessages?: AgentMessage[];
 	finishTurnStarted: boolean;
 };
+
+/** @internal Finalize synthesized failures once, including publication-barrier rejections. */
+export async function finishAgentLoopFailure(
+	execution: AgentLoopExecution,
+	message: AssistantMessage,
+	newMessages: AgentMessage[],
+	signal: AbortSignal | undefined,
+): Promise<void> {
+	if (execution.finishTurnStarted || !execution.context) return;
+	execution.finishTurnStarted = true;
+	try {
+		await execution.config.finishTurn?.(
+			{ message, toolResults: [], canContinue: false, context: execution.context, newMessages },
+			signal,
+		);
+	} catch (finishError) {
+		const detail = finishError instanceof Error ? finishError.message : String(finishError);
+		message.errorMessage += `\n\nfinishTurn failed: ${detail}`;
+	}
+}
 
 /**
  * A harness message is an assistant message with no meaningful content:
@@ -153,8 +175,9 @@ export async function runAgentLoop(
 	emit: AgentEventSink,
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
+	execution?: AgentLoopExecution,
 ): Promise<AgentMessage[]> {
-	return runAgentLoopInternal(prompts, context, config, emit, signal, streamFn);
+	return runAgentLoopInternal(prompts, context, config, emit, signal, streamFn, execution);
 }
 
 async function runAgentLoopInternal(
@@ -190,8 +213,9 @@ export async function runAgentLoopContinue(
 	emit: AgentEventSink,
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
+	execution?: AgentLoopExecution,
 ): Promise<AgentMessage[]> {
-	return runAgentLoopContinueInternal(context, config, emit, signal, streamFn);
+	return runAgentLoopContinueInternal(context, config, emit, signal, streamFn, execution);
 }
 
 async function runAgentLoopContinueInternal(
@@ -311,25 +335,7 @@ function createAgentStream(config: AgentLoopConfig, signal: AbortSignal | undefi
 		if (!turnOpen) emit({ type: "turn_start" });
 		if (!partialMessage) emit({ type: "message_start", message });
 		emit({ type: "message_end", message });
-		if (!execution.finishTurnStarted && execution.context) {
-			execution.finishTurnStarted = true;
-			try {
-				await execution.config.finishTurn?.(
-					{
-						message,
-						toolResults: [],
-						canContinue: false,
-						context: execution.context,
-						newMessages: completedMessages,
-					},
-					signal,
-				);
-			} catch (finishError) {
-				// Settlement must not recurse into a failing finalizer or leave the stream open.
-				const detail = finishError instanceof Error ? finishError.message : String(finishError);
-				message.errorMessage += `\n\nfinishTurn failed: ${detail}`;
-			}
-		}
+		await finishAgentLoopFailure(execution, message, completedMessages, signal);
 		emit({ type: "turn_end", message, toolResults: [] });
 		emit({ type: "agent_end", messages: completedMessages });
 		stream.end(completedMessages);
@@ -351,7 +357,10 @@ async function runLoop(
 	execution?: AgentLoopExecution,
 ): Promise<void> {
 	let currentContext = initialContext;
-	if (execution) execution.context = currentContext;
+	if (execution) {
+		execution.context = currentContext;
+		execution.newMessages = newMessages;
+	}
 	let config = initialConfig;
 	let lastCompletedTurn: PrepareNextTurnContext | undefined;
 	let explicitContinuation = false;

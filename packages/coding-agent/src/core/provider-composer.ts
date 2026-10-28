@@ -32,7 +32,13 @@ import { isHistoryPreservingApi } from "@earendil-works/pi-ai/api/history-proven
 import { isDirectOpenAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { getApiProvider, isKnownApiProvider } from "@earendil-works/pi-ai/compat";
 import { classifierErrorResult, imageErrorResult } from "@earendil-works/pi-ai/utils/model-operations";
-import type { ModelConfig, ModelsJsonModel, ModelsJsonModelOverride, ModelsJsonProvider } from "./model-config.ts";
+import {
+	DEFAULT_CUSTOM_MODEL_CONTEXT_WINDOW,
+	type ModelConfig,
+	type ModelsJsonModel,
+	type ModelsJsonModelOverride,
+	type ModelsJsonProvider,
+} from "./model-config.ts";
 import {
 	clearConfigValueCache,
 	getConfigValueEnvVarNames,
@@ -271,7 +277,7 @@ function modelFromJson(
 		inputLimits: definition.inputLimits,
 		cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		promptCache: definition.promptCache,
-		contextWindow: definition.contextWindow ?? 262144,
+		contextWindow: definition.contextWindow ?? DEFAULT_CUSTOM_MODEL_CONTEXT_WINDOW,
 		maxTokens: definition.maxTokens ?? 16384,
 		samplingParams: definition.samplingParams,
 		samplingParamsByThinkingLevel: definition.samplingParamsByThinkingLevel,

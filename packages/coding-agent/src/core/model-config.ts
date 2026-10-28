@@ -16,6 +16,8 @@ import { stripJsonComments } from "../utils/json.ts";
 import { normalizePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 
+export const DEFAULT_CUSTOM_MODEL_CONTEXT_WINDOW = 262144;
+
 const SamplingParamsSchema = Type.Record(Type.String(), Type.Unknown());
 const SamplingParamsByThinkingLevelSchema = Type.Object(
 	{
@@ -57,7 +59,11 @@ const ModelDefinitionSchema = Type.Object({
 	cost: Type.Optional(ModelCostSchema),
 	promptCache: Type.Optional(ModelPromptCacheSchema),
 	contextWindow: Type.Optional(
-		Type.Number({ exclusiveMinimum: 0, default: 128000, description: ModelFieldDescriptions.contextWindow }),
+		Type.Number({
+			exclusiveMinimum: 0,
+			default: DEFAULT_CUSTOM_MODEL_CONTEXT_WINDOW,
+			description: ModelFieldDescriptions.contextWindow,
+		}),
 	),
 	maxTokens: Type.Optional(
 		Type.Number({ exclusiveMinimum: 0, default: 16384, description: ModelFieldDescriptions.maxTokens }),

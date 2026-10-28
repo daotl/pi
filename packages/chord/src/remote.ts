@@ -110,7 +110,7 @@ export class RemoteBinding {
 	#applied = false;
 	/** Waiting for the first hydration (`whenHydrated`). */
 	readonly #hydrationWaiters = new Set<Settle>();
-	/** Provider-authored method variants; updated on shape receipt, before state hydration. */
+	/** Provider-authored method variants; updated independently of shape/state hydration. */
 	#callVariants: readonly CallVariant[] = [];
 	#projectionChanged = deferred();
 	#fencedCodeVersions: readonly number[] = [];
@@ -248,6 +248,15 @@ export class RemoteBinding {
 		this.stateOn = this.wantsState;
 	}
 
+	/** Control-only metadata must leave a pending shape's missing snapshots and values untouched. */
+	projected(callVariants: readonly CallVariant[], fencedCodeVersions: readonly number[]): void {
+		if (this.ended) return;
+		this.#callVariants = callVariants;
+		this.#fencedCodeVersions = fencedCodeVersions;
+		this.#projectionChanged.resolve();
+		this.#projectionChanged = deferred();
+	}
+
 	/** A unit begins: `listed` are the members whose snapshots follow. */
 	shaped(
 		shape: Shape,
@@ -256,10 +265,7 @@ export class RemoteBinding {
 		fencedCodeVersions: readonly number[],
 	): void {
 		if (this.ended) return;
-		this.#callVariants = callVariants;
-		this.#fencedCodeVersions = fencedCodeVersions;
-		this.#projectionChanged.resolve();
-		this.#projectionChanged = deferred();
+		this.projected(callVariants, fencedCodeVersions);
 		const previous = this.#pending;
 		const missing = new Set<string>(listed);
 		// A newer shape before the older one's snapshots (relays may reorder them): wait for both.
@@ -377,7 +383,7 @@ export class RemoteBinding {
 			const projection =
 				this.host.kind === "client" ? latest : versions.find((entry) => entry.codeVersion === codeVersion);
 			if (projection === undefined) {
-				// Commit control precedes the new shape; new-code tasks must wait for its method metadata.
+				// Commit control precedes the new projections; new-code tasks wait for method metadata, not state.
 				if (versions.every((entry) => entry.codeVersion < ctx.codeVersion)) {
 					await raceSignal(this.#projectionChanged.promise, ctx.signal);
 					continue;

@@ -7,7 +7,15 @@ import { type CtxImpl, RefImpl, variantOf } from "./object.ts";
 import type { RemoteBinding, RemoteChannel } from "./remote.ts";
 import { assertValid } from "./schema.ts";
 import type { Ctx, Readable, Shape, StateEvent } from "./types.ts";
-import { type Frame, fromWireError, isFrame, PROTOCOL_VERSION, type RootRef, toWireError } from "./wire.ts";
+import {
+	type CallVariant,
+	type Frame,
+	fromWireError,
+	isFrame,
+	PROTOCOL_VERSION,
+	type RootRef,
+	toWireError,
+} from "./wire.ts";
 
 export interface LinkOptions {
 	/** Milliseconds between pings (default 15000). */
@@ -108,8 +116,8 @@ interface ServedLocal {
 	readonly again: boolean;
 	/** A unit was sent. */
 	unitSent: boolean;
-	/** Code version covered by the last sent unit's call projections. */
-	unitCodeVersion: number | undefined;
+	/** Code version covered by the last sent call projections (independent of state units). */
+	projectionCodeVersion: number | undefined;
 	/** The members whose snapshot the consumer has, with their streams. */
 	readonly feeds: Map<string, Feed>;
 }
@@ -235,6 +243,12 @@ export class RelayRef {
 			this.#shaped = true;
 			if (this.frame.again !== true) this.urgent = new Set(frame.state);
 		}
+		this.origin.send({ ...frame, id: this.originId, fencedCodeVersions: [...this.origin.fencedCodeVersions] });
+	}
+
+	/** Method metadata crosses every relay immediately without changing its state-unit ordering. */
+	projected(frame: Extract<Frame, { t: "projections" }>): void {
+		if (this.closed) return;
 		this.origin.send({ ...frame, id: this.originId, fencedCodeVersions: [...this.origin.fencedCodeVersions] });
 	}
 
@@ -641,7 +655,10 @@ export class Connection implements RemoteChannel {
 	/** Even unchanged implementations acquire the committed code version; callers need its projection metadata. */
 	codeVersionChanged(): void {
 		for (const served of this.served.values()) {
-			if (served.kind === "local" && served.unitCodeVersion !== this.host.current.id) this.#unit(served);
+			if (served.kind !== "local" || served.projectionCodeVersion === this.host.current.id) continue;
+			// A pending-only type could not send its first unit during prepare: commit must hydrate that hold too.
+			if (!served.unitSent) this.#unit(served);
+			else this.#sendProjections(served);
 		}
 	}
 
@@ -791,6 +808,7 @@ export class Connection implements RemoteChannel {
 				this.#onResync(frame.hold, frame.m);
 				return;
 			case "shape":
+			case "projections":
 			case "gone":
 				this.#onHoldReply(frame);
 				return;
@@ -873,7 +891,7 @@ export class Connection implements RemoteChannel {
 	 */
 	#principalOf(frame: { readonly principal?: unknown }): unknown {
 		if (this.role === "downstream") return this.principal;
-		return frame.principal ?? this.principal;
+		return frame.principal === undefined ? this.principal : frame.principal;
 	}
 
 	/**
@@ -925,7 +943,7 @@ export class Connection implements RemoteChannel {
 			wantsState: frame.state !== false,
 			again: frame.again === true,
 			unitSent: false,
-			unitCodeVersion: undefined,
+			projectionCodeVersion: undefined,
 			feeds: new Map(),
 		};
 		this.served.set(frame.id, served);
@@ -960,16 +978,15 @@ export class Connection implements RemoteChannel {
 		}
 		const urgent = served.feeds.size === 0 && !(served.again && !served.unitSent);
 		if (urgent) this.#sendUnit(served);
-		else this.#queueUnit(served.id, () => this.#sendUnit(served));
+		else {
+			this.#sendProjections(served);
+			this.#queueUnit(served.id, () => this.#sendUnit(served));
+		}
 	}
 
-	/** Builds and sends a unit from the current shape and values. */
-	#sendUnit(served: ServedLocal): void {
-		this.#pending.delete(unitKey(served.id));
-		if (this.served.get(served.id) !== served) return;
-		const shape = served.ref.shape;
-		if (shape === undefined) return;
-		const callVariants = [];
+	/** Current and retained consumer-view method variants, bounded by the host's retained code versions. */
+	#callVariants(served: ServedLocal): CallVariant[] {
+		const callVariants: CallVariant[] = [];
 		for (const [codeVersion, installed] of served.ref.object.implementations) {
 			if (!this.host.hasCodeVersion(codeVersion)) continue;
 			if (codeVersion !== this.host.current.id) {
@@ -985,11 +1002,29 @@ export class Connection implements RemoteChannel {
 			const variant = variantOf(served.ref.viewOf(installed));
 			callVariants.push({ codeVersion, ...(variant === undefined ? {} : { variant }) });
 		}
-		// A type activated only in prepare has no committed implementation yet. Commit refreshes this hold;
-		// rollback disposes the object and sends gone. Never emit invalid empty metadata or admit pending code.
+		return callVariants;
+	}
+
+	/** Publishes only method metadata: never attaches streams, flushes state, or changes pending units. */
+	#sendProjections(served: ServedLocal): void {
+		if (this.served.get(served.id) !== served || served.ref.shape === undefined) return;
+		const callVariants = this.#callVariants(served);
+		if (callVariants.length === 0) return;
+		served.projectionCodeVersion = this.host.current.id;
+		this.send({ t: "projections", id: served.id, callVariants, fencedCodeVersions: [...this.fencedCodeVersions] });
+	}
+
+	/** Builds and sends a unit from the current shape and values. */
+	#sendUnit(served: ServedLocal): void {
+		this.#pending.delete(unitKey(served.id));
+		if (this.served.get(served.id) !== served) return;
+		const shape = served.ref.shape;
+		if (shape === undefined) return;
+		const callVariants = this.#callVariants(served);
+		// Types activated only in prepare have no committed implementation until commit refreshes their holds.
 		if (callVariants.length === 0) return;
 		served.unitSent = true;
-		served.unitCodeVersion = this.host.current.id;
+		served.projectionCodeVersion = this.host.current.id;
 		const members = served.wantsState ? this.#stateMembers(served.ref, shape) : [];
 		const listed = members.filter((name) => !served.feeds.has(name));
 		const snaps: StateFrame[] = [];
@@ -1196,10 +1231,11 @@ export class Connection implements RemoteChannel {
 		return { rootId: root.rootId, codeVersion };
 	}
 
-	#onHoldReply(frame: Extract<Frame, { t: "shape" | "gone" }>): void {
+	#onHoldReply(frame: Extract<Frame, { t: "shape" | "projections" | "gone" }>): void {
 		const relay = this.relayedRefs.get(frame.id);
 		if (relay !== undefined) {
 			if (frame.t === "gone") relay.close(fromWireError(frame.error), { releaseDown: false, notify: true });
+			else if (frame.t === "projections") relay.projected(frame);
 			else relay.shape(frame);
 			return;
 		}
@@ -1208,6 +1244,10 @@ export class Connection implements RemoteChannel {
 		if (frame.t === "gone") {
 			this.remotes.delete(frame.id);
 			binding.gone(fromWireError(frame.error));
+			return;
+		}
+		if (frame.t === "projections") {
+			binding.projected(frame.callVariants, frame.fencedCodeVersions);
 			return;
 		}
 		binding.shaped(

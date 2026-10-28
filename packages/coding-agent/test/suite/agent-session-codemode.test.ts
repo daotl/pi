@@ -15,7 +15,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { ToolResultMessage, Usage } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "../../src/core/extensions/types.ts";
 import type { CustomEntry } from "../../src/core/session-manager.ts";
 import { createToolDefinitionFromAgentTool } from "../../src/core/tools/tool-definition-wrapper.ts";
@@ -705,7 +705,7 @@ describe("codemode models", () => {
 		input: ImagesContext["input"];
 	}
 
-	async function setup() {
+	async function setup(classifierRelease?: Promise<void>) {
 		const harness = await createHarness({
 			initialActiveToolNames: ["codemode"],
 			extensionFactories: [createCodemodeExtension()],
@@ -744,7 +744,7 @@ describe("codemode models", () => {
 					classify: async (model, context, options): Promise<ClassifierResult> => {
 						active++;
 						maxActive = Math.max(maxActive, active);
-						await new Promise((resolve) => setTimeout(resolve, 10));
+						await classifierRelease;
 						active--;
 						const text = context.state.text;
 						observed.push({ baseUrl: model.baseUrl, apiKey: options?.apiKey, text });
@@ -801,8 +801,9 @@ describe("codemode models", () => {
 	});
 
 	it("lists models and classifies with catalog auth, ignoring script-supplied fields", async () => {
-		const { harness, observed, maxActive } = await setup();
-		const result = await run(
+		const release = Promise.withResolvers<void>();
+		const { harness, observed, maxActive } = await setup(release.promise);
+		const pending = run(
 			harness,
 			`
 			const [model] = await models.getAvailableOfType("classifier", "scorer");
@@ -823,6 +824,13 @@ describe("codemode models", () => {
 			};
 		`,
 		);
+		try {
+			await vi.waitFor(() => expect(maxActive()).toBe(4));
+		} finally {
+			release.resolve();
+			await pending;
+		}
+		const result = await pending;
 		expect(result.isError).toBe(false);
 		expect(JSON.parse(resultText(result))).toEqual({
 			id: "judge",

@@ -9,6 +9,11 @@ import { openAICodexResponsesApi } from "@earendil-works/pi-ai/api/openai-codex-
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { registerApiProvider, registerFauxProvider, resetApiProviders } from "@earendil-works/pi-ai/compat";
+import { azureProvider } from "@earendil-works/pi-ai/providers/azure";
+import { cloudflareAIGatewayProvider } from "@earendil-works/pi-ai/providers/cloudflare-ai-gateway";
+import { cloudflareWorkersAIProvider } from "@earendil-works/pi-ai/providers/cloudflare-workers-ai";
+import { opencodeProvider } from "@earendil-works/pi-ai/providers/opencode";
+import { opencodeGoProvider } from "@earendil-works/pi-ai/providers/opencode-go";
 import { afterEach, expect, it } from "vitest";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 
@@ -247,3 +252,25 @@ it.each([
 		expect(runtime.usesAdapterOutputClamp(model)).toBe(false);
 	},
 );
+
+it.each([
+	["Azure", azureProvider],
+	["OpenCode", opencodeProvider],
+	["OpenCode Go", opencodeGoProvider],
+	["Cloudflare gateway", cloudflareAIGatewayProvider],
+	["Cloudflare workers", cloudflareWorkersAIProvider],
+] as const)("retains only output budgeting for model-free %s factory dispatch", async (_name, factory) => {
+	const runtime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false });
+	const native = factory();
+	runtime.registerNativeProvider(native);
+	const model: Model<"openai-completions"> = {
+		...definition,
+		id: "not-in-catalog",
+		api: "openai-completions",
+		provider: native.id,
+		baseUrl: "https://example.invalid/v1",
+	};
+	expect(runtime.usesAdapterOutputClamp(model)).toBe(true);
+	expect(runtime.canAttributeRequestHistory(model)).toBe(false);
+	expect(runtime.canAttributeRequestHistory(model, true)).toBe(false);
+});

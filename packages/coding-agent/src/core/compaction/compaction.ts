@@ -47,6 +47,7 @@ import {
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
+	extractRequestFileOps,
 	type FileOperations,
 	formatFileOperations,
 	type RequestHistoryPolicy,
@@ -918,10 +919,7 @@ export async function generateSummaryWithUsage(
 		fileOps = createFileOps();
 		attributable = canAttributeRequestHistory(model, agent, streamFn, requestHistoryPolicy);
 		if (attributable) {
-			for (const message of llmMessages) {
-				if (message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted")
-					extractFileOpsFromMessage(message, fileOps);
-			}
+			extractRequestFileOps(llmMessages, fileOps);
 		}
 		// Context/converter work can replace the policy while awaiting; read it immediately before dispatch.
 		if (agent) attemptOptions.onPayload = agent.onPayload;

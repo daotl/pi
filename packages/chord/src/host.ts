@@ -564,7 +564,11 @@ export class HostImpl implements Host, HostCore {
 		}
 		if (service === undefined) throw unknownType(type.name, this.name);
 		bind(service.contract, service.options.accepts, type);
-		const { address, normalized, principal } = this.#locate(service, input, options?.principal ?? this.principal);
+		const { address, normalized, principal } = this.#locate(
+			service,
+			input,
+			options?.principal === undefined ? this.principal : options.principal,
+		);
 		// The provider's own placement decides, never where a request says it is going (a client picks that).
 		const placement = service.contract.description.host;
 		if (placement !== undefined && resolveHost(type.name, placement, normalized) !== this.name) {
@@ -662,7 +666,7 @@ export class HostImpl implements Host, HostCore {
 				options.signal === undefined ? [codeVersion.abort.signal] : [options.signal, codeVersion.abort.signal],
 			rootId,
 			codeVersion: codeVersion.id,
-			principal: options.principal ?? this.principal,
+			principal: options.principal === undefined ? this.principal : options.principal,
 		});
 		try {
 			return await fn(ctx);
@@ -1139,7 +1143,7 @@ export class HostImpl implements Host, HostCore {
 	): RefCore {
 		const principal =
 			options?.principal === undefined || this.isSelf(options.principal) ? undefined : options.principal;
-		const key = this.#remoteKey(type, input, principal ?? this.principal);
+		const key = this.#remoteKey(type, input, principal === undefined ? this.principal : principal);
 		let binding = this.bindings.get(key);
 		const fresh = binding === undefined || binding.ended;
 		if (binding === undefined || binding.ended) {
@@ -1169,7 +1173,10 @@ export class HostImpl implements Host, HostCore {
 		else {
 			const route = this.#routeFor(binding.at);
 			if (route === undefined) binding.gone(new ChordError("unavailable", `no route to ${binding.at}`));
-			else bindWhenSynced(this.#resolve(route, binding.at, binding.principal ?? this.principal));
+			else
+				bindWhenSynced(
+					this.#resolve(route, binding.at, binding.principal === undefined ? this.principal : binding.principal),
+				);
 		}
 	}
 

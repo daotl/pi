@@ -25,6 +25,7 @@ import {
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
+	extractRequestFileOps,
 	type FileOperations,
 	formatFileOperations,
 	type RequestHistoryPolicy,
@@ -513,10 +514,7 @@ export async function generateBranchSummary(
 		fileOps = createFileOps();
 		attributable = canAttributeRequestHistory(model, agent, streamFn, options.requestHistoryPolicy);
 		if (attributable) {
-			for (const message of llmMessages) {
-				if (message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted")
-					extractFileOpsFromMessage(message, fileOps);
-			}
+			extractRequestFileOps(llmMessages, fileOps);
 		}
 		if (agent) attemptOptions.onPayload = agent.onPayload;
 		return context;

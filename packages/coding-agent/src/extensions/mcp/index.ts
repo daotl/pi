@@ -39,6 +39,7 @@ import type {
 } from "../../core/extensions/types.ts";
 import { mcpNamespace } from "../../core/mcp-servers.ts";
 import type { ModelRegistry } from "../../core/model-registry.ts";
+import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
 import { CODEMODE_TOOL_NAME } from "../codemode/tool.ts";
 import { TOOL_SEARCH_TOOL_NAME } from "../tool-search/tool.ts";
@@ -698,11 +699,15 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 				if (error instanceof runtime.McpSignInCancelledError) return "Sign-in cancelled.";
 				return `Sign-in failed: ${errorMessage(error)}`;
 			}
+			if (signal.aborted) return "Sign-in cancelled.";
 			// The challenge that asked for this sign-in (for example for more scope) is answered.
 			connection.challenge = undefined;
 			try {
-				await connection.reconnect();
+				const ready = track(connection.reconnect());
+				server.ready = ready.catch(() => undefined);
+				await raceWithAbortSignal(ready, signal);
 			} catch (error) {
+				if (signal.aborted) return "Sign-in cancelled.";
 				return `Signed in, but ${errorMessage(error)}`;
 			}
 			return undefined;

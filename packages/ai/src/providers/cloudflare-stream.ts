@@ -1,3 +1,4 @@
+import { isContextClampingApiStreams, markContextClampingApi } from "../api/context-clamp-provenance.ts";
 import type { ProviderClassifier, ProviderEnv, ProviderStreams } from "../types.ts";
 
 const CLOUDFLARE_ACCOUNT_ID = "CLOUDFLARE_ACCOUNT_ID";
@@ -19,12 +20,13 @@ export function resolveCloudflareModel<TModel extends { baseUrl: string }>(
  * placeholders materialize from the resolved provider env before dispatch.
  */
 export function cloudflareStreams(streams: ProviderStreams): ProviderStreams {
-	return {
+	const wrapped: ProviderStreams = {
 		stream: (model, context, options) =>
 			streams.stream(resolveCloudflareModel(model, options?.env), context, options),
 		streamSimple: (model, context, options) =>
 			streams.streamSimple(resolveCloudflareModel(model, options?.env), context, options),
 	};
+	return isContextClampingApiStreams(streams) ? markContextClampingApi(wrapped) : wrapped;
 }
 
 /** Classifier counterpart of {@link cloudflareStreams}. */
