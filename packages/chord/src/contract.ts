@@ -319,7 +319,7 @@ export function contractFromDescription(description: Description): AnyContract {
 export function coverage(provider: Description, consumer: Description): string | undefined {
 	if (provider.name !== consumer.name || provider.scope !== consumer.scope) return "different type";
 	if (!samePlacement(provider, consumer)) return "host";
-	if (!fits(consumer.input, provider.input)) return "input";
+	if (!fits(consumer.input, provider.input, "cleaned-input")) return "input";
 	for (const [kind, consumerMembers] of Object.entries(consumer.variants)) {
 		const providerMembers = provider.variants[kind];
 		if (providerMembers === undefined) return `variant ${kind} missing`;
@@ -329,7 +329,11 @@ export function coverage(provider: Description, consumer: Description): string |
 			if (offered.kind === "method" && wanted.kind === "method") {
 				// Both take arguments or neither does; a consumer that expects no result accepts any.
 				if ((wanted.args === undefined) !== (offered.args === undefined)) return `${kind}.${name} arguments`;
-				if (wanted.args !== undefined && offered.args !== undefined && !fits(wanted.args, offered.args))
+				if (
+					wanted.args !== undefined &&
+					offered.args !== undefined &&
+					!fits(wanted.args, offered.args, "cleaned-input")
+				)
 					return `${kind}.${name} arguments`;
 				if (wanted.result !== undefined && (offered.result === undefined || !fits(offered.result, wanted.result)))
 					return `${kind}.${name} result`;

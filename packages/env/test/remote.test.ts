@@ -1,11 +1,20 @@
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	renameSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import { getOrThrow, type ShellOutputInfo, type WatchChange, type WatchTarget } from "@earendil-works/pi-durable/env";
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { Connection, nodePlatform } from "../src/connection.ts";
+import { Connection, type Json, nodePlatform, RemoteError } from "../src/connection.ts";
 import { RemoteExecutionEnv } from "../src/remote-env.ts";
 import { daemon } from "./daemon.ts";
 
@@ -100,6 +109,97 @@ describe("RemoteExecutionEnv", () => {
 		}
 		expect(Date.now() - started).toBeLessThan(10_000);
 	}, 30_000);
+
+	it.each([
+		{ name: "small ASCII", prefix: Buffer.from("prefix!") },
+		{ name: "final partial chunk", prefix: Buffer.alloc(512 * 1024 + 7, 0x61) },
+		{
+			name: "UTF-8 across the chunk boundary",
+			prefix: Buffer.concat([Buffer.alloc(512 * 1024 - 1, 0x61), Buffer.from("€😀x")]),
+		},
+		{ name: "incomplete UTF-8 at the initial end", prefix: Buffer.from([0xe2, 0x82]) },
+		{
+			name: "incomplete UTF-8 in the final partial chunk",
+			prefix: Buffer.concat([Buffer.alloc(512 * 1024 + 5, 0x61), Buffer.from([0xe2, 0x82])]),
+		},
+	])("bounds growing text reads by the size at open: $name", async ({ prefix }) => {
+		const { env, connection } = environment();
+		const path = join(env.cwd, "growing.txt");
+		writeFileSync(path, prefix);
+		const appended = Buffer.alloc(100, 0x62);
+		appended[0] = 0xac;
+		const request = connection.request.bind(connection);
+		const gate = vi.spyOn(connection, "request").mockImplementation(async (op, json, options) => {
+			const reply = await request(op, json, options);
+			// The real open has captured its stat; append before the caller can issue its first read.
+			if (op === "open" && json.path === path) appendFileSync(path, appended);
+			return reply;
+		});
+		try {
+			expect(getOrThrow(await env.readTextFile(path, context))).toBe(prefix.toString("utf8"));
+		} finally {
+			gate.mockRestore();
+		}
+	});
+
+	it.each(["abort", "callback_error", "timeout"] as const)(
+		"preserves %s when cancellation happens while delivering completed command output",
+		async (outcome) => {
+			const { env, connection } = environment();
+			const request = connection.request.bind(connection);
+			const gate = vi.spyOn(connection, "request").mockImplementation(async (op, json, options) => {
+				if (op !== "exec") return request(op, json, options);
+				const queued: { event: Json; payload: Uint8Array }[] = [];
+				let spillPath: unknown;
+				try {
+					const reply = await request(op, json, {
+						...options,
+						onEvent: (event, payload) => queued.push({ event, payload }),
+					});
+					spillPath = reply.json.spillPath;
+					return reply;
+				} catch (error) {
+					if (error instanceof RemoteError) spillPath = error.fields.spillPath;
+					throw error;
+				} finally {
+					if (typeof spillPath === "string") dirs.push(join(spillPath, ".."));
+					// Deliver real daemon events only after its result/error has removed the cancellation control.
+					for (const { event, payload } of queued) options?.onEvent?.(event, payload);
+				}
+			});
+			const controller = new AbortController();
+			const callbackFailure = new Error("callback failed");
+			let output = "";
+			try {
+				const result = await env.exec(
+					outcome === "timeout" ? "printf hello; sleep 5" : "printf hello",
+					{
+						...(outcome === "timeout" ? { timeout: 0.3 } : {}),
+						spill: { afterBytes: 1, afterLines: 10 },
+						onOutput: (text) => {
+							output += text;
+							controller.abort();
+							if (outcome === "callback_error") throw callbackFailure;
+						},
+					},
+					withAbortSignal(controller.signal, context),
+				);
+				expect(output).toBe("hello");
+				expect(controller.signal.aborted).toBe(true);
+				expect(result).toMatchObject({ ok: false, error: { code: outcome === "abort" ? "aborted" : outcome } });
+				if (!result.ok) {
+					if (outcome === "callback_error") {
+						expect(result.error.cause).toBe(callbackFailure);
+					} else {
+						expect(typeof result.error.spillPath).toBe("string");
+						expect(getOrThrow(await env.readTextFile(result.error.spillPath!, context))).toBe("hello");
+					}
+				}
+			} finally {
+				gate.mockRestore();
+			}
+		},
+	);
 
 	it("reports the remote system in Node's names", async () => {
 		const { connection } = environment();

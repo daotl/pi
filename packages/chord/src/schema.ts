@@ -126,20 +126,20 @@ const withoutAnnotations = (schema: Schema): Schema =>
 	Object.fromEntries(Object.entries(schema).filter(([key]) => !ANNOTATIONS.has(key)));
 
 /**
- * Conservative structural subtyping: true only if every value valid under `sub` is valid under `sup`, where object
- * fields missing from `sub` but optional in `sup` count as fine (unknown fields are stripped at the provider, see
- * `RecordImpl.call`). A provider schema using a keyword this function does not model (`not`, `allOf`, `contains`,
- * `$ref`, ...) or an `additionalProperties` schema only fits an identical consumer schema.
+ * Conservative structural subtyping: true only if every value valid under `sub` is valid under `sup`.
+ * `cleaned-input` also allows optional fields removed by the caller's schema before input/argument validation;
+ * results and state are not cleaned and must use the default mode. Keywords this function does not model
+ * (`not`, `allOf`, `contains`, `$ref`, ...) or a consumer `additionalProperties` schema require exact equality.
  */
-export function fits(subSchema: unknown, supSchema: unknown): boolean {
+export function fits(subSchema: unknown, supSchema: unknown, mode: "value" | "cleaned-input" = "value"): boolean {
 	const sub = withoutAnnotations(asSchema(subSchema));
 	const sup = withoutAnnotations(asSchema(supSchema));
 	if (Object.keys(sup).length === 0) return true;
 	if (deepEqual(sub, sup)) return true;
 	if (Object.keys(sup).some((key) => !KNOWN.has(key))) return false;
 	if (sup.additionalProperties !== undefined && typeof sup.additionalProperties !== "boolean") return false;
-	if (Array.isArray(sub.anyOf)) return sub.anyOf.every((branch) => fits(branch, sup));
-	if (Array.isArray(sup.anyOf)) return sup.anyOf.some((branch) => fits(sub, branch));
+	if (Array.isArray(sub.anyOf)) return sub.anyOf.every((branch) => fits(branch, sup, mode));
+	if (Array.isArray(sup.anyOf)) return sup.anyOf.some((branch) => fits(sub, branch, mode));
 	if ("const" in sup) return "const" in sub && deepEqual(sub.const, sup.const);
 	if (Array.isArray(sup.enum)) {
 		const values = "const" in sub ? [sub.const] : Array.isArray(sub.enum) ? sub.enum : undefined;
@@ -153,29 +153,37 @@ export function fits(subSchema: unknown, supSchema: unknown): boolean {
 		return false;
 	}
 	if ("const" in sub || Array.isArray(sub.enum)) return true;
-	if (subTypes.includes("object") && !objectFits(sub, sup)) return false;
-	if (subTypes.includes("array") && !arrayFits(sub, sup)) return false;
+	if (subTypes.includes("object") && !objectFits(sub, sup, mode)) return false;
+	if (subTypes.includes("array") && !arrayFits(sub, sup, mode)) return false;
 	if (subTypes.includes("function")) return functionFits(sub, sup);
 	return true;
 }
 
-function objectFits(sub: Schema, sup: Schema): boolean {
+function objectFits(sub: Schema, sup: Schema, mode: "value" | "cleaned-input"): boolean {
 	const subProperties = asSchema(sub.properties);
 	const supProperties = asSchema(sup.properties);
 	const subRequired = new Set((sub.required as string[] | undefined) ?? []);
 	for (const key of (sup.required as string[] | undefined) ?? []) if (!subRequired.has(key)) return false;
 	for (const [key, property] of Object.entries(supProperties)) {
 		if (key in subProperties) {
-			if (!fits(subProperties[key], property)) return false;
-		} else if (
-			Object.entries(asSchema(sub.patternProperties)).some(
-				([pattern, schema]) => new RegExp(pattern, "u").test(key) && !fits(schema, property),
-			)
-		) {
-			// A record may supply an optional named field even when it has no explicit properties entry.
-			return false;
-		} else if (typeof sub.additionalProperties === "object" && !fits(sub.additionalProperties, property)) {
-			return false;
+			if (!fits(subProperties[key], property, mode)) return false;
+		} else {
+			let matched = false;
+			for (const [pattern, schema] of Object.entries(asSchema(sub.patternProperties))) {
+				if (!new RegExp(pattern, "u").test(key)) continue;
+				matched = true;
+				if (!fits(schema, property, mode)) return false;
+			}
+			// Additional properties apply only when no pattern matches. An omitted policy allows arbitrary values,
+			// except on inputs cleaned by the caller's schema, which removes those unknown fields.
+			if (
+				!matched &&
+				sub.additionalProperties !== false &&
+				!(mode === "cleaned-input" && sub.additionalProperties === undefined) &&
+				!fits(sub.additionalProperties, property, mode)
+			) {
+				return false;
+			}
 		}
 	}
 	if (sup.additionalProperties === false) {
@@ -192,11 +200,11 @@ function objectFits(sub: Schema, sup: Schema): boolean {
 			const matcher = new RegExp(pattern, "u");
 			// Named properties also obey every matching pattern; JSON Schema combines these constraints.
 			for (const [key, subProperty] of Object.entries(subProperties)) {
-				if (matcher.test(key) && !fits(subProperty, property)) return false;
+				if (matcher.test(key) && !fits(subProperty, property, mode)) return false;
 			}
 			if (
 				Object.keys(subPatterns).length > 0 &&
-				(!(pattern in subPatterns) || !fits(subPatterns[pattern], property))
+				(!(pattern in subPatterns) || !fits(subPatterns[pattern], property, mode))
 			) {
 				return false;
 			}
@@ -206,13 +214,13 @@ function objectFits(sub: Schema, sup: Schema): boolean {
 	return true;
 }
 
-function arrayFits(sub: Schema, sup: Schema): boolean {
+function arrayFits(sub: Schema, sup: Schema, mode: "value" | "cleaned-input"): boolean {
 	if (Array.isArray(sup.items)) {
 		if (!Array.isArray(sub.items) || sub.items.length !== sup.items.length) return false;
-		return sub.items.every((item, index) => fits(item, (sup.items as unknown[])[index]));
+		return sub.items.every((item, index) => fits(item, (sup.items as unknown[])[index], mode));
 	}
-	if (Array.isArray(sub.items)) return sub.items.every((item) => fits(item, sup.items));
-	return fits(sub.items, sup.items);
+	if (Array.isArray(sub.items)) return sub.items.every((item) => fits(item, sup.items, mode));
+	return fits(sub.items, sup.items, mode);
 }
 
 function functionFits(sub: Schema, sup: Schema): boolean {

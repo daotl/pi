@@ -45,6 +45,9 @@ export const SESSION_WORKER_CONTROL_TOKEN_ENV = "PI_SESSION_WORKER_CONTROL_TOKEN
 export const SESSION_WORKER_SESSION_KEY_ENV = "PI_SESSION_WORKER_SESSION_KEY_BASE64";
 export const SESSION_WORKER_PEER_ID_ENV = "PI_SESSION_WORKER_PEER_ID";
 
+// Independent of the coordinator's opaque routing protocol. Bump for incompatible worker services.
+export const SESSION_WORKER_SERVICE_PROTOCOL_VERSION = 1;
+
 export const SessionWorkerMetadataSchema = StrictObject({
 	id: Type.String({ minLength: 1 }),
 	createdAt: Type.Integer(),
@@ -93,6 +96,8 @@ export type SessionWorkerCommand = Static<typeof SessionWorkerCommandSchema>;
 export const SessionWorkerEventSchema = Type.Union([
 	Type.Object({
 		type: Type.Literal("worker_ready"),
+		// Missing versions identify legacy workers for retirement, never for adoption.
+		serviceProtocolVersion: Type.Optional(Type.Integer()),
 		token: Type.String(),
 		sessionKey: Type.String(),
 		sessionId: Type.String(),
@@ -570,6 +575,7 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 		void control
 			.send({
 				type: "worker_ready",
+				serviceProtocolVersion: SESSION_WORKER_SERVICE_PROTOCOL_VERSION,
 				token,
 				sessionKey,
 				sessionId,
@@ -657,6 +663,7 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 		ready = true;
 		await control.send({
 			type: "worker_ready",
+			serviceProtocolVersion: SESSION_WORKER_SERVICE_PROTOCOL_VERSION,
 			token,
 			sessionKey,
 			sessionId,

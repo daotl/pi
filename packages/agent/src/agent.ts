@@ -830,8 +830,16 @@ export class Agent {
 			stopReason: aborted ? "aborted" : "error",
 			errorMessage: error instanceof Error ? error.message : String(error),
 		} satisfies AgentMessage;
+		const rejected = error instanceof TerminalResponseError ? error.terminalMessage : undefined;
+		if (rejected) {
+			const index = this._state.messages.lastIndexOf(rejected);
+			if (index !== -1) this._state.messages.splice(index, 1);
+		}
 		if (execution.context) {
-			if (
+			const rejectedIndex = rejected ? execution.context.messages.lastIndexOf(rejected) : -1;
+			if (rejectedIndex !== -1) {
+				execution.context.messages[rejectedIndex] = failureMessage;
+			} else if (
 				this._state.streamingMessage?.role === "assistant" ||
 				(execution.config.returnPrefill && execution.context.messages.at(-1)?.role === "assistant")
 			) {

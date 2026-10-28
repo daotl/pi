@@ -11,6 +11,7 @@ import {
 	reduceAssistantMessageFrames,
 } from "../src/index.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
+import { allocatedBytes } from "./memory-helpers.ts";
 
 function seed(): AssistantMessage {
 	return {
@@ -186,6 +187,115 @@ describe("assistant message frames", () => {
 		expect(() => settled.apply({ type: "toolcall_delta", contentIndex: 1, delta: "late" })).toThrow(
 			"follows the end",
 		);
+	});
+
+	it("keeps independent argument snapshots while replacing and hydrating unfinished tool JSON", () => {
+		let reducer = new AssistantMessageFrameReducer();
+		reducer.apply({ type: "start", partial: seed() });
+		for (const contentIndex of [0, 1]) {
+			reducer.apply({
+				type: "toolcall_start",
+				contentIndex,
+				toolCall: { type: "toolCall", id: `call-${contentIndex}`, name: "write", arguments: {} },
+			});
+		}
+		const argumentsAt = (contentIndex: number) => {
+			const block = reducer.message?.content[contentIndex];
+			if (block?.type !== "toolCall") throw new Error("Expected tool call");
+			return block.arguments;
+		};
+		reducer.apply({ type: "toolcall_delta", contentIndex: 0, delta: '{"nested":{"text":"old' });
+		const previousArguments = argumentsAt(0);
+		reducer.apply({ type: "toolcall_delta", contentIndex: 1, delta: '{"path":"other' });
+		expect(argumentsAt(1)).toEqual({ path: "other" });
+		reducer.apply({ type: "toolcall_delta", contentIndex: 0, delta: ' value"}}' });
+		expect(argumentsAt(0)).toEqual({ nested: { text: "old value" } });
+		expect(previousArguments).toEqual({ nested: { text: "old" } });
+
+		const prefix = '{"nested":{"text":"line\\u00';
+		reducer.apply({ type: "toolcall_checkpoint", contentIndex: 0, json: prefix, rawDelta: "raw" });
+		expect(argumentsAt(0)).toEqual({ nested: { text: "line" } });
+		const checkpoint = reducer.checkpoint();
+		expect(JSON.parse(JSON.stringify(checkpoint))).toEqual({
+			blocks: [
+				{ contentIndex: 0, state: { kind: "toolCall", ended: false, json: prefix } },
+				{ contentIndex: 1, state: { kind: "toolCall", ended: false, json: '{"path":"other' } },
+			],
+		});
+		const message = structuredClone(reducer.message);
+		reducer = new AssistantMessageFrameReducer(message, JSON.parse(JSON.stringify(checkpoint)));
+		for (const [delta, text] of [
+			["e", "line"],
+			["9 ", "lineé "],
+			["\\", "lineé "],
+			["q\n", "lineé \\q\n"],
+			['"}}', "lineé \\q\n"],
+		] as const) {
+			reducer.apply({ type: "toolcall_delta", contentIndex: 0, delta });
+			expect(argumentsAt(0)).toEqual({ nested: { text } });
+			expect(argumentsAt(1)).toEqual({ path: "other" });
+		}
+		reducer.apply({ type: "toolcall_delta", contentIndex: 1, delta: '.ts"}' });
+		expect(argumentsAt(1)).toEqual({ path: "other.ts" });
+		expect(message?.content[0]).toMatchObject({ arguments: { nested: { text: "line" } }, raw: "raw" });
+		expect(checkpoint.blocks[0]?.state).toEqual({ kind: "toolCall", ended: false, json: prefix });
+		reducer.apply({
+			type: "toolcall_end",
+			contentIndex: 0,
+			id: "final",
+			name: "write_file",
+			arguments: {},
+			argumentsError: "invalid escape",
+			thoughtSignature: "thought",
+			namespace: "files",
+			raw: "authoritative raw",
+		});
+		expect(reducer.message?.content[0]).toEqual({
+			type: "toolCall",
+			id: "final",
+			name: "write_file",
+			arguments: {},
+			argumentsError: "invalid escape",
+			thoughtSignature: "thought",
+			namespace: "files",
+			raw: "authoritative raw",
+		});
+	});
+
+	it("allocates linearly when reading streamed write arguments after every delta and resuming a checkpoint", async () => {
+		const content = 'const value = "text"; // \\ done\n'.repeat(20_000);
+		const measure = async (size: number) => {
+			const expected = { path: "/src/file.ts", content: content.slice(0, size) };
+			const json = JSON.stringify(expected);
+			let finalMessage: AssistantMessage | undefined;
+			const bytes = await allocatedBytes(() => {
+				let reducer = new AssistantMessageFrameReducer();
+				reducer.apply({ type: "start", partial: seed() });
+				reducer.apply({
+					type: "toolcall_start",
+					contentIndex: 0,
+					toolCall: { type: "toolCall", id: "call", name: "write", arguments: {} },
+				});
+				const resumeAt = Math.floor(json.length / 64) * 32;
+				for (let index = 0; index < json.length; index += 32) {
+					if (index === resumeAt) {
+						reducer = new AssistantMessageFrameReducer(reducer.message, reducer.checkpoint());
+					}
+					reducer.apply({ type: "toolcall_delta", contentIndex: 0, delta: json.slice(index, index + 32) });
+					finalMessage = reducer.message;
+					const block = finalMessage?.content[0];
+					if (block?.type !== "toolCall" || block.arguments.path !== expected.path) {
+						throw new Error("Expected streamed write path");
+					}
+				}
+			});
+			expect(finalMessage?.content[0]).toMatchObject({ arguments: expected });
+			return { bytes, length: json.length };
+		};
+		const small = await measure(50_000);
+		const large = await measure(500_000);
+		expect(large.bytes / large.length).toBeLessThan(300);
+		expect(large.bytes / small.bytes).toBeLessThan(20);
 	});
 
 	it("round-trips OpenAI Responses content supplied only by authoritative end events", async () => {

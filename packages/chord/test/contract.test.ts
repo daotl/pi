@@ -62,6 +62,54 @@ describe("contracts", () => {
 		assert.equal(bind(contract(additiveArgs), undefined, consumer), undefined);
 	});
 
+	it("optional output fields require a constraint on every way the provider may supply them", () => {
+		const wanted = Type.Object({ b: Type.Optional(Type.String()) });
+		for (const additionalProperties of [undefined, true, Type.Number()]) {
+			const offered = Type.Object({}, additionalProperties === undefined ? {} : { additionalProperties });
+			assert.equal(Value.Check(offered, { b: 7 }), true);
+			assert.equal(Value.Check(wanted, { b: 7 }), false);
+			assert.equal(fits(offered, wanted), false);
+		}
+		assert.equal(fits(Type.Object({}, { additionalProperties: false }), wanted), true);
+		assert.equal(fits(Type.Object({}, { additionalProperties: Type.String() }), wanted), true);
+		assert.equal(fits(Type.Object({}, { patternProperties: { "^b$": Type.String() } }), wanted), true);
+		assert.equal(
+			fits(
+				Type.Object({}, { additionalProperties: Type.Number(), patternProperties: { "^b$": Type.String() } }),
+				wanted,
+			),
+			true,
+		);
+		assert.equal(fits(Type.Object({}, { patternProperties: { "^other$": Type.String() } }), wanted), false);
+		assert.equal(
+			fits(Type.Object({}, { patternProperties: { "^b$": Type.String(), b: Type.Number() } }), wanted),
+			false,
+		);
+	});
+
+	it("cleaned inputs preserve nested additive contracts without relaxing output compatibility", () => {
+		const before = Type.Array(Type.Object({ a: Type.String() }));
+		const after = Type.Array(Type.Object({ a: Type.String(), b: Type.Optional(Type.Number()) }));
+		assert.equal(fits(before, after), false);
+		assert.equal(fits(before, after, "cleaned-input"), true);
+		assert.equal(
+			fits(Type.Array(Type.Object({ a: Type.String() }, { additionalProperties: true })), after, "cleaned-input"),
+			false,
+		);
+		const consumer = remote("t.nested-additive", {
+			version: 1,
+			input: Type.Object({ rows: before }),
+			host: hostNamed("server"),
+			variants: { main: { methods: { send: method(Type.Object({ rows: before })) } } },
+		});
+		const provider = remote(consumer.name, {
+			...consumer.def,
+			input: Type.Object({ rows: after }),
+			variants: { main: { methods: { send: method(Type.Object({ rows: after })) } } },
+		});
+		assert.equal(bind(provider, undefined, consumer), undefined);
+	});
+
 	it("fingerprints are stable and description-based", () => {
 		const copy = remote("t.chat", chatV1.def);
 		assert.equal(copy.fingerprint, chatV1.fingerprint);

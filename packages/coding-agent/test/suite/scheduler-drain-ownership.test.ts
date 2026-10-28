@@ -968,6 +968,60 @@ it("stops an outgoing queue batch after its command replaces the runtime", async
 	}
 });
 
+it.each(["replace", "stop"] as const)(
+	"cancels reserved ordinary preflight before %s invalidates its owner",
+	async (transition) => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const ui = await createSchedulingMode({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async (event) => {
+						if (event.messageType === "user" && event.prompt === "discard outgoing input") {
+							entered.resolve();
+							await release.promise;
+						}
+					});
+				},
+			],
+		});
+		const outgoing = ui.harness.session;
+		let providerRequests = 0;
+		ui.harness.setResponses([
+			() => {
+				providerRequests++;
+				return fauxAssistantMessage("must not run");
+			},
+		]);
+		let delivery: Promise<void> | undefined;
+		try {
+			await ui.mode.init();
+			ui.internal.queueCompactionMessage("discard outgoing input", "followUp");
+			ui.internal.queueCompactionMessage("discard reserved rest", "followUp");
+			delivery = ui.internal.flushCompactionQueue();
+			await entered.promise;
+			expect(outgoing.isIdle).toBe(true);
+			if (transition === "replace") await ui.runtime.newSession();
+			else ui.mode.stop();
+			release.resolve();
+			await delivery;
+			await outgoing.waitForIdle();
+			expect(providerRequests).toBe(0);
+			expect(outgoing.agent.state.messages.map(getMessageText)).not.toContain("discard outgoing input");
+			expect(
+				outgoing.sessionManager
+					.getEntries()
+					.some((entry) => entry.type === "message" && getMessageText(entry.message) === "discard outgoing input"),
+			).toBe(false);
+			expect(ui.runtime.session.messages.map(getMessageText)).not.toContain("discard reserved rest");
+		} finally {
+			release.resolve();
+			await delivery?.catch(() => {});
+			await ui.cleanup();
+		}
+	},
+);
+
 it.each(
 	(["interval", "daily"] as const).flatMap((schedule) =>
 		(["started", "handled", "rejected"] as const).map((outcome) => ({ schedule, outcome })),

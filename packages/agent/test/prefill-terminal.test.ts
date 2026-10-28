@@ -13,6 +13,7 @@ import {
 	type AgentTool,
 	type PrepareNextTurnContext,
 	prefillEchoComplete,
+	TerminalResponseError,
 } from "../src/index.ts";
 
 const model: Model<"openai-completions"> = {
@@ -33,6 +34,52 @@ function response(text: string): AssistantMessage {
 }
 
 describe("terminal prefill publication barrier", () => {
+	it("replaces the exact unpublished terminal in public and finalizer histories", async () => {
+		const accepted = response("previous accepted answer");
+		const terminal: AssistantMessage = {
+			...response("unpublished answer"),
+			usage: {
+				input: 11,
+				output: 7,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 18,
+				cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3 },
+			},
+		};
+		let rejected = false;
+		const finalized: PrepareNextTurnContext[] = [];
+		const agent = new Agent({
+			initialState: { model, messages: [{ role: "user", content: "earlier", timestamp: 1 }, accepted] },
+			streamFn: () => {
+				const stream = createAssistantMessageEventStream();
+				stream.end(terminal);
+				return stream;
+			},
+			finishTurn: (turn) => {
+				finalized.push(turn);
+			},
+		});
+		agent.subscribe((event) => {
+			if (event.type === "message_end" && event.message === terminal && !rejected) {
+				rejected = true;
+				throw new TerminalResponseError("publication rejected", terminal);
+			}
+		});
+		await agent.prompt("next");
+		const receipts = agent.state.messages.filter((message) => message.role === "assistant");
+		expect(receipts).toEqual([
+			accepted,
+			expect.objectContaining({ stopReason: "error", usage: terminal.usage, content: [{ type: "text", text: "" }] }),
+		]);
+		expect(finalized).toHaveLength(1);
+		const turn = finalized[0]!;
+		expect(turn.context.messages).not.toContain(terminal);
+		expect(turn.context.messages.at(-1)).toBe(receipts[1]);
+		expect(turn.newMessages.filter((message) => message.role === "assistant")).toEqual([receipts[1]]);
+		expect(receipts.reduce((total, message) => total + message.usage.input, 0)).toBe(accepted.usage.input + 11);
+	});
+
 	it.each([false, true])("awaits rejected terminal finalization without recursion (throws: %s)", async (throws) => {
 		const prefill = response("complete prefix");
 		const physicalModel = { ...model, provider: "physical", id: "physical-model" };

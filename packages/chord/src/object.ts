@@ -167,7 +167,7 @@ export interface Self<P = unknown> {
 		initial: Static<S> | StateInit<Static<S>, P>,
 		options?: StateOptions<Static<S>>,
 	): Cell<Static<S>>;
-	/** An object-owned reference, identified by its address. */
+	/** An object-owned reference, identified by its address. Duplicate remote gets must agree on `state`. */
 	get<C extends AnyContract>(type: C, input: InputOf<C>, options?: GetOptions<P>): Ref<C>;
 	/**
 	 * A resource named `name`: opened before the object goes live, closed after it is disposed. A reload keeps it unless
@@ -1875,10 +1875,17 @@ class SelfImpl implements Self {
 			options?.principal === undefined ? host.principal : options.principal,
 			candidate,
 		);
+		const wantsState = options?.state !== false;
 		const declared = this.#decls.refs.get(address);
 		if (declared !== undefined) {
 			if (declared.contract.fingerprint !== type.fingerprint) {
 				throw invalid("duplicate", `${this.#object.typeName}: ${type.name} held twice with different contracts`);
+			}
+			if ("wantsState" in declared && declared.wantsState !== wantsState) {
+				throw invalid(
+					"duplicate",
+					`${this.#object.typeName}: ${type.name} held twice with different state options`,
+				);
 			}
 			return declared.proxy as Ref<C>;
 		}
@@ -1886,6 +1893,7 @@ class SelfImpl implements Self {
 		if (
 			existing !== undefined &&
 			existing.contract.fingerprint === type.fingerprint &&
+			(!("wantsState" in existing) || existing.wantsState === wantsState) &&
 			existing.status !== "gone" &&
 			existing.status !== "released"
 		) {

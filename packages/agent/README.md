@@ -215,6 +215,8 @@ The low-level `agentLoopContinue` and `runAgentLoopContinue` APIs accept ordered
 
 `Agent.subscribe()` listeners are awaited in registration order. `agent_end` means no more loop events will be emitted, but `await agent.waitForIdle()` and `await agent.prompt(...)` only settle after awaited `agent_end` listeners finish.
 
+A subscriber that rejects an unpublished completed response with `TerminalResponseError` leaves one content-free failure receipt with that response's usage. The exact rejected response is removed from public history and replaced in the active request context before failure finalization. An ordinary `finishTurn` failure does not remove an already accepted response.
+
 ## Agent Options
 
 ```typescript

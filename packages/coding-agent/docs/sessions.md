@@ -95,6 +95,8 @@ Scheduled edit blocks continue only after a nonempty edit is accepted. Rejected 
 
 When settlement defers the first queued prompt, the flush call can return to its awaiting settlement handler without releasing the delivery owner. The rest of the batch enters steering/follow-up only after that first prompt is accepted; the owner remains until the deferred execution, including those queued turns, completes. Deferred rejection restores the original batch ahead of later queued input.
 
+Replacing a session or stopping its interactive presentation cancels any reserved compaction-queue submission still in asynchronous preflight. Releasing the old input/authentication hook afterward cannot dispatch an outgoing provider request or admit the discarded batch into the replacement session.
+
 Tree navigation through the selector or an extension command wakes queued input and due scheduled work after success, cancellation or failure. Selector navigation restores its Escape handler and clears its branch-summary indicator before dispatch resumes. Existing queue ownership and idle checks still decide when work may run, and navigation does not overwrite an unsent draft.
 
 Interval heartbeats track individual deadlines and dispatch at most one most-overdue beat per idle tick. A run started by an interval beat preserves the other beats' deadlines; ordinary activity resets interval countdowns. Typing during heartbeat preflight withdraws that cadence preservation without releasing its dispatch exclusion. Handled or rejected heartbeat input wakes eligible settled schedules; daily beats skip busy or owned-preflight occurrences and rearm for the next local wall-clock occurrence. Bare heartbeat continuation uses the existing synchronous Session run-ownership handoff.

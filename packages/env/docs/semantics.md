@@ -54,7 +54,7 @@ env conformance suite and `test/differential.test.ts` check each rule below.
   abort and `cleanup()` kill the group with `SIGKILL`.
 - After the process exits, output is still collected until both pipes end, or 100 ms pass without output; the timeout
   still applies meanwhile. The pipes are closed when the command settles, even if a descendant keeps them open.
-- An abort settles as `aborted`; `cleanup()` kills without aborting, so the command settles with exit code 137.
+- An abort settles as `aborted`, including an abort raised by the final output callback after the daemon exited. A callback error takes precedence, and a daemon timeout remains `timeout`. Abort and timeout failures preserve any spill path. `cleanup()` kills without aborting, so the command settles with exit code 137.
 - A process killed by a signal reports `128 + signal`.
 - Spill: once the output crosses `spill.afterBytes` or `spill.afterLines` (counted over raw chunks in arrival order, as
   Node counts), the complete raw output goes to `pi-output-<uuid>.log` in a fresh `tmp-` directory.

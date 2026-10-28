@@ -1,5 +1,6 @@
 import type { AssistantMessage, AssistantMessageEvent, TextContent, ThinkingContent, ToolCall } from "../types.ts";
 import { parseStreamingJson } from "./json-parse.ts";
+import { ToolCallArgumentsStream } from "./streaming-json.ts";
 
 /**
  * Compact, replayable assistant-message progress. Terminal settlement is
@@ -412,7 +413,8 @@ export class AssistantMessageFrameReducer {
 	private value: AssistantMessage | undefined;
 	private frameBeforeStart: AssistantMessageFrame["type"] | undefined;
 	private readonly states: Map<number, ReducerBlockState>;
-	private readonly dirtyArguments = new Set<number>();
+	// Keep tolerant provider previews off serialized checkpoints; end frames supply exact arguments.
+	private readonly toolArguments = new Map<number, ToolCallArgumentsStream>();
 
 	constructor(message?: AssistantMessage, checkpoint?: AssistantMessageFrameCheckpoint) {
 		this.value = message === undefined ? undefined : structuredClone(message);
@@ -420,6 +422,12 @@ export class AssistantMessageFrameReducer {
 			checkpoint?.blocks.map(({ contentIndex, state }) => [contentIndex, { ...state }]) ?? [],
 		);
 		this.frameBeforeStart = checkpoint?.frameBeforeStart;
+		for (const [contentIndex, state] of this.states) {
+			if (state.kind !== "toolCall" || state.ended) continue;
+			const argumentsStream = new ToolCallArgumentsStream();
+			argumentsStream.append(state.json);
+			this.toolArguments.set(contentIndex, argumentsStream);
+		}
 	}
 
 	checkpoint(): AssistantMessageFrameCheckpoint {
@@ -430,14 +438,6 @@ export class AssistantMessageFrameReducer {
 	}
 
 	get message(): AssistantMessage | undefined {
-		for (const contentIndex of this.dirtyArguments) {
-			const state = this.states.get(contentIndex);
-			const block = this.value?.content[contentIndex];
-			if (state?.kind !== "toolCall" || state.ended || state.json.length === 0) continue;
-			if (block?.type !== "toolCall") throw new Error("Unreachable tool-call frame state");
-			block.arguments = parseStreamingJson<ToolCall["arguments"]>(state.json);
-		}
-		this.dirtyArguments.clear();
 		return this.value;
 	}
 
@@ -512,14 +512,17 @@ export class AssistantMessageFrameReducer {
 					ended: false,
 					json: "",
 				});
+				this.toolArguments.set(frame.contentIndex, new ToolCallArgumentsStream());
 				break;
 			case "toolcall_checkpoint": {
 				const { block, state } = activeBlock(message, states, frame.contentIndex, "toolCall", frame.type);
 				if (block.type !== "toolCall" || state.kind !== "toolCall") {
 					throw new Error("Unreachable tool-call checkpoint state");
 				}
-				state.json = frame.json;
-				block.arguments = parseStreamingJson<ToolCall["arguments"]>(frame.json);
+				const argumentsStream = new ToolCallArgumentsStream();
+				block.arguments = argumentsStream.append(frame.json);
+				state.json = argumentsStream.text;
+				this.toolArguments.set(frame.contentIndex, argumentsStream);
 				if (frame.rawDelta !== undefined) block.raw = (block.raw ?? "") + frame.rawDelta;
 				break;
 			}
@@ -528,8 +531,12 @@ export class AssistantMessageFrameReducer {
 				if (block.type !== "toolCall" || state.kind !== "toolCall") {
 					throw new Error("Unreachable tool-call frame state");
 				}
-				state.json += frame.delta;
-				this.dirtyArguments.add(frame.contentIndex);
+				if (frame.delta.length > 0) {
+					const argumentsStream = this.toolArguments.get(frame.contentIndex);
+					if (!argumentsStream) throw new Error("Unreachable tool-call argument stream");
+					block.arguments = argumentsStream.append(frame.delta);
+					state.json = argumentsStream.text;
+				}
 				if (frame.rawDelta !== undefined) block.raw = (block.raw ?? "") + frame.rawDelta;
 				break;
 			}
@@ -550,6 +557,7 @@ export class AssistantMessageFrameReducer {
 				if (frame.raw !== undefined) block.raw = frame.raw;
 				state.ended = true;
 				state.json = "";
+				this.toolArguments.delete(frame.contentIndex);
 				break;
 			}
 		}

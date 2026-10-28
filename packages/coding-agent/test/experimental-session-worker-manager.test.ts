@@ -1,3 +1,4 @@
+import { ChildProcess } from "node:child_process";
 import { createHost, defineFacet, type Frame, hostNamed, method, remote } from "@earendil-works/chord";
 import {
 	type AgentLane,
@@ -6,10 +7,17 @@ import {
 	type LaneSnapshot,
 } from "@earendil-works/pi-agent-core";
 import { createRoutedLinkPair } from "@earendil-works/pi-server";
+import lockfile from "proper-lockfile";
 import { Type } from "typebox";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { CoordinatorConnectionEvent } from "../src/experimental/coordinator.ts";
+import * as processRuntime from "../src/experimental/process.ts";
 import { createSessionWorkerServices } from "../src/experimental/services/worker.ts";
+import {
+	SESSION_WORKER_CONTROL_TOKEN_ENV,
+	SESSION_WORKER_PEER_ID_ENV,
+	SESSION_WORKER_SERVICE_PROTOCOL_VERSION,
+} from "../src/experimental/session-worker.ts";
 import { SessionWorkerManager } from "../src/experimental/session-worker-manager.ts";
 
 const metadata: JsonlSessionMetadata = {
@@ -28,6 +36,7 @@ class FakeCoordinator {
 	readonly sent: { peerId: string; payload: unknown }[] = [];
 	readonly #listeners = new Set<(event: CoordinatorConnectionEvent) => void>();
 	onSend?: (peerId: string, payload: Record<string, unknown>) => void;
+	serviceProtocolVersion: number | undefined = SESSION_WORKER_SERVICE_PROTOCOL_VERSION;
 
 	onEvent(listener: (event: CoordinatorConnectionEvent) => void): () => void {
 		this.#listeners.add(listener);
@@ -46,6 +55,9 @@ class FakeCoordinator {
 			from: "worker-1",
 			payload: {
 				type: "worker_ready",
+				...(this.serviceProtocolVersion === undefined
+					? {}
+					: { serviceProtocolVersion: this.serviceProtocolVersion }),
 				token: "worker-token",
 				sessionKey: metadata.path,
 				sessionId: metadata.id,
@@ -105,6 +117,191 @@ async function createAttachedWorker(): Promise<{
 }
 
 describe("Session worker lifecycle failures", () => {
+	test.each([undefined, 0, SESSION_WORKER_SERVICE_PROTOCOL_VERSION + 1])(
+		"fences retained worker protocol %s until process exit and ownership release",
+		async (serviceProtocolVersion) => {
+			vi.useFakeTimers();
+			let legacyAlive = true;
+			vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+				if (pid !== 123 || signal !== 0) throw new Error("Unexpected process signal");
+				if (legacyAlive) return true;
+				throw Object.assign(new Error("No such process"), { code: "ESRCH" });
+			});
+			const ownershipReleased = Promise.withResolvers<void>();
+			const releaseOwnership = vi.fn(() => ownershipReleased.promise);
+			const acquireOwnership = vi.spyOn(lockfile, "lock").mockResolvedValue(releaseOwnership);
+			const coordinator = new FakeCoordinator();
+			coordinator.serviceProtocolVersion = serviceProtocolVersion;
+			let replacementPeer = "";
+			let replacementToken = "";
+			const spawn = vi.spyOn(processRuntime, "spawnInternalProcess").mockImplementation((_role, _args, options) => {
+				const child = new ChildProcess();
+				Object.defineProperty(child, "pid", { value: 456 });
+				replacementPeer = options?.env?.[SESSION_WORKER_PEER_ID_ENV] ?? "";
+				replacementToken = options?.env?.[SESSION_WORKER_CONTROL_TOKEN_ENV] ?? "";
+				queueMicrotask(() =>
+					coordinator.emit({
+						type: "message",
+						from: replacementPeer,
+						payload: {
+							type: "worker_ready",
+							serviceProtocolVersion: SESSION_WORKER_SERVICE_PROTOCOL_VERSION,
+							token: replacementToken,
+							sessionKey: metadata.path,
+							sessionId: metadata.id,
+							pid: 456,
+							metadata,
+							pluginManifestPaths: [],
+						},
+					}),
+				);
+				return child;
+			});
+			coordinator.onSend = (peerId, payload) => {
+				if (payload.type === "shutdown") {
+					// A disconnected control socket (or stop acknowledgement) is not process exit.
+					coordinator.emit({ type: "peer_disconnected", peerId });
+				} else if (payload.type === "session_demand") {
+					queueMicrotask(() =>
+						coordinator.emit({
+							type: "message",
+							from: peerId,
+							payload: {
+								...payload,
+								type: "demand_applied",
+								token: replacementToken,
+								sessionKey: metadata.path,
+							},
+						}),
+					);
+				}
+			};
+			const workers = new SessionWorkerManager(coordinator, "/tmp");
+			try {
+				const discovering = workers.discover(new Set(["worker-1"]));
+				await vi.advanceTimersByTimeAsync(0);
+				const opening = workers.openSession(metadata, BACKGROUND_CONTEXT, []);
+				await vi.advanceTimersByTimeAsync(100);
+				expect(workers.trackedSessions).toEqual([metadata]);
+				expect(workers.workerPids.size).toBe(0);
+				expect(spawn).not.toHaveBeenCalled();
+				expect(acquireOwnership).not.toHaveBeenCalled();
+				legacyAlive = false;
+				await vi.advanceTimersByTimeAsync(100);
+				expect(releaseOwnership).toHaveBeenCalledOnce();
+				expect(spawn).not.toHaveBeenCalled();
+				ownershipReleased.resolve();
+				await discovering;
+				const handle = await opening;
+				const attachment = await handle.attachClient!(BACKGROUND_CONTEXT);
+				attachment.link.send({ t: "ping", n: 1 });
+				await vi.advanceTimersByTimeAsync(0);
+				expect(workers.workerPids.get(metadata.id)).toBe(456);
+				expect(coordinator.sent.filter(({ peerId }) => peerId === "worker-1")).toEqual([
+					{ peerId: "worker-1", payload: { type: "shutdown" } },
+				]);
+				// Neither duplicate readiness nor late disconnect may replace/remove the new worker.
+				coordinator.serviceProtocolVersion = SESSION_WORKER_SERVICE_PROTOCOL_VERSION;
+				await coordinator.broadcast({ type: "discover_workers" });
+				coordinator.emit({ type: "peer_disconnected", peerId: "worker-1" });
+				expect(workers.workerPids.get(metadata.id)).toBe(456);
+				await attachment.release(BACKGROUND_CONTEXT);
+			} finally {
+				ownershipReleased.resolve();
+				workers.detach();
+			}
+		},
+	);
+
+	test("fails closed rather than signalling an unresponsive retained PID", async () => {
+		vi.useFakeTimers();
+		const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+		const acquire = vi.spyOn(lockfile, "lock");
+		const spawn = vi.spyOn(processRuntime, "spawnInternalProcess");
+		const coordinator = new FakeCoordinator();
+		coordinator.serviceProtocolVersion = undefined;
+		const workers = new SessionWorkerManager(coordinator, "/tmp");
+		const discovery = expect(workers.discover(new Set(["worker-1"]))).rejects.toThrow(/did not exit/);
+		await vi.advanceTimersByTimeAsync(10_000);
+		expect(kill).not.toHaveBeenCalledWith(123, "SIGKILL");
+		expect(acquire).not.toHaveBeenCalled();
+		expect(spawn).not.toHaveBeenCalled();
+		await discovery;
+		await expect(workers.openSession(metadata, BACKGROUND_CONTEXT, [])).rejects.toThrow(/did not exit/);
+		expect(workers.workerPids.size).toBe(0);
+		workers.detach();
+	});
+
+	test("does not replace an exited incompatible worker while session ownership is unavailable", async () => {
+		vi.spyOn(process, "kill").mockImplementation(() => {
+			throw Object.assign(new Error("No such process"), { code: "ESRCH" });
+		});
+		vi.spyOn(lockfile, "lock").mockRejectedValue(new Error("Session ownership is unavailable"));
+		const spawn = vi.spyOn(processRuntime, "spawnInternalProcess");
+		const coordinator = new FakeCoordinator();
+		coordinator.serviceProtocolVersion = undefined;
+		const workers = new SessionWorkerManager(coordinator, "/tmp");
+		await expect(workers.discover(new Set(["worker-1"]))).rejects.toThrow(/ownership is unavailable/);
+		await expect(workers.openSession(metadata, BACKGROUND_CONTEXT, [])).rejects.toThrow(/ownership is unavailable/);
+		expect(spawn).not.toHaveBeenCalled();
+		workers.detach();
+	});
+
+	test.each([false, true])(
+		"rejects launched readiness mismatch only after child exit (forced: %s)",
+		async (forceStop) => {
+			vi.useFakeTimers();
+			const child = new ChildProcess();
+			Object.defineProperty(child, "pid", { value: 456 });
+			const kill = vi.spyOn(child, "kill").mockReturnValue(true);
+			const releaseOwnership = vi.fn(async () => {});
+			vi.spyOn(lockfile, "lock").mockResolvedValue(releaseOwnership);
+			const coordinator = new FakeCoordinator();
+			vi.spyOn(processRuntime, "spawnInternalProcess").mockImplementation((_role, _args, options) => {
+				queueMicrotask(() =>
+					coordinator.emit({
+						type: "message",
+						from: options?.env?.[SESSION_WORKER_PEER_ID_ENV] ?? "",
+						payload: {
+							type: "worker_ready",
+							serviceProtocolVersion: SESSION_WORKER_SERVICE_PROTOCOL_VERSION + 1,
+							token: options?.env?.[SESSION_WORKER_CONTROL_TOKEN_ENV],
+							sessionKey: metadata.path,
+							sessionId: metadata.id,
+							pid: 456,
+							metadata,
+							pluginManifestPaths: [],
+						},
+					}),
+				);
+				return child;
+			});
+			const workers = new SessionWorkerManager(coordinator, "/tmp");
+			let settled = false;
+			const opening = workers.openSession(metadata, BACKGROUND_CONTEXT, []).finally(() => {
+				settled = true;
+			});
+			const rejected = expect(opening).rejects.toThrow(/worker service protocol/);
+			await vi.advanceTimersByTimeAsync(100);
+			expect(settled).toBe(false);
+			expect(workers.trackedSessions).toEqual([metadata]);
+			expect(workers.workerPids.size).toBe(0);
+			expect(coordinator.sent.map(({ payload }) => asObject(payload).type)).toEqual(["shutdown"]);
+			if (forceStop) {
+				await vi.advanceTimersByTimeAsync(10_000);
+				expect(kill).toHaveBeenCalledWith("SIGKILL");
+				expect(settled).toBe(false);
+			}
+			Object.defineProperty(child, "exitCode", { value: 0 });
+			child.emit("exit", 0, null);
+			await vi.advanceTimersByTimeAsync(100);
+			await rejected;
+			expect(releaseOwnership).toHaveBeenCalledOnce();
+			if (!forceStop) expect(kill).not.toHaveBeenCalled();
+			workers.detach();
+		},
+	);
+
 	test("adopts a discovered worker with its existing Session plugin selection", async () => {
 		const coordinator = new FakeCoordinator();
 		const workers = new SessionWorkerManager(coordinator, "/tmp");

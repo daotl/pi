@@ -998,6 +998,9 @@ export class InteractiveMode {
 		this.options = { ...options, tuiMode };
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
+			this.compactionQueueDeliveryPending?.submitting?.controller.abort();
+			this.compactionQueueDeliveryPending = undefined;
+			this.compactionQueuedMessages = [];
 			this.resetExtensionUI();
 		});
 		this.runtimeHost.setRebindSession(async () => {
@@ -2663,6 +2666,7 @@ export class InteractiveMode {
 		this.loadedResourcesContainer.clear();
 		this.chatContainer.clear();
 		this.pendingMessagesContainer.clear();
+		this.compactionQueueDeliveryPending?.submitting?.controller.abort();
 		this.compactionQueuedMessages = [];
 		this.compactionQueueDeliveryPending = undefined;
 		this.clearScheduledMessages();
@@ -9624,6 +9628,7 @@ export class InteractiveMode {
 			this.ui.terminal.setProgress(false);
 		}
 		this.clearScheduledMessages();
+		this.compactionQueueDeliveryPending?.submitting?.controller.abort();
 		this.compactionQueueDeliveryPending = undefined;
 		this.clearHeartbeats();
 		this.clearStatusIndicator();

@@ -503,11 +503,12 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 				const inFlight: Promise<Uint8Array>[] = [];
 				let next = 0;
 				while (true) {
-					while (inFlight.length < READ_DEPTH) {
-						const bytes = handle.pread(next, length);
+					while (inFlight.length < READ_DEPTH && next < size) {
+						const readLength = Math.min(length, size - next);
+						const bytes = handle.pread(next, readLength);
 						bytes.catch(() => {});
 						inFlight.push(bytes);
-						next += length;
+						next += readLength;
 					}
 					const bytes = await inFlight.shift()!;
 					if (aborted()) throw abort();
@@ -922,6 +923,11 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 				},
 			);
 			if (callbackError) return err(callbackError);
+			if (signal?.aborted) {
+				const failure = new ExecutionError("aborted", "aborted");
+				if (typeof json.spillPath === "string") failure.spillPath = json.spillPath;
+				return err(failure);
+			}
 			return ok({
 				exitCode: json.exitCode as number,
 				...(typeof json.spillPath === "string" ? { spillPath: json.spillPath } : {}),

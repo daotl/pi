@@ -1,4 +1,11 @@
-import { copyJson, createHost, type Frame, type Link, memoryLinkPair } from "@earendil-works/chord";
+import {
+	copyJson,
+	createHost,
+	type Frame,
+	type JsonRepresentation,
+	type Link,
+	memoryLinkPair,
+} from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
 	AgentHarness,
@@ -514,6 +521,101 @@ describe("Transcript service", () => {
 			]);
 		} finally {
 			await host.close();
+		}
+	});
+
+	test("replays each tool JSON delta after hydration without parsing accumulated prefixes", () => {
+		const reducer = new AssistantMessageFrameReducer();
+		reducer.apply({ type: "start", partial: fauxAssistantMessage([], { stopReason: "pending", timestamp: 1 }) });
+		reducer.apply({
+			type: "toolcall_start",
+			contentIndex: 0,
+			toolCall: { type: "toolCall", id: "call", name: "write", arguments: {} },
+		});
+		const prefix = '{"path":"line\\u00';
+		reducer.apply({ type: "toolcall_delta", contentIndex: 0, delta: prefix });
+		const snapshot = laneSnapshot();
+		snapshot.operation = {
+			id: "run",
+			kind: "run",
+			startedAt: 1,
+			fromTipId: null,
+			status: "open",
+			runningTools: [],
+			streamingMessage: reducer.message,
+			streamingFrameState: { messageId: "response", sequence: 3, checkpoint: reducer.checkpoint() },
+		};
+		const state: TranscriptState = {
+			snapshot: copyJson(snapshot, { omitUndefinedProperties: true }) as LaneTranscriptSnapshot,
+			stream: { ...snapshot.operation.streamingFrameState!, runId: "run" },
+			sequence: 100,
+			events: [],
+		};
+		const replay = new TranscriptReplay();
+		const parse = vi.spyOn(JSON, "parse");
+		try {
+			expect(replay.read(state)).toEqual([]);
+			let inputLength = prefix.length;
+			const read = (frame: AssistantMessageFrame) => {
+				if (frame.type === "toolcall_delta") inputLength += frame.delta.length;
+				if (frame.type === "toolcall_checkpoint") inputLength += frame.json.length;
+				state.sequence++;
+				state.events = [
+					{
+						sequence: state.sequence,
+						event: {
+							type: "assistant_frame",
+							phase: "update",
+							lane: "main",
+							runId: "run",
+							messageId: "response",
+							frame: copyJson(frame, {
+								omitUndefinedProperties: true,
+							}) as JsonRepresentation<AssistantMessageFrame>,
+						},
+					},
+				];
+				const event = replay.read(state)[0];
+				if (event?.type !== "message_update" || event.message.role !== "assistant") {
+					throw new Error("Expected replayed assistant update");
+				}
+				return event.message.content[0];
+			};
+			const first = read({ type: "toolcall_delta", contentIndex: 0, delta: 'e9","content":"' });
+			expect(first).toMatchObject({ arguments: { path: "lineé", content: "" } });
+			let content = "";
+			for (let index = 0; index < 400; index++) {
+				const delta = `${index}:`.padEnd(128, "x");
+				content += delta;
+				expect(read({ type: "toolcall_delta", contentIndex: 0, delta })).toMatchObject({
+					arguments: { path: "lineé", content },
+				});
+			}
+			expect(read({ type: "toolcall_delta", contentIndex: 0, delta: '"}' })).toMatchObject({
+				arguments: { path: "lineé", content },
+			});
+			expect(first).toMatchObject({ arguments: { path: "lineé", content: "" } });
+			expect(read({ type: "toolcall_checkpoint", contentIndex: 0, json: '{"path":"replacement\\' })).toMatchObject({
+				arguments: { path: "replacement" },
+			});
+			expect(read({ type: "toolcall_delta", contentIndex: 0, delta: 'nnext"}' })).toMatchObject({
+				arguments: { path: "replacement\nnext" },
+			});
+			expect(
+				read({
+					type: "toolcall_end",
+					contentIndex: 0,
+					id: "call",
+					name: "write",
+					arguments: {},
+					argumentsError: "malformed provider arguments",
+					raw: "final raw",
+				}),
+			).toMatchObject({ arguments: {}, argumentsError: "malformed provider arguments", raw: "final raw" });
+			const parsedBytes = parse.mock.calls.reduce((total, [text]) => total + text.length, 0);
+			expect(parsedBytes).toBeLessThan(inputLength * 3);
+		} finally {
+			parse.mockRestore();
 		}
 	});
 

@@ -8,6 +8,7 @@ import {
 	type RoutedSessionAttachment,
 	type RoutedSessionHandle,
 } from "@earendil-works/pi-server";
+import lockfile from "proper-lockfile";
 import { Check } from "typebox/value";
 import type { CoordinatorConnection, CoordinatorConnectionEvent } from "./coordinator.ts";
 import { spawnInternalProcess } from "./process.ts";
@@ -15,6 +16,7 @@ import {
 	SESSION_WORKER_CONTROL_ADDRESS_ENV,
 	SESSION_WORKER_CONTROL_TOKEN_ENV,
 	SESSION_WORKER_PEER_ID_ENV,
+	SESSION_WORKER_SERVICE_PROTOCOL_VERSION,
 	SESSION_WORKER_SESSION_KEY_ENV,
 	type SessionWorkerEvent,
 	SessionWorkerEventSchema,
@@ -26,6 +28,7 @@ const WORKER_STARTUP_TIMEOUT_MS = 15_000;
 const WORKER_SHUTDOWN_TIMEOUT_MS = 10_000;
 const WORKER_DISCOVERY_TIMEOUT_MS = 5_000;
 const WORKER_DEMAND_TIMEOUT_MS = 5_000;
+const WORKER_EXIT_POLL_MS = 25;
 
 export class SessionPluginSelectionConflictError extends Error {
 	constructor(message: string) {
@@ -76,6 +79,11 @@ interface PendingLaunch {
 	reject(error: Error): void;
 }
 
+interface RetiringWorker {
+	readonly metadata: JsonlSessionMetadata;
+	readonly stopped: Promise<void>;
+}
+
 /** Session and process bookkeeping owned by one replaceable server process. */
 export class SessionWorkerManager {
 	readonly workerPids = new Map<string, number>();
@@ -88,12 +96,15 @@ export class SessionWorkerManager {
 	readonly #workersBySession = new Map<string, WorkerRecord>();
 	readonly #workersByPeer = new Map<string, WorkerRecord>();
 	readonly #pending = new Map<string, PendingLaunch>();
+	readonly #retiring = new Map<string, RetiringWorker>();
+	readonly #retiredPeers = new Set<string>();
 	readonly #pendingDemand = new Map<string, PendingDemand>();
 	readonly #links = new Map<string, WorkerFrameLink>();
 	readonly #removeListener: () => void;
 	readonly #onWorkerCountChanged: ((count: number) => void) | undefined;
 	#discoveryPeers?: Set<string>;
 	#resolveDiscovery?: () => void;
+	#discovery?: Promise<void>;
 	#detached = false;
 	#shuttingDown = false;
 
@@ -114,7 +125,10 @@ export class SessionWorkerManager {
 	}
 
 	get trackedSessions(): readonly JsonlSessionMetadata[] {
-		return [...this.#workersBySession.values()].map((worker) => worker.metadata);
+		const metadata = new Map<string, JsonlSessionMetadata>();
+		for (const retiring of this.#retiring.values()) metadata.set(retiring.metadata.path, retiring.metadata);
+		for (const worker of this.#workersBySession.values()) metadata.set(worker.metadata.path, worker.metadata);
+		return [...metadata.values()];
 	}
 
 	assertSessionPluginManifestPaths(metadata: JsonlSessionMetadata, manifestPaths: readonly string[]): void {
@@ -132,12 +146,26 @@ export class SessionWorkerManager {
 		}
 	}
 
-	async discover(peerIds: ReadonlySet<string>): Promise<void> {
+	discover(peerIds: ReadonlySet<string>): Promise<void> {
+		const discovering = this.#discover(peerIds);
+		this.#discovery = discovering;
+		void discovering
+			.finally(() => {
+				if (this.#discovery === discovering) this.#discovery = undefined;
+			})
+			.catch(() => {});
+		return discovering;
+	}
+
+	async #discover(peerIds: ReadonlySet<string>): Promise<void> {
 		if (this.#detached) return;
 		const undiscovered = new Set(
 			[...peerIds].filter((peerId) => !this.#workersByPeer.has(peerId) && !this.#pendingPeer(peerId)),
 		);
-		if (undiscovered.size === 0) return;
+		if (undiscovered.size === 0) {
+			await Promise.all([...this.#retiring.values()].map((retiring) => retiring.stopped));
+			return;
+		}
 		this.#discoveryPeers = undiscovered;
 		const discovered = new Promise<void>((resolve) => {
 			this.#resolveDiscovery = resolve;
@@ -154,6 +182,7 @@ export class SessionWorkerManager {
 		if (timer) clearTimeout(timer);
 		this.#discoveryPeers = undefined;
 		this.#resolveDiscovery = undefined;
+		await Promise.all([...this.#retiring.values()].map((retiring) => retiring.stopped));
 	}
 
 	async openSession(
@@ -162,6 +191,15 @@ export class SessionWorkerManager {
 		pluginManifestPaths: readonly string[],
 	): Promise<RoutedSessionHandle> {
 		if (this.#detached || this.#shuttingDown) throw new Error("Experimental server is shutting down");
+		await this.#discovery;
+		await Promise.all(
+			[...this.#retiring.values()]
+				.filter((retiring) => retiring.metadata.path === metadata.path)
+				.map((retiring) => retiring.stopped),
+		);
+		if (this.#detached || this.#shuttingDown || this.#coordinator.wasReplaced) {
+			throw new Error("Experimental server is shutting down");
+		}
 		this.assertSessionPluginManifestPaths(metadata, pluginManifestPaths);
 		const existing = this.#workersBySession.get(metadata.path);
 		if (existing) return this.#routedHandle(existing);
@@ -344,7 +382,10 @@ export class SessionWorkerManager {
 		})();
 		await Promise.all([
 			stopPending,
-			...[...this.#workersBySession.values()].map((worker) => this.#stopWorker(worker, BACKGROUND_CONTEXT)),
+			...[...this.#retiring.values()].map((retiring) => retiring.stopped),
+			...[...this.#workersBySession.values()]
+				.filter((worker) => !this.#retiredPeers.has(worker.peerId))
+				.map((worker) => this.#stopWorker(worker, BACKGROUND_CONTEXT)),
 		]);
 		this.#detachState();
 	}
@@ -494,8 +535,42 @@ export class SessionWorkerManager {
 			return;
 		}
 		this.#markDiscovered(peerId);
+		if (this.#retiredPeers.has(peerId)) return;
 		const pending = this.#pending.get(message.sessionKey);
-		if (pending?.peerId === peerId && !sameStrings(message.pluginManifestPaths, pending.pluginManifestPaths)) {
+		const recorded = this.#workersByPeer.get(peerId);
+		if (
+			recorded &&
+			(recorded.token !== message.token ||
+				recorded.pid !== message.pid ||
+				recorded.metadata.path !== message.sessionKey)
+		)
+			return;
+		if (
+			pending &&
+			(pending.peerId !== peerId || pending.token !== message.token || pending.child.pid !== message.pid)
+		) {
+			return;
+		}
+		if (message.serviceProtocolVersion !== SESSION_WORKER_SERVICE_PROTOCOL_VERSION) {
+			if (recorded) {
+				recorded.stopping = true;
+				recorded.expectedStop = true;
+				this.#closeWorkerLinks(recorded, "Session worker service protocol is incompatible");
+			}
+			const stopped = this.#retireIncompatibleWorker(peerId, message, pending?.child);
+			if (pending) {
+				this.#pending.delete(message.sessionKey);
+				clearTimeout(pending.timer);
+				this.#notifyWorkerCountChanged();
+				const error = new Error("Session worker service protocol is incompatible");
+				void stopped.then(
+					() => pending.reject(error),
+					(stopError: unknown) => pending.reject(new AggregateError([error, stopError], error.message)),
+				);
+			}
+			return;
+		}
+		if (pending && !sameStrings(message.pluginManifestPaths, pending.pluginManifestPaths)) {
 			this.#failPending(message.sessionKey, new Error("Session worker started with stale plugin packages"));
 			return;
 		}
@@ -504,11 +579,9 @@ export class SessionWorkerManager {
 			void this.#coordinator.send(peerId, { type: "shutdown" }).catch(() => {});
 			return;
 		}
-		if (
-			pending &&
-			(pending.peerId !== peerId || pending.token !== message.token || pending.child.pid !== message.pid)
-		) {
-			return;
+		if ([...this.#retiring.values()].some((retiring) => retiring.metadata.path === message.sessionKey)) {
+			// Only a replacement launched after the ownership fence may take this Session.
+			if (!pending) return;
 		}
 		if (existing) return;
 		let resolveTerminated!: (error: Error | undefined) => void;
@@ -529,6 +602,9 @@ export class SessionWorkerManager {
 		};
 		this.#workersBySession.set(message.sessionKey, worker);
 		this.#workersByPeer.set(peerId, worker);
+		for (const [retiringPeer, retiring] of this.#retiring) {
+			if (retiring.metadata.path === message.sessionKey) this.#retiring.delete(retiringPeer);
+		}
 		this.workerPids.set(message.sessionId, message.pid);
 		if (pending) {
 			this.#pending.delete(message.sessionKey);
@@ -536,6 +612,67 @@ export class SessionWorkerManager {
 			pending.resolve(worker);
 		}
 		this.#notifyWorkerCountChanged();
+	}
+
+	#retireIncompatibleWorker(
+		peerId: string,
+		message: Extract<SessionWorkerEvent, { type: "worker_ready" }>,
+		child: ChildProcess | undefined,
+	): Promise<void> {
+		// Keep the fence, including failures, for this manager's lifetime. Late readiness cannot revive it.
+		this.#retiredPeers.add(peerId);
+		const stopped = Promise.resolve().then(async () => {
+			await this.#coordinator.send(peerId, { type: "shutdown" }).catch(() => {});
+			await this.#waitForIncompatibleWorkerExit(message.pid, child);
+			if (this.#detached || this.#coordinator.wasReplaced) throw new Error("Experimental server was replaced");
+			// A disconnected socket and a successful signal are not proof that ownership was released.
+			// Acquire the same lock as the worker, reclaiming a stale lock only after process exit.
+			const release = await lockfile.lock(message.metadata.path, {
+				realpath: true,
+				stale: 2_000,
+				update: 1_000,
+				retries: { retries: 320, factor: 1, minTimeout: 25, maxTimeout: 25, maxRetryTime: 8_000 },
+			});
+			await release();
+			const recorded = this.#workersByPeer.get(peerId);
+			if (recorded) this.#removeWorker(recorded, undefined);
+		});
+		this.#retiring.set(peerId, { metadata: message.metadata, stopped });
+		void stopped.catch(() => {});
+		return stopped;
+	}
+
+	async #waitForIncompatibleWorkerExit(pid: number, child: ChildProcess | undefined): Promise<void> {
+		let deadline = Date.now() + WORKER_SHUTDOWN_TIMEOUT_MS;
+		let killed = false;
+		while (true) {
+			if (this.#detached || this.#coordinator.wasReplaced) throw new Error("Experimental server was replaced");
+			if (child) {
+				if (child.exitCode !== null || child.signalCode !== null) return;
+			} else {
+				try {
+					process.kill(pid, 0);
+				} catch (error) {
+					if (error instanceof Error && "code" in error && error.code === "ESRCH") return;
+					throw error;
+				}
+			}
+			if (Date.now() >= deadline) {
+				// An adopted PID has no child handle: never risk signalling a reused process ID.
+				if (!child || killed) throw new Error("Incompatible Session worker did not exit after shutdown");
+				try {
+					child.kill("SIGKILL");
+				} catch (error) {
+					if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
+				}
+				killed = true;
+				deadline = Date.now() + WORKER_SHUTDOWN_TIMEOUT_MS;
+			}
+			await new Promise<void>((resolve) => {
+				const timer = setTimeout(resolve, WORKER_EXIT_POLL_MS);
+				timer.unref();
+			});
+		}
 	}
 
 	#childExited(pending: PendingLaunch, code: number | null, signal: NodeJS.Signals | null): void {
@@ -651,6 +788,8 @@ export class SessionWorkerManager {
 		}
 		this.#pendingDemand.clear();
 		this.#pending.clear();
+		this.#retiring.clear();
+		this.#retiredPeers.clear();
 		this.#workersByPeer.clear();
 		this.#workersBySession.clear();
 		this.workerPids.clear();

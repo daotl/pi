@@ -562,9 +562,13 @@ describe("review: prepare isolation and contracts", () => {
 			assert.ok(Value.Check(sub, value) && !Value.Check(sup, value), `bad counterexample ${JSON.stringify(value)}`);
 			assert.equal(fits(sub, sup), false, `fits(${JSON.stringify(sub)}, ${JSON.stringify(sup)})`);
 		}
-		// Additive changes still fit.
+		// Additive input changes still fit after the caller strips its unknown fields.
 		assert.ok(
-			fits(Type.Object({ a: Type.String() }), Type.Object({ a: Type.String(), b: Type.Optional(Type.Number()) })),
+			fits(
+				Type.Object({ a: Type.String() }),
+				Type.Object({ a: Type.String(), b: Type.Optional(Type.Number()) }),
+				"cleaned-input",
+			),
 		);
 		assert.ok(fits(Type.Object({ a: Type.String(), extra: Type.Number() }), Type.Object({ a: Type.String() })));
 	});
@@ -1632,7 +1636,7 @@ describe("review: contract and activation boundaries", () => {
 		assert.equal(Value.Check(sub, { b: 1 }), true);
 		assert.equal(Value.Check(sup, { b: 1 }), false);
 		assert.equal(fits(sub, sup), false);
-		assert.equal(fits(Type.Record(Type.Literal("other"), Type.Number()), sup), true);
+		assert.equal(fits(Type.Record(Type.Literal("other"), Type.Number(), { additionalProperties: false }), sup), true);
 	});
 
 	it("reload derivations read commit-time cells after another candidate waits", async () => {

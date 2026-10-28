@@ -18,6 +18,7 @@ import {
 	memoryLinkPair,
 	method,
 	PROTOCOL_VERSION,
+	type Ref,
 	remote,
 } from "../src/index.ts";
 import { CountingLink, stateFrames } from "./fixtures/counting.ts";
@@ -383,6 +384,144 @@ describe("method-only references (state: false)", () => {
 		await browser.close();
 		await server.close();
 	});
+
+	it("object-owned views replace changed state requirements on reload and retire the previous view", async () => {
+		const { server, browser, link } = setup();
+		const Panel = local("t.e8-reload-panel", {
+			version: 1,
+			input: Type.Object({}),
+			members: { title: Type.String(), add: method(Type.String()) },
+		});
+		const views: Ref<typeof Notes>[] = [];
+		const facet = (state: boolean) => ({
+			name: "panel",
+			setup: (api: FacetApi) => {
+				api.serve(Panel, (_input, _principal, self) => {
+					const notes = self.get(Notes, {}, { state });
+					views.push(notes);
+					return {
+						title: state
+							? self.derive([notes.title], (title) => title.toUpperCase())
+							: self.state("off", Type.String(), "off"),
+						add: (text: string, ctx: Ctx) => notes.add(text, ctx),
+					};
+				});
+			},
+		});
+		try {
+			await browser.install(facet(false));
+			const panel = await browser.get(Panel, {});
+			assert.equal(panel.title.value, "off");
+			assert.deepEqual(stateFrames(link.received), []);
+			await panel.add("before");
+			await browser.reload([facet(true)]);
+			assert.equal(views.length, 2, "the consumer factory reran");
+			assert.equal(panel.title.value, "UNTITLED", "the replacement hydrated before publication");
+			assert.notEqual(views[0], views[1]);
+			await until(() => views[0]!.status === "released");
+			await views[1]!.rename("fresh");
+			await until(() => panel.title.value === "FRESH");
+			await browser.reload([facet(false)]);
+			assert.equal(views.length, 3);
+			assert.equal(panel.title.value, "off");
+			assert.notEqual(views[1], views[2]);
+			await until(() => views[1]!.status === "released" && link.count("sent", "unsub") === 1);
+			const before = stateFrames(link.received).length;
+			await panel.add("after");
+			await tick();
+			assert.equal(stateFrames(link.received).length, before);
+			assert.throws(
+				() => views[2]!.title.value,
+				(error) => isChordError(error, "not_ready"),
+			);
+		} finally {
+			await browser.close();
+			await server.close();
+		}
+	});
+
+	for (const initialState of [false, true]) {
+		it(`an aborted state-option replacement preserves the ${initialState ? "full" : "method-only"} installed view`, async () => {
+			const { server, browser, link } = setup();
+			const Panel = local("t.e8-rollback-panel", {
+				version: 1,
+				input: Type.Object({}),
+				members: { title: Type.String(), add: method(Type.String()) },
+			});
+			const views: Ref<typeof Notes>[] = [];
+			const facet = (state: boolean, fail = false) => ({
+				name: "panel",
+				setup: (api: FacetApi) => {
+					api.serve(Panel, (_input, _principal, self) => {
+						const notes = self.get(Notes, {}, { state });
+						views.push(notes);
+						if (fail) {
+							self.resource("failure", {
+								version: 1,
+								open: () => {
+									throw new Error("abort state replacement");
+								},
+							});
+						}
+						return {
+							title: state
+								? self.derive([notes.title], (title) => title.toUpperCase())
+								: self.state("off", Type.String(), "off"),
+							add: (text: string, ctx: Ctx) => notes.add(text, ctx),
+						};
+					});
+				},
+			});
+			try {
+				await browser.install(facet(initialState));
+				const panel = await browser.get(Panel, {});
+				const version = browser.codeVersion;
+				await assert.rejects(browser.reload([facet(!initialState, true)]), /abort state replacement/);
+				assert.equal(browser.codeVersion, version);
+				assert.equal(views.length, 2);
+				assert.notEqual(views[0], views[1]);
+				assert.equal(views[0]!.status, "live");
+				assert.equal(views[1]!.status, "released");
+				await panel.add("still callable");
+				if (initialState) {
+					await views[0]!.rename("retained");
+					await until(() => panel.title.value === "RETAINED");
+				} else {
+					assert.equal(panel.title.value, "off");
+					await until(() => link.count("sent", "unsub") === 1);
+					assert.throws(
+						() => views[0]!.title.value,
+						(error) => isChordError(error, "not_ready"),
+					);
+				}
+			} finally {
+				await browser.close();
+				await server.close();
+			}
+		});
+	}
+
+	it("same-run duplicate gets reject conflicting state options in either order", async () => {
+		for (const state of [false, true]) {
+			const { server, browser } = setup();
+			const Panel = local("t.e8-duplicate-options", { version: 1, input: Type.Object({}) });
+			browser.serve(Panel, (_input, _principal, self) => {
+				const first = self.get(Notes, {}, { state });
+				assert.equal(self.get(Notes, {}, { state }), first);
+				self.get(Notes, {}, state ? { state: false } : undefined);
+				return {};
+			});
+			try {
+				await assert.rejects(
+					browser.get(Panel, {}),
+					(error) => isChordError(error, "invalid") && error.reason === "duplicate" && /state/.test(error.message),
+				);
+			} finally {
+				await browser.close();
+				await server.close();
+			}
+		}
+	});
 });
 
 describe("origins of client holds", () => {
@@ -495,6 +634,87 @@ describe("origins of client holds", () => {
 });
 
 describe("versioned call projections", () => {
+	it("permissive provider outputs cannot promise optional named result or state fields", async () => {
+		for (const member of ["result", "state"] as const) {
+			for (const additionalProperties of [undefined, true]) {
+				const offered = Type.Object({}, additionalProperties === undefined ? {} : { additionalProperties });
+				const wanted = Type.Object({ b: Type.Optional(Type.String()) });
+				const consumer = remote(`t.optional-output-${member}`, {
+					version: 1,
+					input: Type.Object({}),
+					host: hostNamed("server"),
+					variants: {
+						main: {
+							state: { value: member === "state" ? wanted : Type.Unknown() },
+							methods: { read: method(undefined, member === "result" ? wanted : Type.Unknown()) },
+						},
+					},
+				});
+				const provider = remote(consumer.name, {
+					...consumer.def,
+					variants: {
+						main: {
+							state: { value: member === "state" ? offered : Type.Unknown() },
+							methods: { read: method(undefined, member === "result" ? offered : Type.Unknown()) },
+						},
+					},
+				});
+				const { server, browser } = setup();
+				server.serve(provider, (_input, _principal, self) => ({
+					variant: "main",
+					read: () => ({ b: 7 }),
+					value: self.state("value", offered, { b: 7 }),
+				}));
+				try {
+					assert.throws(
+						() => server.hold(consumer, {}),
+						(error) => isChordError(error, "contract_mismatch") && error.message.includes(member),
+					);
+					await assert.rejects(
+						browser.get(consumer, {}),
+						(error) =>
+							isChordError(error, "upgrade_required") &&
+							error.message.includes("contract_mismatch") &&
+							error.message.includes(member),
+					);
+				} finally {
+					await browser.close();
+					await server.close();
+				}
+			}
+		}
+	});
+
+	it("nested additive arguments and inputs are cleaned before reaching local and linked providers", async () => {
+		const before = Type.Array(Type.Object({ a: Type.String() }));
+		const after = Type.Array(Type.Object({ a: Type.String(), b: Type.Optional(Type.Number()) }));
+		const consumer = remote("t.nested-cleaned-inputs", {
+			version: 1,
+			input: Type.Object({ rows: before }),
+			host: hostNamed("server"),
+			variants: { main: { methods: { read: method(Type.Object({ rows: before }), Type.Unknown()) } } },
+		});
+		const provider = remote(consumer.name, {
+			...consumer.def,
+			input: Type.Object({ rows: after }),
+			variants: { main: { methods: { read: method(Type.Object({ rows: after }), Type.Unknown()) } } },
+		});
+		const { server, browser } = setup();
+		server.serve(provider, (input) => ({ variant: "main", read: (args) => ({ input, args }) }));
+		try {
+			for (const host of [server, browser]) {
+				const ref = await host.get(consumer, { rows: [{ a: "address" }] });
+				assert.deepEqual(await ref.read({ rows: [{ a: "argument", b: "stripped" }] } as never), {
+					input: { rows: [{ a: "address" }] },
+					args: { rows: [{ a: "argument" }] },
+				});
+			}
+		} finally {
+			await browser.close();
+			await server.close();
+		}
+	});
+
 	it("same-version consumers reject conflicting named-field patterns at bind and call additive providers", async () => {
 		for (const conflicting of [true, false]) {
 			const consumer = remote("t.consumer-pattern", {
