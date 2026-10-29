@@ -176,26 +176,6 @@ export function getDeclaredTools(messages: TranscriptMessages): Tool[] {
 	return [...definitions.values()];
 }
 
-/**
- * Whether a tool name was declared twice with different definitions. A transport that can
- * only reference previously declared tools by name cannot replay such a history.
- *
- * @deprecated No built-in transport needs this anymore: Anthropic expresses redefinitions with
- * inline `tool_definition` blocks. Kept for API compatibility and will be removed in a future release.
- */
-export function hasToolRedefinitions(messages: TranscriptMessages): boolean {
-	const declared = new Map<string, Tool>();
-	for (const message of messages) {
-		if (!isSystemMessage(message)) continue;
-		for (const tool of message.toolsAdded ?? []) {
-			const previous = declared.get(tool.name);
-			if (previous !== undefined && !declarationsEqual(previous, tool)) return true;
-			declared.set(tool.name, tool);
-		}
-	}
-	return false;
-}
-
 /** Whether tool history contains a removal or same-name redeclaration that an addition-only transport cannot replay. */
 export function hasNonAdditiveToolChanges(messages: TranscriptMessages): boolean {
 	return findLastNonAdditiveToolChange(messages.filter(isSystemMessage)) >= 0;

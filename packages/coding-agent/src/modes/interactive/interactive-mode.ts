@@ -4906,7 +4906,7 @@ export class InteractiveMode {
 	private isShuttingDown = false;
 	private shutdownRecoveryEditor?: Editor;
 
-	private showShutdownRecovery(error: unknown): void {
+	private showShutdownRecovery(error: unknown, restartUi: boolean): void {
 		const editor = new Editor(this.ui, getEditorTheme());
 		editor.onSubmit = (text) => {
 			editor.setText("");
@@ -4918,7 +4918,8 @@ export class InteractiveMode {
 		this.editorContainer.clear();
 		this.editorContainer.addChild(editor);
 		this.ui.setFocus(editor);
-		this.ui.start();
+		// Signal shutdown and recovery retries retain terminal ownership; only interactive quit stopped it.
+		if (restartUi) this.ui.start();
 		this.ui.requestRender(true);
 		this.showError(`Failed to shut down: ${error instanceof Error ? error.message : String(error)}`);
 		this.showStatus("Shutdown is pending. Use /quit or Ctrl+D to retry; ordinary commands are disabled.");
@@ -4945,7 +4946,7 @@ export class InteractiveMode {
 				await this.runtimeHost.dispose({ fromSignal: true });
 			} catch (error: unknown) {
 				if (this.runtimeHost.shutdownPending) {
-					this.showShutdownRecovery(error);
+					this.showShutdownRecovery(error, false);
 					return;
 				}
 				this.isShuttingDown = false;
@@ -4995,7 +4996,7 @@ export class InteractiveMode {
 		} catch (error: unknown) {
 			// Disposal rejected before invalidation; resume the same host registrations.
 			if (this.runtimeHost.shutdownPending) {
-				this.showShutdownRecovery(error);
+				this.showShutdownRecovery(error, true);
 				return;
 			}
 			this.isShuttingDown = false;

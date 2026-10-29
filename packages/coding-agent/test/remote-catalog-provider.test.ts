@@ -11,6 +11,7 @@ import {
 	type Provider,
 	type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
+import { personalizeOpenRouterCatalog } from "@earendil-works/pi-ai/providers/openrouter";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { hydrateModelCatalog } from "../../ai/scripts/hydrate-model-catalog.ts";
 import { VERSION } from "../src/config.ts";
@@ -61,7 +62,7 @@ function testProvider(localGeneratedAt?: number) {
 async function refreshProvider(
 	provider: Provider,
 	store: InMemoryModelsStore,
-	overrides: Partial<Pick<RefreshModelsContext, "allowNetwork" | "force" | "signal">> = {},
+	overrides: Partial<Pick<RefreshModelsContext, "allowNetwork" | "force" | "signal" | "credential">> = {},
 ): Promise<void> {
 	const publish = async (publication: ModelsPublication): Promise<boolean> => {
 		if (publication.persist === null) await store.delete(provider.id);
@@ -70,7 +71,7 @@ async function refreshProvider(
 		return true;
 	};
 	await provider.refreshModels?.({
-		credential: { type: "api_key" },
+		credential: overrides.credential ?? { type: "api_key" },
 		stored: await store.read(provider.id),
 		publish,
 		allowNetwork: overrides.allowNetwork ?? true,
@@ -360,9 +361,66 @@ describe("personalized catalog provider", () => {
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	};
 
-	it("keeps the saved list and saves nothing when personalization fails", async () => {
+	it.each(["transport", "http", "json"] as const)(
+		"personalizes the built-in catalog after an optional overlay %s failure",
+		async (failure) => {
+			vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+				if (String(input).endsWith("/models/user")) {
+					return Response.json({
+						data: [
+							{ id: "static", context_length: 8000, pricing: { prompt: "0.000003", completion: "0.000015" } },
+						],
+					});
+				}
+				if (failure === "transport") throw new TypeError("catalog unavailable");
+				return failure === "http" ? new Response("unavailable", { status: 503 }) : new Response("{invalid");
+			});
+			const store = new InMemoryModelsStore();
+			const personalized = {
+				...model("static"),
+				contextWindow: 8000,
+				cost: { input: 3, output: 15, cacheRead: 0, cacheWrite: 0 },
+			};
+			const provider = withPersonalizedCatalog(
+				builtinProvider([model("static"), model("excluded")]),
+				personalizeOpenRouterCatalog,
+			);
+
+			await refreshProvider(provider, store, { credential: { type: "api_key", key: "test-key" } });
+
+			expect(provider.getModels()).toEqual([personalized]);
+			expect((await store.read(provider.id))?.models).toEqual([personalized]);
+		},
+	);
+
+	it.each(["overlay", "personalization"] as const)(
+		"does not publish a fallback after abort during %s",
+		async (phase) => {
+			const controller = new AbortController();
+			vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+				if (phase === "overlay") controller.abort();
+				return new Response("unavailable", { status: 503 });
+			});
+			const store = new InMemoryModelsStore();
+			const saved = { models: [model("allowed")], checkedAt: 1 };
+			await store.write("test-provider", saved);
+			const personalize = vi.fn<PersonalizeCatalog>(async () => {
+				controller.abort();
+				return [model("static")];
+			});
+			const provider = withPersonalizedCatalog(builtinProvider(), personalize);
+
+			await refreshProvider(provider, store, { signal: controller.signal });
+
+			expect(personalize).toHaveBeenCalledTimes(phase === "overlay" ? 0 : 1);
+			expect(provider.getModels()).toEqual(saved.models);
+			expect(await store.read(provider.id)).toEqual(saved);
+		},
+	);
+
+	it("keeps the saved list and saves nothing when overlay and personalization both fail", async () => {
 		// Saving the catalog without personalization would replace the key's list with every model.
-		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("not found", { status: 404 }));
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("unavailable", { status: 503 }));
 		const store = new InMemoryModelsStore();
 		const saved = { models: [model("allowed")], checkedAt: 1 };
 		await store.write("test-provider", saved);

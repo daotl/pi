@@ -402,8 +402,8 @@ async function checkDaemon(target: SshTarget, remote: RemotePlatform, file: stri
 }
 
 /**
- * Make sure the daemon is on the remote machine, verified by its SHA-256 before it ever runs, and remove daemons of
- * other contents. The upload goes to a new temporary file and is renamed into place only once its hash matches.
+ * Make sure the daemon is on the remote machine, verified by its SHA-256 before it ever runs. Other content hashes
+ * belong to independent, possibly not-yet-started connections. Upload to a temporary file, then rename once verified.
  * Returns the remote path of the binary.
  */
 export async function deployDaemon(
@@ -435,8 +435,6 @@ export async function deployDaemon(
 				`if ((Get-FileHash -Algorithm SHA256 -LiteralPath $t).Hash.ToLower() -ne '${sha256}') { Remove-Item -LiteralPath $t; throw 'pi-env upload is corrupt' }`,
 				// A running daemon or a virus scanner can hold the old file for a moment.
 				"for ($i = 0; ; $i++) { try { Move-Item -Force -LiteralPath $t -Destination $f; break } catch { if ($i -ge 20) { throw }; Start-Sleep -Milliseconds 250 } }",
-				// Older daemons; one that is running stays until it exits.
-				"Get-ChildItem -LiteralPath $d -Filter 'pi-env-*.exe' | Where-Object { $_.FullName -ne $f } | ForEach-Object { Remove-Item -LiteralPath $_.FullName -ErrorAction SilentlyContinue }",
 				"'deployed'",
 			].join("; "),
 		);
@@ -456,8 +454,6 @@ export async function deployDaemon(
 		`if [ "$(hash "$t")" != ${sha256} ]; then rm -f "$t"; echo "pi-env upload is corrupt" >&2; exit 1; fi`,
 		'chmod 700 "$t"',
 		'mv -f "$t" "$f"',
-		// Older daemons; running ones keep their file open until they exit.
-		'for old in "$d"/pi-env-*; do [ "$old" = "$f" ] || rm -f "$old"; done',
 		"echo deployed",
 	].join("\n");
 	await runSsh(target, `sh -c ${quotePosix(upload)}`, { stdin: bytes, timeoutMs: UPLOAD_TIMEOUT_MS });
@@ -491,8 +487,8 @@ function launchCommand(remote: RemotePlatform, file: string, loginShell: boolean
 	return quotePosix(file);
 }
 
-/** What an SSH connection learned about its remote system, and the daemon it verified last. */
-type SshState = { remote?: RemotePlatform; verified?: string };
+/** What an SSH connection learned about its remote system. */
+type SshState = { remote?: RemotePlatform };
 
 /** A `Connection` whose every start detects the remote system (once), verifies or deploys the daemon, then starts it. */
 function sshConnectionFor(options: SshConnectOptions, state: SshState): Connection {
@@ -503,11 +499,8 @@ function sshConnectionFor(options: SshConnectOptions, state: SshState): Connecti
 				for (const warning of remote.warnings) options.onLog?.(`${warning}\n`);
 				state.remote = remote;
 			}
-			// A deployment that just verified the binary counts for the first start.
-			const file =
-				state.verified ??
-				(await deployDaemon(options, state.remote, options.binary ?? packagedDaemon(state.remote)));
-			state.verified = undefined;
+			// An eager connection may have remained unstarted indefinitely; verify again immediately before launch.
+			const file = await deployDaemon(options, state.remote, options.binary ?? packagedDaemon(state.remote));
 			return [
 				options.ssh ?? "ssh",
 				...sshArguments(options),
@@ -541,7 +534,7 @@ export async function connectSsh(
 	options: SshConnectOptions,
 ): Promise<{ connection: Connection; remote: RemotePlatform }> {
 	const remote = await detectPlatform(options);
-	const verified = await deployDaemon(options, remote, options.binary ?? packagedDaemon(remote));
+	await deployDaemon(options, remote, options.binary ?? packagedDaemon(remote));
 	for (const warning of remote.warnings) options.onLog?.(`${warning}\n`);
-	return { connection: sshConnectionFor(options, { remote, verified }), remote };
+	return { connection: sshConnectionFor(options, { remote }), remote };
 }

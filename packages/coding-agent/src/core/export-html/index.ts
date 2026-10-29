@@ -10,14 +10,15 @@ import { SessionManager } from "../session-manager.ts";
 import { getUsageTotals } from "../usage-totals.ts";
 
 /**
- * Interface for rendering custom tools to HTML.
- * Used by agent-session to pre-render extension tool output.
+ * Interface for rendering tools to HTML.
+ * ownerEntryId identifies the assistant entry; toolCallId remains the provider's original call ID.
  */
 export interface ToolHtmlRenderer {
 	/** Render a tool call to HTML. Returns undefined if tool has no custom renderer. */
-	renderCall(toolCallId: string, toolName: string, args: unknown): string | undefined;
+	renderCall(ownerEntryId: string, toolCallId: string, toolName: string, args: unknown): string | undefined;
 	/** Render a tool result and finalized call HTML, or undefined if tool has no custom renderer. */
 	renderResult(
+		ownerEntryId: string,
 		toolCallId: string,
 		toolName: string,
 		result: Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
@@ -27,7 +28,7 @@ export interface ToolHtmlRenderer {
 	): { callHtml?: string; collapsed?: string; expanded?: string } | undefined;
 }
 
-/** Pre-rendered HTML for a custom tool call and result */
+/** Pre-rendered HTML for a tool call and result */
 interface RenderedToolHtml {
 	callHtml?: string;
 	resultHtmlCollapsed?: string;
@@ -135,7 +136,7 @@ interface SessionData {
 	leafId: string | null;
 	systemPrompt?: string;
 	tools?: Array<Pick<ToolDefinition, "name" | "description" | "parameters">>;
-	/** Pre-rendered HTML for custom tool calls/results, keyed by tool call ID */
+	/** Tool HTML keyed by [assistant entry ID, call ID, optional result entry ID]. */
 	renderedTools?: Record<string, RenderedToolHtml>;
 }
 
@@ -188,6 +189,7 @@ function preRenderCustomTools(
 	toolRenderer: ToolHtmlRenderer,
 ): Record<string, RenderedToolHtml> {
 	const renderedTools: Record<string, RenderedToolHtml> = {};
+	const byId = new Map(entries.map((entry) => [entry.id, entry]));
 
 	for (const entry of entries) {
 		if (entry.type !== "message") continue;
@@ -197,9 +199,9 @@ function preRenderCustomTools(
 		if (msg.role === "assistant" && Array.isArray(msg.content)) {
 			for (const block of msg.content) {
 				if (block.type === "toolCall") {
-					const callHtml = toolRenderer.renderCall(block.id, block.name, block.arguments);
+					const callHtml = toolRenderer.renderCall(entry.id, block.id, block.name, block.arguments);
 					if (callHtml) {
-						renderedTools[block.id] = { callHtml };
+						renderedTools[JSON.stringify([entry.id, block.id])] = { callHtml };
 					}
 				}
 			}
@@ -207,9 +209,30 @@ function preRenderCustomTools(
 
 		// Find tool results
 		if (msg.role === "toolResult" && msg.toolCallId) {
+			// Results belong to the nearest matching assistant on their own ancestor path.
+			let owner = entry.parentId ? byId.get(entry.parentId) : undefined;
+			while (owner) {
+				if (owner.type === "message" && owner.message.role === "assistant") {
+					const call = owner.message.content.find(
+						(block) => block.type === "toolCall" && block.id === msg.toolCallId,
+					);
+					if (call?.type === "toolCall") {
+						// Sibling outcomes must start from the original call, not another result's final state.
+						toolRenderer.renderCall(owner.id, call.id, call.name, call.arguments);
+						break;
+					}
+				}
+				if (!owner.parentId || owner.parentId === owner.id) {
+					owner = undefined;
+					break;
+				}
+				owner = byId.get(owner.parentId);
+			}
+			if (!owner) continue;
 			const toolName = msg.toolName || "";
-			const existing = renderedTools[msg.toolCallId];
+			const existing = renderedTools[JSON.stringify([owner.id, msg.toolCallId])];
 			const rendered = toolRenderer.renderResult(
+				owner.id,
 				msg.toolCallId,
 				toolName,
 				msg.content,
@@ -218,7 +241,7 @@ function preRenderCustomTools(
 				msg.durationMs,
 			);
 			if (rendered) {
-				renderedTools[msg.toolCallId] = {
+				renderedTools[JSON.stringify([owner.id, msg.toolCallId, entry.id])] = {
 					...existing,
 					callHtml: rendered.callHtml ?? existing?.callHtml,
 					resultHtmlCollapsed: rendered.collapsed,

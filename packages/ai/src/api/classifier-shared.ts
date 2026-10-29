@@ -74,6 +74,8 @@ export async function postClassifierRequest(
 	const transformed = await options.onPayload?.(payload, model);
 	if (transformed !== undefined) payload = transformed;
 	const requestFetch = options.fetch ?? globalThis.fetch;
+	const headers = requestHeaders(model, apiKey, options.headers, options.identity);
+	const serializedPayload = JSON.stringify(payload);
 	const { response, json } = await retryProviderRequest(
 		async () => {
 			const timeoutSignal = options.timeoutMs !== undefined ? AbortSignal.timeout(options.timeoutMs) : undefined;
@@ -81,19 +83,31 @@ export async function postClassifierRequest(
 				options.signal && timeoutSignal
 					? AbortSignal.any([options.signal, timeoutSignal])
 					: (options.signal ?? timeoutSignal);
+			options.signal?.throwIfAborted();
+			let response: Response;
+			let responseBody: string;
 			try {
-				const next = await requestFetch(url, {
+				response = await requestFetch(url, {
 					method: "POST",
-					headers: requestHeaders(model, apiKey, options.headers, options.identity),
-					body: JSON.stringify(payload),
+					headers,
+					body: serializedPayload,
 					signal,
 				});
-				if (!next.ok) throw httpError(label, next, await next.text());
-				return { response: next, json: (await next.json()) as unknown };
+				responseBody = await response.text();
 			} catch (error) {
-				if (timeoutSignal?.aborted && !options.signal?.aborted) throw timeoutError(options.timeoutMs!);
-				throw error;
+				if (options.signal?.aborted) throw error;
+				if (timeoutSignal?.aborted) throw timeoutError(options.timeoutMs!);
+				if (error instanceof Error && error.name === "AbortError") throw error;
+				const transportError = new Error(error instanceof Error ? error.message : String(error), {
+					cause: error,
+				}) as ClassifierHttpError;
+				transportError.status = undefined;
+				transportError.headers = undefined;
+				transportError.body = "";
+				throw transportError;
 			}
+			if (!response.ok) throw httpError(label, response, responseBody);
+			return { response, json: JSON.parse(responseBody) as unknown };
 		},
 		{
 			maxRetries: options.maxRetries ?? 2,

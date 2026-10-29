@@ -419,6 +419,84 @@ describe("sleeping tasks", () => {
 		await harness.close(context);
 	});
 
+	it("keeps the next future deadline when earlier sleeps become due, change, or abort while paused", async () => {
+		let clock = 1_000;
+		const Nap = napTask(500);
+		const { harness } = await openTasks(new MemoryStorage(), [Nap], { now: () => clock, onWake: () => {} });
+		const root = await harness.root(context);
+		const ids = await root.commit(async (tx) => {
+			const ids: TaskId[] = [];
+			for (let index = 0; index < 3; index++) {
+				const id = await tx.createTask(Nap, null, { ownership: { kind: "conversation" } });
+				ids.push(id);
+			}
+			return ids;
+		}, context);
+		await root.commit(async (tx) => {
+			const records = await Promise.all(ids.map((id) => tx.task(id)));
+			for (const [index, until] of [1_500, 2_000, 3_000].entries()) {
+				const record = records[index]!;
+				// The public transaction omits the scheduler's internal record writer.
+				const internal = tx as unknown as { setTask(value: unknown): void };
+				internal.setTask({
+					...record,
+					state: { status: "sleeping", checkpoint: { phase: "after", slept: 500 }, until },
+				});
+			}
+		}, context);
+		await eventually(() => !harness.wake().active);
+		expect(harness.wake()).toEqual({ active: false, at: 1_500 });
+		clock = 1_500;
+		expect(harness.wake()).toEqual({ active: true, at: 2_000 });
+		clock = 1_200;
+		expect(harness.wake()).toEqual({ active: false, at: 1_500 });
+		await root.commit(async (tx) => {
+			const record = (await tx.task(ids[0]!))!;
+			// The public transaction omits the scheduler's internal record writer.
+			const internal = tx as unknown as { setTask(value: unknown): void };
+			internal.setTask({
+				...record,
+				state: { status: "sleeping", checkpoint: { phase: "after", slept: 500 }, until: 4_000 },
+			});
+		}, context);
+		expect(harness.wake()).toEqual({ active: false, at: 2_000 });
+		await root.commit(async (tx) => {
+			const record = (await tx.task(ids[1]!))!;
+			// The public transaction omits the scheduler's internal record writer.
+			const internal = tx as unknown as { setTask(value: unknown): void };
+			internal.setTask({ ...record, abortRequested: true });
+		}, context);
+		expect(harness.wake()).toEqual({ active: true, at: 3_000 });
+		await harness.close(context);
+	});
+
+	it("reevaluates blocked paused tasks after registry and restart-limit changes", async () => {
+		const Nap = napTask(500);
+		const settings = { restartLimit: 1 };
+		const { harness, registry } = await openTasks(new MemoryStorage(), [], { settings, onWake: () => {} });
+		const root = await harness.root(context);
+		const id = await root.commit((tx) => tx.createTask(Nap, null, { ownership: { kind: "conversation" } }), context);
+		await eventually(() => !harness.wake().active);
+		const extension = defineExtension({ name: "nap", tasks: [Nap] });
+		registry.install(extension);
+		expect(harness.wake()).toEqual({ active: true });
+		await root.commit(async (tx) => {
+			const record = (await tx.task(id))!;
+			// The public transaction omits the scheduler's internal record writer.
+			const internal = tx as unknown as { setTask(value: unknown): void };
+			internal.setTask({ ...record, restarts: 1 });
+		}, context);
+		expect(harness.wake()).toEqual({ active: false });
+		settings.restartLimit = 2;
+		expect(harness.wake()).toEqual({ active: true });
+		settings.restartLimit = 1;
+		expect(harness.wake()).toEqual({ active: false });
+		registry.uninstall(extension);
+		settings.restartLimit = 2;
+		expect(harness.wake()).toEqual({ active: false });
+		await harness.close(context);
+	});
+
 	it("reports a throwing onWake and offers the same wake again at the next pass", async () => {
 		let clock = 1_000;
 		const wakes: Wake[] = [];

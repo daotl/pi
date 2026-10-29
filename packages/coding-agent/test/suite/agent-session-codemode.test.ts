@@ -22,7 +22,6 @@ import { createToolDefinitionFromAgentTool } from "../../src/core/tools/tool-def
 import { readCodemodeStore } from "../../src/extensions/codemode/execute.ts";
 import { createCodemodeExtension } from "../../src/extensions/codemode/index.ts";
 import {
-	CODEMODE_DOCS_PATH,
 	CODEMODE_STORE_ENTRY_TYPE,
 	type CodemodeToolDetails,
 	createCodemodeTool,
@@ -787,17 +786,26 @@ describe("codemode models", () => {
 
 	const questions = `{ approved: { type: "bool", instructions: "Approval?", criteria: { true: "yes", false: "no" } } }`;
 
-	it("declares models only for the session's own codemode tool", async () => {
-		const { harness } = await setup();
+	it("runs the model help examples without file-reading tools", async () => {
+		const { harness, observed, imageRequests } = await setup();
 		const codemode = harness.session.agent.state.tools.find((tool) => tool.name === "codemode");
-		// The description names the models globals and points to the docs for the API.
-		expect(codemode?.description).toContain("`models`: classifiers and image generation");
-		expect(codemode?.description).toContain(CODEMODE_DOCS_PATH);
+		expect(harness.session.agent.state.tools.map((tool) => tool.name)).toEqual(["codemode"]);
+		const outputs: string[] = [];
+		for (const match of codemode?.description.matchAll(/```js\n([\s\S]*?)\n```/g) ?? []) {
+			const result = await run(harness, match[1]);
+			expect(result.isError).toBe(false);
+			outputs.push(checkSavedImages(resultText(result)));
+		}
+		expect(outputs).toEqual([
+			expect.stringContaining('"approved":{"type":"bool","probability":0.9}'),
+			"painted a fox\n<saved>\n<image>",
+		]);
+		expect(observed.map((entry) => entry.text)).toEqual(["good"]);
+		expect(imageRequests.map((entry) => entry.input)).toEqual([[{ type: "text", text: "a fox" }]]);
 
-		const overridden = await createHarness({ tools: [createCodemodeTool() as AgentTool] });
-		harnesses.push(overridden);
-		const plain = overridden.session.agent.state.tools.find((tool) => tool.name === "codemode");
-		expect(plain?.description).not.toContain("`models`");
+		const plain = createCodemodeTool();
+		const result = await plain.execute("plain-models", { code: "return typeof models;" });
+		expect(result.content[1]).toEqual({ type: "text", text: "undefined" });
 	});
 
 	it("lists models and classifies with catalog auth, ignoring script-supplied fields", async () => {

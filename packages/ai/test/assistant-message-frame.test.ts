@@ -40,6 +40,28 @@ function frame(encoder: AssistantMessageFrameEncoder, event: AssistantMessageEve
 }
 
 describe("assistant message frames", () => {
+	it("marks authoritative tool arguments for reconciliation instead of an empty edit", () => {
+		const reducer = new AssistantMessageFrameReducer();
+		reducer.apply({ type: "start", partial: seed() });
+		let visible: unknown = {};
+		const apply = (frame: AssistantMessageFrame) => {
+			reducer.apply(frame);
+			const block = reducer.message?.content[0];
+			if (reducer.toolArgumentChanges === undefined && block?.type === "toolCall")
+				visible = structuredClone(block.arguments);
+		};
+		apply({
+			type: "toolcall_start",
+			contentIndex: 0,
+			toolCall: { type: "toolCall", id: "c", name: "write", arguments: { initial: 1 } },
+		});
+		expect(visible).toEqual({ initial: 1 });
+		apply({ type: "toolcall_checkpoint", contentIndex: 0, json: '{"corrected":2}' });
+		expect(visible).toEqual({ corrected: 2 });
+		apply({ type: "toolcall_end", contentIndex: 0, id: "c", name: "write", arguments: { final: 3 } });
+		expect(visible).toEqual({ final: 3 });
+	});
+
 	it("uses authoritative text end content and signature", () => {
 		const partial = seed();
 		const encoder = new AssistantMessageFrameEncoder();

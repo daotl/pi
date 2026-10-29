@@ -44,7 +44,7 @@ export function assertValid(reason: ChordErrorReason, what: string, schema: TSch
 
 /** Applies defaults, strips unknown fields, validates. Returns a fresh value. */
 export function normalize(schema: TSchema, value: unknown, what: string): unknown {
-	const normalized = Value.Clean(schema, Value.Default(schema, Value.Clone(value ?? {})));
+	const normalized = Value.Clean(schema, Value.Default(schema, Value.Clone(value === undefined ? {} : value)));
 	assertValid("input", what, schema, normalized);
 	return normalized;
 }
@@ -138,6 +138,13 @@ export function fits(subSchema: unknown, supSchema: unknown, mode: "value" | "cl
 	if (deepEqual(sub, sup)) return true;
 	if (Object.keys(sup).some((key) => !KNOWN.has(key))) return false;
 	if (sup.additionalProperties !== undefined && typeof sup.additionalProperties !== "boolean") return false;
+	// Union branches are alternatives, but sibling keywords constrain every branch. Without modeling that
+	// intersection, only the exact equality checked above proves compatibility.
+	if (
+		(Array.isArray(sub.anyOf) && Object.keys(sub).length > 1) ||
+		(Array.isArray(sup.anyOf) && Object.keys(sup).length > 1)
+	)
+		return false;
 	if (Array.isArray(sub.anyOf)) return sub.anyOf.every((branch) => fits(branch, sup, mode));
 	if (Array.isArray(sup.anyOf)) return sup.anyOf.some((branch) => fits(sub, branch, mode));
 	if ("const" in sup) return "const" in sub && deepEqual(sub.const, sup.const);

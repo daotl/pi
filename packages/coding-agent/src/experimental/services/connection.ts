@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { type Client, createClientChordLink } from "@earendil-works/pi-client";
+import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { SessionPlugins } from "./plugins.ts";
 
 export type ServerConnectionState =
@@ -37,8 +38,26 @@ interface ClientHosts {
 	readonly host: Host;
 	readonly removeConnectionListener: () => void;
 	references: number;
+	closePromise?: Promise<void>;
 }
 const clients = new WeakMap<Client, ClientHosts>();
+const shutdowns = new WeakMap<Client, Promise<void>>();
+
+function closeHost(client: Client, shared: ClientHosts): Promise<void> {
+	if (shared.closePromise !== undefined) return shared.closePromise;
+	shared.removeConnectionListener();
+	if (clients.get(client) === shared) clients.delete(client);
+	shared.closePromise = shared.host.close();
+	shutdowns.set(client, shared.closePromise);
+	// Disconnect listeners cannot return promises. Keep rejection observed for the runtime owner to join.
+	void shared.closePromise.catch(() => {});
+	return shared.closePromise;
+}
+
+/** Join cleanup started by the final source release or client disconnection. */
+export async function waitForClientHostClose(client: Client): Promise<void> {
+	await shutdowns.get(client);
+}
 function acquireHost(client: Client, options: ServiceSourceOptions): ClientHosts {
 	let shared = clients.get(client);
 	if (shared === undefined) {
@@ -73,9 +92,7 @@ function acquireHost(client: Client, options: ServiceSourceOptions): ClientHosts
 			references: 0,
 			removeConnectionListener: client.onConnectionStateChange(({ state }) => {
 				if (state !== "disconnected" || shared!.references > 0) return;
-				shared!.removeConnectionListener();
-				clients.delete(client);
-				void host.close();
+				void closeHost(client, shared!);
 			}),
 		};
 		clients.set(client, shared);
@@ -86,9 +103,7 @@ function acquireHost(client: Client, options: ServiceSourceOptions): ClientHosts
 async function releaseHost(client: Client, shared: ClientHosts): Promise<void> {
 	shared.references--;
 	if (shared.references !== 0 || client.connected) return;
-	shared.removeConnectionListener();
-	clients.delete(client);
-	await shared.host.close();
+	await closeHost(client, shared);
 }
 
 export function createServerServiceSource(client: Client, options: ServiceSourceOptions = {}): ServerServiceSource {
@@ -153,7 +168,7 @@ export function createSessionServiceSource(client: Client, options: ServiceSourc
 			if (attachment === undefined || attachment.sessionId !== sessionId)
 				throw new Error(`Session ${sessionId} is not the current attachment`);
 			const current = revision;
-			await hydration;
+			await raceWithAbortSignal(hydration, context.abortSignal);
 			context.abortSignal?.throwIfAborted();
 			if (current !== revision || client.attachment !== attachment)
 				throw new Error("Session attachment changed during hydration");

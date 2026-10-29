@@ -706,7 +706,7 @@ export class ModelRuntime implements Models {
 			mergeHeaders(getOpenCodeSessionHeaders(requestModel, sessionId), resolution.auth.headers),
 			providerOptions.headers,
 		);
-		if (transformHeaders) headers = await transformHeaders(headers ?? {});
+		if (transformHeaders) headers = await transformHeaders(headers ?? {}, requestModel);
 		const env =
 			resolution.env || providerOptions.env
 				? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }

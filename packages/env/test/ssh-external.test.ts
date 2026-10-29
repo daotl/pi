@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -67,6 +67,32 @@ describe.skipIf(host === undefined)("SSH to this machine's server", () => {
 		const info = await connection.info();
 		expect(nodePlatform(info).platform).toBe(process.platform);
 		if (windows) expect(remote.shell).toBe(process.env.PI_ENV_SSH_SHELL ?? "cmd");
+	}, 120_000);
+
+	it("keeps two content-addressed builds runnable across delayed first starts", async () => {
+		const { remote } = await connect();
+		const target: SshTarget = {
+			host: host!,
+			...(process.env.PI_ENV_SSH_USER === undefined ? {} : { user: process.env.PI_ENV_SSH_USER }),
+			...(process.env.PI_ENV_SSH_PORT === undefined ? {} : { port: Number(process.env.PI_ENV_SSH_PORT) }),
+			...(process.env.PI_ENV_SSH_KEY === undefined ? {} : { identityFile: process.env.PI_ENV_SSH_KEY }),
+			...(process.env.PI_ENV_SSH_PROGRAM === undefined ? {} : { ssh: process.env.PI_ENV_SSH_PROGRAM }),
+			knownHostsFile: join(root, "known_hosts"),
+			hostKeyAlias: "pi-env-external",
+		};
+		const alternate = join(root, windows ? "alternate.exe" : "alternate");
+		writeFileSync(alternate, Buffer.concat([readFileSync(daemon), Buffer.from("\npi-env alternate build\n")]));
+		const first = await connectSsh({ ...target, binary: daemon });
+		let second: Connection | undefined;
+		try {
+			second = (await connectSsh({ ...target, binary: alternate })).connection;
+			const [a, b] = await Promise.all([first.connection.info(), second.info()]);
+			expect(a.home).toBe(remote.home);
+			expect(b.home).toBe(remote.home);
+		} finally {
+			first.connection.close();
+			second?.close();
+		}
 	}, 120_000);
 });
 

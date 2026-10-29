@@ -38,19 +38,19 @@
         byId.set(entry.id, entry);
       }
 
-      // Tool call lookup (toolCallId -> {name, arguments})
-      const toolCallMap = new Map();
-      for (const entry of entries) {
-        if (entry.type === 'message' && entry.message.role === 'assistant') {
-          const content = entry.message.content;
-          if (Array.isArray(content)) {
-            for (const block of content) {
-              if (block.type === 'toolCall') {
-                toolCallMap.set(block.id, { name: block.name, arguments: block.arguments });
-              }
-            }
+      // Resolve tool ownership through ancestry, never through a session-global call ID.
+      function findToolCallOwner(resultEntry) {
+        let current = byId.get(resultEntry.parentId);
+        while (current) {
+          if (current.type === 'message' && current.message.role === 'assistant') {
+            const call = current.message.content.find(block =>
+              block.type === 'toolCall' && block.id === resultEntry.message.toolCallId);
+            if (call) return { entry: current, call };
           }
+          if (!current.parentId || current.parentId === current.id) break;
+          current = byId.get(current.parentId);
         }
+        return null;
       }
 
       // Label lookup (entryId -> label string)
@@ -746,7 +746,7 @@
               return labelHtml + `<span class="tree-role-assistant">assistant:</span> <span class="tree-muted">(no text)</span>`;
             }
             if (msg.role === 'toolResult') {
-              const toolCall = msg.toolCallId ? toolCallMap.get(msg.toolCallId) : null;
+              const toolCall = findToolCallOwner(entry)?.call;
               if (toolCall) {
                 return labelHtml + `<span class="tree-role-tool">${escapeHtml(formatToolCall(toolCall.name, toolCall.arguments))}</span>`;
               }
@@ -938,12 +938,11 @@
         return extToLang[ext];
       }
 
-      function findToolResult(toolCallId) {
-        for (const entry of entries) {
-          if (entry.type === 'message' && entry.message.role === 'toolResult') {
-            if (entry.message.toolCallId === toolCallId) {
-              return entry.message;
-            }
+      function findToolResult(ownerEntryId, toolCallId) {
+        for (const entry of getPath(currentLeafId)) {
+          if (entry.type === 'message' && entry.message.role === 'toolResult' &&
+              entry.message.toolCallId === toolCallId && findToolCallOwner(entry)?.entry.id === ownerEntryId) {
+            return entry;
           }
         }
         return null;
@@ -1005,8 +1004,9 @@
         return out;
       }
 
-      function renderToolCall(call) {
-        const result = findToolResult(call.id);
+      function renderToolCall(call, ownerEntryId) {
+        const resultEntry = findToolResult(ownerEntryId, call.id);
+        const result = resultEntry?.message;
         const isError = result?.isError || false;
         const statusClass = result ? (isError ? 'error' : 'success') : 'pending';
 
@@ -1044,13 +1044,14 @@
           return formatExpandableOutput([title, ...lines].join('\n'), 1);
         };
 
-        const toolDomId = `tool-call-${escapeHtml(call.id)}`;
+        const toolDomId = `tool-call-${escapeHtml(JSON.stringify([ownerEntryId, call.id]))}`;
         let html = `<div class="tool-execution ${statusClass}" id="${toolDomId}">`;
         const args = call.arguments || {};
         const name = call.name;
 
         const invalidArg = '<span class="tool-error">[invalid arg]</span>';
-        const rendered = renderedTools?.[call.id];
+        const rendered = (resultEntry && renderedTools?.[JSON.stringify([ownerEntryId, call.id, resultEntry.id])]) ||
+          renderedTools?.[JSON.stringify([ownerEntryId, call.id])];
         if (rendered?.callHtml || rendered?.resultHtmlCollapsed || rendered?.resultHtmlExpanded) {
           if (rendered.callHtml) {
             html += `<div class="tool-header ansi-rendered">${rendered.callHtml}</div>`;
@@ -1372,7 +1373,7 @@
 
             for (const block of msg.content) {
               if (block.type === 'toolCall') {
-                html += renderToolCall(block);
+                html += renderToolCall(block, entry.id);
               }
             }
 
@@ -1595,15 +1596,13 @@
       function getScrollTargetElementId(entryId) {
         const entry = byId.get(entryId);
         if (entry?.type === 'message' && entry.message.role === 'toolResult' && entry.message.toolCallId) {
-          // getElementById() matches the parsed DOM id attribute, whose HTML entities
-          // were already resolved from the escaped id rendered by renderToolCall().
-          return `tool-call-${entry.message.toolCallId}`;
+          const owner = findToolCallOwner(entry);
+          if (owner) return `tool-call-${JSON.stringify([owner.entry.id, entry.message.toolCallId])}`;
         }
         return `entry-${entryId}`;
       }
 
       function renderEntryToNode(entry) {
-        // Check cache first
         if (entryCache.has(entry.id)) {
           return entryCache.get(entry.id).cloneNode(true);
         }
@@ -1624,6 +1623,8 @@
       }
 
       function navigateTo(targetId, scrollMode = 'target', scrollToEntryId = null) {
+        // A shared ancestor can have a result on one branch and be pending on another.
+        if (currentLeafId !== targetId) entryCache.clear();
         currentLeafId = targetId;
         currentTargetId = scrollToEntryId || targetId;
         const targetEntry = byId.get(currentTargetId);

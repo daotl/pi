@@ -355,6 +355,134 @@ describe("reload", () => {
 		assert.deepEqual(log, ["open cache 2", "close lock 1", "open lock 2", "close cache 1"]);
 	});
 
+	for (const failOpen of [false, true]) {
+		it(`closes exclusive dependents before dependencies and ${failOpen ? "restores dependencies before dependents on abort" : "commits their replacements"}`, async () => {
+			const errors: unknown[] = [];
+			const host = createHost({ self: "host", onError: (error) => errors.push(error) });
+			const log: string[] = [];
+			const facet = (version: number): Facet => ({
+				name: "dependent-resources",
+				setup: (api) =>
+					api.serve(Greeter, (_input, _principal, self) => {
+						const dependency = self.resource("dependency", {
+							version,
+							exclusive: true,
+							open: () => {
+								log.push(`open dependency ${version}`);
+								return version;
+							},
+							close: () => void log.push(`close dependency ${version}`),
+						});
+						const dependent = self.resource("dependent", {
+							version,
+							exclusive: true,
+							deps: [dependency],
+							open: () => {
+								log.push(`open dependent ${version} with ${dependency.value}`);
+								if (failOpen && version === 2) throw new Error("replacement open failed");
+								return dependency.value;
+							},
+							close: () => void log.push(`close dependent ${version} with ${dependency.value}`),
+						});
+						return {
+							count: self.state("count", Type.Number(), 0),
+							greet: () => `${dependency.value}:${dependent.value}`,
+						};
+					}),
+			});
+			try {
+				await host.install(facet(1));
+				const ref = await host.get(Greeter, {});
+				assert.equal(await ref.greet("read"), "1:1");
+				log.length = 0;
+				const before = host.codeVersion;
+				if (failOpen) {
+					await assert.rejects(host.reload([facet(2)]), /replacement open failed/);
+					assert.equal(host.codeVersion, before);
+					assert.equal(await ref.greet("read"), "1:1");
+					assert.deepEqual(log, [
+						"close dependent 1 with 1",
+						"close dependency 1",
+						"open dependency 2",
+						"open dependent 2 with 2",
+						"close dependency 2",
+						"open dependency 1",
+						"open dependent 1 with 1",
+					]);
+				} else {
+					await host.reload([facet(2)]);
+					assert.equal(await ref.greet("read"), "2:2");
+					assert.deepEqual(log, [
+						"close dependent 1 with 1",
+						"close dependency 1",
+						"open dependency 2",
+						"open dependent 2 with 2",
+					]);
+				}
+				assert.deepEqual(errors, []);
+			} finally {
+				await host.close();
+			}
+		});
+	}
+
+	for (const member of ["result", "state"] as const) {
+		it(`rejects a same-version reload that drops a union ${member}'s sibling minimum`, async () => {
+			const host = quiet();
+			const wanted = Type.Union([Type.Number(), Type.String()], { minimum: 1 });
+			const offered = Type.Number();
+			const contract = (schema: typeof wanted | typeof offered) =>
+				remote(`t.reload-union-${member}`, {
+					version: 1,
+					input: Type.Object({}),
+					host: hostNamed("host"),
+					variants: {
+						main: {
+							methods: { read: method(undefined, member === "result" ? schema : wanted) },
+							state: { value: member === "state" ? schema : wanted },
+						},
+					},
+				});
+			const initial = contract(wanted);
+			try {
+				await host.install({
+					name: "union",
+					setup: (api) =>
+						api.serve(initial, (_input, _principal, self) => ({
+							variant: "main",
+							read: () => 1,
+							value: self.state("value", Type.Number(), 1),
+						})),
+				});
+				const ref = await host.get(initial, {});
+				assert.ok(ref.variant === "main");
+				const before = host.codeVersion;
+				await assert.rejects(
+					host.reload([
+						{
+							name: "union",
+							setup: (api) =>
+								api.serve(contract(offered), (_input, _principal, self) => ({
+									variant: "main",
+									read: () => 0,
+									value: self.state("value", Type.Number(), 0),
+								})),
+						},
+					]),
+					(error) =>
+						isChordError(error, "contract_mismatch") &&
+						/without a version bump/.test(error.message) &&
+						error.message.includes(member),
+				);
+				assert.equal(host.codeVersion, before);
+				assert.equal(await ref.read(), 1);
+				assert.equal(ref.value.value, 1);
+			} finally {
+				await host.close();
+			}
+		});
+	}
+
 	it("two-version rule: the next reload retires the previous code version; its roots get superseded", async () => {
 		const host = quiet();
 		host.install(greeterFacet({ greeting: "v1" }));

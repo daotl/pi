@@ -14,6 +14,7 @@ import {
 	createSessionServiceSource,
 	type ServerServiceSource,
 	type SessionServiceSource,
+	waitForClientHostClose,
 } from "./services/connection.ts";
 import { Models } from "./services/models.ts";
 import { PresentationPlugins } from "./services/plugins.ts";
@@ -110,9 +111,14 @@ export async function openClientRuntime(
 			serviceSources.map((source) => source.dispose(BACKGROUND_CONTEXT)),
 		);
 		const clientResults = await Promise.allSettled(clients.map((client) => client.dispose()));
-		const errors = [...reconnectResults, ...sourceResults, ...clientResults].flatMap((result) =>
-			result.status === "rejected" ? [result.reason] : [],
-		);
+		const hostResults = await Promise.allSettled(clients.map((client) => waitForClientHostClose(client)));
+		const errors = [
+			...new Set(
+				[...reconnectResults, ...sourceResults, ...clientResults, ...hostResults].flatMap((result) =>
+					result.status === "rejected" ? [result.reason] : [],
+				),
+			),
+		];
 		if (errors.length === 1) throw errors[0];
 		if (errors.length > 1) throw new AggregateError(errors, "Failed to dispose experimental client runtime");
 	};
@@ -227,12 +233,13 @@ export async function activateBuiltinClientServices(
 			try {
 				await remoteManagement.attach(sessionId, ctx);
 				await server.session.whenAttached(sessionId, withAbortSignal(ctx.signal, BACKGROUND_CONTEXT));
-				const models = await host.get(Models, {});
+				const models = await host.get(Models, {}, { signal: ctx.signal });
 				acquired.push(models);
-				const agent = await host.get(AgentController, {});
+				const agent = await host.get(AgentController, {}, { signal: ctx.signal });
 				acquired.push(agent);
-				const transcript = await host.get(Transcript, {});
+				const transcript = await host.get(Transcript, {}, { signal: ctx.signal });
 				acquired.push(transcript);
+				ctx.signal.throwIfAborted();
 				const previous = sessionRefs;
 				sessionRefs = { models, agent, transcript };
 				previous?.models.release();

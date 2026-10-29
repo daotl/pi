@@ -334,8 +334,18 @@ export class TaskScheduler {
 	 * them with reason `restart`, so nothing of them or below them runs a phase again.
 	 */
 	readonly #abandoned = new Set<TaskId>();
-	/** Sleeping live tasks, due or not: the candidates of `#wakeDue()`. */
-	readonly #sleeping = new Set<TaskId>();
+	/** Future sleeps: one indexed heap slot per task, never stale deadline entries. */
+	readonly #sleeping: { readonly id: TaskId; readonly until: number }[] = [];
+	readonly #sleepPositions = new Map<TaskId, number>();
+	/** Due sleeps retained only to restore deadlines if the host clock moves backwards. */
+	readonly #dueSleeping = new Set<TaskId>();
+	#sleepClock = -Infinity;
+	/** Changed candidates, eligible tasks, and tasks blocked on definitions or the live restart limit. */
+	readonly #wakeChecks = new Set<TaskId>();
+	readonly #wakeReady = new Set<TaskId>();
+	readonly #wakeBlocked = new Set<TaskId>();
+	readonly #wakeParked = new Set<TaskId>();
+	#wakeRestartLimit: number | undefined;
 	/** Timer for the earliest sleep, without `onWake` while scheduling runs. */
 	#timer: { readonly at: number; readonly disarm: () => void } | undefined;
 	/** Last value given to `onWake`, so an unchanged one is not repeated. */
@@ -391,6 +401,8 @@ export class TaskScheduler {
 		this.#session.observeCommits((publication) => this.#observe(publication));
 		this.#session.subscribeClose(() => this.#seal());
 		this.#unsubscribeRegistry = this.#registry.subscribe(() => {
+			for (const id of this.#wakeBlocked) this.#wakeChecks.add(id);
+			for (const id of this.#wakeReady) this.#wakeChecks.add(id);
 			this.#notifyBlocked();
 			this.#kick();
 		});
@@ -497,26 +509,27 @@ export class TaskScheduler {
 		// A read-only Harness runs nothing, so it never needs a process.
 		if (this.#readOnly) return { active: false };
 		const now = this.#now();
-		// A reconcile pass with work to do is work too: it finalizes held outcomes and marks cascades, at open as
-		// recovery. A process that dies before it lands must be woken again. A pass with nothing to do is not.
-		let active = this.#invocations.size > 0 || this.#reconcilingWork > 0 || this.#reconcileWork();
-		let at: number | undefined;
+		this.#wakeDue(now);
+		const limit = this.#restartLimit();
+		if (limit !== this.#wakeRestartLimit) {
+			for (const id of this.#wakeParked) this.#wakeChecks.add(id);
+			for (const id of this.#wakeReady) this.#wakeChecks.add(id);
+			this.#wakeRestartLimit = limit;
+		}
 		let snapshot: RegistrySnapshot | undefined;
 		let snapshotFailed = false;
-		for (const record of this.#live.values()) {
-			const state = record.state;
-			if (state.status === "completing") continue;
-			if (state.status === "waiting" && !record.abortRequested && state.on.some((id) => this.#live.has(id)))
-				continue;
-			if (state.status === "sleeping" && !record.abortRequested && state.until > now) {
-				at = at === undefined ? state.until : Math.min(at, state.until);
+		for (const id of this.#wakeChecks) {
+			this.#wakeReady.delete(id);
+			this.#wakeBlocked.delete(id);
+			this.#wakeParked.delete(id);
+			const record = this.#live.get(id);
+			if (record === undefined || record.state.status === "completing") continue;
+			if (this.#waitingOn(record, true).length > 0 || this.#notDue(record)) continue;
+			if (!record.abortRequested && record.restarts !== undefined && record.restarts >= limit) {
+				this.#wakeParked.add(id);
 				continue;
 			}
-			if (active) continue;
-			if (this.#parked(record)) continue;
-			// An abort invocation waits for the live work below it, which counts itself.
-			if (record.abortRequested && this.#waitingOn(record, true).length > 0) continue;
-			// A task no definition can take waits for a registry change, except an abort-marked one, which is orphaned.
+			// An ordinary abort request is runnable even without a definition: reservation orphans it.
 			if (!record.abortRequested || record.abortReason !== undefined) {
 				if (snapshot === undefined && !snapshotFailed) {
 					try {
@@ -526,10 +539,19 @@ export class TaskScheduler {
 						this.#report(error, REGISTRY);
 					}
 				}
-				if (snapshot !== undefined && "reason" in this.#fit(record, snapshot.task(record.kind))) continue;
+				if (snapshot !== undefined && "reason" in this.#fit(record, snapshot.task(record.kind))) {
+					this.#wakeBlocked.add(id);
+					continue;
+				}
 			}
-			active = true;
+			this.#wakeReady.add(id);
 		}
+		this.#wakeChecks.clear();
+		// A throwing host snapshot has no publication to announce recovery. Retry these candidates next time.
+		if (snapshotFailed) for (const id of this.#wakeReady) this.#wakeChecks.add(id);
+		const active =
+			this.#invocations.size > 0 || this.#reconcilingWork > 0 || this.#reconcileWork() || this.#wakeReady.size > 0;
+		const at = this.#sleeping[0]?.until;
 		return at === undefined ? { active } : { active, at };
 	}
 
@@ -1037,6 +1059,12 @@ export class TaskScheduler {
 		}
 		for (const id of passed) this.#unloaded.delete(id);
 		this.#checkContextScopes(start);
+		if (this.#intent.size > 0) {
+			const node =
+				"task" in start ? this.#node(start.task) : { conversationId: start.conversation, background: false };
+			const above = node === undefined ? undefined : this.#nearestLiveAbove(node);
+			if (above?.abortRequested === true) this.#wakeChecks.add(above.id);
+		}
 	}
 
 	#setEdge(conversationId: ConversationId, owner: TaskId | null): void {
@@ -1106,6 +1134,7 @@ export class TaskScheduler {
 	#track(previous: AnyTaskRecord | undefined, record: AnyTaskRecord): void {
 		this.#checkContextScopes(parentOf(record));
 		const id = record.id;
+		this.#wakeChecks.add(id);
 		const invocation = this.#invocations.get(id);
 		if (invocation !== undefined) invocation.record = record as TaskRecord<JsonValue, Checkpoint, JsonValue>;
 		if (record.state.status === "terminal") {
@@ -1118,7 +1147,13 @@ export class TaskScheduler {
 		if (record.state.status === "terminal") {
 			const node = nodeOf(record);
 			this.#live.delete(id);
-			this.#sleeping.delete(id);
+			this.#removeSleep(id);
+			this.#dueSleeping.delete(id);
+			this.#wakeChecks.delete(id);
+			this.#wakeReady.delete(id);
+			this.#wakeBlocked.delete(id);
+			this.#wakeParked.delete(id);
+			this.#parkedTasks.delete(id);
 			this.#intent.delete(id);
 			this.#runnable.delete(id);
 			this.#finalizeChecks.delete(id);
@@ -1126,7 +1161,10 @@ export class TaskScheduler {
 			// Before anything is forgotten: the walk up to the task it held passes the ended tasks between them. Its chain is
 			// loaded, as every commit that ends a task loads the chains of `#unloaded` first.
 			this.#release(node);
-			for (const waiter of this.#waiters.get(id) ?? []) this.#runnable.add(waiter);
+			for (const waiter of this.#waiters.get(id) ?? []) {
+				this.#runnable.add(waiter);
+				this.#wakeChecks.add(waiter);
+			}
 			this.#relist(id);
 			this.#dropIfUnneeded(id);
 			return;
@@ -1135,6 +1173,10 @@ export class TaskScheduler {
 		if (previous === undefined) {
 			if (!this.#known(parentNode(record))) this.#unloaded.add(id);
 			this.#relist(id);
+			if (this.#intent.size > 0) {
+				const above = this.#nearestLiveAbove(record);
+				if (above?.abortRequested === true) this.#wakeChecks.add(above.id);
+			}
 		}
 		if (cancellationIntent(record)) this.#intent.add(id);
 		else this.#intent.delete(id);
@@ -1145,15 +1187,23 @@ export class TaskScheduler {
 			this.#runnable.add(id);
 		}
 		if (record.state.status === "waiting") for (const on of record.state.on) addTo(this.#waiters, on, id);
-		if (record.state.status === "sleeping") this.#sleeping.add(id);
-		else this.#sleeping.delete(id);
+		this.#removeSleep(id);
+		this.#dueSleeping.delete(id);
+		if (record.state.status === "sleeping" && !record.abortRequested) {
+			this.#sleepPositions.set(id, this.#sleeping.length);
+			this.#sleeping.push({ id, until: record.state.until });
+			this.#orderSleep(this.#sleeping.length - 1);
+		}
 	}
 
 	/** The nearest live task above ended ordinary work may be free now: one holding its outcome, or an aborting one. */
 	#release(node: TaskNode, overlay?: Overlay): AnyTaskRecord | undefined {
 		const above = this.#nearestLiveAbove(node, overlay);
 		if (above?.state.status === "completing") this.#finalizeChecks.add(above.id);
-		else if (above?.abortRequested === true) this.#runnable.add(above.id);
+		else if (above?.abortRequested === true) {
+			this.#runnable.add(above.id);
+			this.#wakeChecks.add(above.id);
+		}
 		return above;
 	}
 
@@ -1413,6 +1463,13 @@ export class TaskScheduler {
 		this.#contextScopes.clear();
 		this.#idleContexts.length = 0;
 		this.#idleContextPositions.clear();
+		this.#sleeping.length = 0;
+		this.#sleepPositions.clear();
+		this.#dueSleeping.clear();
+		this.#wakeChecks.clear();
+		this.#wakeReady.clear();
+		this.#wakeBlocked.clear();
+		this.#wakeParked.clear();
 		this.#expiry?.disarm();
 		this.#expiry = undefined;
 		this.#timer?.disarm();
@@ -1461,11 +1518,63 @@ export class TaskScheduler {
 		this.#timer = { at, disarm };
 	}
 
-	/** Make every sleeping task whose time has come a reservation candidate. */
-	#wakeDue(): void {
-		for (const id of this.#sleeping) {
-			const record = this.#live.get(id);
-			if (record !== undefined && !this.#notDue(record)) this.#runnable.add(id);
+	/** Repair a changed sleep heap slot, using the same indexed-heap pattern as idle contexts. */
+	#orderSleep(index: number): void {
+		const queue = this.#sleeping;
+		const swap = (a: number, b: number) => {
+			const value = queue[a]!;
+			queue[a] = queue[b]!;
+			queue[b] = value;
+			this.#sleepPositions.set(queue[a]!.id, a);
+			this.#sleepPositions.set(queue[b]!.id, b);
+		};
+		while (index > 0) {
+			const parent = (index - 1) >>> 1;
+			if (queue[index]!.until >= queue[parent]!.until) break;
+			swap(index, parent);
+			index = parent;
+		}
+		for (;;) {
+			const left = index * 2 + 1;
+			if (left >= queue.length) break;
+			const right = left + 1;
+			const child = right < queue.length && queue[right]!.until < queue[left]!.until ? right : left;
+			if (queue[child]!.until >= queue[index]!.until) break;
+			swap(index, child);
+			index = child;
+		}
+	}
+
+	#removeSleep(id: TaskId): void {
+		const index = this.#sleepPositions.get(id);
+		if (index === undefined) return;
+		this.#sleepPositions.delete(id);
+		const last = this.#sleeping.pop()!;
+		if (index === this.#sleeping.length) return;
+		this.#sleeping[index] = last;
+		this.#sleepPositions.set(last.id, index);
+		this.#orderSleep(index);
+	}
+
+	/** Consume due deadlines once; ordinary progress never visits unrelated sleeping tasks. */
+	#wakeDue(now = this.#now()): void {
+		if (now < this.#sleepClock) {
+			for (const id of this.#dueSleeping) {
+				const record = this.#live.get(id);
+				if (record?.state.status !== "sleeping" || record.abortRequested || record.state.until <= now) continue;
+				this.#dueSleeping.delete(id);
+				this.#sleepPositions.set(id, this.#sleeping.length);
+				this.#sleeping.push({ id, until: record.state.until });
+				this.#orderSleep(this.#sleeping.length - 1);
+				this.#wakeChecks.add(id);
+			}
+		}
+		this.#sleepClock = now;
+		for (let first = this.#sleeping[0]; first !== undefined && first.until <= now; first = this.#sleeping[0]) {
+			this.#removeSleep(first.id);
+			this.#dueSleeping.add(first.id);
+			this.#runnable.add(first.id);
+			this.#wakeChecks.add(first.id);
 		}
 	}
 
@@ -1706,6 +1815,7 @@ export class TaskScheduler {
 			return { kind: "ready", task: fit.task, record: migratedRecord as RunnableTaskRecord };
 		} catch (error) {
 			this.#failedMigrations.set(record.id, { task: fit.task, error });
+			this.#wakeChecks.add(record.id);
 			// Blocked now without a commit: the graph and the host's wake must hear it.
 			queueMicrotask(() => this.#notifyBlocked());
 			this.#scheduleWake();
@@ -2159,7 +2269,10 @@ export class TaskScheduler {
 		invocation.ended = true;
 		if (this.#invocations.get(invocation.taskId) === invocation) {
 			this.#invocations.delete(invocation.taskId);
-			if (this.#live.has(invocation.taskId)) this.#runnable.add(invocation.taskId);
+			if (this.#live.has(invocation.taskId)) {
+				this.#runnable.add(invocation.taskId);
+				this.#wakeChecks.add(invocation.taskId);
+			}
 		}
 		for (const watch of invocation.watches) void watch.stop();
 		for (const disarm of invocation.timers) disarm();

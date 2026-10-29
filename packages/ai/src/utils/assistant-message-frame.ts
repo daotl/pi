@@ -1,6 +1,6 @@
 import type { AssistantMessage, AssistantMessageEvent, TextContent, ThinkingContent, ToolCall } from "../types.ts";
 import { parseStreamingJson } from "./json-parse.ts";
-import { ToolCallArgumentsStream } from "./streaming-json.ts";
+import { type JsonChange, ToolCallArgumentsStream } from "./streaming-json.ts";
 
 /**
  * Compact, replayable assistant-message progress. Terminal settlement is
@@ -415,6 +415,14 @@ export class AssistantMessageFrameReducer {
 	private readonly states: Map<number, ReducerBlockState>;
 	// Keep tolerant provider previews off serialized checkpoints; end frames supply exact arguments.
 	private readonly toolArguments = new Map<number, ToolCallArgumentsStream>();
+	// Replaying checkpoint JSON may catch up beyond a credit-limited published preview.
+	private readonly unalignedToolArguments = new Set<number>();
+	private argumentChanges: readonly JsonChange[] | undefined = [];
+
+	/** Latest argument edits, or undefined when the exact partial snapshot needs reconciliation. */
+	get toolArgumentChanges(): readonly JsonChange[] | undefined {
+		return this.argumentChanges;
+	}
 
 	constructor(message?: AssistantMessage, checkpoint?: AssistantMessageFrameCheckpoint) {
 		this.value = message === undefined ? undefined : structuredClone(message);
@@ -427,6 +435,7 @@ export class AssistantMessageFrameReducer {
 			const argumentsStream = new ToolCallArgumentsStream();
 			argumentsStream.append(state.json);
 			this.toolArguments.set(contentIndex, argumentsStream);
+			this.unalignedToolArguments.add(contentIndex);
 		}
 	}
 
@@ -442,6 +451,7 @@ export class AssistantMessageFrameReducer {
 	}
 
 	apply(frame: AssistantMessageFrame): void {
+		this.argumentChanges = [];
 		if (frame.type === "start") {
 			if (this.value) throw new Error("Assistant message frame sequence contains more than one start frame");
 			if (this.frameBeforeStart !== undefined)
@@ -504,6 +514,7 @@ export class AssistantMessageFrameReducer {
 				break;
 			}
 			case "toolcall_start":
+				this.argumentChanges = undefined;
 				if (frame.toolCall.type !== "toolCall") {
 					throw new Error(`toolcall_start frame contains ${frame.toolCall.type} content`);
 				}
@@ -515,6 +526,7 @@ export class AssistantMessageFrameReducer {
 				this.toolArguments.set(frame.contentIndex, new ToolCallArgumentsStream());
 				break;
 			case "toolcall_checkpoint": {
+				this.argumentChanges = undefined;
 				const { block, state } = activeBlock(message, states, frame.contentIndex, "toolCall", frame.type);
 				if (block.type !== "toolCall" || state.kind !== "toolCall") {
 					throw new Error("Unreachable tool-call checkpoint state");
@@ -523,6 +535,7 @@ export class AssistantMessageFrameReducer {
 				block.arguments = argumentsStream.append(frame.json);
 				state.json = argumentsStream.text;
 				this.toolArguments.set(frame.contentIndex, argumentsStream);
+				this.unalignedToolArguments.delete(frame.contentIndex);
 				if (frame.rawDelta !== undefined) block.raw = (block.raw ?? "") + frame.rawDelta;
 				break;
 			}
@@ -535,12 +548,16 @@ export class AssistantMessageFrameReducer {
 					const argumentsStream = this.toolArguments.get(frame.contentIndex);
 					if (!argumentsStream) throw new Error("Unreachable tool-call argument stream");
 					block.arguments = argumentsStream.append(frame.delta);
+					this.argumentChanges = this.unalignedToolArguments.delete(frame.contentIndex)
+						? undefined
+						: argumentsStream.changes;
 					state.json = argumentsStream.text;
 				}
 				if (frame.rawDelta !== undefined) block.raw = (block.raw ?? "") + frame.rawDelta;
 				break;
 			}
 			case "toolcall_end": {
+				this.argumentChanges = undefined;
 				const { block, state } = activeBlock(message, states, frame.contentIndex, "toolCall", frame.type);
 				if (block.type !== "toolCall" || state.kind !== "toolCall")
 					throw new Error("Unreachable tool-call frame state");
@@ -558,6 +575,7 @@ export class AssistantMessageFrameReducer {
 				state.ended = true;
 				state.json = "";
 				this.toolArguments.delete(frame.contentIndex);
+				this.unalignedToolArguments.delete(frame.contentIndex);
 				break;
 			}
 		}

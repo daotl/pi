@@ -1,14 +1,14 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "@earendil-works/chord";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import type { ToolExecutionApi } from "@earendil-works/pi-durable";
 import type { ExecutionEnv, FileError, Result } from "@earendil-works/pi-durable/env";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { createBashTool, createReadTool } from "@earendil-works/pi-durable/tools";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { Connection } from "../src/connection.ts";
 import { RemoteExecutionEnv } from "../src/remote-env.ts";
 import { daemon } from "./daemon.ts";
@@ -301,6 +301,170 @@ describe("RemoteExecutionEnv against NodeExecutionEnv", () => {
 			}
 		}
 	}, 120_000);
+
+	it.skipIf(process.platform === "win32")(
+		"keeps ordinary operations live while FIFO opens wait and cancels every pending open",
+		async () => {
+			const isolated = new Connection({ command: [daemon] });
+			const root = mkdtempSync(join(tmpdir(), "pi-env-fifo-cancel-"));
+			dirs.push(root);
+			const env = new RemoteExecutionEnv({ connection: isolated, id: "pi-env:fifo-cancel", cwd: root });
+			const controllers = Array.from({ length: 40 }, () => new AbortController());
+			try {
+				expect(await env.exec(["mkfifo", join(root, "fifo")], undefined, context)).toEqual({
+					ok: true,
+					value: { exitCode: 0 },
+				});
+				writeFileSync(join(root, "ordinary"), "still available");
+				const started = Promise.withResolvers<void>();
+				let opening = 0;
+				const reads = controllers.map((controller) =>
+					isolated
+						.request(
+							"open",
+							{ path: join(root, "fifo"), mode: "read" },
+							{
+								signal: controller.signal,
+								onStart: () => {
+									if (++opening === controllers.length) started.resolve();
+								},
+							},
+						)
+						.then(
+							() => "unexpected success",
+							(error: unknown) => {
+								if (error !== null && typeof error === "object" && "code" in error) return error.code;
+								throw error;
+							},
+						),
+				);
+				await started.promise;
+				expect((await env.fileInfo("ordinary", context)).ok).toBe(true);
+				expect(await env.readTextFile("ordinary", context)).toEqual({ ok: true, value: "still available" });
+				const listing = await env.listFiles(".", undefined, context);
+				expect(listing.ok && listing.value.entries).toContainEqual({ path: "ordinary", kind: "file" });
+				for (const controller of controllers) controller.abort();
+				expect(await Promise.all(reads)).toEqual(controllers.map(() => "aborted"));
+				for (const kind of ["text", "binary", "lines"] as const) {
+					const controller = new AbortController();
+					const opening = Promise.withResolvers<void>();
+					const request = isolated.request.bind(isolated);
+					const spy = vi.spyOn(isolated, "request").mockImplementation((op, json, options) =>
+						request(op, json, {
+							...options,
+							onStart: (id, session) => {
+								options?.onStart?.(id, session);
+								if (op === "open") opening.resolve();
+							},
+						}),
+					);
+					try {
+						const cancelled = withAbortSignal(controller.signal, context);
+						const pending =
+							kind === "text"
+								? env.readTextFile("fifo", cancelled)
+								: kind === "binary"
+									? env.readBinaryFile("fifo", cancelled)
+									: env.openTextLineReader("fifo", cancelled);
+						await opening.promise;
+						controller.abort();
+						const result = await pending;
+						expect(result.ok ? "unexpected success" : result.error.code).toBe("aborted");
+					} finally {
+						controller.abort();
+						spy.mockRestore();
+					}
+				}
+				// A fresh read still rendezvous with a writer after cancellation releases every descriptor.
+				const writer = spawn("sh", ["-c", 'printf "after cancellation" > "$1"', "sh", join(root, "fifo")]);
+				try {
+					expect(await env.readTextFile("fifo", context)).toEqual({ ok: true, value: "after cancellation" });
+				} finally {
+					writer.kill();
+				}
+			} finally {
+				for (const controller of controllers) controller.abort();
+				isolated.close();
+			}
+		},
+		15_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"cancels a FIFO read after an idle writer has connected without consuming file workers",
+		async () => {
+			const isolated = new Connection({ command: [daemon] });
+			const root = mkdtempSync(join(tmpdir(), "pi-env-fifo-idle-"));
+			dirs.push(root);
+			const env = new RemoteExecutionEnv({ connection: isolated, id: "pi-env:fifo-idle", cwd: root });
+			const controller = new AbortController();
+			let writer: ChildProcess | undefined;
+			try {
+				expect(await env.exec(["mkfifo", join(root, "fifo")], undefined, context)).toEqual({
+					ok: true,
+					value: { exitCode: 0 },
+				});
+				writer = spawn(process.execPath, [
+					"-e",
+					'const fs=require("node:fs");const fd=fs.openSync(process.argv[1],"w");process.stdout.write("ready");process.stdin.resume();process.stdin.on("end",()=>fs.closeSync(fd));',
+					join(root, "fifo"),
+				]);
+				const ready = Promise.withResolvers<void>();
+				writer.stdout!.once("data", () => ready.resolve());
+				writer.once("error", ready.reject);
+				const reading = Promise.withResolvers<void>();
+				const request = isolated.request.bind(isolated);
+				vi.spyOn(isolated, "request").mockImplementation((op, json, options) => {
+					const result = request(op, json, options);
+					if (op === "pread") reading.resolve();
+					return result;
+				});
+				const pending = env.readBinaryFile("fifo", withAbortSignal(controller.signal, context));
+				await ready.promise;
+				await reading.promise;
+				controller.abort();
+				const result = await pending;
+				expect(result.ok ? "unexpected EOF" : result.error.code).toBe("aborted");
+				expect((await env.fileInfo("fifo", context)).ok).toBe(false);
+			} finally {
+				controller.abort();
+				writer?.kill();
+				isolated.close();
+			}
+		},
+		10_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"finishes FIFO reads when a writer connects and closes without sending bytes",
+		async () => {
+			const isolated = new Connection({ command: [daemon] });
+			const root = mkdtempSync(join(tmpdir(), "pi-env-fifo-empty-"));
+			dirs.push(root);
+			const env = new RemoteExecutionEnv({ connection: isolated, id: "pi-env:fifo-empty", cwd: root });
+			try {
+				expect(await env.exec(["mkfifo", join(root, "fifo")], undefined, context)).toEqual({
+					ok: true,
+					value: { exitCode: 0 },
+				});
+				for (let attempt = 0; attempt < 20; attempt++) {
+					const writer = spawn(process.execPath, [
+						"-e",
+						'const fs=require("node:fs");fs.closeSync(fs.openSync(process.argv[1],"w"));',
+						join(root, "fifo"),
+					]);
+					try {
+						expect(await env.readTextFile("fifo", context)).toEqual({ ok: true, value: "" });
+					} finally {
+						writer.kill();
+					}
+				}
+			} finally {
+				isolated.close();
+			}
+		},
+		15_000,
+	);
 
 	it.skipIf(process.platform === "win32")(
 		"reads devices, FIFOs and directories like Node",

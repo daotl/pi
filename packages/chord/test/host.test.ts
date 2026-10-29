@@ -737,3 +737,52 @@ describe("host: composition", () => {
 		await assert.rejects(host.hold(Page, {}).ready, (error) => isChordError(error, "forbidden"));
 	});
 });
+
+describe("host: nullable input", () => {
+	it("acquires a null-input remote contract without replacing its input with an object", async () => {
+		const host = quiet();
+		const NullInput = remote("t.null-input", {
+			version: 1,
+			input: Type.Null(),
+			host: hostNamed("host"),
+			variants: { main: { methods: { read: method(undefined, Type.Null()) } } },
+		});
+		host.serve(NullInput, (input) => ({ variant: "main", read: () => input }));
+		try {
+			const ref = await host.get(NullInput, null);
+			assert.ok(ref.variant === "main");
+			assert.equal(await ref.read(), null);
+		} finally {
+			await host.close();
+		}
+	});
+
+	it("keeps null and empty-object identities distinct while omitted input still gets object defaults", async () => {
+		const host = quiet();
+		const input = Type.Union([Type.Null(), Type.Object({ count: Type.Number({ default: 1 }) })]);
+		const Nullable = local("t.nullable-input", {
+			version: 1,
+			input,
+			members: { add: method(undefined, input) },
+		});
+		host.serve(Nullable, (initial, _principal, self) => {
+			const state = self.state("input", input, initial);
+			return {
+				add: (ctx) => {
+					if (state.value !== null) state.replace(ctx, { count: state.value.count + 1 });
+					return state.value;
+				},
+			};
+		});
+		try {
+			const nullRef = await host.get(Nullable, null);
+			const objectRef = await host.get(Nullable, {} as never);
+			const omitted = await host.get(Nullable, undefined as never);
+			assert.deepEqual(await objectRef.add(), { count: 2 });
+			assert.equal(await nullRef.add(), null);
+			assert.deepEqual(await omitted.add(), { count: 3 });
+		} finally {
+			await host.close();
+		}
+	});
+});

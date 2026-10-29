@@ -511,7 +511,8 @@ export class Reload {
 		this.#alive();
 		for (const candidate of this.gated) {
 			const { object } = candidate;
-			for (const old of candidate.replaced) {
+			const replaced = new Set(candidate.replaced);
+			for (const old of object.openOrder.filter((resource) => replaced.has(resource)).reverse()) {
 				// Owned by the rollback before closing: a failing close must still be restored.
 				this.closed.push([object, old]);
 				await old.close(object.openOrder);
@@ -574,7 +575,7 @@ export class Reload {
 			return;
 		}
 		// Replaced exclusive resources are restored; one that cannot be is marked unavailable, never silently closed.
-		for (const [object, resource] of this.closed) {
+		for (const [object, resource] of [...this.closed].reverse()) {
 			if (resource.state !== "closed") continue;
 			await resource.open(new AbortController().signal, object.openOrder).catch((error: unknown) => {
 				resource.markUnavailable();
@@ -710,6 +711,7 @@ export class Reload {
 		}
 		object.decls = run.decls;
 		object.service = service;
+		object.hostLifetime = hostLifetime(service);
 		// Kept resources close with the new code's `close`; replaced ones keep their own (closed at retirement).
 		for (const [resource, declaration] of run.decls.adopted) resource.adopt(declaration);
 		object.implementations.set(codeVersion, {

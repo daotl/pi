@@ -148,8 +148,10 @@ class Handle {
 		return this.env.connection.request(op, { ...json, handle: this.id }, { ...options, session: this.session });
 	}
 
-	async pread(offset: number | undefined, length: number): Promise<Uint8Array> {
-		return (await this.request("pread", { ...(offset === undefined ? {} : { offset }), length })).payload;
+	async pread(offset: number | undefined, length: number, signal?: AbortSignal): Promise<Uint8Array> {
+		return (
+			await this.request("pread", { ...(offset === undefined ? {} : { offset }), length }, signal ? { signal } : {})
+		).payload;
 	}
 
 	async close(): Promise<void> {
@@ -323,7 +325,7 @@ class RemoteTextLineReader implements TextLineReader {
 					this.#buffered = "";
 					return ok({ text, terminated: false });
 				}
-				const bytes = await this.#handle.pread(this.#offset, LINE_CHUNK);
+				const bytes = await this.#handle.pread(this.#offset, LINE_CHUNK, context.abortSignal);
 				const afterReadAbort = abortResult<TextLine | undefined>(context.abortSignal, path);
 				if (afterReadAbort) return afterReadAbort;
 				this.#offset += bytes.length;
@@ -428,8 +430,8 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 		}
 	}
 
-	async #open(resolved: string, json: Json): Promise<{ handle: Handle; json: Json }> {
-		const reply = await this.connection.request("open", { path: resolved, ...json });
+	async #open(resolved: string, json: Json, signal?: AbortSignal): Promise<{ handle: Handle; json: Json }> {
+		const reply = await this.connection.request("open", { path: resolved, ...json }, signal ? { signal } : {});
 		return { handle: new Handle(this, reply.json.handle as number, reply.session, resolved), json: reply.json };
 	}
 
@@ -453,7 +455,7 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 	async #readFile(path: string, encoding: boolean, context: Context): Promise<Result<Uint8Array | string, FileError>> {
 		const signal = context.abortSignal;
 		return this.#fileOp(path, context, async (resolved) => {
-			const { handle, json } = await this.#open(resolved, { mode: "read" });
+			const { handle, json } = await this.#open(resolved, { mode: "read" }, signal);
 			const aborted = () => signal?.aborted === true;
 			const abort = () => new FileError("aborted", "The operation was aborted", resolved);
 			try {
@@ -472,7 +474,7 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 					let text = "";
 					while (true) {
 						if (aborted()) throw abort();
-						const bytes = await handle.pread(undefined, READ_FILE_UNKNOWN_CHUNK);
+						const bytes = await handle.pread(undefined, READ_FILE_UNKNOWN_CHUNK, signal);
 						if (bytes.length === 0) break;
 						total += bytes.length;
 						chunks.push(bytes);
@@ -552,7 +554,7 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 
 	async openTextLineReader(path: string, context: Context): Promise<Result<TextLineReader, FileError>> {
 		const opened = await this.#fileOp(path, context, async (resolved) => {
-			return (await this.#open(resolved, { mode: "read" })).handle;
+			return (await this.#open(resolved, { mode: "read" }, context.abortSignal)).handle;
 		});
 		if (!opened.ok) return opened;
 		const aborted = abortResult<TextLineReader>(context.abortSignal, opened.value.path);

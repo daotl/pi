@@ -1,15 +1,6 @@
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import {
-	existsSync,
-	mkdirSync,
-	mkdtempSync,
-	readdirSync,
-	readFileSync,
-	rmSync,
-	statSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, Socket } from "node:net";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
@@ -201,12 +192,7 @@ describe.skipIf(sshd === undefined)("SSH bootstrap", () => {
 		const { connection, remote } = await connectSsh({ ...target, binary: daemon });
 		try {
 			expect(remote.home).toBe(home);
-			const deployed = readFileSync(join(home, ".pi/mobile/tools", deployedName));
-			expect(deployed.equals(readFileSync(daemon))).toBe(true);
-			// Daemons of other contents are removed.
-			expect(readdirSync(join(home, ".pi/mobile/tools")).filter((name) => name.startsWith("pi-env-"))).toEqual([
-				deployedName,
-			]);
+			expect(readFileSync(join(home, ".pi/mobile/tools", deployedName)).equals(readFileSync(daemon))).toBe(true);
 			const env = new RemoteExecutionEnv({ connection, id: "pi-env:test", cwd: home });
 			getOrThrow(await env.writeFile("over-ssh.txt", "hello", context));
 			expect(getOrThrow(await env.readTextFile("over-ssh.txt", context))).toBe("hello");
@@ -234,6 +220,28 @@ describe.skipIf(sshd === undefined)("SSH bootstrap", () => {
 			expect((await connection.info()).home).toBe(home);
 		} finally {
 			connection.close();
+		}
+	}, 60_000);
+
+	it("starts a pending connection after a different daemon build is deployed", async () => {
+		await acceptHostKey(target, (await scanHostKey(target)).lines);
+		const alternate = join(root, "alternate-daemon");
+		// Trailing data leaves the native executable runnable but gives it a distinct content address.
+		writeFileSync(alternate, Buffer.concat([readFileSync(daemon), Buffer.from("\npi-env alternate build\n")]));
+		const first = await connectSsh({ ...target, binary: daemon });
+		let second: Connection | undefined;
+		try {
+			second = (await connectSsh({ ...target, binary: alternate })).connection;
+			expect(readFileSync(join(home, ".pi/mobile/tools", deployedName)).equals(readFileSync(daemon))).toBe(true);
+			const [a, b] = await Promise.all([first.connection.info(), second.info()]);
+			expect(a.home).toBe(home);
+			expect(b.home).toBe(home);
+			const env = new RemoteExecutionEnv({ connection: first.connection, id: "pi-env:pending", cwd: home });
+			getOrThrow(await env.writeFile("pending-start.txt", "both builds survive", context));
+			expect(getOrThrow(await env.readTextFile("pending-start.txt", context))).toBe("both builds survive");
+		} finally {
+			first.connection.close();
+			second?.close();
 		}
 	}, 60_000);
 

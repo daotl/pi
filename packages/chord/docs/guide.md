@@ -602,6 +602,12 @@ export default defineFacet((host) => {
 ```
 
 ```ts
+import { createHost } from "@earendil-works/chord";
+import { nodeLoader } from "@earendil-works/chord/node";
+
+// Module URLs require a loader; configure it when creating the Node host.
+const host = createHost({ self: "host", name: "worker", loader: nodeLoader });
+
 // a host loads the plugins' facets for its kind
 await host.load([
 	new URL("../plugins/chat/worker.ts", import.meta.url),

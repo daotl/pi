@@ -9,7 +9,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// libuv's name for an OS error.
@@ -125,11 +125,11 @@ pub fn open_reader(path: &str, no_follow: bool) -> Result<File, Failure> {
         })
 }
 
-/// Open a file in one of Node's write modes.
+/// Open in Node's modes; the stream reactor supplies blocking read semantics without blocking a file worker.
 pub fn open(path: &str, mode: OpenMode) -> io::Result<File> {
     let mut options = OpenOptions::new();
     match mode {
-        OpenMode::Read => options.read(true),
+        OpenMode::Read => options.read(true).custom_flags(libc::O_NONBLOCK),
         OpenMode::Write => options.write(true).create(true).truncate(true),
         OpenMode::Append => options.append(true).create(true),
         OpenMode::ReadWrite => options.read(true).write(true),
@@ -209,10 +209,16 @@ pub fn write_stdin(mut pipe: std::process::ChildStdin, mut bytes: &[u8], stop: &
         }
     }
     while !bytes.is_empty() && !stop.load(Ordering::SeqCst) {
-        let mut poll = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
         // SAFETY: one valid pollfd; the bounded wait observes stop even if descendants retain stdin.
         let ready = unsafe { libc::poll(&mut poll, 1, 100) };
-        if ready == 0 || (ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted) {
+        if ready == 0
+            || (ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted)
+        {
             continue;
         }
         if ready < 0 {
@@ -221,7 +227,11 @@ pub fn write_stdin(mut pipe: std::process::ChildStdin, mut bytes: &[u8], stop: &
         match pipe.write(&bytes[..bytes.len().min(64 * 1024)]) {
             Ok(0) => return,
             Ok(written) => bytes = &bytes[written..],
-            Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
             Err(_) => return,
         }
     }
@@ -229,16 +239,6 @@ pub fn write_stdin(mut pipe: std::process::ChildStdin, mut bytes: &[u8], stop: &
 
 /// Pipe workers poll `stop` every 100 ms.
 pub fn interrupt_pipe(_worker: &std::thread::JoinHandle<()>) {}
-
-/// The program an argv command runs; `Command` searches `PATH` like `execvp`, as libuv does.
-pub fn resolve_program(
-    program: &str,
-    _cwd: &str,
-    _env: &Map<String, Value>,
-    _inherit_env: bool,
-) -> Result<String, Failure> {
-    Ok(program.to_string())
-}
 
 fn which_bash() -> Option<String> {
     let output = Command::new("which")
@@ -313,8 +313,6 @@ pub fn configure(
         });
     }
 }
-
-pub fn after_spawn(_child: &Child) {}
 
 /// Kill the command's process group, or the process if the group is gone.
 pub fn kill_tree(pid: u32) {

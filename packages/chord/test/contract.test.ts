@@ -33,6 +33,37 @@ describe("contracts", () => {
 		);
 	});
 
+	it("union sibling constraints remain part of result and state coverage", () => {
+		const wanted = Type.Union([Type.Number(), Type.String()], { minimum: 1 });
+		const offered = Type.Number();
+		assert.equal(Value.Check(offered, 0), true);
+		assert.equal(Value.Check(wanted, 0), false);
+		assert.equal(fits(offered, wanted), false);
+		assert.equal(fits(wanted, wanted), true);
+		assert.equal(fits(offered, Type.Union([Type.Number(), Type.String()])), true);
+		for (const member of ["result", "state"] as const) {
+			const contract = (schema: typeof wanted | typeof offered) =>
+				remote(`t.union-siblings-${member}`, {
+					version: 1,
+					input: Type.Object({}),
+					host: hostNamed("server"),
+					variants: {
+						main:
+							member === "result"
+								? { methods: { read: method(undefined, schema) } }
+								: { state: { value: schema } },
+					},
+				});
+			const provider = contract(offered);
+			const consumer = contract(wanted);
+			assert.match(coverage(provider.description, consumer.description) ?? "", new RegExp(member));
+			assert.throws(
+				() => bind(provider, undefined, consumer),
+				(error) => isChordError(error, "contract_mismatch") && error.message.includes(member),
+			);
+		}
+	});
+
 	it("named properties must fit every matching provider pattern without rejecting additive methods", () => {
 		const consumerArgs = Type.Object({ x: Type.String() }, { additionalProperties: false });
 		const conflictingArgs = Type.Object(

@@ -343,3 +343,71 @@ test("a reload that changes a type's lifetime creates its host object, or lets i
 		await host.close();
 	}
 });
+
+for (const initial of ["referenced", "host"] as const) {
+	test(`a surviving ${initial} object uses each candidate's lifetime for registrations and changes lifetime only at commit`, async () => {
+		const errors: unknown[] = [];
+		const host = new HostImpl({ self: "host", onError: (error) => errors.push(error) });
+		onTestFinished(() => host.close());
+		const Kept = local(`t.live-lifetime-${initial}`, {
+			version: 1,
+			input: Type.Object({}),
+			members: { read: method(undefined, Type.String()) },
+		});
+		const Entries = defineRegistry<string>(`t.live-lifetime-${initial}-entries`);
+		const facet = (lifetime: "host" | "referenced", register: boolean, fail = false): Facet => ({
+			name: "kept",
+			setup: (api) =>
+				api.serve(
+					Kept,
+					(_input, _principal, self) => {
+						if (register) self.register(Entries, { current: lifetime });
+						if (fail)
+							self.resource("failure", {
+								version: 1,
+								open: () => {
+									throw new Error("candidate open failed");
+								},
+							});
+						return { read: () => lifetime };
+					},
+					{ lifetime },
+				),
+		});
+		await host.install(facet(initial, initial === "host"));
+		const ref = await host.get(Kept, {});
+		const object = [...host.objects.values()][0]!;
+		const next = initial === "host" ? "referenced" : "host";
+		const codeVersion = host.codeVersion;
+		await assert.rejects(host.reload([facet(next, true, next === "host")]), (error) =>
+			next === "host"
+				? isChordError(error, "unavailable") && /candidate open failed/.test(error.message)
+				: isChordError(error, "invalid") && error.reason === "not_host_lifetime",
+		);
+		assert.equal(host.codeVersion, codeVersion);
+		assert.equal(object.hostLifetime, initial === "host");
+		assert.equal(await ref.read(), initial);
+		assert.equal(host.registry(Entries).get("current"), initial === "host" ? "host" : undefined);
+		await host.reload([facet(next, next === "host")]);
+		await host.ready();
+		assert.equal([...host.objects.values()][0], object);
+		assert.equal(object.hostLifetime, next === "host");
+		assert.equal(await ref.read(), next);
+		assert.equal(host.registry(Entries).get("current"), next === "host" ? "host" : undefined);
+		if (next === "referenced") {
+			await assert.rejects(
+				host.reload([facet(next, true)]),
+				(error) => isChordError(error, "invalid") && error.reason === "not_host_lifetime",
+			);
+			assert.equal(host.hostObjects.has(Kept.name), false);
+			ref.release();
+			await object.dispose(false);
+			assert.equal(object.status, "disposed");
+		} else {
+			ref.release();
+			assert.equal(host.hostObjects.get(Kept.name)?.object, object);
+			assert.equal(host.registry(Entries).get("current"), "host");
+		}
+		assert.deepEqual(errors, []);
+	});
+}

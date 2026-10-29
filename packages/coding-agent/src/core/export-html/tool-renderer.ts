@@ -10,6 +10,7 @@ import type { Component } from "@earendil-works/pi-tui";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { ToolRenderContext, ToolRenderers } from "../extensions/types.ts";
 import { ansiLinesToHtml } from "./ansi-to-html.ts";
+import type { ToolHtmlRenderer } from "./index.ts";
 
 export interface ToolHtmlRendererDeps {
 	/** Renderers of calls to a tool, as resolved by extensions and the registered tool */
@@ -20,20 +21,6 @@ export interface ToolHtmlRendererDeps {
 	cwd: string;
 	/** Terminal width for rendering (default: 100) */
 	width?: number;
-}
-
-export interface ToolHtmlRenderer {
-	/** Render a tool call to HTML. Returns undefined if tool has no custom renderer. */
-	renderCall(toolCallId: string, toolName: string, args: unknown): string | undefined;
-	/** Render a tool result and finalized call HTML. Returns undefined if tool has no custom renderer. */
-	renderResult(
-		toolCallId: string,
-		toolName: string,
-		result: Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
-		details: unknown,
-		isError: boolean,
-		durationMs?: number,
-	): { callHtml?: string; collapsed?: string; expanded?: string } | undefined;
 }
 
 /**
@@ -61,32 +48,33 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 
 	const renderedCallComponents = new Map<string, Component>();
 	const renderedResultComponents = new Map<string, Component>();
-	const renderedStates = new Map<string, any>();
+	const renderedStates = new Map<string, Record<string, unknown>>();
 	const renderedArgs = new Map<string, unknown>();
 
-	const getState = (toolCallId: string): any => {
-		let state = renderedStates.get(toolCallId);
+	const getState = (key: string): Record<string, unknown> => {
+		let state = renderedStates.get(key);
 		if (!state) {
 			state = {};
-			renderedStates.set(toolCallId, state);
+			renderedStates.set(key, state);
 		}
 		return state;
 	};
 
 	const createRenderContext = (
+		key: string,
 		toolCallId: string,
 		lastComponent: Component | undefined,
 		expanded: boolean,
 		isPartial: boolean,
 		isError: boolean,
 		durationMs?: number,
-	): ToolRenderContext => {
+	): ToolRenderContext<Record<string, unknown>, unknown> => {
 		return {
-			args: renderedArgs.get(toolCallId),
+			args: renderedArgs.get(key),
 			toolCallId,
 			invalidate: () => {},
 			lastComponent,
-			state: getState(toolCallId),
+			state: getState(key),
 			cwd,
 			executionStarted: false,
 			argsComplete: true,
@@ -100,9 +88,13 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 	};
 
 	return {
-		renderCall(toolCallId: string, toolName: string, args: unknown): string | undefined {
+		renderCall(ownerEntryId: string, toolCallId: string, toolName: string, args: unknown): string | undefined {
 			try {
-				renderedArgs.set(toolCallId, args);
+				const key = JSON.stringify([ownerEntryId, toolCallId]);
+				renderedCallComponents.delete(key);
+				renderedResultComponents.delete(key);
+				renderedStates.delete(key);
+				renderedArgs.set(key, args);
 				const toolDef = getToolRenderers(toolName);
 				if (!toolDef?.renderCall) {
 					return undefined;
@@ -112,9 +104,9 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 				const component = toolDef.renderCall(
 					args,
 					theme,
-					createRenderContext(toolCallId, renderedCallComponents.get(toolCallId), true, true, false),
+					createRenderContext(key, toolCallId, undefined, true, true, false),
 				);
-				renderedCallComponents.set(toolCallId, component);
+				renderedCallComponents.set(key, component);
 				const lines = component.render(width);
 				return ansiLinesToHtml(lines);
 			} catch {
@@ -124,6 +116,7 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 		},
 
 		renderResult(
+			ownerEntryId: string,
 			toolCallId: string,
 			toolName: string,
 			result: Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
@@ -132,6 +125,7 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 			durationMs?: number,
 		): { callHtml?: string; collapsed?: string; expanded?: string } | undefined {
 			try {
+				const key = JSON.stringify([ownerEntryId, toolCallId]);
 				const toolDef = getToolRenderers(toolName);
 				if (!toolDef?.renderResult) {
 					return undefined;
@@ -151,15 +145,16 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 					{ expanded: false, isPartial: false },
 					theme,
 					createRenderContext(
+						key,
 						toolCallId,
-						renderedResultComponents.get(toolCallId),
+						renderedResultComponents.get(key),
 						false,
 						false,
 						isError,
 						durationMs,
 					),
 				);
-				renderedResultComponents.set(toolCallId, collapsedComponent);
+				renderedResultComponents.set(key, collapsedComponent);
 				const collapsed = ansiLinesToHtml(trimRenderedResultLines(collapsedComponent.render(width)));
 
 				// Render expanded
@@ -168,19 +163,20 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 					{ expanded: true, isPartial: false },
 					theme,
 					createRenderContext(
+						key,
 						toolCallId,
-						renderedResultComponents.get(toolCallId),
+						renderedResultComponents.get(key),
 						true,
 						false,
 						isError,
 						durationMs,
 					),
 				);
-				renderedResultComponents.set(toolCallId, expandedComponent);
+				renderedResultComponents.set(key, expandedComponent);
 				const expanded = ansiLinesToHtml(trimRenderedResultLines(expandedComponent.render(width)));
 
 				// Result renderers can move their final output into the cached call component.
-				const callComponent = renderedCallComponents.get(toolCallId);
+				const callComponent = renderedCallComponents.get(key);
 
 				return {
 					...(callComponent ? { callHtml: ansiLinesToHtml(callComponent.render(width)) } : {}),

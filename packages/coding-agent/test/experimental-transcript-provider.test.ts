@@ -779,3 +779,265 @@ describe("Transcript service", () => {
 		expect(unsubscribe).toHaveBeenCalledOnce();
 	});
 });
+
+test.each([50_000, 500_000])(
+	"streams %i tool argument characters without comparing growing prefixes",
+	async (size) => {
+		let listener: EventListener | undefined;
+		const host = createHost({ name: "session", self: null });
+		const snapshot = laneSnapshot();
+		try {
+			await host.load([
+				createTranscriptServiceFacet({
+					watch: async () => ({
+						snapshot,
+						start(next: EventListener) {
+							listener = next;
+						},
+						unsubscribe() {},
+						resnapshot: async () => snapshot,
+					}),
+				} as unknown as AgentLane),
+			]);
+			const transcript = await host.get(Transcript, {});
+			const message = fauxAssistantMessage([], { stopReason: "pending" });
+			await listener!({ type: "run_start", lane: "main", runId: "run", startedAt: 1 }, BACKGROUND_CONTEXT);
+			let sequence = 0;
+			const send = async (frame: AssistantMessageFrame) => {
+				await listener!(
+					frame.type === "start"
+						? {
+								type: "message_start",
+								lane: "main",
+								runId: "run",
+								entryId: "response",
+								frameSequence: ++sequence,
+								frame,
+								message,
+							}
+						: {
+								type: "message_update",
+								lane: "main",
+								runId: "run",
+								entryId: "response",
+								frameSequence: ++sequence,
+								frame,
+								message,
+								event: { type: "toolcall_delta", contentIndex: 0, delta: "", partial: message },
+							},
+					BACKGROUND_CONTEXT,
+				);
+				await vi.waitFor(() => expect(transcript.state.value.stream?.sequence).toBe(sequence));
+			};
+			await send({ type: "start", partial: message });
+			await send({
+				type: "toolcall_start",
+				contentIndex: 0,
+				toolCall: { type: "toolCall", id: "call", name: "write", arguments: {} },
+			});
+			const sibling = "completed sibling".repeat(4096);
+			await send({
+				type: "toolcall_delta",
+				contentIndex: 0,
+				delta: `{"sibling":${JSON.stringify({ content: sibling })},"content":"`,
+			});
+			const startsWith = String.prototype.startsWith;
+			let compared = 0;
+			const spy = vi.spyOn(String.prototype, "startsWith").mockImplementation(function (
+				this: string,
+				prefix: string,
+				position?: number,
+			) {
+				if (prefix.length >= 32 && prefix[0] === "x" && this[0] === "x") compared += prefix.length;
+				return startsWith.call(this, prefix, position);
+			});
+			try {
+				for (let offset = 0; offset < size; offset += 32)
+					await send({ type: "toolcall_delta", contentIndex: 0, delta: "x".repeat(Math.min(32, size - offset)) });
+			} finally {
+				spy.mockRestore();
+			}
+			expect(compared).toBeLessThan(size * 4);
+			expect(transcript.state.value.snapshot?.operation?.streamingMessage?.content[0]).toMatchObject({
+				arguments: { sibling: { content: sibling }, content: "x".repeat(size) },
+			});
+			await send({ type: "toolcall_checkpoint", contentIndex: 0, json: '{"corrected":"line\\' });
+			await send({ type: "toolcall_delta", contentIndex: 0, delta: 'nnext"}' });
+			expect(transcript.state.value.snapshot?.operation?.streamingMessage?.content[0]).toMatchObject({
+				arguments: { corrected: "line\nnext" },
+			});
+			await send({ type: "toolcall_end", contentIndex: 0, id: "call", name: "write", arguments: { final: true } });
+			expect(transcript.state.value.snapshot?.operation?.streamingMessage?.content[0]).toMatchObject({
+				arguments: { final: true },
+			});
+		} finally {
+			await host.close();
+		}
+	},
+	120_000,
+);
+
+test("matches reducer previews for incomplete scalars, deep paths, and snapshot-credit lag", async () => {
+	let listener: EventListener | undefined;
+	const host = createHost({ name: "session", self: null });
+	const snapshot = laneSnapshot();
+	try {
+		await host.load([
+			createTranscriptServiceFacet({
+				watch: async () => ({
+					snapshot,
+					start(next: EventListener) {
+						listener = next;
+					},
+					unsubscribe() {},
+					resnapshot: async () => snapshot,
+				}),
+			} as unknown as AgentLane),
+		]);
+		const transcript = await host.get(Transcript, {});
+		const reducer = new AssistantMessageFrameReducer();
+		await listener!({ type: "run_start", lane: "main", runId: "run", startedAt: 1 }, BACKGROUND_CONTEXT);
+		let sequence = 0;
+		const send = async (frame: AssistantMessageFrame) => {
+			reducer.apply(frame);
+			const message = reducer.message!;
+			await listener!(
+				frame.type === "start"
+					? {
+							type: "message_start",
+							lane: "main",
+							runId: "run",
+							entryId: "response",
+							frameSequence: ++sequence,
+							frame,
+							message,
+						}
+					: {
+							type: "message_update",
+							lane: "main",
+							runId: "run",
+							entryId: "response",
+							frameSequence: ++sequence,
+							frame,
+							message,
+							event: { type: "toolcall_delta", contentIndex: 0, delta: "", partial: message },
+						},
+				BACKGROUND_CONTEXT,
+			);
+			await vi.waitFor(() => expect(transcript.state.value.stream?.sequence).toBe(sequence));
+			expect(transcript.state.value.snapshot?.operation?.streamingMessage).toEqual(message);
+		};
+		await send({ type: "start", partial: fauxAssistantMessage([], { stopReason: "pending" }) });
+		await send({
+			type: "toolcall_start",
+			contentIndex: 0,
+			toolCall: { type: "toolCall", id: "call", name: "write", arguments: {} },
+		});
+		const cases = [
+			['{"number":', "1", "2", "e", "+", "3", ',"literal":', "t", "r", "u", "e", "}"],
+			['{"duplicate":"old","duplicate":', "1", "e", "+", "x", ',"next":"ok"}'],
+			['{"literal":', "n", "u", "l", "l", ',"bad":', "f", "a", "x", "}"],
+			[`${'{"nested":'.repeat(36)}"line\\`, "u00", "e9", `tail"${"}".repeat(36)}`],
+			[`{"values":[${"0,".repeat(4096)}`, "1", "2", ",", '"', ...Array.from({ length: 64 }, () => "z"), '"]}'],
+			['["', "not an object", '"]'],
+			['{"array":["', "one", "two", '","three"]}'],
+		];
+		for (const chunks of cases) {
+			await send({ type: "toolcall_checkpoint", contentIndex: 0, json: "" });
+			for (const delta of chunks) await send({ type: "toolcall_delta", contentIndex: 0, delta });
+			// The next ordinary string delta must not replay edits skipped during credit lag or fallback.
+			await send({ type: "toolcall_checkpoint", contentIndex: 0, json: '{"fresh":"' });
+			await send({ type: "toolcall_delta", contentIndex: 0, delta: 'tail"}' });
+		}
+	} finally {
+		await host.close();
+	}
+});
+
+test("catches up a credit-limited tool preview on the first delta after hydration", async () => {
+	const source = new AssistantMessageFrameReducer();
+	source.apply({ type: "start", partial: fauxAssistantMessage([], { stopReason: "pending" }) });
+	source.apply({
+		type: "toolcall_start",
+		contentIndex: 0,
+		toolCall: { type: "toolCall", id: "call", name: "write", arguments: {} },
+	});
+	let sequence = 2;
+	const apply = (delta: string) => {
+		source.apply({ type: "toolcall_delta", contentIndex: 0, delta });
+		sequence++;
+	};
+	apply(`{"values":[${"0,".repeat(4096)}"`);
+	let text = "";
+	let lagged = false;
+	for (let index = 0; index < 512; index++) {
+		text += "z";
+		apply("z");
+		const block = source.message!.content[0];
+		if (block.type !== "toolCall") throw new Error("Expected streaming tool call");
+		const values = block.arguments.values as unknown[];
+		if (values[4096] !== text) {
+			lagged = true;
+			break;
+		}
+	}
+	expect(lagged).toBe(true);
+	const snapshot = laneSnapshot();
+	snapshot.operation = {
+		id: "run",
+		kind: "run",
+		startedAt: 1,
+		fromTipId: null,
+		status: "open",
+		runningTools: [],
+		streamingMessage: structuredClone(source.message!),
+		streamingFrameState: { messageId: "response", sequence, checkpoint: source.checkpoint() },
+	};
+	const hydrated = new AssistantMessageFrameReducer(
+		snapshot.operation.streamingMessage,
+		snapshot.operation.streamingFrameState!.checkpoint,
+	);
+	let listener: EventListener | undefined;
+	const host = createHost({ name: "session", self: null });
+	try {
+		await host.load([
+			createTranscriptServiceFacet({
+				watch: async () => ({
+					snapshot,
+					start(next: EventListener) {
+						listener = next;
+					},
+					unsubscribe() {},
+					resnapshot: async () => snapshot,
+				}),
+			} as unknown as AgentLane),
+		]);
+		const transcript = await host.get(Transcript, {});
+		for (const delta of ["tail", "more", '"]}']) {
+			const frame: AssistantMessageFrame = { type: "toolcall_delta", contentIndex: 0, delta };
+			hydrated.apply(frame);
+			const message = hydrated.message!;
+			await listener!(
+				{
+					type: "message_update",
+					lane: "main",
+					runId: "run",
+					entryId: "response",
+					frameSequence: ++sequence,
+					frame,
+					message,
+					event: { type: "toolcall_delta", contentIndex: 0, delta, partial: message },
+				},
+				BACKGROUND_CONTEXT,
+			);
+			await vi.waitFor(() => expect(transcript.state.value.stream?.sequence).toBe(sequence));
+			expect(transcript.state.value.snapshot?.operation?.streamingMessage).toEqual(message);
+			const block = message.content[0];
+			if (block.type !== "toolCall") throw new Error("Expected hydrated tool call");
+			if (delta !== '"]}') text += delta;
+			expect((block.arguments.values as unknown[])[4096]).toBe(text);
+		}
+	} finally {
+		await host.close();
+	}
+});

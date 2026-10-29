@@ -65,6 +65,7 @@ pre{white-space:pre-wrap;word-break:break-word;font:12.5px/1.45 ui-monospace,Men
 <script>
 let data = null, view = "inbox", cat = "", selectedNumber = null, openDetails = new Set();
 let loadGeneration = 0, pendingMutations = 0, decisionPending = false;
+let loadError = "";
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 const gh = (n) => `https://github.com/${data.repo}/issues/${n}`;
@@ -74,18 +75,26 @@ const WARN = new Set(["theoretical", "AI-written", "third-party", "upstream", "m
 const BAD = new Set(["regression", "spam", "empty", "duplicate cluster"]);
 
 async function load() {
-	if (pendingMutations) return;
+	if (pendingMutations) return false;
 	const generation = ++loadGeneration;
-	const res = await fetch("/api/state");
-	if (!res.ok) {
-		const message = await res.text();
-		if (generation === loadGeneration && !pendingMutations) $("main").innerHTML = `<p class="empty">${res.status}: ${esc(message)}</p>`;
-		return;
+	try {
+		const res = await fetch("/api/state");
+		if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+		const snapshot = await res.json();
+		if (generation !== loadGeneration || pendingMutations) return false;
+		data = snapshot;
+		loadError = "";
+		decisionPending = false;
+		render();
+		return true;
+	} catch (error) {
+		if (generation === loadGeneration && !pendingMutations) {
+			loadError = `${error instanceof Error ? error.message : String(error)}. State refresh failed; use Sync to retry.`;
+			if (data) render();
+			else $("status").innerHTML = `<span class="err">${esc(loadError)}</span>`;
+		}
+		return false;
 	}
-	const snapshot = await res.json();
-	if (generation !== loadGeneration || pendingMutations) return;
-	data = snapshot;
-	render();
 }
 
 async function post(path, body) {
@@ -98,8 +107,7 @@ async function post(path, body) {
 		await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 	} finally {
 		pendingMutations--;
-		try { await load(); }
-		finally { if (decision) { decisionPending = false; render(); } }
+		await load();
 	}
 }
 
@@ -169,6 +177,7 @@ function render() {
 		data.sync.running ? "syncing…" : data.sync.lastSync ? `synced ${ago(data.sync.lastSync)} ago` : "",
 		data.sync.lastError ? `<span class="err">sync: ${esc(data.sync.lastError)}</span>` : "",
 		`${esc(data.model)} $${data.cost.toFixed(2)}`,
+		loadError ? `<span class="err">${esc(loadError)}</span>` : "",
 	].filter(Boolean).join(" · ");
 	let html = "";
 	for (const [name, list] of groups(items)) {
@@ -210,7 +219,7 @@ document.querySelectorAll(".tab").forEach((t) => t.onclick = () => {
 	document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("on", x === t));
 	render();
 });
-$("sync").onclick = () => post("/api/sync", {});
+$("sync").onclick = () => loadError ? load() : post("/api/sync", {});
 
 // Keyboard: j/k select, 0/1/n decide, o open on GitHub.
 document.addEventListener("keydown", (e) => {

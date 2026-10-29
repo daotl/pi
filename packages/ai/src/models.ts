@@ -118,8 +118,8 @@ export interface ModelsRefreshResult {
 }
 
 export interface ModelsRequestTransforms {
-	/** Transform fully assembled model/auth/request headers before provider dispatch. */
-	transformHeaders?: (headers: ProviderHeaders) => ProviderHeaders | Promise<ProviderHeaders>;
+	/** Transform assembled model/auth/request headers with the effective physical model after auth endpoint resolution. */
+	transformHeaders?: (headers: ProviderHeaders, model: AnyModel) => ProviderHeaders | Promise<ProviderHeaders>;
 }
 
 export type ModelsApiStreamOptions<TApi extends Api> = ApiStreamOptions<TApi> & ModelsRequestTransforms;
@@ -883,7 +883,7 @@ class ModelsImpl implements MutableModels {
 			mergeHeaders(getOpenCodeSessionHeaders(requestModel, sessionId), auth.headers),
 			options?.headers,
 		);
-		if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {});
+		if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {}, requestModel);
 		const env = resolution.env || options?.env ? { ...(resolution.env ?? {}), ...(options?.env ?? {}) } : undefined;
 		const identity = mergeClientIdentity(this.identity, options?.identity);
 		const { transformHeaders: _transformHeaders, ...providerOptions } = options ?? {};

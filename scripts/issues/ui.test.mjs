@@ -19,6 +19,7 @@ function harness() {
 	const respond = async (request, value) => { request.resolve({ ok: true, json: async () => value }); await tick(); };
 	const key = (key, repeat = false) => listeners.keydown({ key, repeat, target: { tagName: "BODY" } });
 	const click = (dataset) => listeners.click({ target: { closest: (selector) => selector === "[data-act]" ? { dataset } : null } });
+	Object.assign(nodes.sync, { retry: () => nodes.sync.onclick() });
 	return { nodes, requests, respond, key, click, poll: () => poll(), tab: (view) => tabs.find((tab) => tab.dataset.view === view).onclick(), category: (value) => { nodes.cat.value = value; listeners.change({ target: { id: "cat", value, dataset: {} } }); } };
 }
 
@@ -115,3 +116,45 @@ test("decision controls stay disabled until the authoritative refresh finishes",
 	ui.click({ act: "prio", n: "20", p: "p1" });
 	assert.deepEqual(ui.requests[3].body, { number: 20, priority: "p1" });
 });
+
+for (const order of ["decision-first", "other-first"]) {
+	test(`overlapping ${order} mutations keep decisions gated until current state installs`, async () => {
+		const ui = harness();
+		await ui.respond(ui.requests[0], snapshot([issue(10)]));
+		ui.tab("all");
+		ui.click({ act: "prio", n: "10", p: "p0" });
+		ui.click({ act: "retriage", n: "10" });
+		await ui.respond(ui.requests[order === "decision-first" ? 1 : 2]);
+		ui.click({ act: "prio", n: "10", p: "p0" });
+		assert.equal(ui.requests.length, 3);
+		assert.match(ui.nodes.main.innerHTML, /data-act="prio" data-p="p0" data-n="10" disabled/);
+		await ui.respond(ui.requests[order === "decision-first" ? 2 : 1]);
+		ui.click({ act: "prio", n: "10", p: "p0" });
+		assert.equal(ui.requests.length, 4);
+		const decided = issue(10); decided.decision = { priority: "p0" };
+		await ui.respond(ui.requests[3], snapshot([decided]));
+		ui.click({ act: "prio", n: "10", p: "p0" });
+		assert.deepEqual(ui.requests[4].body, { number: 10, priority: null });
+	});
+}
+
+for (const failure of ["http", "network"]) {
+	test(`failed ${failure} decision refresh stays gated and Sync retries without mutating`, async () => {
+		const ui = harness();
+		await ui.respond(ui.requests[0], snapshot([issue(10)]));
+		ui.tab("all");
+		ui.click({ act: "prio", n: "10", p: "p0" });
+		await ui.respond(ui.requests[1]);
+		ui.requests[2].resolve(failure === "http" ? { ok: false, status: 503, text: async () => "unavailable" } : Promise.reject(new Error("offline")));
+		await tick();
+		assert.match(ui.nodes.status.innerHTML, /Sync to retry/);
+		ui.click({ act: "prio", n: "10", p: "p0" });
+		assert.equal(ui.requests.length, 3);
+		ui.nodes.sync.retry();
+		assert.equal(ui.requests[3].path, "/api/state");
+		const decided = issue(10); decided.decision = { priority: "p0" };
+		await ui.respond(ui.requests[3], snapshot([decided]));
+		ui.click({ act: "prio", n: "10", p: "p0" });
+		assert.deepEqual(ui.requests[4].body, { number: 10, priority: null });
+	});
+}

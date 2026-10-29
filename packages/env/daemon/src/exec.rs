@@ -7,11 +7,14 @@ use crate::output::Output;
 use crate::sys;
 use crate::window::{Pending, Window};
 use serde_json::{Map, Value, json};
+#[cfg(unix)]
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::ExitStatus;
+#[cfg(unix)]
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -22,8 +25,11 @@ const EXIT_STDIO_GRACE: Duration = Duration::from_millis(100);
 /// How often a delivery waiting for the link to drain looks again.
 const UNSENT_POLL: Duration = Duration::from_millis(20);
 
-/// Commands this daemon started and has not reaped; killed when the connection ends.
+/// Commands this daemon started whose process trees have not finished cleanup.
+#[cfg(unix)]
 pub type Groups = Arc<Mutex<HashSet<u32>>>;
+#[cfg(windows)]
+pub type Groups = sys::ProcessGroups;
 
 pub enum Message {
     Data(usize, Vec<u8>),
@@ -107,6 +113,7 @@ impl ExecRequest {
     }
 }
 
+#[cfg(unix)]
 pub fn kill_group(pid: u32) {
     sys::kill_tree(pid);
 }
@@ -188,6 +195,7 @@ impl Spill {
     }
 }
 
+#[cfg(unix)]
 fn spawn(
     request: &ExecRequest,
     program: &str,
@@ -205,9 +213,7 @@ fn spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     sys::configure(&mut command, args, &request.env, request.inherit_env);
-    let child = command.spawn()?;
-    sys::after_spawn(&child);
-    Ok(child)
+    command.spawn()
 }
 
 /// Read one pipe on its own thread. Without an output window, reading waits while too much output is unsent.
@@ -248,7 +254,15 @@ pub fn run(
     control: &Control,
     groups: &Groups,
 ) -> Result<Value, Failure> {
-    run_with_shell(id, request, tmpdir, output, control, groups, sys::shell_config)
+    run_with_shell(
+        id,
+        request,
+        tmpdir,
+        output,
+        control,
+        groups,
+        sys::shell_config,
+    )
 }
 
 fn run_with_shell(
@@ -278,11 +292,7 @@ fn run_with_shell(
             }
         }
         (None, Some(argv)) => match argv.split_first() {
-            Some((first, rest)) => (
-                sys::resolve_program(first, &request.cwd, &request.env, request.inherit_env)?,
-                rest.to_vec(),
-                None,
-            ),
+            Some((first, rest)) => (first.clone(), rest.to_vec(), None),
             None => return Err(Failure::new("spawn_error", "Empty argv: no program to run")),
         },
         (None, None) => return Err(Failure::new("EINVAL", "exec needs command or argv")),
@@ -296,9 +306,24 @@ fn run_with_shell(
             ),
         ));
     }
-    let mut child = spawn(&request, &program, &args, stdin_command.is_some())
-        .map_err(|error| Failure::new("spawn_error", error.to_string()))?;
+    #[cfg(unix)]
+    let child = spawn(&request, &program, &args, stdin_command.is_some());
+    #[cfg(windows)]
+    let child = sys::spawn_process(
+        &program,
+        &args,
+        &request.cwd,
+        &request.env,
+        request.inherit_env,
+        stdin_command.is_some(),
+        groups,
+    );
+    let mut child = child.map_err(|error| Failure::new("spawn_error", error.to_string()))?;
+    #[cfg(windows)]
+    let job = child.job.clone();
+    #[cfg(unix)]
     let pid = child.id();
+    #[cfg(unix)]
     groups.lock().unwrap().insert(pid);
     let deadline = request.timeout.map(|timeout| Instant::now() + timeout);
     let stop = Arc::new(AtomicBool::new(false));
@@ -328,10 +353,12 @@ fn run_with_shell(
         ),
     ];
     // Readers and cancellation/deadline tracking must be live before a script can fill stdin.
-    let writer = stdin_command.zip(child.stdin.take()).map(|(command, stdin)| {
-        let stop = stop.clone();
-        thread::spawn(move || sys::write_stdin(stdin, command.as_bytes(), &stop))
-    });
+    let writer = stdin_command
+        .zip(child.stdin.take())
+        .map(|(command, stdin)| {
+            let stop = stop.clone();
+            thread::spawn(move || sys::write_stdin(stdin, command.as_bytes(), &stop))
+        });
     let waiter = sender.clone();
     thread::spawn(move || {
         let _ = waiter.send(match child.wait() {
@@ -378,10 +405,22 @@ fn run_with_shell(
     let mut timed_out = false;
     let mut aborted = false;
     let mut killed = false;
+    #[cfg(windows)]
+    let mut cleanup_error = None;
+    #[cfg(unix)]
     let kill = |killed: &mut bool| {
         if !*killed {
             *killed = true;
             kill_group(pid);
+        }
+    };
+    #[cfg(windows)]
+    let mut kill = |killed: &mut bool| {
+        if !*killed {
+            *killed = true;
+            if let Err(error) = job.terminate_and_wait() {
+                cleanup_error = Some(error);
+            }
         }
     };
     if control.killed.load(Ordering::SeqCst) {
@@ -460,6 +499,14 @@ fn run_with_shell(
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+    #[cfg(windows)]
+    {
+        // A normal leader exit does not transfer ownership of its descendants to the client.
+        // Keep the job registered until termination of the whole tree has completed.
+        if let Err(error) = sys::finish_job(groups, &job) {
+            cleanup_error = Some(error);
+        }
+    }
     // Like Node destroying its streams: stop reading, so the pipes close even if a descendant still holds them.
     stop.store(true, Ordering::SeqCst);
     // Repeat interruption until each worker exits: on Windows a worker can enter a synchronous I/O call between
@@ -471,6 +518,7 @@ fn run_with_shell(
         }
         let _ = worker.join();
     }
+    #[cfg(unix)]
     groups.lock().unwrap().remove(&pid);
     emit(&mut pending, 0, decoders[0].decode(&[], true));
     emit(&mut pending, 1, decoders[1].decode(&[], true));
@@ -484,6 +532,13 @@ fn run_with_shell(
         Some(path) => failure.extra(json!({ "spillPath": path })),
         None => failure,
     };
+    #[cfg(windows)]
+    if let Some(error) = cleanup_error {
+        return Err(with_spill(Failure::new(
+            "spawn_error",
+            format!("Failed to clean process tree: {error}"),
+        )));
+    }
     if timed_out {
         return Err(with_spill(Failure::new("timeout", "timeout")));
     }
@@ -547,13 +602,22 @@ mod tests {
             let started = Instant::now();
             // Exercise the real exec lifecycle with the legacy WSL stdin transport, using Unix bash -s. The
             // first sleep is finite so a regression fails rather than leaving the test waiting indefinitely.
-            let failure = run_with_shell(1, request, &sys::tmpdir(), &output, &control, &groups, |_| {
-                Ok(sys::ShellConfig {
-                    program: "/bin/bash".into(),
-                    args: vec!["-s".into()],
-                    command_on_stdin: true,
-                })
-            }).unwrap_err();
+            let failure = run_with_shell(
+                1,
+                request,
+                &sys::tmpdir(),
+                &output,
+                &control,
+                &groups,
+                |_| {
+                    Ok(sys::ShellConfig {
+                        program: "/bin/bash".into(),
+                        args: vec!["-s".into()],
+                        command_on_stdin: true,
+                    })
+                },
+            )
+            .unwrap_err();
             if let Some(cancel) = cancel {
                 cancel.join().unwrap();
             }
@@ -571,13 +635,22 @@ mod tests {
             "timeoutMs": 2000,
         })).unwrap();
         let started = Instant::now();
-        let result = run_with_shell(3, request, &sys::tmpdir(), &Arc::new(Output::default()), &Control::default(), &Arc::default(), |_| {
-            Ok(sys::ShellConfig {
-                program: "/bin/bash".into(),
-                args: vec!["-s".into()],
-                command_on_stdin: true,
-            })
-        }).unwrap();
+        let result = run_with_shell(
+            3,
+            request,
+            &sys::tmpdir(),
+            &Arc::new(Output::default()),
+            &Control::default(),
+            &Arc::default(),
+            |_| {
+                Ok(sys::ShellConfig {
+                    program: "/bin/bash".into(),
+                    args: vec!["-s".into()],
+                    command_on_stdin: true,
+                })
+            },
+        )
+        .unwrap();
         assert_eq!(result["exitCode"], 0);
         assert!(started.elapsed() < Duration::from_secs(2));
     }
@@ -591,13 +664,22 @@ mod tests {
         })).unwrap();
         let output = Arc::new(Output::default());
         let started = Instant::now();
-        let result = run_with_shell(2, request, &sys::tmpdir(), &output, &Control::default(), &Arc::default(), |_| {
-            Ok(sys::ShellConfig {
-                program: "/bin/bash".into(),
-                args: vec!["-s".into()],
-                command_on_stdin: true,
-            })
-        }).unwrap();
+        let result = run_with_shell(
+            2,
+            request,
+            &sys::tmpdir(),
+            &output,
+            &Control::default(),
+            &Arc::default(),
+            |_| {
+                Ok(sys::ShellConfig {
+                    program: "/bin/bash".into(),
+                    args: vec!["-s".into()],
+                    command_on_stdin: true,
+                })
+            },
+        )
+        .unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(result["exitCode"], 0);
         output.close();

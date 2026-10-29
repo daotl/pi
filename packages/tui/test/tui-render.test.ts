@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
+import { Box } from "../src/components/box.ts";
 import { Image } from "../src/components/image.ts";
 import { Input } from "../src/components/input.ts";
 import { Text } from "../src/components/text.ts";
@@ -17,7 +18,13 @@ import {
 } from "../src/terminal-image.ts";
 import { type Component, CURSOR_MARKER, type TUI } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
-import { isWrapLinesToWidth, setWrapLinesToWidth, sliceByColumn } from "../src/utils.ts";
+import {
+	isPadLinesToWidth,
+	isWrapLinesToWidth,
+	setPadLinesToWidth,
+	setWrapLinesToWidth,
+	sliceByColumn,
+} from "../src/utils.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class TestComponent implements Component {
@@ -1017,6 +1024,93 @@ describe("TUI overlays over native-reflow content", () => {
 			tui.stop();
 		}
 	});
+
+	for (const row of [0, 1, 2]) {
+		for (const col of [0, 3, 7]) {
+			it(`protects an offset Kitty placement from a disjoint overlay at row ${row}, column ${col}`, async () => {
+				const padLines = isPadLinesToWidth();
+				setPadLinesToWidth(true);
+				const terminal = new LoggingVirtualTerminal(20, 5);
+				const tui = new TuiMainScreen(terminal);
+				const base = new TestComponent();
+				base.lines = [encodeKitty("AAAA", { columns: 3, rows: 3, imageId: 94, moveCursor: false }), "", ""];
+				const box = new Box(4, 0, (text) => `\x1b[44m${text}\x1b[49m`);
+				box.addChild(base);
+				tui.addChild(box);
+				tui.addChild(new Text("after", 0, 0));
+				try {
+					tui.start();
+					await terminal.waitForRender();
+					const before = terminal.getScrollBuffer();
+					terminal.clearWrites();
+					const overlay = new InputComponent();
+					overlay.lines = ["X"];
+					const handle = tui.showOverlay(overlay, { width: 1, row, col });
+					await terminal.waitForRender();
+					assert.strictEqual(terminal.getViewport()[row]?.trimEnd(), `${" ".repeat(col)}X`);
+					terminal.sendInput("Y");
+					await terminal.waitForRender();
+					assert.strictEqual(terminal.getViewport()[row]?.trimEnd(), `${" ".repeat(col)}Y`);
+					handle.hide();
+					await terminal.waitForRender();
+					assert.deepStrictEqual(
+						terminal.getScrollBuffer().map((line) => line.trimEnd()),
+						before.map((line) => line.trimEnd()),
+					);
+					const writes = terminal.getWrites();
+					assert.ok(!writes.includes("\x1b_G"), "disjoint overlays must not hide or replay the placement");
+					assert.ok(writes.includes("\x1b[1G\x1b[4X"), "left-side painting must stop before the image");
+					assert.ok(writes.includes("\x1b[8G\x1b[13X"), "right-side painting must start after the image");
+					assert.ok(!writes.includes("\x1b[2K"), "painting must not erase the placement's cells");
+					assert.ok(!writes.includes("\x1b[3J"));
+				} finally {
+					tui.stop();
+					setPadLinesToWidth(padLines);
+				}
+			});
+		}
+
+		for (const col of [4, 6]) {
+			it(`restores an offset Kitty placement after an overlay at row ${row}, column ${col}`, async () => {
+				const padLines = isPadLinesToWidth();
+				setPadLinesToWidth(true);
+				const terminal = new LoggingVirtualTerminal(20, 5);
+				const tui = new TuiMainScreen(terminal);
+				const base = new TestComponent();
+				base.lines = [encodeKitty("AAAA", { columns: 3, rows: 3, imageId: 95, moveCursor: false }), "", ""];
+				const box = new Box(4, 0, (text) => `\x1b[44m${text}\x1b[49m`);
+				box.addChild(base);
+				tui.addChild(box);
+				tui.addChild(new Text("after", 0, 0));
+				try {
+					tui.start();
+					await terminal.waitForRender();
+					const before = terminal.getScrollBuffer();
+					terminal.clearWrites();
+					const handle = tui.showOverlay(new Text("X", 0, 0), { width: 1, row, col });
+					await terminal.waitForRender();
+					assert.strictEqual(terminal.getViewport()[row]?.trimEnd(), `${" ".repeat(col)}X`);
+					assert.ok(terminal.getWrites().includes("\x1b_Ga=d,d=i,i=95,q=2\x1b\\"));
+					assert.ok(!terminal.getWrites().includes(deleteKittyImage(95)), "image data must remain retained");
+					terminal.clearWrites();
+					handle.hide();
+					await terminal.waitForRender();
+					assert.deepStrictEqual(
+						terminal.getScrollBuffer().map((line) => line.trimEnd()),
+						before.map((line) => line.trimEnd()),
+					);
+					assert.ok(
+						terminal.getWrites().includes("\x1b[5G\x1b_Ga=p,i=95,c=3,r=3,C=1,q=2\x1b\\"),
+						"retained placement must return to its original column, excluding ANSI styling from the width",
+					);
+					assert.ok(!terminal.getWrites().includes("\x1b[3J"));
+				} finally {
+					tui.stop();
+					setPadLinesToWidth(padLines);
+				}
+			});
+		}
+	}
 
 	it("keeps content after reserved Kitty placeholders when an overlay opens and closes", async () => {
 		const terminal = new LoggingVirtualTerminal(20, 5);

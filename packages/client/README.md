@@ -20,7 +20,7 @@ const client = await Client.connect({
   serverId: "01234567-89ab-4def-8123-456789abcdef",
   transportFactory,
 });
-const host = createHost({ name: "tui", self: "tui" });
+const host = createHost({ name: "tui", kind: "client", self: "tui" });
 host.connect(createClientChordLink(client, () => ({ serverId: client.serverId })), {
   principal: "tui",
 });

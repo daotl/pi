@@ -15,11 +15,12 @@ import { streamSimple as streamNativeCompletions } from "@earendil-works/pi-ai/a
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { VERSION } from "../src/config.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import type { ExtensionFactory } from "../src/core/extensions/types.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createInMemoryModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
-import { createTestResourceLoader } from "./utilities.ts";
+import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
 
 describe("createAgentSession client identity", () => {
 	let tempDir: string;
@@ -147,6 +148,8 @@ describe("createAgentSession client identity", () => {
 			telemetryEnabled?: boolean;
 			providerHeaders?: Record<string, string>;
 			requestHeaders?: SimpleStreamOptions["headers"];
+			extensionFactory?: ExtensionFactory;
+			virtualProvider?: string;
 		} = {},
 	): Promise<Headers> {
 		const settingsManager = SettingsManager.inMemory({
@@ -160,23 +163,50 @@ describe("createAgentSession client identity", () => {
 		);
 		registry.registerProvider(model.provider, {
 			api: "openai-completions",
+			baseUrl: model.baseUrl,
+			models: [
+				{
+					id: model.id,
+					name: model.name,
+					reasoning: model.reasoning,
+					input: model.input,
+					cost: model.cost,
+					contextWindow: model.contextWindow,
+					maxTokens: model.maxTokens,
+				},
+			],
 			headers: options.providerHeaders,
 			streamSimple: (requestModel, context, requestOptions) =>
 				streamNativeCompletions({ ...requestModel, api: "openai-completions" }, context, requestOptions),
 		});
+		const runtime = getModelRuntime(registry);
+		if (options.virtualProvider) {
+			runtime.registerVirtualModel({
+				provider: options.virtualProvider,
+				id: "routed",
+				name: "Routed",
+				route: () => ({ model, thinkingLevel: "off" }),
+			});
+		}
+		const selected = options.virtualProvider ? runtime.getModel(options.virtualProvider, "routed")! : model;
 		const { session } = await createAgentSession({
 			cwd,
 			agentDir,
-			model,
-			modelRuntime: getModelRuntime(registry),
+			model: selected,
+			modelRuntime: runtime,
 			settingsManager,
 			sessionManager: SessionManager.inMemory(cwd),
-			resourceLoader: createTestResourceLoader(),
+			resourceLoader: createTestResourceLoader({
+				extensionsResult: await createTestExtensionsResult(
+					options.extensionFactory ? [options.extensionFactory] : [],
+					cwd,
+				),
+			}),
 		});
 		let captured: Headers | undefined;
 		try {
 			const stream = await session.agent.streamFunction(
-				model,
+				selected,
 				normalizeContext({
 					messages: [{ role: "user", content: "hello", timestamp: 1 }],
 				}),
@@ -197,7 +227,7 @@ describe("createAgentSession client identity", () => {
 				},
 			);
 			const result = await stream.result();
-			expect(result.stopReason).toBe("stop");
+			expect(result.stopReason, result.errorMessage).toBe("stop");
 			if (!captured) throw new Error("Native request was not dispatched");
 			return captured;
 		} finally {
@@ -205,6 +235,26 @@ describe("createAgentSession client identity", () => {
 			registry.unregisterProvider(model.provider);
 		}
 	}
+
+	it.each([
+		["openrouter", "other", "https://other.example/v1", false],
+		["router", "openrouter", "https://openrouter.ai/api/v1", true],
+	] as const)(
+		"assembles identity for physical %s routing to %s",
+		async (virtualProvider, provider, baseUrl, attributed) => {
+			let observed: SimpleStreamOptions["headers"];
+			const headers = await captureNativeHeaders(createModel(provider, baseUrl), {
+				virtualProvider,
+				extensionFactory: (pi) => {
+					pi.on("before_provider_headers", (event) => {
+						observed = { ...event.headers };
+					});
+				},
+			});
+			expect(Object.keys(observed ?? {}).some((name) => name.toLowerCase() === "http-referer")).toBe(attributed);
+			expect(headers.has("http-referer")).toBe(attributed);
+		},
+	);
 
 	it.each([
 		["openrouter", "https://openrouter.ai/api/v1", "http-referer", "https://pi.dev"],
@@ -226,6 +276,33 @@ describe("createAgentSession client identity", () => {
 			},
 			requestHeaders: { "X-OpenRouter-Title": "request-title", "X-OpenRouter-Categories": null },
 		});
+		expect(headers.get("http-referer")).toBe("https://provider.example");
+		expect(headers.get("x-openrouter-title")).toBe("request-title");
+		expect(headers.has("x-openrouter-categories")).toBe(false);
+	});
+
+	it("exposes identity defaults and configured precedence before native header hooks", async () => {
+		let observed: SimpleStreamOptions["headers"];
+		const headers = await captureNativeHeaders(createModel("openrouter", "https://openrouter.ai/api/v1"), {
+			providerHeaders: { "http-referer": "https://provider.example" },
+			requestHeaders: { "X-OpenRouter-Title": "request-title" },
+			extensionFactory: (pi) => {
+				pi.on("before_provider_headers", (event) => {
+					observed = { ...event.headers };
+					event.headers["User-Agent"] = "hook-agent";
+					event.headers["X-OpenRouter-Categories"] = null;
+				});
+			},
+		});
+
+		expect(observed).toMatchObject({
+			"User-Agent": expect.stringContaining(`pi/${VERSION}`),
+			"http-referer": "https://provider.example",
+			"X-OpenRouter-Title": "request-title",
+			"X-OpenRouter-Categories": "cli-agent",
+		});
+		expect(observed).not.toHaveProperty("HTTP-Referer");
+		expect(headers.get("user-agent")).toBe("hook-agent");
 		expect(headers.get("http-referer")).toBe("https://provider.example");
 		expect(headers.get("x-openrouter-title")).toBe("request-title");
 		expect(headers.has("x-openrouter-categories")).toBe(false);

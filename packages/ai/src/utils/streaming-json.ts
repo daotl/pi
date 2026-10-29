@@ -120,11 +120,20 @@ export class StreamingJsonParser {
 	#snapshot: JsonValue | undefined = undefined;
 	/** Changes of the piece being read. */
 	#changes: OpenChange[] = [];
+	#snapshotCurrent = true;
+	#changesMatchSnapshot = true;
+
+	/** Whether the latest append changes alone reproduce the latest snapshot. */
+	get changesMatchSnapshot(): boolean {
+		return this.#changesMatchSnapshot && this.#snapshotCurrent;
+	}
 
 	/**
 	 * Read the next piece of text; returns the changes it made, in order. Costs time linear in `text.length`.
 	 */
 	append(text: string): readonly JsonChange[] {
+		this.#changesMatchSnapshot =
+			this.#snapshotCurrent && this.#scalar === "" && this.#stack.every((frame) => frame.reportsInside);
 		this.#credit += CREDIT_PER_APPEND + CREDIT_PER_CHARACTER * text.length;
 		this.#changes = [];
 		if (this.#string !== undefined) this.#string.change = undefined;
@@ -147,9 +156,13 @@ export class StreamingJsonParser {
 		if (!this.#dirty) return this.#snapshot;
 		const pending = this.#pendingScalar();
 		const cost = this.#pathCost + (pending === undefined ? 0 : 1);
-		if (cost > this.#credit) return this.#snapshot;
+		if (cost > this.#credit) {
+			this.#snapshotCurrent = false;
+			return this.#snapshot;
+		}
 		this.#credit -= cost;
 		this.#dirty = false;
+		this.#snapshotCurrent = true;
 		this.#snapshot = this.#copyOpenPath(pending);
 		return this.#snapshot;
 	}
@@ -225,6 +238,7 @@ export class StreamingJsonParser {
 				return;
 			}
 			default:
+				this.#changesMatchSnapshot = false;
 				this.#scalar = char;
 				this.#scalarSlot = this.#valueSlot();
 				if (this.#scalarSlot !== undefined) this.#dirty = true;
@@ -361,6 +375,7 @@ export class StreamingJsonParser {
 	#openContainer(container: JsonContainer): void {
 		const slot = this.#valueSlot();
 		const path = this.#reportedPath(slot);
+		if (path === undefined || path.length >= MAX_REPORTED_DEPTH) this.#changesMatchSnapshot = false;
 		this.#place(slot, container);
 		this.#stack.push({
 			container,
@@ -454,6 +469,12 @@ export class ToolCallArgumentsStream {
 	#parser = new StreamingJsonParser();
 	#snapshot: JsonValue | undefined = undefined;
 	#arguments: ToolCall["arguments"] = {};
+	#changes: readonly JsonChange[] | undefined = [];
+
+	/** Latest decoded edits, or undefined when exact snapshot previews require reconciliation. */
+	get changes(): readonly JsonChange[] | undefined {
+		return this.#changes;
+	}
 
 	/** The raw argument text received so far. */
 	get text(): string {
@@ -463,8 +484,16 @@ export class ToolCallArgumentsStream {
 	/** Append a piece of argument text; returns the partial arguments, a new object whenever they changed. */
 	append(delta: string): ToolCall["arguments"] {
 		this.#text += delta;
-		this.#parser.append(delta);
-		return this.#partial();
+		const changes = this.#parser.append(delta);
+		const partial = this.#partial();
+		this.#changes =
+			this.#parser.changesMatchSnapshot &&
+			typeof this.#snapshot === "object" &&
+			this.#snapshot !== null &&
+			!Array.isArray(this.#snapshot)
+				? changes
+				: undefined;
+		return partial;
 	}
 
 	/**
@@ -474,7 +503,7 @@ export class ToolCallArgumentsStream {
 	replace(text: string): { readonly delta: string | undefined; readonly arguments: ToolCall["arguments"] } {
 		if (text.startsWith(this.#text)) {
 			const delta = text.slice(this.#text.length);
-			return { delta, arguments: delta === "" ? this.#partial() : this.append(delta) };
+			return { delta, arguments: this.append(delta) };
 		}
 		this.#text = "";
 		this.#parser = new StreamingJsonParser();

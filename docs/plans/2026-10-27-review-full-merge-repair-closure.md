@@ -1354,3 +1354,221 @@ Original #1 is still P1 and unfixed. The isolated Windows Job prototype was not 
 
 Status: INCOMPLETE / BLOCKED, not fix-all complete and not merge approval. A post-commit full merge plus subsequent-diff review was explicitly requested and will be appended separately.
 
+
+## Post-commit complete merge review - 63b666a45
+
+**Scope:** `839dc79197595a4285d711e37d02fb623e5b6b7b` -> `63b666a4503aed3d2237697746f1c9a590321d81`, 1536 changed paths. Includes upstream merge and every later repair commit, not only the latest 90 repair files.
+**Intent:** Preserve intentional Crystal behavior while checking current provider/session/tool, storage, UI and resource ownership contracts.
+**Mode:** markdown report-only. No product fixes were applied after this repair commit.
+**Commit:** `63b666a45` - fix: repair validated merge lifecycle and consumer defects. No push.
+
+**Reviewers:** Ten correctness slices (ai, agent, chord, durable, env, session, interactive, integrations, tooling, docs), project-standards, testing, maintainability, agent-native, security, performance, api-contract, data-migration, reliability, adversarial, julik-frontend-races, deployment-verification-agent.
+- Testing covers changed assertions/harnesses; maintainability covers structural changes; agent-native covers tools/MCP; security covers auth/trust/public inputs; performance covers streaming/cache/wake complexity; API covers external contracts; reliability covers async ownership/timeouts.
+- Data migration and deployment are selected by actual changed migration artifacts, not prompt prose: Chord SQLite migrations, durable SQLite migrations/schema, legacy-v3 JSONL conversion. Durable migration lines 94-106 create/copy/drop/rename a task table.
+- UI races cover event/timer/recovery transitions. Local adversarial covers persistence/concurrency and silent-pass guards. External cross-model not started because host serving family is unattested; no cross-family independence claim.
+
+### Triage Groups
+
+| Group | Findings | Context | Preferred Resolution | Why |
+|---|---|---|---|---|
+| Runtime and resource ownership (apply-queue) | #2, #3, #4, #5 | Confirmed lifetime and shutdown ordering failures; Windows env defect differs from prior Chord manager blocker. | Stop duplicate terminal start; preserve candidate lifetime; close resources in reverse open order; implement real Windows process-tree ownership. | Each path needs actual owner/join semantics rather than suppression. |
+| Chord input and result contracts (apply-queue) | #6, #7 | Confirmed schema coverage/normalization accept or reject wrong values. | Preserve union sibling constraints and explicit null inputs; verify via public acquisition/dispatch. | Public contract validation must describe actual accepted input and returned results. |
+
+### P1 -- High
+
+| # | File | Issue | Reviewer | Confidence |
+|---|---|---|---|---|
+| 1 | `.github/workflows/nix.yml:114` | Nix jobs discard the timestamp required by hydration | adversarial, correctness-tooling | 100 |
+| 2 | `packages/coding-agent/src/modes/interactive/interactive-mode.ts:4921` | Avoid restarting an already-running terminal during shutdown recovery | julik-frontend-races, correctness-interactive | 100 |
+| 3 | `packages/env/daemon/src/sys/windows.rs:542` | Preserve Windows descendants until shutdown cleanup completes | correctness-env | 75 |
+
+- **#1** - Every Nix build job replaces the valid two-field catalog pin with a revision-only JSON object before evaluating the flake. The current derivation now reads modelCatalogPin.generatedAt, so normal PR, scheduled, manual, and release-tag builds fail with a missing-attribute error, and release tags can never advance stable. Forwarding the timestamp with the revision preserves the immutable catalog identity that the hydrator requires. Response: Expose generatedAt from the pin job alongside revision, pass both outputs into the build and commit-pin jobs, and write both fields when reconstructing nix/model-catalog.json at lines 114 and 175. On tag builds preserve the committed pin unchanged instead of rewriting it.
+- **#2** - A failed signal-triggered shutdown starts the same live ProcessTerminal a second time, so each subsequent key is delivered twice and the original stdin/resize handlers remain registered. The signal branch has not stopped the TUI when it enters showShutdownRecovery; repeated failed recovery retries compound the listeners, and the eventual stop removes only the newest handlers and restores the second start's already-raw state. Recovery must distinguish a stopped interactive-quit renderer from the still-running signal renderer rather than unconditionally calling start(). Response: Track whether shutdown actually stopped the renderer and pass that state into showShutdownRecovery; call ui.start() only for the stopped interactive-quit path. On signal recovery and subsequent failed retries, replace the editor and request a render without starting the existing terminal again. Keep the fix local; no additional dependency is needed.
+- **#3** - Closing a Windows connection can leave the command's subprocesses running. The job explicitly permits every descendant to escape, while shutdown starts taskkill asynchronously and immediately exits; job-handle closure can kill the tracked shell before taskkill enumerates its tree, leaving the escaped children without a live root to find. This contradicts the connection's promise to kill everything it started, even though these flags mirror libuv's deliberately weaker ownership model. Response: Use a daemon-owned job that retains descendants (remove silent/explicit breakaway permissions unless a documented separate detached-process capability requires them), and ensure shutdown waits for process-tree termination before exiting. Preserve per-command cancellation isolation; a per-command job whose handle is retained until its cleanup completes is the most robust default on supported Windows versions.
+
+### P2 -- Moderate
+
+| # | File | Issue | Reviewer | Confidence |
+|---|---|---|---|---|
+| 4 | `packages/chord/src/object.ts:2030` | Update lifetime eligibility when reusing objects across reloads | correctness-chord | 100 |
+| 5 | `packages/chord/src/reload.ts:514` | Close dependent exclusive resources before their dependencies | correctness-chord | 100 |
+| 6 | `packages/chord/src/schema.ts:142` | Preserve sibling constraints when comparing union schemas | correctness-chord | 100 |
+| 7 | `packages/chord/src/schema.ts:47` | Preserve null contract inputs during normalization | api-contract | 100 |
+| 10 | `scripts/issues/ui.html:102` | Keep decisions gated when another mutation skips their refresh | julik-frontend-races | 100 |
+
+- **#4** - Changing an already-live referenced type to lifetime "host" fails as soon as its new factory registers a registry entry: register still sees the object's original false lifetime flag and aborts the reload. Conversely, an object changed from host to referenced retains permission to register. Reload explicitly supports these lifetime transitions, but only changes the service and lifecycle pin, not this eligibility flag. Response: Evaluate register eligibility against the service of the factory run being recorded (pass its lifetime into SelfImpl), and update the committed object lifetime at install. Keep prepare/abort from mutating the installed lifetime; cover both directions with a surviving external reference and registry entries.
+- **#5** - Reloading two exclusive resources where B depends on A closes A before B, even though B was opened after A. A normal B.close that needs A.value then fails with not_ready, aborting an otherwise valid reload and potentially leaving external cleanup incomplete. The ordinary disposal and retirement paths already close resources in reverse open order; the destructive gate must use that same dependency-safe order. Response: Sort replaced resources by descending position in object.openOrder before closing them at the gate. Record their actual close order and reopen rollback resources in dependency/open order (reverse of that close order). Add a scenario where an exclusive dependent's close reads its dependency.
+- **#6** - An incompatible same-version contract can pass coverage and reload checks when the consumer schema combines anyOf with a sibling validation constraint. For example, fits({type:"number"}, {anyOf:[{type:"number"},{type:"string"}], minimum:1}) returns true through the number branch, although 0 is valid only for the provider. In-process remote-contract consumers can consequently receive values outside their promised schema because direct dispatch validates the provider's schema, not the consumer's. Response: Do not discard sibling validation keywords when descending into sup.anyOf. Conservatively require equality when a union has unmodeled siblings, or check the siblings conjunctively in addition to branch containment. Cover results/state and same-version reload with the numeric minimum counterexample.
+- **#7** - A contract declaring input: Type.Null() can be constructed and its typed host.get(token, null) call is valid, but acquisition always rejects invalid/input because normalization changes null to {} before checking the schema. A nullable object contract can instead select the empty-object instance when the caller requested the null instance. Preserving explicit null retains the declared input domain and distinguishes those identities. Response: Replace value ?? {} with value === undefined ? {} : value in normalize, so only omitted input receives the empty-object fallback; add a focused host acquisition scenario for Type.Null() and a nullable object union.
+- **#10** - A decision can re-enable priority controls before its authoritative state has been fetched when a concurrent retriage or sync request is still pending. load() returns immediately while pendingMutations is nonzero, but the decision finally block nevertheless clears decisionPending; a second click derives its toggle from the old data and can send p0 again instead of clearing the successfully saved p0. Retriage and Sync remain reachable while a decision is pending, so this is not prevented by the disabled decision buttons. Response: Keep the decision gate latched until pendingMutations reaches zero and a fresh state response reflecting the decision has actually been installed. Centralize the final refresh/gate release in the last mutation completion (or serialize mutation completion and refresh), rather than interpreting a skipped load() as a completed authoritative refresh. Preserve the existing generation check and use the current counters instead of introducing a dependency.
+
+### Actionable Findings
+
+| # | File | Issue | Route | Notes |
+|---|---|---|---|---|
+| 1 | `.github/workflows/nix.yml:114` | Nix jobs discard the timestamp required by hydration | `manual -> downstream-resolver` | Independently validated; suggested_fix present; not applied |
+| 2 | `packages/coding-agent/src/modes/interactive/interactive-mode.ts:4921` | Avoid restarting an already-running terminal during shutdown recovery | `gated_auto -> downstream-resolver` | Independently validated; suggested_fix present; not applied |
+| 3 | `packages/env/daemon/src/sys/windows.rs:542` | Preserve Windows descendants until shutdown cleanup completes | `manual -> downstream-resolver` | Independently validated; suggested_fix present; not applied |
+| 4 | `packages/chord/src/object.ts:2030` | Update lifetime eligibility when reusing objects across reloads | `gated_auto -> downstream-resolver` | Independently validated; suggested_fix present; not applied |
+| 5 | `packages/chord/src/reload.ts:514` | Close dependent exclusive resources before their dependencies | `gated_auto -> downstream-resolver` | Independently validated; suggested_fix present; not applied |
+| 6 | `packages/chord/src/schema.ts:142` | Preserve sibling constraints when comparing union schemas | `gated_auto -> downstream-resolver` | Independently validated; suggested_fix present; not applied |
+| 7 | `packages/chord/src/schema.ts:47` | Preserve null contract inputs during normalization | `gated_auto -> downstream-resolver` | Independently validated; suggested_fix present; not applied |
+| 10 | `scripts/issues/ui.html:102` | Keep decisions gated when another mutation skips their refresh | `gated_auto -> downstream-resolver` | Independently validated; suggested_fix present; not applied |
+
+### Unvalidated source candidates - not confirmed findings
+
+These 18 have source-review evidence but were outside the one eight-finding independent validator batch. They are not cleared, not confirmed, and not in the validated actionable queue. Stable candidate numbers are retained.
+
+| Candidate | Severity | File | Source claim |
+|---|---|---|---|
+| #8 | P2 | `packages/client/README.md:23` | Declare the documented presentation host as a client |
+| #9 | P2 | `packages/coding-agent/src/core/export-html/index.ts:199` | Key exported builtin renderings by owning message |
+| #11 | P2 | `packages/ai/src/api/classifier-shared.ts:95` | Retry Decisions transport failures within the configured retry policy |
+| #12 | P2 | `packages/chord/docs/guide.md:606` | Configure a loader before the plugin loading example |
+| #13 | P2 | `packages/chord/src/connection.ts:930` | Stage new remote contracts during coordinated breaking reloads |
+| #14 | P2 | `packages/coding-agent/src/core/remote-catalog-provider.ts:226` | Personalize OpenRouter even when the optional catalog is down |
+| #15 | P2 | `packages/coding-agent/src/core/sdk.ts:368` | Assemble identity headers before invoking header hooks |
+| #16 | P2 | `packages/coding-agent/src/experimental/services/connection.ts:156` | Preserve cancellation while hydrating attached session services |
+| #17 | P2 | `packages/coding-agent/src/experimental/services/connection.ts:78` | Join shared-host cleanup when disposing the client runtime |
+| #18 | P2 | `packages/coding-agent/src/experimental/services/transcript-provider.ts:373` | Apply tool argument deltas without rescanning growing prefixes |
+| #19 | P2 | `packages/coding-agent/src/extensions/codemode/tool.ts:131` | Keep model API help reachable without file-reading tools |
+| #20 | P2 | `packages/durable/src/harness/scheduler.ts:506` | Avoid full live-task scans on every wake update |
+| #21 | P2 | `packages/env/daemon/src/list.rs:98` | Enforce hidden exclusion independently of gitignore negations |
+| #22 | P2 | `packages/env/daemon/src/main.rs:478` | Keep blocking FIFO operations off the shared file pool |
+| #23 | P2 | `packages/env/package.json:27` | Daemon tests build outside the pinned Rust toolchain directory |
+| #24 | P2 | `packages/env/src/ssh.ts:460` | A newer connection deletes a pending connection's daemon |
+| #25 | P2 | `packages/tui/src/tui-main-screen.ts:633` | Preserve horizontal image offsets when restoring overlay placements |
+| #26 | P3 | `packages/ai/src/utils/transcript.ts:184` | Remove compatibility-only helper after the clean cutover |
+
+Each candidate retains full why_it_matters, evidence and suggested_fix in unvalidated-candidates.json. #26 is a scoped clean-cutover standards claim, not proof that deleting an external API is harmless; external consumers were not enumerated.
+
+### Testing and advisory dispositions
+
+- Counts: **31 raw = 26 source candidates + 2 semantic duplicates + 2 testing-only gaps + 1 P3/50 standards advisory suppressed**. Of 26 source candidates: **8 independently accepted / 18 unvalidated**. No malformed return/finding or missing-detail drop. No P0. All three P1 selected and accepted.
+- Nix timestamp reports share one defect and fix; terminal restart P1/P2 reports share one defect and fix. Reviewer/independent-reviewer sets and all source evidence were unioned before mechanics rerun. Distinct Windows env and prior Chord-manager ownership problems were not merged.
+- Testing-only native-platform CI gap (`packages/chord/test/manager.test.ts:152`): add actual macOS/Windows manager execution. Testing-only audit fixture gap (`scripts/npm-audit.mjs:55`): cover accepted GHSA/package pairing, mixed/indirect advisories, stale acceptance and malformed audit errors. Both arrived as structured P2/75 and are explicitly routed to testing_gaps under the absence-of-coverage soft-bucket rule, not claimed false, settled or implemented.
+- Single-use expression helper suggestion (`packages/tui/src/terminal-image.ts:389`) is P3/50, below primary confidence gate. No undefined stable number leaks into primary/actionable output.
+- Existing reported gaps include tool-argument work scaling, sleeping-population wake scans, codemode-only model-help discoverability, exported branch tool-call identity, attach cancellation and shared-host close joins. These remain candidates or advisory test scenarios as recorded, not silently treated as fixed.
+
+### Deployment Notes
+
+- Production NO-GO until an owner binds actual storage paths and proves backup/restore, migration-only comparison, production-sized time/disk headroom, exclusive ownership and unchanged namespace/prefix. Suggested checks were not executed against production.
+- SQLite v2 rebuilds tasks and indexes atomically. Older schema-1 binaries reject v2; code-only rollback is insufficient. Restore a coherent WAL-aware snapshot, accounting for later writes and external tool effects. Compare sqlite_master, allocator metadata, exact task JSON/IDs, unrelated tables/indexes and absence of a temporary task table.
+- Preserve legacy JSONL before its first non-empty upgrade commit. Compare selected leaf, IDs/reminted relationships, configuration/system/tool checkpoints and exactly-once usage across conversion/reopen. Actual production conversion and native Workers transactions/alarms were not exercised.
+- Observe telemetry flush/close rejection as well as dropped counters. Full operational checklist and SQL are in deployment-verification-agent.json.
+
+### Coverage
+
+- All 22 successful launches reached usable terminal completion before synthesis; zero failed/timed-out reviewer. One concurrent harness task batch plus blocking collection was used. Async launch receipts were never counted as completion; no detached shell reviewer, status polling or partial-roster synthesis.
+- Correctness partitions account for all 1536 paths exactly once. Conservative current-source evidence establishes some semantic ranges in **407** assigned paths; **1129** have no separately established current-source semantic range. Diff/document/hunk review also occurred. **1109** paths retain at least one reviewer-declared insufficient range. These sets overlap; neither inventory nor hunk traversal is whole-path clearance.
+- Assigned / some current-source semantic ranges by correctness slice: ai 209/39; agent 52/28; chord 123/62; durable 231/89; env 38/37; session 132/37; interactive 108/19; integrations 250/44; tooling 135/41; docs 258/11. Exact arrays, source windows, missed ranges and reasons remain in coverage-audit.json and each report.
+- One deterministic independent validator batch accepted #1/#2/#3/#4/#5/#6/#7/#10, rejected zero. Zero cross-family shortcuts. Eighteen unselected source candidates explicitly remain unvalidated; overall coverage/validation is degraded despite complete reviewer lifecycle.
+- Graph discovery failed with WeakMap keys must be objects or non-registered symbols. Current source/history and available parent LSP were fallback; child source/text tracing does not establish exhaustive dynamic/external caller coverage. No requirements plan was established; settlement suppression not evaluated.
+- Repair commit verification: isolated ./test.sh **12787 passed / 0 failed / 947 skipped**, exit 0, artifact://12517 (bg_685); npm run check and pre-commit hook: **No fixes applied**. These prove executed paths, not absent workflow or platform defects.
+- Actual review smoke executed the workflow build pin shell step in an isolated directory with GITHUB_REF_TYPE=tag. It wrote revision only and dropped committed generatedAt=2026-10-21T12:12:47.000Z. Nix package line 47 requires that field. Both workflow writers were source-inspected; native Nix was not available.
+- No Windows, fish, native Nix, real Kitty or actual issue-UI browser validation. No paid cloud-provider execution. Prior known Windows Chord-manager #1 was not rediscovered by the blind reviewers and therefore has no new report number; it remains independently recorded **unfixed/blocked**, not discharged by omission or green non-Windows tests. New #3 is the separate env-daemon Windows breakaway/shutdown problem.
+- Post-commit review changes only this ledger. HEAD/branch/my-merge/crystal refs, empty index, full source manifest and all 749 protected hashes are checked after append; exact receipt is preservation.json. No product source change, dependency/lockfile change, push or follow-on fix commit.
+- Artifacts: `/tmp/compound-engineering-501/ce-code-review/20261029-postcommit-63b666a4`. Complete full diff/manifest, 22 reports, source detail map, mechanics, semantic/test disposition, eight verdicts, unvalidated candidates, operational outputs, actual smoke, report and metadata.
+
+---
+
+### Verdict
+
+**Not ready.** Address #1 Nix pin serialization, #2 terminal recovery start ownership and #3 env Windows tree shutdown first; then five confirmed P2. Prior Chord-manager Windows #1 also remains blocked. This is complete-scope but partial-source/validation-degraded review, not fix-all completion or merge approval. No post-commit product fixes were applied.
+
+### Actionable Findings recap
+
+- #1 P1 `.github/workflows/nix.yml:114` - Nix jobs discard the timestamp required by hydration; manual -> downstream-resolver; suggested_fix present; confidence 100.
+- #2 P1 `packages/coding-agent/src/modes/interactive/interactive-mode.ts:4921` - Avoid restarting an already-running terminal during shutdown recovery; gated_auto -> downstream-resolver; suggested_fix present; confidence 100.
+- #3 P1 `packages/env/daemon/src/sys/windows.rs:542` - Preserve Windows descendants until shutdown cleanup completes; manual -> downstream-resolver; suggested_fix present; confidence 75.
+- #4 P2 `packages/chord/src/object.ts:2030` - Update lifetime eligibility when reusing objects across reloads; gated_auto -> downstream-resolver; suggested_fix present; confidence 100.
+- #5 P2 `packages/chord/src/reload.ts:514` - Close dependent exclusive resources before their dependencies; gated_auto -> downstream-resolver; suggested_fix present; confidence 100.
+- #6 P2 `packages/chord/src/schema.ts:142` - Preserve sibling constraints when comparing union schemas; gated_auto -> downstream-resolver; suggested_fix present; confidence 100.
+- #7 P2 `packages/chord/src/schema.ts:47` - Preserve null contract inputs during normalization; gated_auto -> downstream-resolver; suggested_fix present; confidence 100.
+- #10 P2 `scripts/issues/ui.html:102` - Keep decisions gated when another mutation skips their refresh; gated_auto -> downstream-resolver; suggested_fix present; confidence 100.
+
+
+
+## Post-commit review repair - 63b666a45 working tree
+
+Status: INCOMPLETE / BLOCKED overall. Of this round's 26 source candidates, 24 have retained implementation and local behavior verification, #3 has a retained cross-compiled Windows implementation without native execution, and #13 remains unimplemented. Both testing gaps are addressed. Original Chord-manager Windows #1 remains a separate unfixed blocker. No push.
+
+The 18 previously unvalidated source candidates were independently source-validated before mutation. Their prior historical labels remain unchanged above. Source-confirmed is not runtime-confirmed; #26 is a clean-cutover rule issue, not a runtime bug. Testing raw IDs 15/29 refer to native CI/audit coverage, not source #15 headers.
+
+### Source dispositions
+
+| Candidate | Issue | Disposition |
+|---|---|---|
+| #1 | Nix jobs discard the timestamp required by hydration | Fixed and runtime-checked. Carry generatedAt through both workflow jobs; release tags keep committed pin byte-for-byte. Actual workflow shell and local bare Git publication fixtures pass. |
+| #2 | Avoid restarting an already-running terminal during shutdown recovery | Fixed. Restart recovery UI only if interactive quit stopped it; real ProcessTerminal listeners/raw-mode and repeated retry regression red 2 -> green 20. |
+| #3 | Preserve Windows descendants until shutdown cleanup completes | Implemented, platform proof BLOCKED. Atomic CreateProcessW JOB_LIST per command, noninheritable kill-on-close job, ActiveProcesses join; removes taskkill/global breakaway. Windows GNU tests type-check and independent audit pass; actual Windows execution unavailable. |
+| #4 | Update lifetime eligibility when reusing objects across reloads | Fixed. Candidate factory registration uses candidate service lifetime; committed object lifetime changes only at install. Abort retains old lifetime and registry. |
+| #5 | Close dependent exclusive resources before their dependencies | Fixed. Close replaced exclusive resources in reverse actual openOrder using a Set; rollback reopens dependency order. |
+| #6 | Preserve sibling constraints when comparing union schemas | Fixed. anyOf with sibling validation constraints requires exact equality conservatively; result/state binding and reload regressions reject widening. |
+| #7 | Preserve null contract inputs during normalization | Fixed. Only undefined receives object fallback; null acquisition and null/object identities remain distinct. |
+| #8 | Declare the documented presentation host as a client | Fixed active docs. Presentation host declares kind client; real native Chord handshake/call smoke returned 23. |
+| #9 | Key exported builtin renderings by owning message | Fixed. Assistant owner plus call ID keys HTML/components/state; result-entry keys and selected-branch ancestry resolve output/status/images. Actual viewer builtin/custom/fallback red 3 -> green 17. |
+| #10 | Keep decisions gated when another mutation skips their refresh | Fixed. Decisions remain gated until newest authoritative snapshot installs, even across overlapping mutations. HTTP/network refresh errors are visible; Sync retries state without another mutation. Ten UI cases pass. |
+| #11 | Retry Decisions transport failures within the configured retry policy | Fixed. Normalize fetch/body transport failures for bounded retry; abort, malformed JSON and hooks remain terminal. AI retry/replay 31 pass. |
+| #12 | Configure a loader before the plugin loading example | Fixed active docs. Plugins snippet configures nodeLoader; actual temporary facet URL load/reload smoke passes. |
+| #13 | Stage new remote contracts during coordinated breaking reloads | BLOCKED / NOT IMPLEMENTED. Protocol-7 proposal was fully rolled back. Candidate-reference ownership and child abort completion need a complete coordinated protocol design; no partial frames, candidate views or tests landed. |
+| #14 | Personalize OpenRouter even when the optional catalog is down | Fixed. Optional catalog overlay failure does not prevent independent OpenRouter personalization. Saved personal data remains if personalization fails; abort prevents publication. |
+| #15 | Assemble identity headers before invoking header hooks | Fixed. before_provider_headers observes identity defaults beneath configured case-insensitive precedence; documented null suppression preserved, no new delete-property contract. |
+| #16 | Preserve cancellation while hydrating attached session services | Fixed. Individual attachment waits race caller abort without cancelling shared hydration; all capability acquisitions receive the caller signal. |
+| #17 | Join shared-host cleanup when disposing the client runtime | Fixed. Shared-host close promise is owned/observed and joined by runtime dispose after client disconnect, including delayed/rejected cleanup. |
+| #18 | Apply tool argument deltas without rescanning growing prefixes | Fixed common streaming hot path. Parser/reducer expose snapshot-consistent touched edits; ordinary object strings append without prefix rescans. Exceptional scalar/deep/credit-lag frames reconcile exact preview. First hydrated argument delta reconciles to avoid lost prefix characters. |
+| #19 | Keep model API help reachable without file-reading tools | Fixed discovery. Codemode-only loadout contains runnable classifier/image help without requiring read/bash; examples executed using faux/local fixtures. |
+| #20 | Avoid full live-task scans on every wake update | Fixed measured hot path. Indexed sleep deadlines and per-task wake invalidation avoid unrelated live-task scans while retaining paused/read-only/restart/registry/backwards-clock semantics. |
+| #21 | Enforce hidden exclusion independently of gitignore negations | Fixed. hidden:false rejects dot/Windows-hidden entries independently of gitignore negation; selected hidden root stays traversable. |
+| #22 | Keep blocking FIFO operations off the shared file pool | Fixed Unix read boundary. Bounded quick/slow raw-open helpers preserve real FIFO rendezvous and descriptor ownership; queued/active cancellation uses standalone daemon-owned SIGUSR2. Ordinary file workers remain independent. Write-mode FIFO semantics unchanged. |
+| #23 | Daemon tests build outside the pinned Rust toolchain directory | Fixed. npm daemon build runs Cargo in daemon cwd, discovering pinned toolchain; external CARGO_TARGET_DIR honored. Initial local mise shim failure required rustup PATH, not product fallback. |
+| #24 | A newer connection deletes a pending connection's daemon | Fixed. SSH deployment retains other content hashes; every start revalidates its binary. Delayed first-start multibuild fixture preserves both connections. |
+| #25 | Preserve horizontal image offsets when restoring overlay placements | Fixed. Kitty printable prefix origin flows through intersection/protected painting/retained restoration; padded colored Box anchor/continuation regressions pass. Real Kitty graphics not executed. |
+| #26 | Remove compatibility-only helper after the clean cutover | Clean cutover. Removed public compatibility-only hasToolRedefinitions plus two helper-only assertions; hasNonAdditiveToolChanges behavior and released history retained. LSP found no production caller, not proof of external absence. |
+
+### Verification and integration
+
+- Final frozen-product isolated ./test.sh: **12864 passed / 0 failed / 948 skipped**, exit 0, job bg_783, artifact://13278, 289.68 seconds. SHA-256 manifests of all 64 product paths before and after execution match exactly; no product edits occurred during this final run. Earlier bg_780 reached 12864/0/948 (artifact://13263), bg_766 reached 12860/0/948 (artifact://13196), and bg_761 reached 12860/0/948 (artifact://13187); those are historical, not the final receipt. No paid provider calls.
+- Mandatory npm run check: bg_784, 1979 files, **No fixes applied**; pinned/runtime deps, imports, entry graphs, install lock, TypeScript and browser bundle guard passed. This is not browser visual proof.
+- Rust: 25 unit tests pass, Clippy --all-targets -D warnings passes, and final Windows GNU cargo check --locked --target x86_64-pc-windows-gnu --tests (bg_785) passes with existing pinned windows-sys plus Win32_Globalization feature. All Cargo targets are external under /tmp/pi-postreview-fix-63b666a4. No protected daemon target writes.
+- Focused: retained Chord protocol-6 suite 854 passed / 2 Windows skips; real terminal recovery 20; provider AI 31 and coding-agent 67; export/MCP/whitespace 17; client lifetime 36; transcript 11; parser/frame 132; scheduler 116; TUI rendering 58; env 27 / 6 platform skips; scripts 108 + 1. Counts are separate runs, not additive to root total.
+- Scheduler same 64-turn workload with 250/500/1000/2000 retained sleepers: baseline unrelated record.state reads 32000/64000/128000/256000, patched 0/0/0/0. Measurement is deterministic property visits, not a universal scheduler runtime claim. Temporary measurement file removed.
+- Transcript baseline 50k write-style stream compared 39062496 prefix characters; 500k exhausted worker heap. Optimized 50k/500k workloads and exact per-frame preview cases pass. Array-string concatenation and exceptional full reconciliation retain their existing cost; universal linear allocation is not claimed.
+- Docs smoke observed {"pluginLoadReload":true,"clientHandshakeAndCall":23}. Throwaway script removed; its initial fixture import error is not counted as product evidence. Workflow fixtures execute actual shell steps and local bare-Git publication without network.
+- Native CI gap: macos-latest/windows-latest Chord job added; local Darwin command executed 854/2. Actual Windows CI was not triggered in this session. Audit gap: eight offline subprocess fixtures exercise acceptance identity, severity, indirect advisories, stale warning and malformed/top-level errors.
+
+### Independent implementation audits and corrections
+
+- Windows audit found cwd canonicalization resolving junctions and relative shell paths losing daemon-cwd anchoring. Both fixed, native fixtures added, Windows target recompiled, follow-up audit found no further concrete defect. Native Windows tests remain unexecuted. Minimum Windows 10 / Server 2016 and fail-closed job nesting requirement documented.
+- Argument audit found checkpoint-credit-lag hydration losing pre-hydration characters. The exact 4096-element lag/hydrate/next-delta case failed before correction and passed after; first nonempty hydrated tool delta now forces reconciliation. Raw-only/empty deltas keep the alignment marker. Follow-up source audit is clean.
+- FIFO audit found Darwin/device EOF readiness mismatch, descriptor close/reopen losing an empty writer rendezvous, and quick deferral before first syscall starving a regular open. Corrected with direct nonblocking reads, one real descriptor transferred after blocking open, and deferral only after an actual EINTR. Native fixtures cover 40 pending opens, queued/active cancellation, idle writer, 20 empty writers, intentional quick misclassification and initially deferred ordinary open. Final safety audit found no further concrete defect. SIGUSR2 handler ownership/mask/registration and raw libc::open EINTR behavior were reviewed; no process-wide handler is silently overwritten.
+- Coordinated reload #13 did not converge: six baseline failures motivated protocol-7 staging; later audits found an unowned pending activation and an overbroad shared-activation join; after those corrections, immediate next-batch failure exposed missing remote abort completion. All protocol-7 product/tests/spec changes were restored to pre-#13 state, retaining #4-#7. Proposal, failures and audits remain only in scratch. No abort-ack scaffold or compatibility path landed.
+- Simplification: three full-rubric reviewers completed. Applied three: one canonical renderer interface, unreachable branch removal, one reactor buffer for idle reads. Successful payload takes ownership of that buffer; only one idle scratch capacity is retained, not reuse across completed payloads. Initially skipped three optional event-channel/cache/navigation optimizations; the later independent latency finding justified and validated the bounded event-channel fix recorded below. Cache/navigation changes stayed out of scope.
+
+### Platform limits and remaining blockers
+
+- Original Chord-manager Windows #1 remains unfixed. No safe JS/native ownership primitive or Windows execution proof was introduced there.
+- This round #13 remains a source defect, blocked on complete coordinated candidate/abort-completion protocol design. Runtime stays protocol 6.
+- This round #3 source implementation is retained, cross-compiled and audited, but native Windows process-tree behavior has not run. Windows CI must exercise immediate descendants, normal leader exit, isolated cancellation, timeout, EOF and abrupt daemon death, Unicode environment, junction cwd and shell path parity.
+- No Windows, fish, native Nix, real Kitty or actual browser visual verification. Virtual-terminal/protocol and actual export-viewer function execution are bounded evidence, not real graphics/browser clearance.
+
+### Final retained repair review and followups
+
+- Review scope: 63 frozen repair paths versus HEAD 63b666a45, not another whole-merge review. All 11 selected reviewers completed and all full artifacts/details were loaded before mechanics; zero failed reviewer or malformed return. Reported hunk/source coverage is bounded, not exhaustive unchanged-source or external-caller clearance. Graph WeakMap remains unavailable; current-source/history and parent LSP are fallback.
+- 13 raw findings -> seven distinct primary candidates + five semantic duplicates + one testing-only DOM/cache gap. One independent validator accepted six (#1/#2/#3/#4/#5/#7), rejected #6 as an existing sibling-result rendering gap at baseline. No cross-family validation shortcut; host serving family is unattested, so only local adversarial coverage ran.
+- Corrected final review #1: native Chord CI now builds telemetry before tests. A clean archive with no telemetry dist reproduced actual Node loader ERR_MODULE_NOT_FOUND; telemetry build followed by the same loader exited zero. Dependencies were linked from the existing install; no fresh npm ci or Windows CI execution is claimed.
+- Corrected #2 and #5: identical ToolCallArgumentsStream.replace refreshes edits via append even for an empty suffix; authoritative toolcall_start/checkpoint/end expose undefined reconciliation rather than empty edits. New getter-driven regressions failed before fixes; parser/frame 134 passed afterward.
+- Corrected #3 initially used the precise identity target type, then a narrow audit found that captured virtual selections could recreate attribution on the wrong physical provider. ModelsRequestTransforms.transformHeaders now receives the effective physical model after auth baseUrl resolution in both AI Models and coding ModelRuntime. SDK derives defaults from that argument, not the virtual selection. Two actual native SDK cross-provider cases failed before the fix; coding 55 and AI 85/1 focused tests passed afterward. LSP traced all 14 transform references. Subsequent audit found no concrete issue; auth-baseUrl override is source-traced, not independently exercised by the new virtual fixtures.
+- Corrected #4: Nix fixture evaluates the supported actual workflow predicate and rejects unsupported expressions; branch input starts with a different committed revision/time, so skipped replacement is observable. Tag exact-byte preservation and actual shell/local Git publication remain covered. Isolated always-true and always-false mutations each failed the relevant tag/branch assertion with exit 1; neither modified product files.
+- Corrected #7: helper completions and arrivals share one bounded reactor event channel; idle reactor blocks, active cancellation/reads retain periodic polling. New ordinary/error/cancellation completion tests pass without relying on a latency threshold. Same local 50 sequential ordinary reads measured 696.65 ms before and 12.91 ms after; one paired observation, not an SLA. Rust 25 and env 27/6 pass; narrow audit found no concrete regression. In-process idle drop would leave helper senders connected, but the standalone production path exits after serve; no embedding lifetime guarantee is added.
+- Validator-rejected-as-introduced #6 was still fixed as a bounded pre-existing dependency followup: rerender each result from original owner arguments with fresh call/result components and state. Builtin edit success/error/pending sibling cases failed twice before and passed after. Public renderer signatures and provider toolCallId remain unchanged from this repair's owner-qualified cutover. Export/related consumers 43 passed; narrow audit is clean. Actual DOM navigation/cache behavior remains a testing limitation.
+- Three narrow post-fix audits reached terminal completion. Getter audit's effective-target finding was fixed and re-audited; export and event-channel audits found no further concrete defect. Final root suite above was run after these product edits. No accepted incremental review finding remains unapplied.
+- Final retained source/test/docs footprint: **64 owned product paths + this existing ledger**. Four new files (special.rs, native Windows process tests, Nix workflow fixtures, npm-audit fixtures) were explicitly staged for complete review capture; they are work-owned, not pre-existing index content. Unrelated cargo-fmt churn in frame.rs/pty.rs/watch.rs was restored to baseline; it changed no semantics. No dependency version, lockfile, released changelog or protocol-7 proposal is included. The existing windows-sys feature addition is explicit.
+- Artifacts: `/tmp/pi-postreview-fix-63b666a4`; complete source dispositions/evidence matrix, validator packets, isolated implementation results, failing-before/passing-after observations, measurements, rejected protocol proposal, simplification decisions, full final review at `review/report.md`, mechanics, verdicts, narrow audits, verification and preservation receipts.
+
+### Final status
+
+**INCOMPLETE / BLOCKED**, not fix-all complete and not merge approval. Twenty-four of this round's source items have retained locally verified fixes, #3 has a retained cross-compiled Windows implementation without native execution, and #13 is unimplemented with its candidate protocol fully rolled back. Both testing gaps and all accepted final incremental findings are addressed. Original Chord-manager Windows #1 remains separately unfixed.
+
+The authorized repair commit contains only the exact owned paths and this ledger, including the prior post-commit review append whose prefix is preserved. No push. HEAD/branch/my-merge/crystal, staged ownership, all 749 protected hashes and absence of protocol-7 assets are checked before committing; exact final receipt is preservation-final.json.
+

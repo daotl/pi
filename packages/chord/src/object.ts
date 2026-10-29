@@ -1053,7 +1053,7 @@ export class ObjectImpl {
 	readonly input: unknown;
 	readonly principal: unknown;
 	/** The one object of a `lifetime: "host"` type: only such objects may register. */
-	readonly hostLifetime: boolean;
+	hostLifetime: boolean;
 	status: ObjectStatus = "activating";
 	ready: Promise<void> = Promise.resolve();
 	service: Service | undefined;
@@ -1188,7 +1188,7 @@ export class ObjectImpl {
 	 * declarations stay in `pending` (visible to the cycle check) until the caller installs or discards them.
 	 */
 	run(service: Service, previous: Decls | undefined): Run {
-		const self = new SelfImpl(this, previous);
+		const self = new SelfImpl(this, previous, hostLifetime(service));
 		const discard = (run: Run): void => {
 			this.pending.delete(run.decls);
 			void this.unwind(run).catch((cleanup: unknown) => this.host.report(cleanup));
@@ -1869,12 +1869,14 @@ function validateImplementation(service: Service, implementation: Record<string,
 class SelfImpl implements Self {
 	readonly #object: ObjectImpl;
 	readonly #previous: Decls | undefined;
+	readonly #hostLifetime: boolean;
 	readonly #decls = new Decls();
 	readonly #created: Run["created"] = { refs: [], resources: [], derives: [], inits: [] };
 
-	constructor(object: ObjectImpl, previous: Decls | undefined) {
+	constructor(object: ObjectImpl, previous: Decls | undefined, hostLifetime: boolean) {
 		this.#object = object;
 		this.#previous = previous;
+		this.#hostLifetime = hostLifetime;
 	}
 
 	run(implementation: unknown): Run {
@@ -2027,7 +2029,7 @@ class SelfImpl implements Self {
 	}
 
 	register<V>(registry: Registry<V>, entries: Readonly<Record<string, V>>): void {
-		if (!this.#object.hostLifetime)
+		if (!this.#hostLifetime)
 			throw invalid("not_host_lifetime", `${this.#object.typeName}: only objects of lifetime "host" may register`);
 		for (const [key, value] of Object.entries(entries)) {
 			const id = `${registry.name}\u0000${key}`;

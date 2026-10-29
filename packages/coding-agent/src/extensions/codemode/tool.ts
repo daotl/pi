@@ -119,7 +119,7 @@ const DESCRIPTION_INTRO = `Run JavaScript that calls other tools. The input is r
 - \`await tools.<name>({ ...args })\` resolves to a string, or an object if the tool's declaration says so, and rejects with an Error on failure. A tool whose declaration returns an object resolves on failure too when it returned that object; check its fields. Calls still running when the script ends are cancelled.
 - Optional first line: \`// @options: {"max_output_tokens": 10000, "timeout_ms": 60000}\``;
 
-/** One line per global. The details live in {@link CODEMODE_DOCS_PATH}. */
+/** Script globals and self-contained model help; extended details live in {@link CODEMODE_DOCS_PATH}. */
 function describeGlobals(models: boolean): string {
 	const lines = [
 		"Globals:",
@@ -128,7 +128,16 @@ function describeGlobals(models: boolean): string {
 		"- `ALL_TOOLS`, `await searchTools(query, { limit?, namespace? })`, `await describeTool(name)`, `await describeNamespace(name)`: find unlisted tools, such as MCP tools.",
 	];
 	if (models) {
-		lines.push(`- \`models\`: classifiers and image generation. Read ${CODEMODE_DOCS_PATH} first.`);
+		lines.push(
+			'- `models` (all functions return promises): `models.getModelsOfType(type, provider?)`, `models.getAvailableOfType(type, provider?)` (configured auth only), `models.getModelOfType(type, provider, id)` (undefined when missing). `type` is "chat", "image", or "classifier".',
+			'- `models.classify(model, { state: { ... }, images?: [{ type: "image", data, mimeType }], questions: { <id>: { type: "choice", instructions, criteria: { <label>: <meaning> } } | { type: "score", instructions, criteria: [<lowest level>, ..., <highest level>] } | { type: "bool", instructions, criteria: { true: <meaning>, false: <meaning> } } } })` resolves to `{ answers: { <id>: ... }, stopReason, errorMessage?, usage? }`. Image `data` is base64.',
+			'- `models.generateImages(model, { input: [{ type: "text", text: <prompt> }, ...optional { type: "image", data, mimeType }] })` resolves to `{ output: [text or image blocks], stopReason, errorMessage?, usage? }`; show each image with `image(block)`. Use catalog models, not API keys. At most four classify/image calls run at once; more wait.',
+			"Classifier example (select a configured classifier):",
+			'```js\nconst [model] = await models.getAvailableOfType("classifier");\nif (!model) throw new Error("No configured classifier");\nconst result = await models.classify(model, { state: { text: "good" }, questions: { approved: { type: "bool", instructions: "Approval?", criteria: { true: "yes", false: "no" } } } });\ntext(result.answers);\n```',
+			"Image example (select a configured image model):",
+			'```js\nconst [model] = await models.getAvailableOfType("image");\nif (!model) throw new Error("No configured image model");\nconst result = await models.generateImages(model, { input: [{ type: "text", text: "a fox" }] });\nfor (const block of result.output) { if (block.type === "image") image(block); else text(block.text); }\n```',
+			`Optional extended reference: ${CODEMODE_DOCS_PATH}.`,
+		);
 	}
 	return lines.join("\n");
 }

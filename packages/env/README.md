@@ -55,8 +55,11 @@ daemon: raw output, input, resizing and its exit code, for interactive terminals
 machine, for terminals without SSH (`new Connection({ command: [localDaemon()] })`). Terminals are not supported on
 Windows yet.
 
-Supported remote systems: Linux, macOS, Android (Termux) and Windows, on x86-64 and arm64. On Windows, string commands
-run through Git Bash as `NodeExecutionEnv` runs them there; argv commands run directly.
+Supported remote systems: Linux, macOS, Android (Termux) and Windows, on x86-64 and arm64. Windows execution requires Windows 10 / Server 2016 or newer with compatible nested-job policy. String commands run through Git Bash as `NodeExecutionEnv` runs them there; argv commands run directly.
+
+Each Windows command is created inside its own noninheritable kill-on-close Job. Normal completion, cancellation and connection shutdown terminate remaining descendants and wait for the Job's active-process count to reach zero. Unsupported process-attribute or ambient-job configurations fail with `spawn_error`; there is no taskkill-only fallback. Process creation through an external service/broker is outside Job inheritance; this is not a sandbox for malicious same-user code.
+
+On Unix, FIFO read opens use bounded daemon-owned helper queues, separate from ordinary file work. Cancellation interrupts the owning helper; queued requests can be cancelled without waiting for a worker. The standalone daemon reserves `SIGUSR2` for this purpose and refuses to replace a nondefault inherited handler. Actual blocking open preserves the writer rendezvous, including an empty writer; successful descriptors are transferred without reopening. Write-mode FIFO operations retain their existing blocking semantics.
 
 ## Development
 

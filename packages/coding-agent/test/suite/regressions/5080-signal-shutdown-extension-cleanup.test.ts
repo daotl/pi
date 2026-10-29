@@ -503,10 +503,48 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 				},
 			);
 			const terminal = new VirtualTerminal(120, 40);
+			const processTerminal = new ProcessTerminal();
+			const stdin = process.stdin;
+			const originalRaw = Object.getOwnPropertyDescriptor(stdin, "isRaw");
+			const originalSetRawMode = Object.getOwnPropertyDescriptor(stdin, "setRawMode");
+			Object.defineProperty(stdin, "isRaw", { configurable: true, writable: true, value: false });
+			Object.defineProperty(stdin, "setRawMode", {
+				configurable: true,
+				value: (raw: boolean) => {
+					stdin.isRaw = raw;
+					return stdin;
+				},
+			});
+			vi.spyOn(stdin, "resume").mockReturnValue(stdin);
+			vi.spyOn(stdin, "pause").mockReturnValue(stdin);
+			vi.spyOn(stdin, "setEncoding").mockReturnValue(stdin);
+			const dataListeners = stdin.listenerCount("data");
+			const originalDataListeners = new Set(stdin.listeners("data"));
+			const originalResizeListeners = new Set(process.stdout.listeners("resize"));
+			const resizeListeners = process.stdout.listenerCount("resize");
+			// Keep xterm rendering, but exercise real ProcessTerminal listener and raw-mode ownership.
+			const withSilentWrites = (action: () => void) => {
+				const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+				try {
+					action();
+				} finally {
+					write.mockRestore();
+				}
+			};
+			vi.spyOn(terminal, "start").mockImplementation((onInput, onResize) => {
+				withSilentWrites(() => processTerminal.start(onInput, onResize));
+			});
+			vi.spyOn(terminal, "stop").mockImplementation(() => {
+				withSilentWrites(() => processTerminal.stop());
+			});
+			vi.spyOn(terminal, "sendInput").mockImplementation((data) => {
+				stdin.emit("data", data);
+			});
 			const mode = new InteractiveMode(runtime, { terminal, tuiMode });
 			const internal = mode as unknown as {
 				shutdown(options?: { fromSignal?: boolean }): Promise<void>;
 				defaultEditor: { onSubmit(text: string): Promise<void> };
+				shutdownRecoveryEditor?: { getText(): string };
 				onInputCallback?: (text: string) => void;
 				pendingUserInputs: string[];
 				switchTuiMode(mode: "regular" | "fullscreen"): boolean;
@@ -545,6 +583,21 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 				expect(closed).toBe(true);
 				await terminal.waitForRender();
 				expect(terminal.getViewport().join("\n")).toContain("resource reactivation failed");
+				expect(stdin.listenerCount("data")).toBe(dataListeners + 1);
+				expect(process.stdout.listenerCount("resize")).toBe(resizeListeners + 1);
+				expect(stdin.isRaw).toBe(true);
+				terminal.sendInput("x");
+				expect(internal.shutdownRecoveryEditor?.getText()).toBe("x");
+				terminal.sendInput("\x7f");
+				// Another persistence failure must reuse the live terminal on recovery retries, too.
+				failFlush = true;
+				await internal.shutdown();
+				expect(runtime.shutdownPending).toBe(true);
+				expect(stdin.listenerCount("data")).toBe(dataListeners + 1);
+				expect(process.stdout.listenerCount("resize")).toBe(resizeListeners + 1);
+				terminal.sendInput("y");
+				expect(internal.shutdownRecoveryEditor?.getText()).toBe("y");
+				terminal.sendInput("\x7f");
 				const submitKeyboard = async (text: string) => {
 					terminal.sendInput(`\x1b[200~${text}\x1b[201~`);
 					terminal.sendInput("\r");
@@ -577,22 +630,37 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 				});
 				if (retryKey === "/quit") await submitKeyboard("/quit");
 				else terminal.sendInput("\x04");
-				await vi.waitFor(() => expect(disposal).toHaveBeenCalledTimes(2));
+				await vi.waitFor(() => expect(disposal).toHaveBeenCalledTimes(3));
 				await retryEntered.promise;
 				terminal.sendInput("\x04");
 				await terminal.waitForRender();
-				expect(disposal).toHaveBeenCalledTimes(2);
+				expect(disposal).toHaveBeenCalledTimes(3);
 				expect(exit).not.toHaveBeenCalled();
 				releaseRetry.resolve();
 				await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
 				expect(actions).toEqual([]);
-				expect(starts).toBe(2);
+				expect(starts).toBe(3);
+				expect(stdin.listenerCount("data")).toBe(dataListeners);
+				expect(process.stdout.listenerCount("resize")).toBe(resizeListeners);
+				expect(stdin.isRaw).toBe(false);
 			} finally {
 				releaseRetry.resolve();
 				bindSpy.mockRestore();
 				flush.mockRestore();
 				disposal.mockRestore();
 				mode.stop();
+				for (const listener of stdin.listeners("data")) {
+					if (!originalDataListeners.has(listener))
+						stdin.removeListener("data", listener as (...args: unknown[]) => void);
+				}
+				for (const listener of process.stdout.listeners("resize")) {
+					if (!originalResizeListeners.has(listener))
+						process.stdout.removeListener("resize", listener as (...args: unknown[]) => void);
+				}
+				if (originalRaw) Object.defineProperty(stdin, "isRaw", originalRaw);
+				else Reflect.deleteProperty(stdin, "isRaw");
+				if (originalSetRawMode) Object.defineProperty(stdin, "setRawMode", originalSetRawMode);
+				else Reflect.deleteProperty(stdin, "setRawMode");
 				internal.onInputCallback?.("stop prompt loop");
 				await loop;
 				getInput.mockRestore();

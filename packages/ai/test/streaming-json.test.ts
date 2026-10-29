@@ -884,6 +884,18 @@ describe("ToolCallArgumentsStream", () => {
 		expect(args.text).toBe('{"b":2}');
 	});
 
+	it("does not replay the last append when complete text is replaced unchanged", () => {
+		const args = new ToolCallArgumentsStream();
+		args.append('{"a":"x');
+		args.append("y");
+		expect(args.changes).toEqual([{ kind: "append", path: ["a"], text: "y" }]);
+		expect(args.replace(args.text)).toEqual({ delta: "", arguments: { a: "xy" } });
+		expect(args.changes).toEqual([]);
+		args.replace('{"number":1e');
+		args.replace(args.text);
+		expect(args.changes).toBeUndefined();
+	});
+
 	it("is collected with its snapshots once the stream is dropped", async () => {
 		const references: WeakRef<object>[] = [];
 		(() => {

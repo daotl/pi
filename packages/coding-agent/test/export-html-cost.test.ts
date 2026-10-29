@@ -10,6 +10,27 @@ import { CURRENT_SESSION_VERSION, type SessionHeader, SessionManager } from "../
 import { createShellRenderers } from "../src/core/tools/renderers/bash.ts";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
 
+function renderExportedEntry(html: string, entryId: string): string {
+	const encoded = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1];
+	if (!encoded) throw new Error("Missing exported session payload");
+	const data = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+	const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
+	const viewer = scripts.pop();
+	if (!viewer) throw new Error("Missing viewer script");
+	const context = createContext({
+		atob,
+		TextDecoder,
+		URLSearchParams,
+		document: { getElementById: () => ({ textContent: encoded }), querySelector: () => null },
+		window: { location: { search: "" } },
+	});
+	const render = runInContext(
+		viewer.replace("function renderEntry(entry) {", "return renderEntry; function renderEntry(entry) {"),
+		context,
+	) as (entry: unknown) => string;
+	return render(data.entries.find((entry: { id: string }) => entry.id === entryId));
+}
+
 describe("export HTML cost", () => {
 	it.each([42000, undefined])(
 		"uses only recorded duration %s while exporting historical bash results",
@@ -19,7 +40,7 @@ describe("export HTML cost", () => {
 				initTheme("dark");
 				const manager = SessionManager.create(cwd, cwd);
 				manager.appendMessage({ role: "user", content: "run", timestamp: 1 });
-				manager.appendMessage({
+				const ownerId = manager.appendMessage({
 					...fauxAssistantMessage(""),
 					content: [{ type: "toolCall", id: "bash-1", name: "bash", arguments: { command: "echo done" } }],
 				});
@@ -43,12 +64,7 @@ describe("export HTML cost", () => {
 					}),
 					"utf8",
 				);
-				const encoded = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1];
-				if (!encoded) throw new Error("Missing session payload");
-				const data = JSON.parse(Buffer.from(encoded, "base64").toString("utf8")) as {
-					renderedTools: Record<string, { resultHtmlExpanded?: string }>;
-				};
-				const text = data.renderedTools["bash-1"].resultHtmlExpanded ?? "";
+				const text = renderExportedEntry(html, ownerId).replace(/<[^>]*>/g, "");
 				if (durationMs !== undefined) expect(text).toContain("Took 42.0s");
 				else expect(text).not.toContain("Took");
 			} finally {
@@ -63,7 +79,7 @@ describe("export HTML cost", () => {
 			initTheme("dark");
 			const manager = SessionManager.create(cwd, cwd);
 			manager.appendMessage({ role: "user", content: "read", timestamp: 1 });
-			manager.appendMessage({
+			const ownerId = manager.appendMessage({
 				...fauxAssistantMessage(""),
 				content: [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "file" } }],
 			});
@@ -82,36 +98,14 @@ describe("export HTML cost", () => {
 				await exportSessionToHtml(manager, undefined, {
 					outputPath: join(cwd, "out.html"),
 					toolRenderer: {
-						renderCall: (_id, name) => (name === "read" ? "custom read call" : undefined),
-						renderResult: (_id, name) => (name === "read" ? { expanded: "custom read result" } : undefined),
+						renderCall: (_owner, _id, name) => (name === "read" ? "custom read call" : undefined),
+						renderResult: (_owner, _id, name) =>
+							name === "read" ? { expanded: "custom read result" } : undefined,
 					},
 				}),
 				"utf8",
 			);
-			const encoded = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1];
-			if (!encoded) throw new Error("Missing exported session payload");
-			const exported = JSON.parse(Buffer.from(encoded, "base64").toString("utf8")) as {
-				renderedTools: Record<string, unknown>;
-			};
-			expect(exported.renderedTools["read-1"]).toEqual({
-				callHtml: "custom read call",
-				resultHtmlExpanded: "custom read result",
-			});
-			const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
-			const viewer = scripts.pop();
-			if (!viewer) throw new Error("Missing viewer script");
-			const context = createContext({
-				atob,
-				TextDecoder,
-				URLSearchParams,
-				document: { getElementById: () => ({ textContent: encoded }), querySelector: () => null },
-				window: { location: { search: "" } },
-			});
-			const render = runInContext(
-				viewer.replace("function renderToolCall(call) {", "return renderToolCall; function renderToolCall(call) {"),
-				context,
-			) as (call: { id: string; name: string; arguments: object }) => string;
-			const rendered = render({ id: "read-1", name: "read", arguments: { path: "file" } });
+			const rendered = renderExportedEntry(html, ownerId);
 			expect(rendered).toContain("custom read call");
 			expect(rendered).toContain("custom read result");
 			expect(rendered).toContain('src="data:image/png;base64,cGl4ZWxz"');

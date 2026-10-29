@@ -268,6 +268,81 @@ describe("OpenAI Decisions", () => {
 		expect(fetch).toHaveBeenCalledTimes(hook === "onPayload" ? 0 : 1);
 	});
 
+	it.each(["fetch", "body"] as const)("retries a transient %s transport failure", async (boundary) => {
+		const fetch = vi.fn(async () => Response.json({ answers: wireAnswers }));
+		if (boundary === "fetch") {
+			fetch.mockRejectedValueOnce(new TypeError("connection reset"));
+		} else {
+			fetch.mockResolvedValueOnce(
+				new Response(
+					new ReadableStream({
+						start(controller) {
+							controller.error(new TypeError("connection reset"));
+						},
+					}),
+				),
+			);
+		}
+		const result = await classify(model, context, { apiKey: "secret", fetch, maxRetries: 1 });
+
+		expect(fetch).toHaveBeenCalledTimes(2);
+		expect(result.stopReason).toBe("stop");
+		expect(result.answers.approved).toEqual({ type: "bool", probability: 0.95 });
+	});
+
+	it("honors zero retries for transport failures", async () => {
+		const fetch = vi.fn(async () => {
+			throw new TypeError("connection reset");
+		});
+		const result = await classify(model, context, { apiKey: "secret", fetch, maxRetries: 0 });
+
+		expect(fetch).toHaveBeenCalledOnce();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("connection reset");
+	});
+
+	it("does not retry a request cancelled by the caller", async () => {
+		const controller = new AbortController();
+		const fetch = vi.fn(async () => {
+			controller.abort();
+			throw new TypeError("connection reset");
+		});
+		const result = await classify(model, context, {
+			apiKey: "secret",
+			fetch,
+			maxRetries: 1,
+			signal: controller.signal,
+		});
+
+		expect(fetch).toHaveBeenCalledOnce();
+		expect(result.stopReason).toBe("aborted");
+	});
+
+	it("does not retry malformed response JSON", async () => {
+		const fetch = vi.fn(async () => new Response("{invalid"));
+		const result = await classify(model, context, { apiKey: "secret", fetch, maxRetries: 1 });
+
+		expect(fetch).toHaveBeenCalledOnce();
+		expect(result.stopReason).toBe("error");
+		expect(result.answers).toEqual({});
+	});
+
+	it.each(["onPayload", "onResponse"] as const)("does not retry a %s TypeError", async (hook) => {
+		const fetch = vi.fn(async () => Response.json({ answers: wireAnswers }));
+		const result = await classify(model, context, {
+			apiKey: "secret",
+			fetch,
+			maxRetries: 1,
+			[hook]: () => {
+				throw new TypeError("hook failed");
+			},
+		});
+
+		expect(fetch).toHaveBeenCalledTimes(hook === "onPayload" ? 0 : 1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("hook failed");
+	});
+
 	it("still retries other server errors", async () => {
 		let attempt = 0;
 		const result = await classify(model, context, {

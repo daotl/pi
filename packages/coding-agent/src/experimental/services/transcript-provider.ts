@@ -16,7 +16,12 @@ import {
 	type LaneWatchEvent,
 	reduceLaneSnapshot,
 } from "@earendil-works/pi-agent-core";
-import { type AssistantMessage, type AssistantMessageFrame, AssistantMessageFrameReducer } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	type AssistantMessageFrame,
+	AssistantMessageFrameReducer,
+	type JsonChange,
+} from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { Transcript, type TranscriptEvent, TranscriptStateSchema } from "./transcript.ts";
 
@@ -186,7 +191,12 @@ export function createTranscriptServiceFacet(lane: AgentLane): Facet {
 									streamingMessage !== undefined &&
 									forwarded?.type === "assistant_frame"
 								) {
-									applyFrameMessage(operation, streamingMessage, forwarded.frame);
+									applyFrameMessage(
+										operation,
+										streamingMessage,
+										forwarded.frame,
+										stream.reducer.toolArgumentChanges,
+									);
 								}
 								if (stream && checkpoint) {
 									const current = draft.stream;
@@ -317,11 +327,12 @@ function hydrateStream(snapshot: LaneSnapshot): TranscriptStream | undefined {
 		: undefined;
 }
 
-/** Apply only the frame's touched block; never replace the growing snapshot message per delta. */
+/** Apply touched paths for ordinary deltas; reconcile exceptional and authoritative previews exactly. */
 function applyFrameMessage(
 	operation: Draft<NonNullable<LaneTranscriptSnapshot["operation"]>>,
 	message: AssistantMessage,
 	frame: JsonRepresentation<AssistantMessageFrame>,
+	argumentChanges: readonly JsonChange[] | undefined,
 ): void {
 	if (frame.type === "start") {
 		operation.streamingMessage = copyJson(message, {
@@ -338,6 +349,38 @@ function applyFrameMessage(
 	}
 	if (frame.type === "thinking_delta" && block?.type === "thinking") {
 		appendText(block, "thinking", frame.delta);
+		return;
+	}
+	if (frame.type === "toolcall_delta" && block?.type === "toolCall" && argumentChanges !== undefined) {
+		for (const change of argumentChanges) {
+			if (change.path.length === 0) {
+				if (change.kind === "set") {
+					const value = copyJson(change.value);
+					block.arguments = isJsonRecord(value) ? value : {};
+				}
+				continue;
+			}
+			let parent: JsonValue = block.arguments;
+			for (const part of change.path.slice(0, -1)) {
+				if (typeof parent !== "object" || parent === null || !Object.hasOwn(parent, part))
+					throw new Error("Transcript argument delta has no parent");
+				parent = (parent as Record<string | number, JsonValue>)[part]!;
+			}
+			if (typeof parent !== "object" || parent === null)
+				throw new Error("Transcript argument delta has no container");
+			const key = change.path[change.path.length - 1]!;
+			if (change.kind === "append") {
+				if (Array.isArray(parent)) {
+					const current = parent[Number(key)];
+					if (typeof current !== "string") throw new Error("Transcript argument append has no string");
+					parent[Number(key)] = current + change.text;
+				} else appendText(parent as Draft<Record<string, string>>, String(key), change.text);
+			} else (parent as Record<string | number, JsonValue>)[key] = copyJson(change.value);
+		}
+		if (frame.rawDelta !== undefined) {
+			if (block.raw === undefined) block.raw = frame.rawDelta;
+			else appendText(block as Draft<{ raw: string }>, "raw", frame.rawDelta);
+		}
 		return;
 	}
 	const content = message.content[frame.contentIndex];

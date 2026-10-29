@@ -10,6 +10,8 @@ mod list;
 mod output;
 mod pty;
 mod scan;
+#[cfg(unix)]
+mod special;
 mod sys;
 mod watch;
 mod window;
@@ -47,6 +49,8 @@ const CONTROL_PAYLOAD: usize = 64 * 1024;
 struct FileHandle {
     file: File,
     path: String,
+    #[cfg(unix)]
+    stream: bool,
     /// A failed chunk write poisons a write handle, so later chunks cannot leave a gap.
     failed: AtomicBool,
     /// Chunk writes run one at a time in arrival order, though the client sends several at once.
@@ -106,7 +110,10 @@ impl DirHandle {
             if next_size > frame_limit {
                 self.pending = Some(entry);
                 if entries.is_empty() {
-                    return Err(Failure::new("E2BIG", "directory entry exceeds the frame limit"));
+                    return Err(Failure::new(
+                        "E2BIG",
+                        "directory entry exceeds the frame limit",
+                    ));
                 }
                 break;
             }
@@ -135,6 +142,8 @@ struct Server {
     controls: Mutex<HashMap<u32, Arc<Control>>>,
     groups: exec::Groups,
     terminals: pty::Terminals,
+    #[cfg(unix)]
+    special: Mutex<Option<special::Sender>>,
 }
 
 fn now_ms() -> u64 {
@@ -180,12 +189,25 @@ impl Server {
     }
 
     fn insert_file(&self, file: File, path: &str) -> Result<u64, Failure> {
+        #[cfg(unix)]
+        let stream = special::is_stream(&file);
         self.insert(Handle::File(Arc::new(FileHandle {
             file,
             path: path.to_string(),
+            #[cfg(unix)]
+            stream,
             failed: AtomicBool::new(false),
             serial: Mutex::new(Serial::default()),
         })))
+    }
+
+    fn open_read(&self, file: File, path: &str) -> Result<Value, Failure> {
+        let mut result = match file.metadata() {
+            Ok(metadata) => json!({ "stat": fs::info(path, &metadata) }),
+            Err(error) => json!({ "statError": Failure::io(&error, "fstat", path).to_json() }),
+        };
+        result["handle"] = json!(self.insert_file(file, path)?);
+        Ok(result)
     }
 
     fn dispatch(
@@ -249,18 +271,10 @@ impl Server {
             "open" => {
                 let path = field(json, "path")?;
                 if json["mode"].as_str() == Some("read") {
-                    // Node's `open(path, "r")`: any kind of file, blocking; reads report what the file is.
+                    // Unix read opens are dispatched through the cancellable stream reactor when necessary.
                     let file = sys::open(path, sys::OpenMode::Read)
                         .map_err(|error| Failure::io(&error, "open", path))?;
-                    let stat = match file.metadata() {
-                        Ok(metadata) => json!({ "stat": fs::info(path, &metadata) }),
-                        Err(error) => {
-                            json!({ "statError": Failure::io(&error, "fstat", path).to_json() })
-                        }
-                    };
-                    let mut result = stat;
-                    result["handle"] = json!(self.insert_file(file, path)?);
-                    return plain(Ok(result));
+                    return plain(self.open_read(file, path));
                 }
                 let (file, info) = fs::open_reader(path, flag(json, "noFollow"))?;
                 plain(Ok(
@@ -364,10 +378,16 @@ fn scan_lines(file: &File, path: &str, json: &Value, control: &Control) -> Resul
     }
 }
 
-fn kill_all(groups: &exec::Groups) {
-    for pid in groups.lock().unwrap().iter() {
-        exec::kill_group(*pid);
+fn kill_all(groups: &exec::Groups) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        for pid in groups.lock().unwrap().iter() {
+            exec::kill_group(*pid);
+        }
+        Ok(())
     }
+    #[cfg(windows)]
+    sys::shutdown_jobs(groups)
 }
 
 /// Stdin that records when bytes last arrived, so a large frame arriving slowly counts as a live client.
@@ -405,8 +425,75 @@ fn start_workers() -> Sender<Job> {
 }
 
 fn respond(server: &Server, id: u32, request: Frame, control: Arc<Control>) {
+    #[cfg(unix)]
+    {
+        let prepared = (|| -> Result<Option<special::Operation>, Failure> {
+            match request.json["op"].as_str() {
+                Some("open") if request.json["mode"].as_str() == Some("read") => {
+                    if control.aborted.load(Ordering::SeqCst) {
+                        return Err(Failure::new("aborted", "aborted"));
+                    }
+                    let path = field(&request.json, "path")?;
+                    let slow = std::fs::metadata(path)
+                        .is_ok_and(|metadata| !metadata.is_file() && !metadata.is_dir());
+                    // Metadata chooses a bounded queue only. A real open retains the writer rendezvous.
+                    return Ok(Some(special::Operation::Open {
+                        path: path.to_string(),
+                        slow,
+                    }));
+                }
+                Some("pread") => {
+                    let handle = server.file(&request.json)?;
+                    if handle.stream {
+                        return Ok(Some(special::Operation::Read {
+                            handle,
+                            offset: request.json["offset"].as_u64(),
+                            length: (number(&request.json, "length")? as usize)
+                                .min(frame::MAX_PAYLOAD),
+                        }));
+                    }
+                }
+                _ => {}
+            }
+            Ok(None)
+        })();
+        match prepared {
+            Ok(Some(operation)) => {
+                let pending = special::Request {
+                    id,
+                    control,
+                    operation,
+                };
+                let queued = match server.special.lock().unwrap().as_ref() {
+                    Some(sender) => sender
+                        .try_send(pending)
+                        .map_err(|_| Failure::new("EMFILE", "too many pending stream requests")),
+                    None => Err(Failure::new("EIO", "stream reactor is unavailable")),
+                };
+                if let Err(failure) = queued {
+                    finish_response(server, id, false, Err(failure));
+                }
+                return;
+            }
+            Err(failure) => {
+                finish_response(server, id, false, Err(failure));
+                return;
+            }
+            Ok(None) => {}
+        }
+    }
     let is_exec = matches!(request.json["op"].as_str(), Some("exec" | "pty"));
-    let reply = match server.dispatch(id, &request.json, request.payload, &control) {
+    let result = server.dispatch(id, &request.json, request.payload, &control);
+    finish_response(server, id, is_exec, result);
+}
+
+fn finish_response(
+    server: &Server,
+    id: u32,
+    is_exec: bool,
+    result: Result<(Value, Vec<u8>), Failure>,
+) {
+    let reply = match result {
         Ok((json, payload)) => Frame::with_payload(RESULT, id, json, payload),
         Err(failure) => Frame::new(ERROR, id, failure.to_json()),
     };
@@ -515,6 +602,8 @@ fn serve_frames(server: &Arc<Server>, input: &mut impl Read) -> io::Result<()> {
 }
 
 fn serve(token: &str) -> io::Result<()> {
+    #[cfg(unix)]
+    special::install_interrupt()?;
     {
         let mut stdout = io::stdout().lock();
         writeln!(stdout, "PI-ENV {token}")?;
@@ -535,7 +624,13 @@ fn serve(token: &str) -> io::Result<()> {
         controls: Mutex::new(HashMap::new()),
         groups: Arc::new(Mutex::new(Default::default())),
         terminals: Arc::new(Mutex::new(HashMap::new())),
+        #[cfg(unix)]
+        special: Mutex::new(None),
     });
+    #[cfg(unix)]
+    {
+        *server.special.lock().unwrap() = Some(special::start(Arc::downgrade(&server)));
+    }
     let last_seen = Arc::new(AtomicU64::new(now_ms()));
     {
         let output = output.clone();
@@ -549,7 +644,10 @@ fn serve(token: &str) -> io::Result<()> {
                 // A client that went silent (a phone that lost its network) leaves nothing running.
                 if now_ms().saturating_sub(last_seen.load(Ordering::Relaxed)) > SILENCE_LIMIT_MS {
                     pty::kill_all(&terminals);
-                    kill_all(&groups);
+                    if let Err(error) = kill_all(&groups) {
+                        eprintln!("pi-env: failed to clean process trees: {error}");
+                        std::process::exit(1);
+                    }
                     std::process::exit(0);
                 }
             }
@@ -565,10 +663,10 @@ fn serve(token: &str) -> io::Result<()> {
     let result = serve_frames(&server, &mut input);
     // However input ended, the client is gone: stop everything it started.
     pty::kill_all(&server.terminals);
-    kill_all(&server.groups);
+    let cleanup = kill_all(&server.groups);
     output.close();
     let _ = writer.join();
-    result
+    result.and(cleanup)
 }
 
 fn main() {
@@ -587,7 +685,7 @@ fn main() {
                 eprintln!("pi-env: {error}");
                 std::process::exit(1);
             }
-            // Request threads may still be blocked (a FIFO open); nothing is left to answer them.
+            // Request threads may still be blocked in a filesystem write; the client is gone.
             std::process::exit(0);
         }
         Some("--version") => println!("pi-env {VERSION}"),
@@ -604,7 +702,12 @@ mod tests {
 
     #[test]
     fn directory_pages_fit_encoded_frames_without_losing_the_carried_entry() {
-        let path = sys::mkdtemp(&format!("{}{}pi-env-readdir-", sys::tmpdir(), sys::PATH_SEPARATOR)).unwrap();
+        let path = sys::mkdtemp(&format!(
+            "{}{}pi-env-readdir-",
+            sys::tmpdir(),
+            sys::PATH_SEPARATOR
+        ))
+        .unwrap();
         let names = ["first", "second", "third"];
         for name in names {
             std::fs::write(std::path::Path::new(&path).join(name), "").unwrap();
@@ -614,9 +717,15 @@ mod tests {
             .map(|entry| fs::dir_entry(&path, &entry.unwrap().file_name()))
             .collect();
         // The byte limit fits any one entry but cannot fit two, with no giant directory fixture.
-        let limit = expected.iter().map(|entry| {
-            9 + serde_json::to_vec(&json!({ "entries": [entry], "done": false })).unwrap().len()
-        }).max().unwrap();
+        let limit = expected
+            .iter()
+            .map(|entry| {
+                9 + serde_json::to_vec(&json!({ "entries": [entry], "done": false }))
+                    .unwrap()
+                    .len()
+            })
+            .max()
+            .unwrap();
         let mut dir = DirHandle {
             entries: sys::read_dir(&path).unwrap(),
             path: path.clone(),
@@ -634,7 +743,10 @@ mod tests {
             }
         }
         assert!(done);
-        let mut actual_names: Vec<_> = actual.iter().map(|entry| entry["name"].as_str().unwrap()).collect();
+        let mut actual_names: Vec<_> = actual
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
         actual_names.sort();
         assert_eq!(actual_names, names);
         drop(dir);
@@ -643,9 +755,16 @@ mod tests {
 
     #[test]
     fn a_single_oversized_directory_entry_returns_a_request_error() {
-        let path = sys::mkdtemp(&format!("{}{}pi-env-readdir-", sys::tmpdir(), sys::PATH_SEPARATOR)).unwrap();
+        let path = sys::mkdtemp(&format!(
+            "{}{}pi-env-readdir-",
+            sys::tmpdir(),
+            sys::PATH_SEPARATOR
+        ))
+        .unwrap();
         let entry = json!({ "name": "quotes\" and newline\n and unicode é", "error": { "code": "ENOENT" } });
-        let limit = 9 + serde_json::to_vec(&json!({ "entries": [&entry], "done": false })).unwrap().len();
+        let limit = 9 + serde_json::to_vec(&json!({ "entries": [&entry], "done": false }))
+            .unwrap()
+            .len();
         let mut dir = DirHandle {
             entries: sys::read_dir(&path).unwrap(),
             path: path.clone(),
@@ -654,7 +773,10 @@ mod tests {
         assert_eq!(dir.read_page(1, limit - 1).unwrap_err().code, "E2BIG");
         let page = dir.read_page(1, limit).unwrap();
         assert_eq!(page, json!({ "entries": [entry], "done": false }));
-        assert_eq!(dir.read_page(1, limit).unwrap(), json!({ "entries": [], "done": true }));
+        assert_eq!(
+            dir.read_page(1, limit).unwrap(),
+            json!({ "entries": [], "done": true })
+        );
         drop(dir);
         std::fs::remove_dir_all(path).unwrap();
     }

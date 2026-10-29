@@ -10,14 +10,18 @@ use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::FileExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
-use std::os::windows::process::CommandExt;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::OnceLock;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::UNIX_EPOCH;
-use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, UNIX_EPOCH};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0,
+};
+use windows_sys::Win32::Globalization::CompareStringOrdinal;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_ALWAYS, CreateFileW, FILE_APPEND_DATA,
     FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -27,12 +31,19 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
-    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectExtendedLimitInformation, SetInformationJobObject,
+    CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject,
 };
-use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+use windows_sys::Win32::System::Threading::{
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+};
 
 /// libuv's `uv_translate_sys_error` for the errors file and process operations produce.
 pub fn os_error_name(error: &io::Error) -> &'static str {
@@ -273,7 +284,7 @@ pub fn read_pipe(mut pipe: impl Pipe, stop: &AtomicBool, mut on_data: impl FnMut
 }
 
 /// Feed stdin on its own thread, checking stop between bounded writes.
-pub fn write_stdin(mut pipe: std::process::ChildStdin, mut bytes: &[u8], stop: &AtomicBool) {
+pub fn write_stdin(mut pipe: io::PipeWriter, mut bytes: &[u8], stop: &AtomicBool) {
     use std::io::Write;
     while !bytes.is_empty() && !stop.load(Ordering::SeqCst) {
         match pipe.write(&bytes[..bytes.len().min(64 * 1024)]) {
@@ -327,7 +338,10 @@ pub fn resolve_program(
             .map(|(_, value)| value)
             .unwrap_or_default();
         std::iter::once(std::path::PathBuf::from(cwd))
-            .chain(std::env::split_paths(&path_variable).map(|directory| Path::new(cwd).join(directory)))
+            .chain(
+                std::env::split_paths(&path_variable)
+                    .map(|directory| Path::new(cwd).join(directory)),
+            )
             .flat_map(|directory| candidates(&directory.join(program)))
             .find(|path| path.is_file())
     };
@@ -355,20 +369,19 @@ fn is_legacy_wsl_bash(path: &str) -> bool {
         )
 }
 
-fn bash_config(program: &str) -> ShellConfig {
-    if is_legacy_wsl_bash(program) {
-        ShellConfig {
-            program: program.into(),
-            args: vec!["-s".into()],
-            command_on_stdin: true,
-        }
-    } else {
-        ShellConfig {
-            program: program.into(),
-            args: vec!["-c".into()],
-            command_on_stdin: false,
-        }
-    }
+fn bash_config(program: &str) -> Result<ShellConfig, Failure> {
+    // shell_config validates paths against the daemon's cwd. Anchor that selected executable now,
+    // before exec's cwd or PATH can reinterpret a relative configured shell as another program.
+    let program = std::path::absolute(program)
+        .map_err(|error| Failure::new("shell_unavailable", error.to_string()))?
+        .to_string_lossy()
+        .into_owned();
+    let command_on_stdin = is_legacy_wsl_bash(&program);
+    Ok(ShellConfig {
+        program,
+        args: vec![if command_on_stdin { "-s" } else { "-c" }.into()],
+        command_on_stdin,
+    })
 }
 
 fn where_bash() -> Option<String> {
@@ -395,7 +408,7 @@ fn where_bash() -> Option<String> {
 pub fn shell_config(shell_path: Option<&str>) -> Result<ShellConfig, Failure> {
     if let Some(configured) = shell_path {
         if path_exists(configured) {
-            return Ok(bash_config(configured));
+            return bash_config(configured);
         }
         return Err(Failure::new(
             "shell_unavailable",
@@ -409,10 +422,10 @@ pub fn shell_config(shell_path: Option<&str>) -> Result<ShellConfig, Failure> {
         }
     }
     if let Some(found) = candidates.iter().find(|candidate| path_exists(candidate)) {
-        return Ok(bash_config(found));
+        return bash_config(found);
     }
     if let Some(found) = where_bash() {
-        return Ok(bash_config(&found));
+        return bash_config(&found);
     }
     let searched: String = candidates
         .iter()
@@ -510,68 +523,355 @@ fn child_environment(env: &Map<String, Value>, inherit_env: bool) -> Vec<(String
     entries
 }
 
-/// Arguments quoted as libuv quotes them, Node's environment, and a hidden console.
-pub fn configure(
-    command: &mut Command,
-    args: &[String],
-    env: &Map<String, Value>,
-    inherit_env: bool,
-) {
-    for argument in args {
-        command.raw_arg(quote_argument(argument));
-    }
-    command.env_clear();
-    for (key, value) in child_environment(env, inherit_env) {
-        command.env(key, value);
-    }
-    command.creation_flags(CREATE_NO_WINDOW);
+/// Jobs remain registered until their entire tree has terminated, not just until the leader exits.
+/// The same lock gates process creation and shutdown, including a request still preparing its pipes.
+#[derive(Default)]
+pub struct Jobs {
+    stopping: bool,
+    jobs: Vec<Arc<Job>>,
 }
 
-/// libuv puts every child it starts into one job that ends its processes when the daemon exits.
-fn job() -> Option<isize> {
-    static JOB: OnceLock<Option<isize>> = OnceLock::new();
-    *JOB.get_or_init(|| {
-        // SAFETY: plain Win32 calls with a zeroed, correctly sized information struct.
-        unsafe {
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job.is_null() {
-                return None;
-            }
-            let mut information: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK
-                | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
-                | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
-                | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+pub type ProcessGroups = Arc<Mutex<Jobs>>;
+
+/// An unnamed, noninheritable job belonging to exactly one exec request.
+pub struct Job {
+    handle: OwnedHandle,
+}
+
+impl Job {
+    fn new() -> io::Result<Self> {
+        // SAFETY: null attributes create a noninheritable handle; a null name creates a private job.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateJobObjectW returned a new owned handle.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+        let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        // No breakaway permission: descendants stay in this job, including nested-job descendants.
+        information.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: a valid job and a correctly sized, initialized information structure.
+        if unsafe {
             SetInformationJobObject(
-                job,
+                handle.as_raw_handle(),
                 JobObjectExtendedLimitInformation,
                 (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            );
-            Some(job as isize)
+                std::mem::size_of_val(&information) as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
         }
-    })
-}
+        Ok(Self { handle })
+    }
 
-pub fn after_spawn(child: &Child) {
-    if let Some(job) = job() {
-        // SAFETY: both handles are valid for the duration of the call.
-        unsafe {
-            AssignProcessToJobObject(job as _, child.as_raw_handle() as _);
+    /// Termination is asynchronous. Join job accounting, which includes descendants and nested jobs,
+    /// rather than waiting on the leader or assuming that requesting termination completed it.
+    pub fn terminate_and_wait(&self) -> io::Result<()> {
+        // SAFETY: this job owns its handle for the entire call, including concurrent shutdown.
+        if unsafe { TerminateJobObject(self.handle.as_raw_handle(), 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        loop {
+            let mut information = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            // SAFETY: a live job handle and a correctly sized writable accounting structure.
+            if unsafe {
+                QueryInformationJobObject(
+                    self.handle.as_raw_handle(),
+                    JobObjectBasicAccountingInformation,
+                    (&mut information as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    std::mem::size_of_val(&information) as u32,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if information.ActiveProcesses == 0 {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 }
 
-/// Node's `killProcessTree` on Windows: `taskkill /F /T`, not waited for.
-pub fn kill_tree(pid: u32) {
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
-    let _ = Command::new(format!("{system_root}\\System32\\taskkill.exe"))
-        .args(["/F", "/T", "/PID", &pid.to_string()])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+/// Finish even a normally exited leader's remaining descendants before unregistering the command.
+pub fn finish_job(groups: &ProcessGroups, job: &Arc<Job>) -> io::Result<()> {
+    job.terminate_and_wait()?;
+    groups
+        .lock()
+        .map_err(|_| io::Error::other("process ownership lock poisoned"))?
+        .jobs
+        .retain(|active| !Arc::ptr_eq(active, job));
+    Ok(())
+}
+
+/// Prevent new processes first, then synchronously join every command's actual job tree.
+pub fn shutdown_jobs(groups: &ProcessGroups) -> io::Result<()> {
+    let mut groups = groups
+        .lock()
+        .map_err(|_| io::Error::other("process ownership lock poisoned"))?;
+    groups.stopping = true;
+    let mut failure = None;
+    for job in &groups.jobs {
+        if let Err(error) = job.terminate_and_wait() {
+            failure.get_or_insert(error);
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Synchronous pipes match the daemon's interruptible reader and writer workers.
+pub struct Child {
+    process: OwnedHandle,
+    pub job: Arc<Job>,
+    pub stdin: Option<io::PipeWriter>,
+    pub stdout: Option<io::PipeReader>,
+    pub stderr: Option<io::PipeReader>,
+}
+
+impl Child {
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.stdin.take();
+        // SAFETY: this child retains the process handle throughout both calls.
+        if unsafe { WaitForSingleObject(self.process.as_raw_handle(), INFINITE) } != WAIT_OBJECT_0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut code = 0;
+        // SAFETY: a live process handle, now signaled, and writable exit-code storage.
+        if unsafe { GetExitCodeProcess(self.process.as_raw_handle(), &mut code) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ExitStatus::from_raw(code))
+    }
+}
+
+struct Attributes(Vec<usize>);
+
+impl Attributes {
+    fn new() -> io::Result<Self> {
+        let mut bytes = 0;
+        // SAFETY: the documented sizing call deliberately passes a null buffer.
+        unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut bytes) };
+        if bytes == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Pointer-aligned backing storage for the opaque attribute list.
+        let mut storage = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
+        // SAFETY: the buffer is aligned and at least the size returned by the sizing call.
+        if unsafe {
+            InitializeProcThreadAttributeList(storage.as_mut_ptr().cast(), 2, 0, &mut bytes)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(storage))
+    }
+
+    fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.0.as_mut_ptr().cast()
+    }
+}
+
+impl Drop for Attributes {
+    fn drop(&mut self) {
+        // SAFETY: only successfully initialized lists construct Attributes.
+        unsafe { DeleteProcThreadAttributeList(self.as_mut_ptr()) };
+    }
+}
+
+fn inheritable(handle: &OwnedHandle) -> io::Result<OwnedHandle> {
+    let mut duplicate = std::ptr::null_mut();
+    // SAFETY: duplicate a live handle into this process; only the new duplicate is inheritable.
+    if unsafe {
+        let process = GetCurrentProcess();
+        DuplicateHandle(
+            process,
+            handle.as_raw_handle(),
+            process,
+            &mut duplicate,
+            0,
+            1,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: DuplicateHandle returned a new owned handle.
+    Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
+}
+
+/// CreateProcess's job-list attribute installs ownership atomically, before any child instruction.
+/// A suspended spawn followed by assignment would still leak a suspended process if the daemon
+/// died between those calls. Unsupported job-list or nesting configurations fail closed instead.
+pub fn spawn_process(
+    program: &str,
+    args: &[String],
+    cwd: &str,
+    env: &Map<String, Value>,
+    inherit_env: bool,
+    piped_stdin: bool,
+    groups: &ProcessGroups,
+) -> io::Result<Child> {
+    let program = resolve_program(program, cwd, env, inherit_env)
+        .map_err(|failure| io::Error::new(io::ErrorKind::NotFound, failure.message))?;
+    let application = wide(&program)?;
+    let mut line = quote_argument(&program);
+    for argument in args {
+        line.push(' ');
+        line.push_str(&quote_argument(argument));
+    }
+    let mut line = wide(&line)?;
+    // GetFullPathName-style normalization preserves junction/symlink spelling and drive identity.
+    let cwd = std::path::absolute(cwd)?;
+    let cwd = cwd.to_string_lossy();
+    let cwd = if let Some(unc) = cwd.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{unc}")
+    } else {
+        cwd.strip_prefix("\\\\?\\").unwrap_or(&cwd).to_string()
+    };
+    let cwd = wide(&cwd)?;
+    let mut entries = Vec::new();
+    for (key, value) in child_environment(env, inherit_env) {
+        // Node chooses case-duplicate names above; std::Command previously supplied the final
+        // case-insensitive Windows ordering and NUL rejection when serializing this block.
+        if key.contains('\0') || value.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid environment variable",
+            ));
+        }
+        entries.push((wide(&key)?, value));
+    }
+    let mut sort_error = None;
+    entries.sort_by(|(a, _), (b, _)| {
+        // SAFETY: both keys are NUL-terminated UTF-16 strings alive for this comparison.
+        let order = unsafe { CompareStringOrdinal(a.as_ptr(), -1, b.as_ptr(), -1, 1) };
+        if order == 0 {
+            sort_error = Some(io::Error::last_os_error());
+        }
+        order.cmp(&2)
+    });
+    if let Some(error) = sort_error {
+        return Err(error);
+    }
+    let mut environment = Vec::new();
+    for (mut key, value) in entries {
+        key.pop();
+        environment.extend(key);
+        environment.push(b'=' as u16);
+        environment.extend(value.encode_utf16());
+        environment.push(0);
+    }
+    if environment.is_empty() {
+        environment.push(0);
+    }
+    environment.push(0);
+
+    let job = Arc::new(Job::new()?);
+    let (stdin_child, stdin) = if piped_stdin {
+        let (reader, writer) = io::pipe()?;
+        (OwnedHandle::from(reader), Some(writer))
+    } else {
+        (OwnedHandle::from(File::open("NUL")?), None)
+    };
+    let (stdout, stdout_child) = io::pipe()?;
+    let (stderr, stderr_child) = io::pipe()?;
+    let stdin_child = inheritable(&stdin_child)?;
+    let stdout_child = inheritable(&OwnedHandle::from(stdout_child))?;
+    let stderr_child = inheritable(&OwnedHandle::from(stderr_child))?;
+    let handles: [HANDLE; 3] = [
+        stdin_child.as_raw_handle(),
+        stdout_child.as_raw_handle(),
+        stderr_child.as_raw_handle(),
+    ];
+    let jobs: [HANDLE; 1] = [job.handle.as_raw_handle()];
+    let mut attributes = Attributes::new()?;
+    for (attribute, values) in [
+        (PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles.as_slice()),
+        (PROC_THREAD_ATTRIBUTE_JOB_LIST, jobs.as_slice()),
+    ] {
+        // SAFETY: both arrays and their handles outlive the attribute list. The job is deliberately
+        // absent from HANDLE_LIST, so descendants cannot keep kill-on-close ownership alive.
+        if unsafe {
+            UpdateProcThreadAttribute(
+                attributes.as_mut_ptr(),
+                0,
+                attribute as usize,
+                values.as_ptr().cast(),
+                std::mem::size_of_val(values),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "Windows exec requires Windows 10 / Server 2016 or newer and compatible job nesting (process attribute {attribute}): {error}",
+                ),
+            ));
+        }
+    }
+    let mut startup = STARTUPINFOEXW::default();
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = handles[0];
+    startup.StartupInfo.hStdOutput = handles[1];
+    startup.StartupInfo.hStdError = handles[2];
+    startup.lpAttributeList = attributes.as_mut_ptr();
+    let mut information = PROCESS_INFORMATION::default();
+    let mut groups = groups
+        .lock()
+        .map_err(|_| io::Error::other("process ownership lock poisoned"))?;
+    if groups.stopping {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "the connection has ended",
+        ));
+    }
+    // SAFETY: all strings, environment, attribute values and inherited handles remain live through
+    // CreateProcessW. JOB_LIST assigns the job as part of process creation, not afterwards.
+    if unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+            environment.as_ptr().cast(),
+            cwd.as_ptr(),
+            &startup.StartupInfo,
+            &mut information,
+        )
+    } == 0
+    {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "CreateProcessW with mandatory command job failed; Windows 10 / Server 2016 or newer and compatible job nesting are required: {error}",
+            ),
+        ));
+    }
+    // SAFETY: successful CreateProcessW returned two newly owned handles.
+    let process = unsafe { OwnedHandle::from_raw_handle(information.hProcess) };
+    let _thread = unsafe { OwnedHandle::from_raw_handle(information.hThread) };
+    groups.jobs.push(job.clone());
+    Ok(Child {
+        process,
+        job,
+        stdin,
+        stdout: Some(stdout),
+        stderr: Some(stderr),
+    })
 }
 
 /// Exit codes are unsigned 32-bit values on Windows (an access violation is 3221225477).
@@ -682,7 +982,11 @@ mod tests {
         use std::path::Path;
         use std::process::Command;
 
-        let root = mkdtemp(&format!("{}\\pi-env-program-", std::env::temp_dir().display())).unwrap();
+        let root = mkdtemp(&format!(
+            "{}\\pi-env-program-",
+            std::env::temp_dir().display()
+        ))
+        .unwrap();
         let tools = Path::new(&root).join("tools");
         std::fs::create_dir(&tools).unwrap();
         let source = Path::new(&std::env::var_os("SystemRoot").unwrap()).join("System32\\cmd.exe");
@@ -691,18 +995,27 @@ mod tests {
         std::fs::copy(&source, &executable).unwrap();
         for path in ["tools".to_string(), tools.to_string_lossy().into_owned()] {
             let env = json!({ "Path": path, "PATHEXT": ".CMD" });
-            let resolved = resolve_program(program, &root, env.as_object().unwrap(), false).unwrap();
+            let resolved =
+                resolve_program(program, &root, env.as_object().unwrap(), false).unwrap();
             assert!(Path::new(&resolved).is_absolute());
             assert_eq!(Path::new(&resolved), executable);
-            let status = Command::new(&resolved).current_dir(&root).args(["/D", "/C", "exit 23"]).status().unwrap();
+            let status = Command::new(&resolved)
+                .current_dir(&root)
+                .args(["/D", "/C", "exit 23"])
+                .status()
+                .unwrap();
             assert_eq!(status.code(), Some(23));
         }
         let local = Path::new(&root).join(format!("{program}.exe"));
         std::fs::copy(&source, &local).unwrap();
         let env = json!({ "PATH": ";missing;" });
-        assert_eq!(Path::new(&resolve_program(program, &root, env.as_object().unwrap(), false).unwrap()), local);
+        assert_eq!(
+            Path::new(&resolve_program(program, &root, env.as_object().unwrap(), false).unwrap()),
+            local
+        );
         std::fs::write(Path::new(&root).join("batch.cmd"), "exit /b 0").unwrap();
-        let error = resolve_program("batch.cmd", &root, env.as_object().unwrap(), false).unwrap_err();
+        let error =
+            resolve_program("batch.cmd", &root, env.as_object().unwrap(), false).unwrap_err();
         assert_eq!(error.code, "spawn_error");
         assert_eq!(error.message, "spawn batch.cmd EINVAL");
         std::fs::remove_dir_all(root).unwrap();

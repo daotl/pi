@@ -53,6 +53,7 @@ jobs:
       contents: read
     outputs:
       revision: ${{ steps.pin.outputs.revision }}
+      generatedAt: ${{ steps.pin.outputs.generatedAt }}
       updated: ${{ steps.pin.outputs.updated }}
     steps:
       - name: Checkout
@@ -74,7 +75,9 @@ jobs:
             node scripts/update-model-catalog-pin.mjs --if-stale
           fi
           revision="$(node -p 'require("./nix/model-catalog.json").revision')"
+          generated_at="$(node -p 'require("./nix/model-catalog.json").generatedAt')"
           echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
+          echo "generatedAt=${generated_at}" >> "${GITHUB_OUTPUT}"
           if git diff --quiet -- nix/model-catalog.json; then
             echo "updated=false" >> "${GITHUB_OUTPUT}"
           else
@@ -108,10 +111,12 @@ jobs:
           persist-credentials: false
 
       - name: Use the resolved model catalog pin
+        if: ${{ github.ref_type != 'tag' }}
         env:
           REVISION: ${{ needs.pin.outputs.revision }}
+          GENERATED_AT: ${{ needs.pin.outputs.generatedAt }}
         run: |
-          printf '{\n  "revision": "%s"\n}\n' "${REVISION}" > nix/model-catalog.json
+          printf '{\n  "revision": "%s",\n  "generatedAt": "%s"\n}\n' "${REVISION}" "${GENERATED_AT}" > nix/model-catalog.json
 
       - name: Install Nix
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
@@ -168,11 +173,12 @@ jobs:
       - name: Commit and push the model catalog pin
         env:
           REVISION: ${{ needs.pin.outputs.revision }}
+          GENERATED_AT: ${{ needs.pin.outputs.generatedAt }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          printf '{\n  "revision": "%s"\n}\n' "${REVISION}" > nix/model-catalog.json
+          printf '{\n  "revision": "%s",\n  "generatedAt": "%s"\n}\n' "${REVISION}" "${GENERATED_AT}" > nix/model-catalog.json
           git add nix/model-catalog.json
           if git diff --staged --quiet; then
             echo "Model catalog pin is already ${REVISION}."

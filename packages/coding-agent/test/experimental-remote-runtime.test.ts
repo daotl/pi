@@ -2,11 +2,11 @@ import { lstat, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHost, type Frame, hostNamed, method, remote } from "@earendil-works/chord";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import { Client, ServerError as ClientServerError } from "@earendil-works/pi-client";
 import { createUnixTransportFactory } from "@earendil-works/pi-client/unix";
 import { Type } from "typebox";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, type Mock, test, vi } from "vitest";
 import { ExampleFacetService } from "../examples/plugins/pi-example-plugin/src/contract.ts";
 import { runClient } from "../src/experimental/client.ts";
 import { activateBuiltinClientServices, openClientRuntime } from "../src/experimental/client-runtime.ts";
@@ -108,6 +108,138 @@ afterEach(async () => {
 });
 
 describe("experimental durable server composition", () => {
+	test.each([Models, AgentController, Transcript])(
+		"cancels pending %s acquisition without publishing capabilities",
+		async (pending) => {
+			const { runtime } = await makeServer();
+			const clientRuntime = await openClientRuntime({
+				command: "client",
+				connect: { transport: "unix", path: runtime.socketPath },
+			});
+			const runtimeServer = clientRuntime.servers[0]!;
+			const server = await activateBuiltinClientServices(runtimeServer);
+			const host = server.server.host;
+			const get = host.get.bind(host);
+			const entered = Promise.withResolvers<void>();
+			const delayed = Promise.withResolvers<void>();
+			const releases: Mock[] = [];
+			const spy = vi.spyOn(host, "get").mockImplementation(async (contract, input, options) => {
+				if (contract.name === pending.name) {
+					entered.resolve();
+					await new Promise<void>((resolve, reject) => {
+						const abort = () => reject(options?.signal?.reason);
+						options?.signal?.addEventListener("abort", abort, { once: true });
+						void delayed.promise.then(() => {
+							options?.signal?.removeEventListener("abort", abort);
+							resolve();
+						});
+						if (options?.signal?.aborted) abort();
+					});
+				}
+				const reference = await get(contract, input, options);
+				if ([Models.name, AgentController.name, Transcript.name].includes(contract.name)) {
+					const release = reference.release.bind(reference);
+					const observed = vi.fn(release);
+					reference.release = observed;
+					releases.push(observed);
+				}
+				return reference;
+			});
+			const controller = new AbortController();
+			const reason = new Error("cancel capability readiness");
+			try {
+				const attach = host.root((ctx) => server.management.attach("demo-1", ctx), { signal: controller.signal });
+				const observed = expect(attach).rejects.toBe(reason);
+				await entered.promise;
+				controller.abort(reason);
+				await observed;
+				for (const release of releases) expect(release).toHaveBeenCalledOnce();
+				expect(() => server.models).toThrow("No Session is attached");
+				expect(() => server.agent).toThrow("No Session is attached");
+				expect(() => server.transcript).toThrow("No Session is attached");
+			} finally {
+				delayed.resolve();
+				spy.mockRestore();
+				await clientRuntime.dispose();
+			}
+		},
+	);
+
+	test("cancels one attachment waiter without cancelling shared hydration", async ({ onTestFinished }) => {
+		const { runtime } = await makeServer();
+		const client = await Client.connect({
+			serverId: runtime.serverId,
+			transportFactory: createUnixTransportFactory({ path: runtime.socketPath }),
+		});
+		clients.add(client);
+		const source = createSessionServiceSource(client);
+		const delayed = Promise.withResolvers<void>();
+		const get = source.host.get.bind(source.host);
+		const spy = vi.spyOn(source.host, "get").mockImplementation(async (contract, input, options) => {
+			if (contract.name === SessionPlugins.name) await delayed.promise;
+			return get(contract, input, options);
+		});
+		onTestFinished(() => spy.mockRestore());
+		try {
+			await attachSession(client, "demo-1");
+			const controller = new AbortController();
+			const reason = new Error("cancel individual waiter");
+			const cancelled = source.whenAttached("demo-1", withAbortSignal(controller.signal, BACKGROUND_CONTEXT));
+			const observed = expect(cancelled).rejects.toBe(reason);
+			const retained = source.whenAttached("demo-1", BACKGROUND_CONTEXT);
+			controller.abort(reason);
+			await observed;
+			expect(source.attachment.value).toEqual({ status: "attaching", sessionId: "demo-1" });
+			delayed.resolve();
+			await retained;
+			expect(source.attachment.value).toEqual({ status: "attached", sessionId: "demo-1" });
+		} finally {
+			delayed.resolve();
+			await source.dispose(BACKGROUND_CONTEXT);
+		}
+	});
+
+	test.each([false, true])("joins final presentation host cleanup and propagates failure (%s)", async (reject) => {
+		const { runtime } = await makeServer();
+		const clientRuntime = await openClientRuntime({
+			command: "client",
+			connect: { transport: "unix", path: runtime.socketPath },
+		});
+		const host = clientRuntime.servers[0]!.server.host;
+		const entered = Promise.withResolvers<void>();
+		const cleanup = Promise.withResolvers<void>();
+		const close = host.close.bind(host);
+		const spy = vi.spyOn(host, "close").mockImplementation(async () => {
+			entered.resolve();
+			await cleanup.promise;
+			await close();
+		});
+		const failure = new Error("presentation cleanup failed");
+		let settled = false;
+		const disposal = clientRuntime.dispose();
+		void disposal.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		const observed = reject ? expect(disposal).rejects.toBe(failure) : expect(disposal).resolves.toBeUndefined();
+		try {
+			await entered.promise;
+			await Promise.resolve();
+			expect(settled).toBe(false);
+			if (reject) cleanup.reject(failure);
+			else cleanup.resolve();
+			await observed;
+		} finally {
+			cleanup.resolve();
+			spy.mockRestore();
+			await close();
+		}
+	});
+
 	test("uses PI_SERVER_DIR and PI_SERVER_ID", async () => {
 		const directory = await mkdtemp(join("/tmp", "pi-server-dir-"));
 		directories.add(directory);

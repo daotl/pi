@@ -81,6 +81,23 @@ fn relative(root: &Path, path: &Path) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+fn hidden(entry: &ignore::DirEntry) -> bool {
+    if entry.file_name().as_encoded_bytes().starts_with(b".") {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        return entry.metadata().is_ok_and(|metadata| {
+            metadata.file_attributes()
+                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN
+                != 0
+        });
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 /// List `root` depth first, siblings in byte order of their names. Stops with `truncated` at the first entry beyond
 /// a bound; fails with `aborted` once `aborted()` is true. Entries that cannot be read are skipped.
 pub fn list(root: &str, options: &Options, aborted: &dyn Fn() -> bool) -> Result<Listing, Failure> {
@@ -94,6 +111,7 @@ pub fn list(root: &str, options: &Options, aborted: &dyn Fn() -> bool) -> Result
     }
     let root_path = Path::new(root);
     let exclude = options.exclude.clone();
+    let include_hidden = options.hidden;
     let walk = WalkBuilder::new(root_path)
         .hidden(!options.hidden)
         .ignore(false)
@@ -107,8 +125,13 @@ pub fn list(root: &str, options: &Options, aborted: &dyn Fn() -> bool) -> Result
         .current_dir(root_path)
         .sort_by_file_name(|a, b| a.cmp(b))
         .filter_entry(move |entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
             let name = entry.file_name();
-            name != ".git" && !exclude.iter().any(|excluded| excluded == name)
+            (include_hidden || !hidden(entry))
+                && name != ".git"
+                && !exclude.iter().any(|excluded| excluded == name)
         })
         .build();
     let started = Instant::now();
@@ -299,6 +322,58 @@ mod tests {
         // A subdirectory of a work tree applies the rules of its parents.
         let sub = list(&tree.0.join("sub").to_string_lossy(), &options(), &|| false).unwrap();
         assert_eq!(sub.payload, b"f.gitignore\0fkeep.txt\0");
+    }
+
+    #[test]
+    fn hidden_filter_overrides_gitignore_whitelists_but_not_the_root() {
+        let tree = Tree::new(&[".env", ".config/child", "visible"]);
+        tree.write(".git/HEAD", "ref: refs/heads/main\n");
+        tree.write(".gitignore", "!.env\n!.config/\n");
+        let (entries, _) = tree.list(Options {
+            hidden: false,
+            ..options()
+        });
+        assert_eq!(entries, ["f visible"]);
+        let (entries, _) = tree.list(options());
+        assert!(entries.contains(&"f .env".to_string()));
+        assert!(entries.contains(&"f .config/child".to_string()));
+        let root = tree.0.join(".config");
+        let listing = list(
+            &root.to_string_lossy(),
+            &Options {
+                hidden: false,
+                ..options()
+            },
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(listing.payload, b"fchild\0");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hidden_attributes_override_whitelists_and_preserve_root_traversal() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
+        let tree = Tree::new(&["secret", "private/child", "visible"]);
+        tree.write(".git/HEAD", "ref: refs/heads/main\n");
+        tree.write(".gitignore", "!secret\n!private/\n");
+        for path in [&tree.0, &tree.0.join("secret"), &tree.0.join("private")] {
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            // SAFETY: the path is NUL-terminated and points to a fixture owned by this test.
+            assert_ne!(
+                unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN) },
+                0
+            );
+        }
+        let (entries, _) = tree.list(Options {
+            hidden: false,
+            ..options()
+        });
+        assert_eq!(entries, ["f visible"]);
+        let (entries, _) = tree.list(options());
+        assert!(entries.contains(&"f secret".to_string()));
+        assert!(entries.contains(&"f private/child".to_string()));
     }
 
     #[cfg(unix)]
