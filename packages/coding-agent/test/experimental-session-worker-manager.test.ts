@@ -420,9 +420,11 @@ describe("Session worker native channels", () => {
 		});
 		const entered = Promise.withResolvers<void>();
 		const cancelled = Promise.withResolvers<void>();
+		const closedScopes: (typeof scope)[] = [];
 		const services = await createSessionWorkerServices({
 			lane: createServiceLane(),
 			modelRuntime: undefined,
+			onAttachmentClosed: (closedScope) => closedScopes.push(closedScope),
 			facetLoader: async () => ({
 				facets: [
 					{
@@ -497,6 +499,10 @@ describe("Session worker native channels", () => {
 			);
 			await waiting;
 			await cancelled.promise;
+			expect(closedScopes).toEqual([scope]);
+			// Repeated demand cannot resurrect this closed attachment; late calls are ignored.
+			services.attach(scope);
+			expect(services.receive(scope, { t: "ping", n: 99 })).toBe(false);
 			await expect(retainedClient.root((ctx) => retainedRef.echo("still attached", ctx))).resolves.toBe(
 				"still attached",
 			);

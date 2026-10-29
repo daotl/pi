@@ -34,6 +34,7 @@ export function sessionEntryToContextMessages(entry: Entry): AgentMessage[] {
 			return isContextMessage(entry.message) ? [entry.message] : [];
 		case "compaction":
 			return [
+				...(entry.systemMessage === undefined ? [] : [entry.systemMessage]),
 				createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp),
 				...entry.retainedTail.filter(isContextMessage),
 			];

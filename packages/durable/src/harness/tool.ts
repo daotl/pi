@@ -397,7 +397,7 @@ async function run(
 			const key = options.key ?? String(++sequence);
 			if (options.key !== undefined) checkKey(options.key);
 			// The memo first, once per attempt; a failed one is tried again by the next call.
-			madeNestedMemo ??= runtime.memo(MADE_NESTED_CALLS, true, callContext).catch((error: unknown) => {
+			madeNestedMemo ??= runtime.memo(MADE_NESTED_CALLS, true, context).catch((error: unknown) => {
 				madeNestedMemo = undefined;
 				throw error;
 			});

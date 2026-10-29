@@ -173,6 +173,172 @@ describe("cross-host reload", () => {
 		assert.equal(await greeter.greet("x"), "v1 x");
 	});
 
+	for (const failure of ["rejection", "timeout"] as const) {
+		it(`a child vote ${failure} cancels and joins a coordinator open before releasing its reload slot`, async () => {
+			const started = latch();
+			const cancelled = latch();
+			const finishOpen = latch();
+			const finishClose = latch();
+			const closing = latch();
+			const errors: unknown[] = [];
+			const server = createHost({ self: {}, name: "server", onError: (error) => errors.push(error) });
+			const [down, up] = memoryLinkPair();
+			let loseVote = failure === "timeout";
+			server.accept(down, { kind: "host", name: "worker", principal: {} });
+			const worker = createHost({
+				self: {},
+				name: "worker",
+				upstream: { link: dropping(up, (frame) => loseVote && frame.t === "vote"), principal: {} },
+				loader: async (names) => {
+					if (names.length > 0) {
+						await started.promise;
+						if (failure === "rejection") throw new Error("worker rejects preparation");
+					}
+					return names.map((name) => ({ name: String(name), setup: () => {} }));
+				},
+				onError: (error) => errors.push(error),
+			});
+			onTestFinished(async () => {
+				finishOpen.open();
+				finishClose.open();
+				await worker.close();
+				await server.close();
+			});
+			const Store = local(`t.vote-${failure}`, {
+				version: 1,
+				input: Type.Object({}),
+				members: { read: method(undefined, Type.String()) },
+			});
+			const facet = (candidate: boolean): Facet => ({
+				name: "store",
+				setup: ({ serve }) =>
+					serve(Store, (_input, _principal, self) => {
+						if (candidate) {
+							self.resource("candidate", {
+								version: 1,
+								open: async ({ signal }) => {
+									started.open();
+									signal.addEventListener("abort", cancelled.open, { once: true });
+									await cancelled.promise;
+									await finishOpen.promise;
+									return "candidate";
+								},
+								close: async () => {
+									closing.open();
+									await finishClose.promise;
+								},
+							});
+						}
+						return { read: () => (candidate ? "new" : "old") };
+					}),
+			});
+			await server.install(facet(false));
+			const ref = await server.get(Store, {});
+			await tick();
+			const before = [server.codeVersion, worker.codeVersion];
+			const reloading = server.reload([facet(true)], { remote: { worker: ["candidate"] }, voteDeadline: 100 });
+			let settled = false;
+			const rejected = assert
+				.rejects(reloading, (error) => {
+					if (failure === "timeout") return isChordError(error, "aborted") && error.reason === "vote_deadline";
+					return isChordError(error, "unavailable") && /worker: .*worker rejects preparation/.test(error.message);
+				})
+				.then(() => {
+					settled = true;
+				});
+			rejected.catch(() => {});
+			await cancelled.promise;
+			assert.equal(settled, false);
+			assert.equal(await ref.read(), "old");
+			await assert.rejects(
+				server.reload([]),
+				(error) => isChordError(error, "unavailable") && error.reason === "reload_running",
+			);
+			finishOpen.open();
+			await closing.promise;
+			assert.equal(settled, false, "late resource cleanup must finish before returning the vote error");
+			finishClose.open();
+			await rejected;
+			assert.deepEqual([server.codeVersion, worker.codeVersion], before);
+			loseVote = false;
+			await server.reload([facet(false)]);
+			assert.equal(await ref.read(), "old");
+			assert.deepEqual(errors, []);
+		});
+	}
+
+	it("a rejected vote waits for an old exclusive close before rollback restores it", async () => {
+		const closing = latch();
+		const finishClose = latch();
+		const aborted = latch();
+		const effects: string[] = [];
+		const server = createHost({ self: {}, name: "server", onError: () => {} });
+		const [down, up] = memoryLinkPair();
+		server.accept(down, { kind: "host", name: "worker", principal: {} });
+		const worker = createHost({
+			self: {},
+			name: "worker",
+			upstream: { link: up, principal: {} },
+			loader: async () => {
+				await closing.promise;
+				throw new Error("worker rejects during close");
+			},
+			onError: () => {},
+		});
+		onTestFinished(async () => {
+			finishClose.open();
+			await worker.close();
+			await server.close();
+		});
+		const Store = local("t.rollback-close-race", {
+			version: 1,
+			input: Type.Object({}),
+			members: { read: method(undefined, Type.String()) },
+		});
+		const facet = (version: number): Facet => ({
+			name: "store",
+			setup: ({ serve, signal }) => {
+				if (version === 2) signal.addEventListener("abort", aborted.open, { once: true });
+				serve(Store, (_input, _principal, self) => {
+					const resource = self.resource("exclusive", {
+						version,
+						exclusive: true,
+						open: () => {
+							effects.push(`open ${version}`);
+							return `value ${version}`;
+						},
+						close: async () => {
+							effects.push(`closing ${version}`);
+							closing.open();
+							await finishClose.promise;
+							effects.push(`closed ${version}`);
+						},
+					});
+					return { read: () => resource.value };
+				});
+			},
+		});
+		await server.install(facet(1));
+		const ref = await server.get(Store, {});
+		await tick();
+		const rejected = assert.rejects(
+			server.reload([facet(2)], { remote: { worker: ["candidate"] } }),
+			/worker rejects during close/,
+		);
+		rejected.catch(() => {});
+		await aborted.promise;
+		assert.deepEqual(effects, ["open 1", "closing 1"]);
+		await assert.rejects(ref.read(), (error) => isChordError(error, "upgrade_conflict"));
+		finishClose.open();
+		await rejected;
+		assert.equal(
+			await ref.read(),
+			"value 1",
+			"rollback must restore the resource and release its gate before rejecting",
+		);
+		assert.deepEqual(effects, ["open 1", "closing 1", "closed 1", "open 1"]);
+	});
+
 	it("a worker gate blocked past its deadline aborts the whole reload", async () => {
 		const { server, worker, modules } = setup();
 		await tick();

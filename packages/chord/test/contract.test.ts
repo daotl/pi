@@ -87,6 +87,62 @@ describe("contracts", () => {
 		);
 	});
 
+	it("closed results and state reject provider pattern keys outside the consumer policy", () => {
+		const offered = Type.Object({}, { patternProperties: { "^x$": Type.Number() }, additionalProperties: false });
+		const wanted = Type.Object({}, { additionalProperties: false });
+		assert.equal(Value.Check(offered, { x: 1 }), true);
+		assert.equal(Value.Check(wanted, { x: 1 }), false);
+		assert.equal(fits(offered, wanted), false);
+		for (const member of ["result", "state"] as const) {
+			const contract = (schema: typeof wanted) =>
+				remote(`t.closed-pattern-${member}`, {
+					version: 1,
+					input: Type.Object({}),
+					host: hostNamed("server"),
+					variants: {
+						main:
+							member === "result"
+								? { methods: { read: method(undefined, schema) } }
+								: { state: { value: schema } },
+					},
+				});
+			assert.throws(
+				() => bind(contract(offered), undefined, contract(wanted)),
+				(error) => isChordError(error, "contract_mismatch") && error.message.includes(member),
+			);
+		}
+	});
+
+	it("closed object patterns remain conservative while accepting identical compatible name policies", () => {
+		const wanted = Type.Object({}, { patternProperties: { "^x": Type.Number() }, additionalProperties: false });
+		const offered = Type.Object(
+			{ x: Type.Optional(Type.Integer()) },
+			{ patternProperties: { "^x": Type.Integer() }, additionalProperties: false },
+		);
+		assert.equal(Value.Check(offered, { x: 1, xx: 2 }), true);
+		assert.equal(Value.Check(wanted, { x: 1, xx: 2 }), true);
+		assert.equal(fits(offered, wanted), true);
+		const provider = remote("t.closed-compatible-patterns", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: { main: { state: { value: offered }, methods: { read: method(undefined, offered) } } },
+		});
+		const consumer = remote(provider.name, {
+			...provider.def,
+			variants: { main: { state: { value: wanted }, methods: { read: method(undefined, wanted) } } },
+		});
+		assert.equal(bind(provider, undefined, consumer), undefined);
+		assert.equal(
+			fits(Type.Object({}, { patternProperties: { "^y": Type.Number() }, additionalProperties: false }), wanted),
+			false,
+		);
+		assert.equal(
+			fits(Type.Object({}, { patternProperties: { "^x": Type.String() }, additionalProperties: false }), wanted),
+			false,
+		);
+	});
+
 	it("cleaned inputs preserve nested additive contracts without relaxing output compatibility", () => {
 		const before = Type.Array(Type.Object({ a: Type.String() }));
 		const after = Type.Array(Type.Object({ a: Type.String(), b: Type.Optional(Type.Number()) }));

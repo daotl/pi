@@ -25,7 +25,7 @@ export interface ToolHtmlRendererDeps {
 export interface ToolHtmlRenderer {
 	/** Render a tool call to HTML. Returns undefined if tool has no custom renderer. */
 	renderCall(toolCallId: string, toolName: string, args: unknown): string | undefined;
-	/** Render a tool result to collapsed/expanded HTML. Returns undefined if tool has no custom renderer. */
+	/** Render a tool result and finalized call HTML. Returns undefined if tool has no custom renderer. */
 	renderResult(
 		toolCallId: string,
 		toolName: string,
@@ -33,7 +33,7 @@ export interface ToolHtmlRenderer {
 		details: unknown,
 		isError: boolean,
 		durationMs?: number,
-	): { collapsed?: string; expanded?: string } | undefined;
+	): { callHtml?: string; collapsed?: string; expanded?: string } | undefined;
 }
 
 /**
@@ -108,10 +108,11 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 					return undefined;
 				}
 
+				// Static HTML cannot use the terminal's expansion shortcut.
 				const component = toolDef.renderCall(
 					args,
 					theme,
-					createRenderContext(toolCallId, renderedCallComponents.get(toolCallId), false, true, false),
+					createRenderContext(toolCallId, renderedCallComponents.get(toolCallId), true, true, false),
 				);
 				renderedCallComponents.set(toolCallId, component);
 				const lines = component.render(width);
@@ -129,7 +130,7 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 			details: unknown,
 			isError: boolean,
 			durationMs?: number,
-		): { collapsed?: string; expanded?: string } | undefined {
+		): { callHtml?: string; collapsed?: string; expanded?: string } | undefined {
 			try {
 				const toolDef = getToolRenderers(toolName);
 				if (!toolDef?.renderResult) {
@@ -178,7 +179,11 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 				renderedResultComponents.set(toolCallId, expandedComponent);
 				const expanded = ansiLinesToHtml(trimRenderedResultLines(expandedComponent.render(width)));
 
+				// Result renderers can move their final output into the cached call component.
+				const callComponent = renderedCallComponents.get(toolCallId);
+
 				return {
+					...(callComponent ? { callHtml: ansiLinesToHtml(callComponent.render(width)) } : {}),
 					...(collapsed && collapsed !== expanded ? { collapsed } : {}),
 					expanded,
 				};

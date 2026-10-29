@@ -1,7 +1,7 @@
 import { lstat, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { hostNamed, method, remote } from "@earendil-works/chord";
+import { createHost, type Frame, hostNamed, method, remote } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Client, ServerError as ClientServerError } from "@earendil-works/pi-client";
 import { createUnixTransportFactory } from "@earendil-works/pi-client/unix";
@@ -710,6 +710,76 @@ describe("experimental durable server composition", () => {
 		replacement.release();
 		expect(errors).toEqual([]);
 		await services.dispose(BACKGROUND_CONTEXT);
+	});
+
+	test("duplicate native calls close only their attachment and release every retirement hold", async ({
+		onTestFinished,
+	}) => {
+		const spawn = vi
+			.spyOn(processRuntime, "spawnInternalProcess")
+			.mockImplementation((role, args, options) =>
+				realSpawnInternalProcess(
+					role,
+					args,
+					role === "session-worker" ? { ...options, entryUrl: fauxWorkerEntryUrl } : options,
+				),
+			);
+		onTestFinished(() => spawn.mockRestore());
+		const { runtime } = await makeServer();
+		const offender = await attachClient(runtime, "demo-1");
+		const retained = await attachClient(runtime, "demo-1");
+		const pid = runtime.workerPids.get("demo-1")!;
+		const link = offender.chordLink(offender.attachment!);
+		const closed = Promise.withResolvers<string>();
+		link.onClose(closed.resolve);
+		const calls: Extract<Frame, { t: "call" }>[] = [];
+		const bothSent = Promise.withResolvers<void>();
+		const client = createHost({ name: "offender", kind: "client", self: null });
+		onTestFinished(() => client.close());
+		client.connect(
+			{
+				get closed() {
+					return link.closed;
+				},
+				send(frame) {
+					const bytes = link.send(frame);
+					if (frame.t === "call") {
+						calls.push(frame);
+						if (calls.length === 2) bothSent.resolve();
+					}
+					return bytes;
+				},
+				receive: (handler) => link.receive(handler),
+				onClose: (handler) => link.onClose(handler),
+				close: (reason) => link.close(reason),
+			},
+			{ principal: "worker" },
+		);
+		const ref = await client.get(KeyedProbe, { key: "duplicate" });
+		const retainedServices = createSessionServiceSource(retained);
+		onTestFinished(() => retainedServices.dispose(BACKGROUND_CONTEXT));
+		const healthy = await retainedServices.host.get(KeyedProbe, { key: "retained" });
+		const first = expect(client.root((ctx) => ref.wait(ctx))).rejects.toMatchObject({ code: "unavailable" });
+		const second = expect(client.root((ctx) => ref.wait(ctx))).rejects.toMatchObject({ code: "unavailable" });
+		await bothSent.promise;
+		link.send(calls[0]!);
+		// Already queued traffic must not reopen a closed channel or retain a new request hold.
+		link.send({ ...calls[0]!, id: calls[1]!.id + 1 });
+		await expect(closed.promise).resolves.toMatch(/duplicate call id/);
+		await Promise.all([first, second]);
+		await retainedServices.host.root((ctx) => healthy.replace("still live", ctx));
+		await vi.waitFor(() => expect(healthy.state.value.value).toBe("still live"));
+		expect(runtime.workerPids.get("demo-1")).toBe(pid);
+		expect(processExists(pid)).toBe(true);
+		healthy.release();
+		ref.release();
+		await retainedServices.dispose(BACKGROUND_CONTEXT);
+		await offender.dispose();
+		await retained.dispose();
+		clients.delete(offender);
+		clients.delete(retained);
+		await expect.poll(() => runtime.workerPids.has("demo-1")).toBe(false);
+		expect(processExists(pid)).toBe(false);
 	});
 
 	test("streams prompt events through the worker-owned service provider", async ({ onTestFinished }) => {

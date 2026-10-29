@@ -3,12 +3,14 @@ import {
 	type Api,
 	type AssistantMessage,
 	contentText,
+	getCurrentSystemMessage,
 	type Model,
 	type Models,
 	type RetryCallbacks,
 	type RetryPolicy,
 	retryAssistantCall,
 	type SimpleStreamOptions,
+	type SystemMessage,
 	type Usage,
 	uuidv7,
 } from "@earendil-works/pi-ai";
@@ -104,6 +106,8 @@ export interface CompactResult<T = JsonValue> {
 	usage?: Usage;
 	/** Retained recent messages stored directly on the compaction entry. */
 	retainedTail: AgentMessage[];
+	/** Effective system policy and tools retained independently of conversational history. */
+	systemMessage?: SystemMessage;
 	/** Optional implementation-specific details stored with the compaction entry. */
 	details?: T;
 }
@@ -618,6 +622,8 @@ export interface CompactionPreparation {
 	turnPrefixMessages: AgentMessage[];
 	/** Recent messages retained after compaction and stored on the compaction entry. */
 	retainedTail: AgentMessage[];
+	/** Effective system policy and tools captured before summarization. */
+	systemMessage?: SystemMessage;
 	/** Whether compaction splits a turn. */
 	isSplitTurn: boolean;
 	/** Estimated context tokens before compaction. */
@@ -664,28 +670,28 @@ export function prepareCompaction(
 	}
 	const boundaryEnd = compactableEntries.length;
 
-	const tokensBefore = estimateContextTokens(
-		buildContextEntries(pathEntries).flatMap(sessionEntryToContextMessages),
-	).tokens;
+	const contextMessages = buildContextEntries(pathEntries).flatMap(sessionEntryToContextMessages);
+	const tokensBefore = estimateContextTokens(contextMessages).tokens;
+	const systemMessage = getCurrentSystemMessage(contextMessages);
 
 	const cutPoint = findCutPoint(compactableEntries, 0, boundaryEnd, settings.keepRecentTokens);
 	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
 	const messagesToSummarize: AgentMessage[] = [];
 	for (let i = 0; i < historyEnd; i++) {
 		const msg = getMessageFromEntryForCompaction(compactableEntries[i]);
-		if (msg) messagesToSummarize.push(msg);
+		if (msg && msg.role !== "system") messagesToSummarize.push(msg);
 	}
 	const turnPrefixMessages: AgentMessage[] = [];
 	if (cutPoint.isSplitTurn) {
 		for (let i = cutPoint.turnStartIndex; i < cutPoint.firstKeptEntryIndex; i++) {
 			const msg = getMessageFromEntryForCompaction(compactableEntries[i]);
-			if (msg) turnPrefixMessages.push(msg);
+			if (msg && msg.role !== "system") turnPrefixMessages.push(msg);
 		}
 	}
 	const retainedTail: AgentMessage[] = [];
 	for (let i = cutPoint.firstKeptEntryIndex; i < boundaryEnd; i++) {
 		const msg = getMessageFromEntryForCompaction(compactableEntries[i]);
-		if (msg) retainedTail.push(msg);
+		if (msg && msg.role !== "system") retainedTail.push(msg);
 	}
 	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);
 	if (cutPoint.isSplitTurn) {
@@ -698,6 +704,7 @@ export function prepareCompaction(
 		messagesToSummarize,
 		turnPrefixMessages,
 		retainedTail,
+		...(systemMessage === undefined ? {} : { systemMessage }),
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
 		previousSummary,
@@ -761,6 +768,7 @@ export async function compactWithRequest(
 		messagesToSummarize,
 		turnPrefixMessages,
 		retainedTail,
+		systemMessage,
 		isSplitTurn,
 		tokensBefore,
 		previousSummary,
@@ -812,7 +820,14 @@ export async function compactWithRequest(
 	summary += formatFileOperations(readFiles, modifiedFiles);
 	const details: CompactionDetails = { readFiles, modifiedFiles };
 
-	return ok({ summary, tokensBefore, usage: summaryUsage, retainedTail, details });
+	return ok({
+		summary,
+		tokensBefore,
+		usage: summaryUsage,
+		retainedTail,
+		...(systemMessage === undefined ? {} : { systemMessage }),
+		details,
+	});
 }
 async function generateTurnPrefixSummary(
 	messages: AgentMessage[],

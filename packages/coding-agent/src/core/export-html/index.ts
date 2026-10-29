@@ -16,7 +16,7 @@ import { getUsageTotals } from "../usage-totals.ts";
 export interface ToolHtmlRenderer {
 	/** Render a tool call to HTML. Returns undefined if tool has no custom renderer. */
 	renderCall(toolCallId: string, toolName: string, args: unknown): string | undefined;
-	/** Render a tool result to HTML. Returns collapsed/expanded or undefined if tool has no custom renderer. */
+	/** Render a tool result and finalized call HTML, or undefined if tool has no custom renderer. */
 	renderResult(
 		toolCallId: string,
 		toolName: string,
@@ -24,7 +24,7 @@ export interface ToolHtmlRenderer {
 		details: unknown,
 		isError: boolean,
 		durationMs?: number,
-	): { collapsed?: string; expanded?: string } | undefined;
+	): { callHtml?: string; collapsed?: string; expanded?: string } | undefined;
 }
 
 /** Pre-rendered HTML for a custom tool call and result */
@@ -220,6 +220,7 @@ function preRenderCustomTools(
 			if (rendered) {
 				renderedTools[msg.toolCallId] = {
 					...existing,
+					callHtml: rendered.callHtml ?? existing?.callHtml,
 					resultHtmlCollapsed: rendered.collapsed,
 					resultHtmlExpanded: rendered.expanded,
 				};

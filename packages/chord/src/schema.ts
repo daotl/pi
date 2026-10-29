@@ -162,6 +162,8 @@ export function fits(subSchema: unknown, supSchema: unknown, mode: "value" | "cl
 function objectFits(sub: Schema, sup: Schema, mode: "value" | "cleaned-input"): boolean {
 	const subProperties = asSchema(sub.properties);
 	const supProperties = asSchema(sup.properties);
+	const subPatterns = asSchema(sub.patternProperties);
+	const supPatterns = asSchema(sup.patternProperties);
 	const subRequired = new Set((sub.required as string[] | undefined) ?? []);
 	for (const key of (sup.required as string[] | undefined) ?? []) if (!subRequired.has(key)) return false;
 	for (const [key, property] of Object.entries(supProperties)) {
@@ -188,13 +190,17 @@ function objectFits(sub: Schema, sup: Schema, mode: "value" | "cleaned-input"): 
 	}
 	if (sup.additionalProperties === false) {
 		if (sub.additionalProperties !== false) return false;
-		if (Object.keys(subProperties).some((key) => !(key in supProperties))) return false;
+		for (const key of Object.keys(subProperties)) {
+			if (key in supProperties) continue;
+			if (!Object.keys(supPatterns).some((pattern) => new RegExp(pattern, "u").test(key))) return false;
+		}
+		// A source pattern permits names beyond its explicit properties. Regex containment is not modeled: require
+		// the same name policy, whose value constraints are checked below, rather than silently admitting extra keys.
+		if (Object.keys(subPatterns).some((pattern) => !(pattern in supPatterns))) return false;
 	}
-	const supPatterns = asSchema(sup.patternProperties);
 	if (Object.keys(supPatterns).length > 0) {
 		// Every value the consumer may put under a matching name must fit, and the consumer must not allow arbitrary
 		// extra names (it would then allow any value under a matching one).
-		const subPatterns = asSchema(sub.patternProperties);
 		if (sub.additionalProperties !== false && Object.keys(subPatterns).length === 0) return false;
 		for (const [pattern, property] of Object.entries(supPatterns)) {
 			const matcher = new RegExp(pattern, "u");

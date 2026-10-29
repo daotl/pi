@@ -80,6 +80,7 @@ export function durableCompactionPreparation(
 		messagesToSummarize: preparation.messagesToSummarize,
 		turnPrefixMessages: preparation.turnPrefixMessages,
 		retainedTail: preparation.retainedTail,
+		...(preparation.systemMessage === undefined ? {} : { systemMessage: preparation.systemMessage }),
 		isSplitTurn: preparation.isSplitTurn,
 		tokensBefore: preparation.tokensBefore,
 		...(preparation.previousSummary === undefined ? {} : { previousSummary: preparation.previousSummary }),
@@ -114,6 +115,7 @@ function compactionPreparation(
 		messagesToSummarize: preparation.messagesToSummarize,
 		turnPrefixMessages: preparation.turnPrefixMessages,
 		retainedTail: preparation.retainedTail,
+		...(preparation.systemMessage === undefined ? {} : { systemMessage: preparation.systemMessage }),
 		isSplitTurn: preparation.isSplitTurn,
 		tokensBefore: preparation.tokensBefore,
 		...(preparation.previousSummary === undefined ? {} : { previousSummary: preparation.previousSummary }),
@@ -264,6 +266,7 @@ async function publishStructuralOutcome<TContext extends object | undefined>(
 					type: "compaction",
 					summary: outcome.result.summary,
 					retainedTail: outcome.result.retainedTail,
+					...(outcome.result.systemMessage === undefined ? {} : { systemMessage: outcome.result.systemMessage }),
 					tokensBefore: outcome.result.tokensBefore,
 					...(outcome.result.details === undefined ? {} : { details: outcome.result.details }),
 					...(outcome.result.usage === undefined ? {} : { usage: outcome.result.usage }),
@@ -664,7 +667,12 @@ export async function runStructuralDecision<TContext extends object | undefined>
 		return publishStructuralOutcome(lane, drive, deciding, {
 			kind: "compaction",
 			resultEntryId: lane.session.idGenerator.next(),
-			result: hook.compaction,
+			result: {
+				...hook.compaction,
+				...(preparation.value.systemMessage === undefined
+					? {}
+					: { systemMessage: preparation.value.systemMessage }),
+			},
 			fromHook: true,
 		});
 	}

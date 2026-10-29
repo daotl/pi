@@ -14,6 +14,7 @@ import {
 } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import type { Op, Path, Seg } from "@earendil-works/chord/delta";
+import { ModelCostRatesSchema, ModelThinkingLevelSchema } from "@earendil-works/pi-ai/providers/model-schema";
 import { Type } from "typebox";
 import type { ConversationHandle, Harness } from "./harness.ts";
 import type {
@@ -24,6 +25,7 @@ import type {
 	Envelope,
 	Id,
 	JsonObject,
+	JsonValue,
 	NewEntry,
 	SendInput,
 	ViewEvent,
@@ -56,6 +58,174 @@ export const PicoHarnessService = local("pi.harness", {
 
 const IdSchema = Type.Integer({ minimum: 0 });
 const JsonObjectSchema = Type.Unsafe<JsonObject>(Type.Record(Type.String(), Type.Unknown()));
+// Chord's JSON links establish the durable JSON value domain before schema validation.
+const JsonValueSchema = Type.Unsafe<JsonValue>(Type.Unknown());
+const TextContentSchema = Type.Object({
+	type: Type.Literal("text"),
+	text: Type.String(),
+	textSignature: Type.Optional(Type.String()),
+});
+const ImageContentSchema = Type.Object({
+	type: Type.Literal("image"),
+	data: Type.String(),
+	mimeType: Type.String(),
+});
+const UserContentSchema = Type.Union([Type.String(), Type.Array(Type.Union([TextContentSchema, ImageContentSchema]))]);
+const UsageSchema = Type.Object({
+	input: Type.Number(),
+	output: Type.Number(),
+	cacheRead: Type.Number(),
+	cacheWrite: Type.Number(),
+	cacheWrite1h: Type.Optional(Type.Number()),
+	reasoning: Type.Optional(Type.Number()),
+	totalTokens: Type.Number(),
+	cost: Type.Object({
+		...ModelCostRatesSchema.properties,
+		total: Type.Number(),
+		totalFromProvider: Type.Optional(Type.Boolean()),
+	}),
+});
+const StoredMessageSchema = Type.Union([
+	Type.Object({
+		role: Type.Literal("system"),
+		content: Type.Union([Type.String(), Type.Array(TextContentSchema)]),
+		sections: Type.Optional(Type.Record(Type.String(), Type.Union([Type.String(), Type.Null()]))),
+		toolsAdded: Type.Optional(
+			Type.Array(
+				Type.Object({
+					name: Type.String(),
+					description: Type.String(),
+					parameters: JsonObjectSchema,
+					constrainedSampling: Type.Optional(
+						Type.Union([
+							Type.Literal(false),
+							Type.Object({
+								type: Type.Literal("json_schema"),
+								strict: Type.Union([Type.Literal("prefer"), Type.Literal("require")]),
+							}),
+							Type.Object({
+								type: Type.Literal("grammar"),
+								variants: Type.Object({
+									openai_lark: Type.Optional(Type.String()),
+									openai_regex: Type.Optional(Type.String()),
+								}),
+							}),
+						]),
+					),
+				}),
+			),
+		),
+		toolsRemoved: Type.Optional(Type.Array(Type.Object({ name: Type.String() }))),
+		timestamp: Type.Number(),
+	}),
+	Type.Object({ role: Type.Literal("user"), content: UserContentSchema, timestamp: Type.Number() }),
+	Type.Object({
+		role: Type.Literal("assistant"),
+		content: Type.Array(
+			Type.Union([
+				TextContentSchema,
+				Type.Object({
+					type: Type.Literal("thinking"),
+					thinking: Type.String(),
+					thinkingSignature: Type.Optional(Type.String()),
+					redacted: Type.Optional(Type.Boolean()),
+				}),
+				Type.Object({
+					type: Type.Literal("toolCall"),
+					id: Type.String(),
+					name: Type.String(),
+					arguments: JsonObjectSchema,
+					thoughtSignature: Type.Optional(Type.String()),
+					namespace: Type.Optional(Type.String()),
+					raw: Type.Optional(Type.String()),
+					argumentsError: Type.Optional(Type.String()),
+				}),
+			]),
+		),
+		api: Type.String(),
+		provider: Type.String(),
+		model: Type.String(),
+		responseModel: Type.Optional(Type.String()),
+		responseId: Type.Optional(Type.String()),
+		providerThinkingLevel: Type.Optional(Type.String()),
+		thinkingLevel: Type.Optional(ModelThinkingLevelSchema),
+		diagnostics: Type.Optional(
+			Type.Array(
+				Type.Object({
+					type: Type.String(),
+					timestamp: Type.Number(),
+					error: Type.Optional(
+						Type.Object({
+							name: Type.Optional(Type.String()),
+							message: Type.String(),
+							stack: Type.Optional(Type.String()),
+							code: Type.Optional(Type.Union([Type.String(), Type.Number()])),
+						}),
+					),
+					details: Type.Optional(JsonObjectSchema),
+				}),
+			),
+		),
+		usage: UsageSchema,
+		stopReason: Type.Union([
+			Type.Literal("pending"),
+			Type.Literal("stop"),
+			Type.Literal("length"),
+			Type.Literal("toolUse"),
+			Type.Literal("error"),
+			Type.Literal("aborted"),
+			Type.Literal("deferred"),
+		]),
+		deferred: Type.Optional(
+			Type.Object({
+				provider: Type.String(),
+				modelId: Type.String(),
+				api: Type.String(),
+				id: Type.String(),
+				expiresAt: Type.Optional(Type.Number()),
+				pollAfterMs: Type.Optional(Type.Number()),
+				data: Type.Optional(JsonValueSchema),
+			}),
+		),
+		errorMessage: Type.Optional(Type.String()),
+		rawStopReason: Type.Optional(Type.String()),
+		endTurn: Type.Optional(Type.Boolean()),
+		timestamp: Type.Number(),
+		durationMs: Type.Optional(Type.Number()),
+	}),
+	Type.Object({
+		role: Type.Literal("toolResult"),
+		toolCallId: Type.String(),
+		toolName: Type.String(),
+		content: Type.Array(Type.Union([TextContentSchema, ImageContentSchema])),
+		details: Type.Optional(JsonValueSchema),
+		usage: Type.Optional(UsageSchema),
+		nestedCalls: Type.Optional(
+			Type.Object({
+				calls: Type.Array(
+					Type.Object({
+						id: Type.String(),
+						name: Type.String(),
+						arguments: Type.Optional(JsonObjectSchema),
+						argumentsBytes: Type.Optional(Type.Number()),
+						status: Type.Union([Type.Literal("ok"), Type.Literal("error"), Type.Literal("unfinished")]),
+						durationMs: Type.Optional(Type.Number()),
+						error: Type.Optional(Type.String()),
+					}),
+				),
+				complete: Type.Boolean(),
+			}),
+		),
+		isError: Type.Boolean(),
+		timestamp: Type.Number(),
+		durationMs: Type.Optional(Type.Number()),
+	}),
+]);
+const ContextEditSchema = Type.Object({
+	target: IdSchema,
+	action: Type.Union([Type.Literal("omit"), Type.Literal("replace")]),
+	messages: Type.Optional(Type.Array(StoredMessageSchema)),
+});
 const ConversationSpecSchema = Type.Unsafe<Omit<ConversationSpec, "parent">>(
 	Type.Object({
 		rewindable: Type.Optional(JsonObjectSchema),
@@ -94,27 +264,23 @@ export const PicoConversationService = remote("pi.conversation", {
 			},
 			methods: {
 				send: method(
-					Type.Unsafe<SendInput>(
-						Type.Object({
-							content: Type.Union([Type.String(), Type.Array(Type.Unknown())]),
-							requestId: Type.Optional(Type.String()),
-							whenBusy: Type.Optional(
-								Type.Union([Type.Literal("steer"), Type.Literal("followUp"), Type.Literal("reject")]),
-							),
-						}),
-					),
+					Type.Object({
+						content: UserContentSchema,
+						requestId: Type.Optional(Type.String()),
+						whenBusy: Type.Optional(
+							Type.Union([Type.Literal("steer"), Type.Literal("followUp"), Type.Literal("reject")]),
+						),
+					}),
 					IdSchema,
 				),
 				write: method(
-					Type.Unsafe<NewEntry>(
-						Type.Object({
-							kind: Type.String(),
-							model: Type.Optional(Type.Array(Type.Unknown())),
-							data: Type.Optional(JsonObjectSchema),
-							head: Type.Optional(Type.Union([IdSchema, Type.Literal("self")])),
-							edits: Type.Optional(Type.Array(Type.Unknown())),
-						}),
-					),
+					Type.Object({
+						kind: Type.String(),
+						model: Type.Optional(Type.Array(StoredMessageSchema)),
+						data: Type.Optional(JsonObjectSchema),
+						head: Type.Optional(Type.Union([IdSchema, Type.Literal("self")])),
+						edits: Type.Optional(Type.Array(ContextEditSchema)),
+					}),
 					IdSchema,
 				),
 				inputAbort: method(

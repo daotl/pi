@@ -1,6 +1,7 @@
 import * as storedValues from "@earendil-works/pi-agent-core";
 import * as sessionWrites from "@earendil-works/pi-agent-core";
 import { BACKGROUND_CONTEXT, prepareStorageCommit } from "@earendil-works/pi-agent-core";
+import type { SystemMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import {
 	createNodeSqliteFactory,
@@ -12,6 +13,7 @@ import {
 import { applyInitialSchema } from "../src/sqlite/migrations.ts";
 import { advanceNextSeq, readNextSeq } from "../src/sqlite/session/session-sequences.ts";
 import { listValueReadQuery } from "../src/sqlite/session/values.ts";
+import { buildSessionContext } from "../../../agent/src/harness/session/context.ts";
 
 const SESSION_ID = "session";
 
@@ -91,6 +93,54 @@ function insertCommitSessionRow(db: SqliteDatabase, nextSeq = 1): void {
 }
 
 describe("SqliteStorage", () => {
+	it("preserves system policy and tool checkpoints when reopening compaction entries", async () => {
+		await withStorage(async (storage, db) => {
+			insertCommitSessionRow(db);
+			const systemMessage: SystemMessage = {
+				role: "system",
+				content: "Preserved policy",
+				sections: { safety: "<safety>Keep secrets private.</safety>" },
+				toolsAdded: [
+					{
+						name: "read",
+						description: "Read",
+						parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+					},
+				],
+				timestamp: 1,
+			};
+			await storage.commit(
+				[
+					sessionWrites.insertEntry({
+						id: "checkpoint",
+						parentId: null,
+						type: "compaction",
+						summary: "saved summary",
+						retainedTail: [],
+						systemMessage,
+						tokensBefore: 100,
+						fromHook: false,
+					}),
+				],
+				BACKGROUND_CONTEXT,
+			);
+			await storage.close(BACKGROUND_CONTEXT);
+			const reopened = new SqliteStorage(db, { sessionId: SESSION_ID });
+			try {
+				const entries = await reopened.scanBranch(
+					{ start: "checkpoint", order: "oldestFirst" },
+					BACKGROUND_CONTEXT,
+				);
+				expect(await buildSessionContext(entries, undefined, BACKGROUND_CONTEXT)).toEqual([
+					systemMessage,
+					expect.objectContaining({ role: "compactionSummary", summary: "saved summary" }),
+				]);
+			} finally {
+				await reopened.close(BACKGROUND_CONTEXT);
+			}
+		});
+	});
+
 	it("uses one write transaction for an ordinary commit", async () => {
 		const db = new TransactionCountingDatabase(await createNodeSqliteFactory().open(":memory:"));
 		try {

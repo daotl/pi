@@ -1,4 +1,4 @@
-import type { ImageContent, TextContent, Usage } from "@earendil-works/pi-ai";
+import type { ImageContent, SystemMessage, TextContent, Usage } from "@earendil-works/pi-ai";
 import { uuidv7 } from "@earendil-works/pi-ai/utils/uuid";
 import type { AgentMessage, ThinkingLevel } from "../../../types.ts";
 import type { Context } from "../../context.ts";
@@ -58,6 +58,7 @@ interface LegacyV3CompactionEntry extends LegacyV3EntryBase {
 	summary: string;
 	firstKeptEntryId: string;
 	tokensBefore: number;
+	systemMessage?: SystemMessage;
 	details?: JsonValue;
 	usage?: Usage;
 	fromHook?: boolean;
@@ -360,7 +361,12 @@ function normalizeRetainedEntry(
 			...committedBase,
 			type: "compaction",
 			summary: entry.summary,
-			retainedTail,
+			// A system checkpoint already folds every policy delta in the retained range.
+			retainedTail:
+				entry.systemMessage === undefined
+					? retainedTail
+					: retainedTail.filter((message) => message.role !== "system"),
+			...(entry.systemMessage === undefined ? {} : { systemMessage: entry.systemMessage }),
 			tokensBefore: entry.tokensBefore,
 			details: entry.details,
 			usage: entry.usage,

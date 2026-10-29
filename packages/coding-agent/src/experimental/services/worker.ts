@@ -25,7 +25,8 @@ export interface WorkerServiceScope {
 
 export interface SessionWorkerServices {
 	attach(scope: WorkerServiceScope): void;
-	receive(scope: WorkerServiceScope, frame: Frame): void;
+	/** False when the attachment is absent or its native link has already closed. */
+	receive(scope: WorkerServiceScope, frame: Frame): boolean;
 	removeAttachments(matches: (scope: WorkerServiceScope) => boolean): Promise<void>;
 	dispose(): Promise<void>;
 }
@@ -36,6 +37,7 @@ export async function createSessionWorkerServices(options: {
 	readonly settingsManager?: SettingsManager;
 	readonly facetLoader?: () => Promise<LoadedPluginFacets>;
 	publish(scope: WorkerServiceScope, frame: Frame): Promise<void>;
+	onAttachmentClosed?(scope: WorkerServiceScope): void;
 }): Promise<SessionWorkerServices> {
 	const host = createHost({ name: "session", self: "worker" });
 	let reloadTail = Promise.resolve();
@@ -93,6 +95,7 @@ export async function createSessionWorkerServices(options: {
 			throw new AggregateError([error, ...failures], "Session facets failed to start and clean up");
 		throw error;
 	}
+	// Keep closed links until demand is removed, so repeated attach cannot reopen a revoked channel.
 	const attachments = new Map<string, { scope: WorkerServiceScope; link: Link }>();
 	const removeAttachments = async (matches: (scope: WorkerServiceScope) => boolean): Promise<void> => {
 		const released: string[] = [];
@@ -116,14 +119,16 @@ export async function createSessionWorkerServices(options: {
 			});
 			tunnel.onClose((reason) => {
 				if (attachments.get(key)?.link !== tunnel) return;
+				options.onAttachmentClosed?.(scope);
 				void options.publish(scope, { t: "bye", reason }).catch(() => {});
 			});
 			host.accept(provider, { principal: key, kind: "client" });
 		},
 		receive(scope, frame) {
 			const entry = attachments.get(serviceScopeKey(scope));
-			if (entry === undefined) throw new Error("Session worker has no active attachment");
+			if (entry === undefined || entry.link.closed) return false;
 			entry.link.send(frame);
+			return true;
 		},
 		removeAttachments,
 		async dispose() {

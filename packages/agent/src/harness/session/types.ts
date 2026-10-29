@@ -1,5 +1,5 @@
 import type { JsonValue } from "@earendil-works/chord";
-import type { AssistantMessage, StopReason, Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, StopReason, SystemMessage, Usage } from "@earendil-works/pi-ai";
 import type { AgentMessage, QueueMode, ThinkingLevel } from "../../types.ts";
 import type { BranchPreparation } from "../compaction/branch-summarization.ts";
 import type { CompactionPreparation, CompactionSettings } from "../compaction/compaction.ts";
@@ -34,6 +34,8 @@ export interface CompactionEntry extends EntryBase {
 	type: "compaction";
 	summary: string;
 	retainedTail: AgentMessage[];
+	/** System policy and tool checkpoint preceding the summary and retained tail. */
+	systemMessage?: SystemMessage;
 	tokensBefore: number;
 	details?: JsonValue;
 	usage?: Usage;
@@ -363,6 +365,7 @@ export type DurableStructuralPreparation =
 			messagesToSummarize: CompactionPreparation["messagesToSummarize"];
 			turnPrefixMessages: CompactionPreparation["turnPrefixMessages"];
 			retainedTail: CompactionPreparation["retainedTail"];
+			systemMessage?: CompactionPreparation["systemMessage"];
 			isSplitTurn: boolean;
 			tokensBefore: number;
 			previousSummary?: string;

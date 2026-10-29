@@ -79,21 +79,20 @@ export async function runClusterReload(
 				},
 			);
 		});
-		let local = false;
-		const results = await Promise.allSettled([
-			reload.prepare().then(() => {
-				local = true;
-			}),
-			...votes,
-		]);
-		const failed = results.find((result) => result.status === "rejected");
-		if (failed !== undefined) {
+		const preparing = [reload.prepare(), ...votes];
+		try {
+			await Promise.all(preparing);
+		} catch (error) {
+			const rollback = reload.rollback();
 			for (const connection of participants) {
+				// Settle outstanding votes too: their timers and rejection handlers must not outlive this operation.
+				connection.votes.get(id)?.reject(error);
 				connection.votes.delete(id);
 				connection.send({ t: "abort", reload: id });
 			}
-			if (local) await reload.rollback();
-			throw failed.reason;
+			// Rollback aborts immediately, then waits for in-flight preparation before restoring the old runtime.
+			await Promise.allSettled([...preparing, rollback]);
+			throw error;
 		}
 		let report: ReloadReport;
 		try {
@@ -112,9 +111,7 @@ export async function runClusterReload(
 		}
 		host.rememberRemoteModules(options.remote, options.remoteRemove);
 		const children: Record<string, ReloadReport> = {};
-		for (const result of results.slice(1)) {
-			if (result.status !== "fulfilled") continue;
-			const [name, child] = result.value as readonly [string, ReloadReport | undefined];
+		for (const [name, child] of await Promise.all(votes)) {
 			if (child !== undefined) children[name] = child;
 		}
 		return { ...report, children };

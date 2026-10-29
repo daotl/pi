@@ -645,6 +645,43 @@ describe("nested tool calls", () => {
 		await harness.close(context);
 	});
 
+	it("isolates concurrent admission from an already-cancelled caller context", async () => {
+		const setup = chatSetup();
+		const echo = echoTool();
+		addTool(setup.registry, echo.registration);
+		let outcomes: PromiseSettledResult<NestedToolExecutionResult>[] = [];
+		addTool(
+			setup.registry,
+			tool("batch", async (_args, api, callContext) => {
+				const cancel = new AbortController();
+				cancel.abort(new Error("cancelled admission"));
+				outcomes = await Promise.allSettled([
+					api.executeTool("echo", { text: "cancelled" }, withAbortSignal(cancel.signal, callContext), {
+						key: "cancelled",
+					}),
+					api.executeTool("echo", { text: "healthy" }, callContext, { key: "healthy" }),
+				]);
+				return {};
+			}),
+		);
+		const { harness, status } = await runOnce(setup, [call("batch"), DONE]);
+		try {
+			expect(status).toBe("done");
+			expect(outcomes[0]).toMatchObject({ status: "rejected", reason: new Error("cancelled admission") });
+			expect(outcomes[1]).toMatchObject({
+				status: "fulfilled",
+				value: { isError: false, structuredOutput: "echo healthy" },
+			});
+			expect(echo.state.runs).toBe(1);
+			expect((await toolTasks(harness)).map((task) => task.input)).toEqual([
+				expect.objectContaining({ kind: "model" }),
+				expect.objectContaining({ kind: "nested", key: "healthy" }),
+			]);
+		} finally {
+			await harness.close(context);
+		}
+	});
+
 	it("admits one nested call for a key used by concurrent calls", async () => {
 		const setup = chatSetup();
 		const echo = echoTool();

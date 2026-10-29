@@ -1,11 +1,13 @@
 import {
 	BACKGROUND_CONTEXT,
+	DEFAULT_COMPACTION_SETTINGS,
 	type JsonlSessionMetadata,
 	JsonlSessionRepo,
+	prepareCompaction,
 	type Session,
 } from "@earendil-works/pi-agent-core";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { type AssistantMessage, getCurrentSystemMessage, type SystemMessage } from "@earendil-works/pi-ai";
 import * as fs from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -304,6 +306,23 @@ describe("SessionManager.removeLastMessages", () => {
 		const dir = fs.mkdtempSync(join(tmpdir(), "pi-retain-none-import-"));
 		tempDirs.push(dir);
 		const producer = SessionManager.create(dir, dir);
+		const policy: SystemMessage = {
+			role: "system",
+			content: [{ type: "text", text: "Preserve this policy after compaction." }],
+			sections: {
+				safety: "<safety>Never reveal secrets.</safety>",
+				workspace: "<workspace>Use this repo.</workspace>",
+			},
+			toolsAdded: [
+				{
+					name: "read",
+					description: "Read a file",
+					parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+				},
+			],
+			timestamp: 0,
+		};
+		producer.appendMessage(policy);
 		producer.appendMessage(userMessage("summarized question", 1));
 		producer.appendMessage(assistantMessage([{ type: "text", text: "summarized answer" }], 2));
 		const retained = producer.appendMessage(userMessage("deleted retained question", 3));
@@ -311,6 +330,20 @@ describe("SessionManager.removeLastMessages", () => {
 		const checkpoint = producer.appendCompaction("saved summary", retained, 100, { source: "deletion" });
 		expect(producer.removeLastMessages(2)).toBe(2);
 		expect(producer.getEntry(checkpoint)).toMatchObject({ firstKeptEntryId: checkpoint });
+		const producerCheckpoint = producer.getEntry(checkpoint);
+		if (producerCheckpoint?.type !== "compaction" || !producerCheckpoint.systemMessage) {
+			throw new Error("Missing producer system checkpoint");
+		}
+		const systemMessage = structuredClone(producerCheckpoint.systemMessage);
+		expect(systemMessage).toEqual({
+			...policy,
+			content: "Preserve this policy after compaction.",
+			timestamp: expect.any(Number),
+		});
+		expect(producer.buildSessionContext().messages).toEqual([
+			systemMessage,
+			expect.objectContaining({ role: "compactionSummary", summary: "saved summary" }),
+		]);
 		const path = producer.getSessionFile()!;
 		const bytes = fs.readFileSync(path);
 		const header = producer.getHeader()!;
@@ -332,21 +365,30 @@ describe("SessionManager.removeLastMessages", () => {
 				type: "compaction",
 				summary: "saved summary",
 				retainedTail: [],
+				systemMessage,
 				details: { source: "deletion" },
 			});
 			expect(await buildSessionContext(entries, undefined, BACKGROUND_CONTEXT)).toEqual([
+				systemMessage,
 				expect.objectContaining({ role: "compactionSummary", summary: "saved summary" }),
 			]);
 			expect(
 				(await session.findEntries({ type: "message", order: "asc" }, BACKGROUND_CONTEXT)).map((entry) =>
-					entry.type === "message" && "content" in entry.message ? entry.message.content : undefined,
+					entry.type === "message" ? entry.message : undefined,
 				),
-			).toEqual(["summarized question", [{ type: "text", text: "summarized answer" }]]);
+			).toEqual([
+				policy,
+				userMessage("summarized question", 1),
+				assistantMessage([{ type: "text", text: "summarized answer" }], 2),
+			]);
 		};
 		try {
 			const fork = await repo.fork(metadata, { scope: "tree", id: "retain-none-fork" }, BACKGROUND_CONTEXT);
 			await assertCheckpoint(fork);
 			await fork.close(BACKGROUND_CONTEXT);
+			const reopenedFork = await repo.open(fork.metadata, BACKGROUND_CONTEXT);
+			await assertCheckpoint(reopenedFork);
+			await reopenedFork.close(BACKGROUND_CONTEXT);
 			expect(fs.readFileSync(path)).toEqual(bytes);
 			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
 			await assertCheckpoint(session);
@@ -357,6 +399,105 @@ describe("SessionManager.removeLastMessages", () => {
 			expect(JSON.parse(fs.readFileSync(path, "utf8").split("\n")[0])).toMatchObject({ v: 4 });
 			const reopened = await repo.open(metadata, BACKGROUND_CONTEXT);
 			await assertCheckpoint(reopened);
+			const upgradedFork = await repo.fork(
+				metadata,
+				{ scope: "tree", id: "upgraded-retain-none-fork" },
+				BACKGROUND_CONTEXT,
+			);
+			await assertCheckpoint(upgradedFork);
+			await upgradedFork.close(BACKGROUND_CONTEXT);
+			await reopened.close(BACKGROUND_CONTEXT);
+		} finally {
+			await repo.close(BACKGROUND_CONTEXT);
+			await fileSystem.cleanup(BACKGROUND_CONTEXT);
+		}
+	});
+
+	it("imports nonempty retained checkpoints without replaying folded system deltas", async () => {
+		const dir = fs.mkdtempSync(join(tmpdir(), "pi-retained-policy-import-"));
+		tempDirs.push(dir);
+		const producer = SessionManager.create(dir, dir);
+		const policy: SystemMessage = {
+			role: "system",
+			content: "Base policy.",
+			sections: { safety: "Never reveal secrets.", workspace: "Old workspace." },
+			toolsAdded: [{ name: "read", description: "Read a file", parameters: { type: "object", properties: {} } }],
+			timestamp: 0,
+		};
+		const delta: SystemMessage = {
+			role: "system",
+			content: "Retained policy delta.",
+			sections: { safety: null, workspace: "Current workspace." },
+			toolsRemoved: [{ name: "read" }],
+			toolsAdded: [{ name: "write", description: "Write a file", parameters: { type: "object", properties: {} } }],
+			timestamp: 4,
+		};
+		producer.appendMessage(policy);
+		producer.appendMessage(userMessage("summarized question", 1));
+		producer.appendMessage(assistantMessage([{ type: "text", text: "summarized answer" }], 2));
+		const retained = producer.appendMessage(userMessage("retained question", 3));
+		producer.appendMessage(delta);
+		producer.appendMessage(assistantMessage([{ type: "text", text: "deleted retained answer" }], 5));
+		const checkpoint = producer.appendCompaction("saved summary", retained, 100);
+		expect(producer.removeLastMessages(1)).toBe(1);
+		expect(producer.getEntry(checkpoint)).toMatchObject({ firstKeptEntryId: retained });
+		producer.appendMessage(userMessage("follow-up question", 6));
+		const systemMessage = getCurrentSystemMessage(producer.buildSessionContext().messages);
+		expect(systemMessage).toEqual({
+			role: "system",
+			content: "Base policy.\n\nRetained policy delta.",
+			sections: { workspace: "Current workspace." },
+			toolsAdded: delta.toolsAdded,
+			timestamp: expect.any(Number),
+		});
+		expect(producer.getEntry(checkpoint)).toMatchObject({ systemMessage });
+		const path = producer.getSessionFile()!;
+		const bytes = fs.readFileSync(path);
+		const header = producer.getHeader()!;
+		const metadata: JsonlSessionMetadata = {
+			id: header.id,
+			cwd: header.cwd,
+			path,
+			createdAt: Date.parse(header.timestamp),
+			modifiedAt: Date.parse(header.timestamp),
+			storageVersion: 3,
+		};
+		const fileSystem = new NodeExecutionEnv({ cwd: dir });
+		const repo = new JsonlSessionRepo({ fileSystem, sessionsRoot: dir });
+		const assertPolicy = async (session: Session) => {
+			const branch = await session.branch("main", BACKGROUND_CONTEXT);
+			if (!branch) throw new Error("Missing imported main branch");
+			const entries = await branch.findEntries({ order: "oldestFirst" }, BACKGROUND_CONTEXT);
+			expect(entries.find((entry) => entry.type === "compaction")).toMatchObject({
+				retainedTail: [userMessage("retained question", 3)],
+				systemMessage,
+			});
+			const messages = await buildSessionContext(entries, undefined, BACKGROUND_CONTEXT);
+			expect(messages).toEqual([
+				systemMessage,
+				expect.objectContaining({ role: "compactionSummary", summary: "saved summary" }),
+				userMessage("retained question", 3),
+				userMessage("follow-up question", 6),
+			]);
+			expect(getCurrentSystemMessage(messages)).toEqual(systemMessage);
+			const preparation = prepareCompaction(entries, { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 1 });
+			if (!preparation.ok) throw preparation.error;
+			expect(preparation.value).toMatchObject({
+				systemMessage,
+				messagesToSummarize: [userMessage("retained question", 3)],
+				retainedTail: [userMessage("follow-up question", 6)],
+			});
+		};
+		try {
+			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
+			await assertPolicy(session);
+			expect(fs.readFileSync(path)).toEqual(bytes);
+			await session.setName("upgraded retained policy checkpoint", BACKGROUND_CONTEXT);
+			await assertPolicy(session);
+			await session.close(BACKGROUND_CONTEXT);
+			expect(JSON.parse(fs.readFileSync(path, "utf8").split("\n")[0])).toMatchObject({ v: 4 });
+			const reopened = await repo.open(metadata, BACKGROUND_CONTEXT);
+			await assertPolicy(reopened);
 			await reopened.close(BACKGROUND_CONTEXT);
 		} finally {
 			await repo.close(BACKGROUND_CONTEXT);

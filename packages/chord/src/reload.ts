@@ -11,6 +11,7 @@ import {
 	RefImpl,
 	type ResourceImpl,
 	type Run,
+	raceSignal,
 	type ServeOptions,
 	type Service,
 	type StagedListeners,
@@ -196,6 +197,9 @@ export class Reload {
 	readonly deferred = new Map<ObjectImpl, StagedListeners>();
 	/** This reload's run of each facet it loads (`FacetApi.signal`): installed at commit, aborted at rollback. */
 	readonly facetRuns = new Map<string, AbortController>();
+	#preparing: Promise<void> | undefined;
+	#activations: Promise<void> | undefined;
+	#rollback: Promise<void> | undefined;
 
 	constructor(host: HostImpl, facets: readonly Facet[], options: ReloadOptions, codeVersion?: number) {
 		this.host = host;
@@ -206,24 +210,33 @@ export class Reload {
 
 	/** Everything up to the commit. On failure the host is rolled back and the underlying error is thrown. */
 	async prepare(): Promise<void> {
+		this.#preparing = this.#prepare();
 		try {
-			await this.waitForRetirement();
-			this.load();
-			this.checkProviders();
-			await this.prepareAll();
-			// From here new objects of changed types are rejected (upgrade_conflict, retryable) until commit or abort,
-			// so the candidate set is final once the activations already in flight have been prepared.
-			this.host.gating = this.changed;
-			await this.withDeadline(this.prepareAll(), "activations in flight did not finish");
-			this.checkRefs();
-			this.tables = this.host.buildTables(this.entries());
-			await this.gate();
-			this.#alive();
-			this.#stage();
+			await this.#preparing;
 		} catch (error) {
 			await this.rollback();
 			throw reloadError(error);
 		}
+	}
+
+	async #prepare(): Promise<void> {
+		await this.waitForRetirement();
+		this.#alive();
+		this.load();
+		this.checkProviders();
+		await this.prepareAll();
+		this.#alive();
+		// From here new objects of changed types are rejected (upgrade_conflict, retryable) until commit or abort,
+		// so the candidate set is final once the activations already in flight have been prepared.
+		this.host.gating = this.changed;
+		this.#activations = this.prepareAll();
+		await this.withDeadline(this.#activations, "activations in flight did not finish");
+		this.#alive();
+		this.checkRefs();
+		this.tables = this.host.buildTables(this.entries());
+		await this.gate();
+		this.#alive();
+		this.#stage();
 	}
 
 	/** What a successful prepare will commit (a child sends it with its vote). */
@@ -361,7 +374,7 @@ export class Reload {
 					(object.status === "live" || object.status === "activating"),
 			);
 			if (todo.length === 0) return;
-			await Promise.allSettled(todo.map((object) => object.ready));
+			await raceSignal(Promise.allSettled(todo.map((object) => object.ready)), this.abort.signal);
 			this.#alive();
 			for (const object of todo) {
 				if (object.status === "live" && object.service !== this.services.get(object.typeName)) {
@@ -415,11 +428,14 @@ export class Reload {
 			run.created.refs,
 			this.abort.signal,
 		);
-		await object.waitHydrated(run);
+		this.#alive();
+		await raceSignal(object.waitHydrated(run), this.abort.signal);
+		this.#alive();
 		// Cells this reload adds read their first value once the new resources are open (gated objects: at the gate);
 		// the derivations over them are checked after.
 		if (candidate.reasons.length === 0) {
 			await object.initCells(run, this.abort.signal);
+			this.#alive();
 			dryRun(candidate);
 		}
 	}
@@ -471,13 +487,15 @@ export class Reload {
 		});
 		const deadline = this.options.gateDeadline ?? 5000;
 		let timer: ReturnType<typeof setTimeout> | undefined;
-		const timedOut = await Promise.race([
-			Promise.all(drained).then(() => false),
-			new Promise<boolean>((resolve) => {
-				timer = setTimeout(() => resolve(true), deadline);
-			}),
-		]);
-		clearTimeout(timer);
+		const timedOut = await raceSignal(
+			Promise.race([
+				Promise.all(drained).then(() => false),
+				new Promise<boolean>((resolve) => {
+					timer = setTimeout(() => resolve(true), deadline);
+				}),
+			]),
+			this.abort.signal,
+		).finally(() => clearTimeout(timer));
 		if (timedOut) {
 			const blocking = this.gated.flatMap(({ object }) => [...(object.gate?.grandfathered ?? [])]);
 			throw new ChordError(
@@ -496,6 +514,7 @@ export class Reload {
 				// Owned by the rollback before closing: a failing close must still be restored.
 				this.closed.push([object, old]);
 				await old.close(object.openOrder);
+				this.#alive();
 			}
 			await object.open(candidate.atGate, [], this.abort.signal);
 			this.#alive();
@@ -524,10 +543,21 @@ export class Reload {
 	}
 
 	async rollback(): Promise<void> {
-		if (this.rolledBack) return;
+		if (this.#rollback !== undefined) return this.#rollback;
 		this.rolledBack = true;
+		// Cache the join before aborting: prepare's failure path and the coordinator may both request rollback.
+		const rollback = this.#restore();
+		this.#rollback = rollback;
 		this.abort.abort(new ChordError("aborted", "reload aborted"));
 		for (const run of this.facetRuns.values()) run.abort(new ChordError("aborted", "reload aborted"));
+		return rollback;
+	}
+
+	async #restore(): Promise<void> {
+		// Join the preparation body, not prepare() (which itself awaits rollback on failure). Pending opens/old
+		// exclusive closes must settle before unwind, restoration, and opening the gates can race with them.
+		await this.#preparing?.catch(() => {});
+		await this.#activations?.catch(() => {});
 		const report = (error: unknown): void => this.host.report(error);
 		for (const candidate of this.candidates.values()) candidate.staged?.discard();
 		for (const staged of this.deferred.values()) staged.discard();

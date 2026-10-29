@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHost, replicatedState } from "@earendil-works/chord";
+import { createHost, memoryLinkPair, replicatedState } from "@earendil-works/chord";
 import { onTestFinished, test } from "vitest";
 import {
 	attachChordView,
@@ -139,4 +139,194 @@ test("native Chord conversation objects retain keyed config and conversation sco
 	await sleep(0);
 	assert.equal(first.view.value.conversation.id, root.id);
 	assert.equal(second.view.value.conversation.id, child.id);
+});
+
+test("remote conversation validation rejects malformed messages and edits without committing history", async () => {
+	const harness = await Harness.open(new MemoryStorage(), { models: fake({ respond: () => ({ text: "ok" }) }) }, ctx);
+	const root = await harness.root(ctx);
+	const provider = createHost({ name: "harness", self: null });
+	const client = createHost({ name: "presentation", kind: "client", self: null });
+	onTestFinished(async () => {
+		try {
+			await client.close();
+		} finally {
+			try {
+				await provider.close();
+			} finally {
+				await harness.close(ctx);
+			}
+		}
+	});
+	await provider.install(createPicoHarnessFacet(harness));
+	const [upstream, downstream] = memoryLinkPair();
+	provider.accept(downstream, { principal: "presentation", kind: "client" });
+	let wireArgs: unknown;
+	let overrideArgs = false;
+	client.connect(
+		{
+			get closed() {
+				return upstream.closed;
+			},
+			send(frame) {
+				return upstream.send(frame.t === "call" && overrideArgs ? { ...frame, args: wireArgs } : frame);
+			},
+			receive: (handler) => upstream.receive(handler),
+			onClose: (handler) => upstream.onClose(handler),
+			close: (reason) => upstream.close(reason),
+		},
+		{ principal: "harness" },
+	);
+	const ref = await client.get(PicoConversationService, { conversationId: root.id });
+	const original = await root.context(ctx);
+	const assistant = {
+		role: "assistant" as const,
+		content: [{ type: "text" as const, text: "valid" }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "fake-1",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop" as const,
+		timestamp: 1,
+	};
+	overrideArgs = true;
+	for (const malformed of [
+		{ kind: "bad", model: [{ role: "assistant", content: null }] },
+		{ kind: "bad", model: [{ ...assistant, content: [{ type: "text", text: 42 }] }] },
+		{
+			kind: "bad",
+			model: [{ ...assistant, content: [{ type: "toolCall", id: "call", name: "tool", arguments: null }] }],
+		},
+		{ kind: "bad", model: [{ role: "user", content: [{ type: "image", data: "base64" }], timestamp: 1 }] },
+		{ kind: "bad", edits: [null] },
+		{ kind: "bad", edits: [{ target: 0, action: "delete" }] },
+		{ kind: "bad", edits: [{ target: 0, action: "replace", messages: [{ ...assistant, content: null }] }] },
+	]) {
+		wireArgs = malformed;
+		await assert.rejects(
+			client.root((call) => ref.write({ kind: "valid" }, call)),
+			{ code: "invalid", reason: "args" },
+		);
+		assert.deepEqual(await root.context(ctx), original);
+	}
+	for (const constrainedSampling of [
+		null,
+		[],
+		{ type: "grammar", variants: [] },
+		true,
+		"json_schema",
+		{},
+		{ type: "unsupported" },
+		{ type: "json_schema" },
+		{ type: "json_schema", strict: "sometimes" },
+		{ type: "json_schema", strict: true },
+		{ type: "grammar" },
+		{ type: "grammar", variants: null },
+		{ type: "grammar", variants: "grammar" },
+		{ type: "grammar", variants: { openai_lark: 42 } },
+		{ type: "grammar", variants: { openai_regex: false } },
+	]) {
+		wireArgs = {
+			kind: "bad-sampling",
+			model: [
+				{
+					role: "system",
+					content: "instructions",
+					timestamp: 1,
+					toolsAdded: [{ name: "tool", description: "a tool", parameters: {}, constrainedSampling }],
+				},
+			],
+		};
+		await assert.rejects(
+			client.root((call) => ref.write({ kind: "valid" }, call)),
+			{ code: "invalid", reason: "args" },
+		);
+		assert.deepEqual(await root.context(ctx), original);
+	}
+	for (const content of [
+		null,
+		[{ type: "text", text: null }],
+		[{ type: "image", data: "base64" }],
+		[{ type: "toolCall" }],
+	]) {
+		wireArgs = { content };
+		await assert.rejects(
+			client.root((call) => ref.send({ content: "valid" }, call)),
+			{ code: "invalid", reason: "args" },
+		);
+		assert.deepEqual(await root.context(ctx), original);
+	}
+	overrideArgs = false;
+	await client.root((call) => ref.write({ kind: "valid", model: [assistant] }, call));
+	const committed = await root.context(ctx);
+	assert.deepEqual(committed.messages, [...original.messages, assistant]);
+	const target = committed.entries.at(-1)!.id;
+	const replacement = {
+		role: "user" as const,
+		content: [{ type: "text" as const, text: "replacement" }],
+		timestamp: 2,
+	};
+	await assert.rejects(
+		client.root((call) =>
+			ref.write({ kind: "edit", edits: [{ target, action: "replace", messages: [replacement] }] }, call),
+		),
+		/edits are core only/,
+	);
+	assert.deepEqual(await root.context(ctx), committed);
+	const toolAssistant = {
+		...assistant,
+		content: [
+			{ type: "thinking" as const, thinking: "plan", thinkingSignature: "signature" },
+			{ type: "toolCall" as const, id: "call", name: "tool", arguments: { value: [null, true, 1] } },
+		],
+		stopReason: "toolUse" as const,
+	};
+	const samplingConfigurations = [
+		false,
+		{ type: "json_schema", strict: "prefer" },
+		{ type: "json_schema", strict: "require" },
+		{ type: "grammar", variants: {} },
+		{ type: "grammar", variants: { openai_lark: 'start: "ok"' } },
+		{ type: "grammar", variants: { openai_regex: "^ok$" } },
+		{ type: "grammar", variants: { openai_lark: 'start: "ok"', openai_regex: "^ok$" } },
+	] as const;
+	const messages = [
+		{
+			role: "system" as const,
+			content: "instructions",
+			timestamp: 3,
+			toolsAdded: [
+				{
+					name: "tool",
+					description: "a tool",
+					parameters: { type: "object" },
+				},
+				...samplingConfigurations.map((constrainedSampling, index) => ({
+					name: `constrained-tool-${index}`,
+					description: "a constrained tool",
+					parameters: { type: "object" },
+					constrainedSampling,
+				})),
+			],
+		},
+		replacement,
+		toolAssistant,
+		{
+			role: "toolResult" as const,
+			toolCallId: "call",
+			toolName: "tool",
+			isError: false,
+			timestamp: 4,
+			content: [{ type: "image" as const, data: "base64", mimeType: "image/png" }],
+			details: null,
+		},
+	];
+	await client.root((call) => ref.write({ kind: "valid-unions", model: messages }, call));
+	assert.deepEqual((await root.context(ctx)).messages, [...original.messages, assistant, ...messages]);
 });

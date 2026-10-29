@@ -492,6 +492,17 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 			modelRuntime: runtime.modelRuntime,
 			settingsManager: runtime.settingsManager,
 			facetLoader: runtime.facetLoader,
+			onAttachmentClosed: (scope) => {
+				for (const [key, call] of activeCalls) {
+					if (
+						call.scope.serverConnectionId !== scope.serverConnectionId ||
+						call.scope.attachmentId !== scope.attachmentId
+					)
+						continue;
+					activeCalls.delete(key);
+					call.release();
+				}
+			},
 			publish: async (scope, frame) => {
 				try {
 					await control.send({ type: "chord", token, sessionKey, scope, frame });
@@ -559,15 +570,22 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 		harness.events.on("fault", closeAndExit),
 	];
 	const handleFrame = (command: Static<typeof WorkerFrameSchema>): void => {
+		let trackedKey: string | undefined;
 		if (command.frame.t === "call") {
 			const key = `${demandKey(command.scope.serverConnectionId, command.scope.attachmentId)}\0${command.frame.id}`;
-			if (activeCalls.has(key)) throw new Error("Duplicate native request ID");
-			activeCalls.set(key, {
-				scope: command.scope,
-				release: lifecycle!.beginRequest(command.scope.serverConnectionId, command.scope.attachmentId),
-			});
+			// Chord owns duplicate-ID violations and closes only the offending link.
+			if (!activeCalls.has(key)) {
+				activeCalls.set(key, {
+					scope: command.scope,
+					release: lifecycle!.beginRequest(command.scope.serverConnectionId, command.scope.attachmentId),
+				});
+				trackedKey = key;
+			}
 		}
-		services.receive(command.scope, command.frame);
+		if (!services.receive(command.scope, command.frame) && trackedKey !== undefined) {
+			activeCalls.get(trackedKey)?.release();
+			activeCalls.delete(trackedKey);
+		}
 	};
 	let ready = false;
 	const announce = (): void => {

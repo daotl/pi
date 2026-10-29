@@ -1,13 +1,20 @@
-import { createModels, fauxAssistantMessage, fauxProvider, type MutableModels } from "@earendil-works/pi-ai";
+import {
+	createModels,
+	fauxAssistantMessage,
+	fauxProvider,
+	type MutableModels,
+	type SystemMessage,
+} from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { HarnessEvent, WatchHandle } from "../../../src/harness/agent-harness.ts";
-import { DEFAULT_COMPACTION_SETTINGS } from "../../../src/harness/compaction/compaction.ts";
+import { DEFAULT_COMPACTION_SETTINGS, prepareCompaction } from "../../../src/harness/compaction/compaction.ts";
 import { BACKGROUND_CONTEXT } from "../../../src/harness/context.ts";
 import { HookRegistry } from "../../../src/harness/hooks.ts";
 import { runCheckpoint } from "../../../src/harness/runtime/drive/checkpoint.ts";
 import { runGeneration } from "../../../src/harness/runtime/drive/generation.ts";
 import {
 	commitNavigation,
+	durableCompactionPreparation,
 	recoverStructuralGeneration,
 	runStructuralDecision,
 	runStructuralGeneration,
@@ -17,6 +24,7 @@ import { Lane } from "../../../src/harness/runtime/lane.ts";
 import { restoreLane } from "../../../src/harness/runtime/restore.ts";
 import { type Config, Drive } from "../../../src/harness/runtime/types.ts";
 import { insertEntry } from "../../../src/harness/session/commit.ts";
+import { buildSessionContext } from "../../../src/harness/session/context.ts";
 import { MemoryStorage } from "../../../src/harness/session/memory.ts";
 import { StorageBackedSession } from "../../../src/harness/session/session.ts";
 import { InstrumentedStorage } from "../../../src/harness/session/testing/instrumented-storage.ts";
@@ -286,6 +294,106 @@ afterEach(async () => {
 });
 
 describe("runtime structural drive", () => {
+	it.each([
+		["generated", 1],
+		["generated", 100_000],
+		["hook", 1],
+		["hook", 100_000],
+	] as const)("preserves system checkpoints in %s compaction with retention %s", async (mode, keepRecentTokens) => {
+		const fixture = await createFixture();
+		const baseline: SystemMessage = {
+			role: "system",
+			content: "Imported policy",
+			sections: { safety: "old safety", obsolete: "remove me" },
+			toolsAdded: [
+				{
+					name: "read",
+					description: "Read",
+					parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+				},
+			],
+			timestamp: 1,
+		};
+		const patch: SystemMessage = {
+			role: "system",
+			content: "Updated instructions",
+			sections: { safety: "new safety", obsolete: null },
+			toolsRemoved: [{ name: "read" }],
+			toolsAdded: [
+				{
+					name: "write",
+					description: "Write",
+					parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+				},
+			],
+			timestamp: 2,
+		};
+		const expectedPolicy: SystemMessage = {
+			role: "system",
+			content: "Imported policy\n\nUpdated instructions",
+			sections: { safety: "new safety" },
+			toolsAdded: patch.toolsAdded,
+			timestamp: 1,
+		};
+		const entries: NewEntry[] = [
+			{
+				id: "imported",
+				parentId: null,
+				type: "compaction",
+				summary: "imported summary",
+				retainedTail: [],
+				systemMessage: baseline,
+				tokensBefore: 100,
+				fromHook: false,
+			},
+			{ id: "history", parentId: "imported", type: "message", message: user("old history") },
+			{ id: "policy-patch", parentId: "history", type: "message", message: patch },
+			{ id: "tip", parentId: "policy-patch", type: "message", message: user("recent question") },
+		];
+		const prepared = prepareCompaction(
+			entries.map((entry, index) => ({ ...entry, seq: index + 1, timestamp: index + 1 })),
+			{ enabled: true, reserveTokens: 1_000, keepRecentTokens },
+		);
+		if (!prepared.ok || prepared.value === undefined) throw new Error("Missing repeated compaction preparation");
+		const deciding = { ...runScope(), at: "summary.deciding", task: standaloneCompactionTask() } as const;
+		await installOperation(
+			fixture,
+			deciding,
+			{ kind: "compaction" },
+			{
+				entries,
+				preparation: { taskId: "task", value: durableCompactionPreparation(prepared.value) },
+			},
+		);
+		if (mode === "hook") {
+			fixture.hooks.on("before_compaction", ({ preparation }) => ({
+				compaction: {
+					summary: "new summary",
+					tokensBefore: preparation.tokensBefore,
+					retainedTail: preparation.retainedTail,
+				},
+			}));
+		} else {
+			fixture.faux.setResponses([fauxAssistantMessage("new summary")]);
+		}
+		await runStructuralDecision(fixture.lane, fixture.drive, deciding);
+		if (mode === "generated") {
+			const ready = currentState(fixture);
+			if (ready.at !== "summary.ready") throw new Error("Missing summary generation state");
+			await runStructuralGeneration(fixture.lane, fixture.drive, ready);
+		}
+		const entry = await fixture.session.getEntry(fixture.lane.state.tipId!, BACKGROUND_CONTEXT);
+		if (entry?.type !== "compaction") throw new Error("Missing repeated compaction entry");
+		const tail = keepRecentTokens === 1 ? [user("recent question")] : [user("old history"), user("recent question")];
+		expect(entry.systemMessage).toEqual(expectedPolicy);
+		expect(entry.retainedTail).toEqual(tail);
+		expect(await buildSessionContext([entry], undefined, BACKGROUND_CONTEXT)).toEqual([
+			expectedPolicy,
+			expect.objectContaining({ role: "compactionSummary", summary: "new summary" }),
+			...tail,
+		]);
+	});
+
 	it("routes a declined threshold directly to assistant generation", async () => {
 		const fixture = await createFixture();
 		const model = fixture.faux.getModel();

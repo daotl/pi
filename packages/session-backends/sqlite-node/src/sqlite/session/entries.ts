@@ -38,6 +38,7 @@ function entryPayload(entry: Entry): StoredEntryPayload<Entry> {
 			const payload: StoredEntryPayload<CompactionEntry> = {
 				summary: entry.summary,
 				retainedTail: entry.retainedTail,
+				...(entry.systemMessage === undefined ? {} : { systemMessage: entry.systemMessage }),
 				tokensBefore: entry.tokensBefore,
 				...(entry.details === undefined ? {} : { details: entry.details }),
 				...(entry.usage === undefined ? {} : { usage: entry.usage }),
