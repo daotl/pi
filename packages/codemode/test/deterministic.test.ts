@@ -324,6 +324,57 @@ for (const [backend, create] of Object.entries(BACKENDS)) {
 			});
 		});
 
+		it("reserves declared script names before raw aliases in either declaration order", async () => {
+			const declarations = [
+				{ name: "save", jsName: "first", description: "Save tool" },
+				{ name: "write", jsName: "save", description: "Write tool" },
+			];
+			for (const tools of [declarations, [...declarations].reverse()]) {
+				const recorded = start(
+					create(),
+					`return {
+						values: [await tools.first(), await tools.save(), await tools.write()],
+						all: ALL_TOOLS,
+					};`,
+					{ tools, answer: (call) => ({ ok: true, value: call.name }) },
+				);
+				expect(await recorded.run.result).toMatchObject({
+					ok: true,
+					value: {
+						values: ["save", "write", "write"],
+						all: tools.map(({ jsName, description }) => ({ name: jsName, description })),
+					},
+				});
+				expect(recorded.calls.map(({ target, name }) => ({ target, name }))).toEqual([
+					{ target: "tool", name: "save" },
+					{ target: "tool", name: "write" },
+					{ target: "tool", name: "write" },
+				]);
+			}
+		});
+
+		it("keeps the first normalized binding and distinct raw aliases in legacy execute", async () => {
+			const declarations = [
+				{ name: "my-tool", description: "Dashes", execute: () => "dash" },
+				{ name: "my_tool", description: "Underscore", execute: () => "underscore" },
+			];
+			for (const tools of [declarations, [...declarations].reverse()]) {
+				const sandbox = create({ tools });
+				expect(
+					await sandbox.execute(`return {
+						values: [await tools.my_tool(), await tools["my-tool"]()],
+						all: ALL_TOOLS,
+					};`),
+				).toMatchObject({
+					ok: true,
+					value: {
+						values: [tools[0]!.execute(), "dash"],
+						all: [{ name: "my_tool", description: tools[0]!.description }],
+					},
+				});
+			}
+		});
+
 		it("ends with an error the script cannot catch when the caller aborts", async () => {
 			const sandbox = create();
 			const controller = new AbortController();

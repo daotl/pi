@@ -24,13 +24,14 @@ import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { retainedBytes } from "./heap-retained.ts";
 
 const waiting = new Map<string, () => void>();
-/** Holds until released by name, then completes. */
+/** Reads the nonempty conversation context, holds until released by name, then completes. */
 const Hold = defineTask<{ name: string }, { phase: "hold" }, null>({
 	name: "bench.hold",
 	version: 1,
 	initial: () => ({ phase: "hold" }),
 	phases: {
 		hold: async (task, runtime, ctx) => {
+			await runtime.context(runtime.conversationId, ctx);
 			await new Promise<void>((resolve) => waiting.set(task.input.name, resolve));
 			await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: null } }), ctx);
 		},
@@ -47,7 +48,7 @@ async function release(name: string): Promise<void> {
 
 type Sizes = Record<"live" | "settled" | "edges" | "below" | "roots" | "unloaded" | "dropQueue", number>;
 
-async function run(cycles: number) {
+async function run(cycles: number, contextRetentionMs: number) {
 	const directory = mkdtempSync(join(tmpdir(), "pi-durable-memory-bench-"));
 	try {
 		const storage = await openNodeSqliteStorage(join(directory, "session.sqlite"));
@@ -64,7 +65,12 @@ async function run(cycles: number) {
 		};
 		const registry = createRegistry();
 		registry.install(defineExtension({ name: "bench", tasks: [Hold] }));
-		const harness = await Harness.open(storage, { models: createModels(), registry }, context);
+		// Keep every completed conversation inside one deterministic retention window, independent of machine speed.
+		const harness = await Harness.open(
+			storage,
+			{ models: createModels(), registry, now: () => 0, settings: { contextRetentionMs } },
+			context,
+		);
 		const root = await harness.root(context);
 		harness.resume();
 		const parent = await root.commit(
@@ -82,6 +88,10 @@ async function run(cycles: number) {
 					{ ownership: { kind: "task", taskId: parent } },
 				);
 				const child = await tx.createConversation({ ownership: { kind: "task", taskId: tool } });
+				await tx.appendEntry(child.id, {
+					kind: "message",
+					model: [{ role: "user", content: `subagent ${n}`, timestamp: 0 }],
+				});
 				const inner = await tx.createTask(
 					Hold,
 					{ name: `inner${n}` },
@@ -100,6 +110,7 @@ async function run(cycles: number) {
 		const sizes = (harness as unknown as Record<symbol, Sizes>)[SCHEDULER_INDEX_SIZES]!;
 		// A later message into an old subagent conversation: a task created there, run, and ended.
 		const readsBefore = reads.count;
+		const lateStarted = performance.now();
 		const old = (await harness.conversation(first!, context))!;
 		const late = await old.commit(
 			(tx) => tx.createTask(Hold, { name: "late" }, { ownership: { kind: "conversation" } }),
@@ -108,23 +119,28 @@ async function run(cycles: number) {
 		await release("late");
 		await harness.waitForTask(late, context);
 		const lateReads = reads.count - readsBefore;
+		const lateTransitionMs = performance.now() - lateStarted;
 		await release("parent");
 		await harness.waitForTask(parent, context);
 		await harness.close(context);
-		return { ms, sizes, heap: heapAfter - heapBefore, lateReads };
+		return { ms, sizes, heap: heapAfter - heapBefore, lateReads, lateTransitionMs };
 	} finally {
 		rmSync(directory, { recursive: true, force: true });
 	}
 }
 
 const cycles = process.argv.slice(2).map(Number);
-console.log("cycles | ms     | settled | edges  | below | heap growth             | reads for a later message");
+console.log(
+	"cycles | context retention | ms     | settled | edges  | below | heap growth             | late reads | late transition ms",
+);
 for (const n of cycles.length > 0 ? cycles : [1000, 10000]) {
-	const { ms, sizes, heap, lateReads } = await run(n);
-	console.log(
-		`${String(n).padEnd(6)} | ${String(ms).padEnd(6)} | ${String(sizes.settled).padEnd(7)} | ${String(sizes.edges).padEnd(6)} | ${String(sizes.below).padEnd(5)} | ${`${(heap / 1024 / 1024).toFixed(1)} MiB, ${Math.round(heap / n)} B/cycle`.padEnd(23)} | ${lateReads}`,
-	);
-	// The scheduler's ownership indexes must not grow with ended history; the heap still includes the Session's caches.
-	if (sizes.settled > 0 || sizes.edges > 1)
-		throw new Error(`ownership indexes grew with history: ${JSON.stringify(sizes)}`);
+	for (const retention of [0, 600_000]) {
+		const { ms, sizes, heap, lateReads, lateTransitionMs } = await run(n, retention);
+		console.log(
+			`${String(n).padEnd(6)} | ${String(retention).padEnd(17)} | ${String(ms).padEnd(6)} | ${String(sizes.settled).padEnd(7)} | ${String(sizes.edges).padEnd(6)} | ${String(sizes.below).padEnd(5)} | ${`${(heap / 1024 / 1024).toFixed(1)} MiB, ${Math.round(heap / n)} B/cycle`.padEnd(23)} | ${lateReads} | ${lateTransitionMs.toFixed(3)}`,
+		);
+		// Ownership indexes must not grow with ended history; retained context is measured separately by the control.
+		if (sizes.settled > 0 || sizes.edges > 1)
+			throw new Error(`ownership indexes grew with history: ${JSON.stringify(sizes)}`);
+	}
 }

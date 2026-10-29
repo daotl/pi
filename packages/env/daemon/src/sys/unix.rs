@@ -235,6 +235,7 @@ pub fn resolve_program(
     program: &str,
     _cwd: &str,
     _env: &Map<String, Value>,
+    _inherit_env: bool,
 ) -> Result<String, Failure> {
     Ok(program.to_string())
 }

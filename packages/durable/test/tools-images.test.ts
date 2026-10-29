@@ -594,6 +594,37 @@ describe("createNodePhotonImages", () => {
 		expect(png).toEqual(copy);
 	}, 60_000);
 
+	it("keeps its replacement when a retired worker reports exit later", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const images = await createNodePhotonImages({ idleMs: 10 });
+		const workers: Worker[] = [];
+		const postMessage = Worker.prototype.postMessage;
+		const terminate = Worker.prototype.terminate;
+		const post = vi.spyOn(Worker.prototype, "postMessage").mockImplementation(function (this: Worker, ...args) {
+			workers.push(this);
+			return postMessage.apply(this, args);
+		});
+		// Idle retirement happens now, but the old worker's exit notification is delayed until after replacement.
+		const stop = vi.spyOn(Worker.prototype, "terminate").mockResolvedValue(0);
+		try {
+			const bytes = gif();
+			const expected = { data: toBase64(bytes), mimeType: "image/gif" };
+			expect(await images.prepare(bytes, "image/gif", DEFAULT_IMAGE_LIMITS)).toEqual(expected);
+			vi.advanceTimersByTime(10);
+			expect(stop).toHaveBeenCalledTimes(1);
+			expect(await images.prepare(bytes, "image/gif", DEFAULT_IMAGE_LIMITS)).toEqual(expected);
+			expect(workers[1]).not.toBe(workers[0]);
+			workers[0]!.emit("exit", 0);
+			expect(await images.prepare(bytes, "image/gif", DEFAULT_IMAGE_LIMITS)).toEqual(expected);
+			expect(workers[2]).toBe(workers[1]);
+		} finally {
+			post.mockRestore();
+			stop.mockRestore();
+			await Promise.all([...new Set(workers)].map((worker) => terminate.call(worker)));
+			vi.useRealTimers();
+		}
+	});
+
 	it("prepares concurrent images, and starts a new worker after the idle one exited", async () => {
 		const images = await createNodePhotonImages({ idleMs: 10 });
 		const results = await Promise.all([

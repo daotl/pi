@@ -285,8 +285,11 @@ export async function forgetHostKey(target: SshTarget): Promise<void> {
 	);
 }
 
-/** POSIX detection, run by the remote login shell; a Windows host answers through PowerShell instead. */
-const POSIX_PROBE = `sh -c 'echo PI-ENV-PROBE; uname -s; uname -m; uname -o 2>/dev/null || echo -; printf "%s\\n" "$HOME" "\${TMPDIR:--}" "\${LD_PRELOAD:--}"'`;
+/** POSIX detection through an explicit `sh`; the outer login shell may be fish. Windows answers through PowerShell. */
+const POSIX_PROBE = `sh -c ${quotePosix(
+	// biome-ignore lint/suspicious/noTemplateCurlyInString: these expansions belong to the remote POSIX shell.
+	'echo PI-ENV-PROBE; uname -s; uname -m; uname -o 2>/dev/null || echo -; printf "%s\\n" "$HOME" "${TMPDIR:--}" "${LD_PRELOAD:--}"',
+)}`;
 
 function powershell(script: string): string {
 	return `powershell -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(script, "utf16le").toString("base64")}`;
@@ -367,8 +370,9 @@ export function localDaemon(): string {
 	return packagedDaemon({ platform, arch: normalizeArch(process.arch) });
 }
 
+/** A literal argument in POSIX shells and fish; fish also interprets backslashes inside single quotes. */
 function quotePosix(text: string): string {
-	return `'${text.replaceAll("'", "'\\''")}'`;
+	return `'${text.replace(/['\\]/g, (character) => `'\\${character}'`)}'`;
 }
 
 function quotePowerShell(text: string): string {
@@ -464,8 +468,8 @@ export async function deployDaemon(
 export interface SshConnectOptions extends SshTarget {
 	binary?: string;
 	/**
-	 * POSIX: start the daemon through the user's login shell (`$SHELL -l`), so commands see the environment of
-	 * `~/.profile` and similar files. Off by default: `ssh` runs commands without a login shell.
+	 * Unix: start the daemon through the user's login shell (`$SHELL -l`), so commands see the environment of
+	 * `~/.profile`, fish's `config.fish` and similar files. Off by default: `ssh` runs commands without a login shell.
 	 */
 	loginShell?: boolean;
 	onLog?: ConnectionOptions["onLog"];
@@ -478,8 +482,12 @@ function launchCommand(remote: RemotePlatform, file: string, loginShell: boolean
 		if (remote.shell === "powershell") return `& ${quotePowerShell(file)}`;
 		return file.includes(" ") ? `"${file}"` : file;
 	}
-	// `$0` is the daemon, `"$@"` its arguments; `$SHELL` is the login shell's own name for itself.
-	if (loginShell) return `exec "$SHELL" -lc 'exec "$0" "$@"' ${quotePosix(file)}`;
+	if (loginShell) {
+		// Dispatch inside `sh`, not the outer SSH shell. Fish puts all extra -c arguments in $argv;
+		// POSIX shells instead use the first as $0 and the rest as "$@".
+		const launch = `case "\${SHELL##*/}" in fish) exec "$SHELL" -lc 'exec $argv' "$0" "$@" ;; *) exec "$SHELL" -lc 'exec "$0" "$@"' "$0" "$@" ;; esac`;
+		return `exec sh -c ${quotePosix(launch)} ${quotePosix(file)}`;
+	}
 	return quotePosix(file);
 }
 

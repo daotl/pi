@@ -872,3 +872,216 @@ describe("versioned call projections", () => {
 		await server.close();
 	});
 });
+
+describe("terminal consumer host shutdown", () => {
+	it("ends externally held upstream views after cleanup and rejects new acquisitions", async () => {
+		const { server, browser } = setup();
+		const ref = await browser.get(Notes, {});
+		await ref.add("retained");
+		await until(() => ref.notes.value.length === 1);
+		await browser.close();
+		assert.equal(ref.status, "gone");
+		assert.throws(
+			() => ref.notes.value,
+			(error) => isChordError(error, "gone"),
+		);
+		await assert.rejects(ref.add("after close"), (error) => isChordError(error, "gone"));
+		await assert.rejects(browser.get(Notes, {}), (error) => isChordError(error, "gone"));
+		assert.throws(
+			() => browser.hold(Notes, {}),
+			(error) => isChordError(error, "gone"),
+		);
+		await server.close();
+	});
+
+	it("settles loading readiness and fences a route that completes after close", async () => {
+		const resolving = Promise.withResolvers<void>();
+		const route = Promise.withResolvers<Link>();
+		const consumer = new HostImpl({ self: "host", name: "consumer", kind: "client" });
+		consumer.route("server", {
+			principal: () => "server",
+			authorize: () => true,
+			resolve: async () => {
+				resolving.resolve();
+				return route.promise;
+			},
+		});
+		const ref = consumer.hold(Notes, {});
+		const rejected = assert.rejects(ref.ready, (error) => isChordError(error, "gone"));
+		await resolving.promise;
+		await consumer.close();
+		await rejected;
+		assert.equal(ref.status, "gone");
+		await assert.rejects(ref.rename("closed"), (error) => isChordError(error, "gone"));
+		const [down, up] = memoryLinkPair();
+		route.resolve(down);
+		await tick();
+		assert.equal(down.closed, true);
+		assert.equal(up.closed, true);
+		assert.equal(consumer.connections.size, 0);
+		assert.equal(consumer.bindings.size, 0);
+	});
+});
+
+describe("current projections decode fresh calls", () => {
+	for (const stalled of ["window", "snapshot"] as const) {
+		for (const beforeArgs of [false, true]) {
+			for (const kind of ["client", "host"] as const) {
+				it(`${kind} ${beforeArgs ? "args to no args" : "no args to args"} with a blocked ${stalled} preserves implicit arguments and holder cancellation`, async () => {
+					const Switch = remote("t.projection-arity", {
+						version: 1,
+						input: Type.Object({}),
+						host: hostNamed("server"),
+						variants: {
+							args: {
+								state: { n: Type.Number(), extra: Type.String(), argsOnly: Type.String() },
+								methods: {
+									send: method(Type.String(), Type.String()),
+									wait: method(Type.String(), Type.String()),
+									bump: method(),
+								},
+							},
+							bare: {
+								state: { n: Type.Number(), extra: Type.String(), bareOnly: Type.String() },
+								methods: {
+									send: method(undefined, Type.String()),
+									wait: method(undefined, Type.String()),
+									bump: method(),
+								},
+							},
+						},
+					});
+					const server = createHost({ self: "host", name: "server" });
+					const calls: unknown[] = [];
+					const entered = Promise.withResolvers<void>();
+					const facet = (args: boolean) => ({
+						name: "arity",
+						setup: (api: FacetApi) => {
+							api.serve(Switch, (_input, _principal, self) => {
+								const n = self.state("n", Type.Number(), 0);
+								const extra = self.state("extra", Type.String(), "shared");
+								const bump = (ctx: Ctx) => n.replace(ctx, n.value + 1);
+								const wait = async (value: unknown, ctx: Ctx) => {
+									calls.push(value);
+									entered.resolve();
+									await new Promise<void>((resolve) =>
+										ctx.signal.addEventListener("abort", () => resolve(), { once: true }),
+									);
+									return "cancelled";
+								};
+								return args
+									? {
+											variant: "args",
+											n,
+											extra,
+											argsOnly: self.state("argsOnly", Type.String(), "args snapshot"),
+											bump,
+											send: (value: string) => {
+												calls.push(value);
+												return value;
+											},
+											wait,
+										}
+									: {
+											variant: "bare",
+											n,
+											extra,
+											bareOnly: self.state("bareOnly", Type.String(), "bare snapshot"),
+											bump,
+											send: () => {
+												calls.push(undefined);
+												return "bare";
+											},
+											wait: (ctx: Ctx) => wait(undefined, ctx),
+										};
+							});
+						},
+					});
+					await server.install(facet(beforeArgs));
+					const [down, up] = memoryLinkPair();
+					server.accept(down, {
+						principal: "guest",
+						...(kind === "host" ? { kind, name: "worker" } : {}),
+						window: stalled === "window" ? 1 : undefined,
+					});
+					let holdSnapshots = false;
+					let held: Frame[] = [];
+					let deliver: ((frame: Frame) => void) | undefined;
+					const counting = new CountingLink(up);
+					const link: Link = {
+						get closed() {
+							return counting.closed;
+						},
+						send: (frame) => counting.send(frame),
+						onClose: (handler) => counting.onClose(handler),
+						close: (reason) => counting.close(reason),
+						receive: (handler) => {
+							deliver = handler;
+							counting.receive((frame) => {
+								if (holdSnapshots && frame.t === "state" && frame.as === "snap") held.push(frame);
+								else handler(frame);
+							});
+						},
+					};
+					const browser = createHost({
+						self: "host",
+						name: "worker",
+						kind,
+						upstream: { link, principal: "server" },
+					});
+					const Runner = local("t.arity-holder", { version: 1, input: Type.Object({}) });
+					const start = Promise.withResolvers<void>();
+					const finished = Promise.withResolvers<unknown>();
+					browser.serve(Runner, (_input, _principal, self) => {
+						const target = self.get(Switch, {});
+						self.task(async (ctx) => {
+							await start.promise;
+							try {
+								const call = Reflect.get(target, "wait") as (...args: unknown[]) => Promise<string>;
+								await (beforeArgs ? call(ctx) : call("holder", ctx));
+								finished.resolve("not cancelled");
+							} catch (error) {
+								finished.resolve(error);
+							}
+						});
+						return {};
+					});
+					try {
+						const ref = await browser.get(Switch, {});
+						const runner = await browser.get(Runner, {});
+						if (stalled === "window") {
+							counting.paused = true;
+							await ref.bump();
+							await ref.bump();
+						} else holdSnapshots = true;
+						await server.reload([facet(!beforeArgs)]);
+						await until(() =>
+							counting.received.some(
+								(frame) =>
+									(frame.t === "projections" || frame.t === "shape") &&
+									frame.callVariants.some((entry) => entry.variant === (beforeArgs ? "bare" : "args")),
+							),
+						);
+						assert.equal(ref.variant, beforeArgs ? "args" : "bare");
+						const send = Reflect.get(ref, "send") as (...args: unknown[]) => Promise<string>;
+						assert.equal(await (beforeArgs ? send() : send("implicit")), beforeArgs ? "bare" : "implicit");
+						start.resolve();
+						await entered.promise;
+						runner.release();
+						assert.ok(isChordError(await finished.promise, "aborted"));
+						assert.deepEqual(calls, beforeArgs ? [undefined, undefined] : ["implicit", "holder"]);
+						assert.equal(ref.variant, beforeArgs ? "args" : "bare");
+					} finally {
+						start.resolve();
+						counting.release();
+						holdSnapshots = false;
+						for (const frame of held) deliver?.(frame);
+						held = [];
+						await browser.close();
+						await server.close();
+					}
+				});
+			}
+		}
+	}
+});

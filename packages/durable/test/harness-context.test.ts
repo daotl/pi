@@ -1,5 +1,6 @@
 import type { Context } from "@earendil-works/chord";
 import { createModels, type Message } from "@earendil-works/pi-ai";
+import { calculateContextTokens, estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
 import {
 	type ContextView,
 	createRegistry,
@@ -13,6 +14,7 @@ import {
 	type Storage,
 } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { estimateContext } from "../src/harness/compaction.ts";
 import { addTask, assistant, describeMessage, openHarness, system, toolResult, user } from "./harness-support.ts";
 import { context } from "./session-support.ts";
 
@@ -235,6 +237,41 @@ describe("conversation context", () => {
 			"assistant:answer",
 			"user:next",
 		]);
+	});
+
+	it("counts a late baseline until a later response measures it, even with a fixed clock", async () => {
+		const harness = await Harness.open(
+			new MemoryStorage(),
+			{ models: createModels(), registry: createRegistry(), now: () => 1 },
+			context,
+		);
+		const root = await harness.root(context);
+		const append = (kind: string, message: Message) =>
+			root.commit((tx) => tx.appendEntry(root.id, { kind, model: [{ ...message, timestamp: 1 }] }), context);
+		const old = assistant("old answer");
+		old.usage.input = 100;
+		old.usage.totalTokens = 100;
+		await append("pi.user", user("first"));
+		await append("pi.assistant", old);
+		await append("pi.user", user("next"));
+		await append("pi.system", system({ plan: "x".repeat(8000) }));
+		// The failed attempt is excluded, so a retry has no new measured response or planned system extras.
+		await append("pi.assistant", assistant("failed", { stopReason: "error" }));
+		let view = await root.context(context);
+		expect(view.messages[0]?.role).toBe("system");
+		expect(estimateContext(view, [])).toBe(
+			view.messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0),
+		);
+		const fresh = assistant("new answer");
+		fresh.usage.input = 2200;
+		fresh.usage.totalTokens = 2200;
+		await append("pi.assistant", fresh);
+		await append("pi.user", user("after"));
+		view = await root.context(context);
+		expect(estimateContext(view, [])).toBe(
+			calculateContextTokens(fresh.usage) + estimateMessageTokens(view.messages.at(-1)!),
+		);
+		await harness.close(context);
 	});
 
 	// #10904
@@ -935,6 +972,131 @@ describe("conversation context", () => {
 		expect(vi.getTimerCount()).toBe(idle);
 		await probe("second");
 		expect(rows).toEqual({ first: 22, second: 22 });
+		await harness.close(context);
+	});
+
+	it("retains a cached scope while tracking and forgetting a 20,000-deep task chain", async () => {
+		const { harness, registry, root, scanned } = await countingSetup();
+		const rows: Record<string, number> = {};
+		const Probe = probeTask(async (name, load) => {
+			const before = scanned.rows;
+			await load();
+			rows[name] = scanned.rows - before;
+		});
+		const Finish = defineTask<null, { phase: "finish" }, null>({
+			name: "test.context-deep-finish",
+			version: 1,
+			initial: () => ({ phase: "finish" }),
+			phases: {
+				finish: async (_task, runtime, taskContext) => {
+					await runtime.commit(() => DONE, taskContext);
+				},
+			},
+			abort: async (_task, runtime, taskContext) => {
+				await runtime.commit(() => ABORTED, taskContext);
+			},
+		});
+		for (const task of [Probe, Finish]) addTask(registry, task);
+		harness.resume();
+		const first = await root.commit(
+			(tx) => tx.createTask(Probe, { name: "first" }, { ownership: { kind: "conversation" } }),
+			context,
+		);
+		expect((await harness.waitForTask(first, context)).state.outcome).toEqual(DONE.outcome);
+		const head = await root.commit(async (tx) => {
+			const head = await tx.createTask(Finish, null, { ownership: { kind: "conversation" } });
+			let owner = head;
+			for (let depth = 1; depth < 20_000; depth++) {
+				owner = await tx.createTask(Finish, null, { ownership: { kind: "task", taskId: owner } });
+			}
+			return head;
+		}, context);
+		expect((await harness.waitForTask(head, context)).state.outcome).toEqual(DONE.outcome);
+		await root.waitForIdle(context);
+		const after = await root.commit(
+			(tx) => tx.createTask(Probe, { name: "after" }, { ownership: { kind: "conversation" } }),
+			context,
+		);
+		expect((await harness.waitForTask(after, context)).state.outcome).toEqual(DONE.outcome);
+		expect(rows).toEqual({ first: 22, after: 1 });
+		await harness.close(context);
+	}, 60_000);
+
+	it("keeps an ancestor busy through owned work and reapplies live idle retention", async () => {
+		let clock = 0;
+		let retention = 1000;
+		const { harness, registry, root, scanned } = await countingSetup({
+			now: () => clock,
+			settings: {
+				get contextRetentionMs() {
+					return retention;
+				},
+			},
+		});
+		const reached = Promise.withResolvers<void>();
+		const childReached = Promise.withResolvers<void>();
+		const releaseOwner = Promise.withResolvers<void>();
+		const releaseChild = Promise.withResolvers<void>();
+		const Hold = defineTask<{ child: boolean }, { phase: "hold" }, null>({
+			name: "test.context-owned-hold",
+			version: 1,
+			initial: () => ({ phase: "hold" }),
+			phases: {
+				hold: async (task, runtime, taskContext) => {
+					await runtime.context(root.id, taskContext);
+					(task.input.child ? childReached : reached).resolve();
+					await (task.input.child ? releaseChild : releaseOwner).promise;
+					await runtime.commit(() => DONE, taskContext);
+				},
+			},
+			abort: async (_task, runtime, taskContext) => {
+				await runtime.commit(() => ABORTED, taskContext);
+			},
+		});
+		const rows: Record<string, number> = {};
+		const Probe = probeTask(async (name, load) => {
+			const before = scanned.rows;
+			await load();
+			rows[name] = scanned.rows - before;
+		});
+		for (const task of [Hold, Probe]) addTask(registry, task);
+		harness.resume();
+		const owner = await root.commit(
+			(tx) => tx.createTask(Hold, { child: false }, { ownership: { kind: "conversation" } }),
+			context,
+		);
+		await reached.promise;
+		// Foreground work in the owned conversation also keeps the ancestor's context busy.
+		const child = await root.commit(async (tx) => {
+			const conversation = await tx.createConversation({ ownership: { kind: "task", taskId: owner } });
+			return tx.createTask(
+				Hold,
+				{ child: true },
+				{ ownership: { kind: "conversation" }, conversationId: conversation.id },
+			);
+		}, context);
+		await childReached.promise;
+		releaseOwner.resolve();
+		clock = 2000;
+		const probe = async (name: string) => {
+			const id = await root.commit(
+				(tx) => tx.createTask(Probe, { name }, { ownership: { kind: "conversation" } }),
+				context,
+			);
+			expect((await harness.waitForTask(id, context)).state.outcome).toEqual(DONE.outcome);
+		};
+		await probe("busy");
+		releaseChild.resolve();
+		expect((await harness.waitForTask(child, context)).state.outcome).toEqual(DONE.outcome);
+		expect((await harness.waitForTask(owner, context)).state.outcome).toEqual(DONE.outcome);
+		await root.waitForIdle(context);
+		clock += 500;
+		retention = 2000;
+		await probe("extended");
+		clock += 250;
+		retention = 100;
+		await probe("shortened");
+		expect(rows).toEqual({ busy: 1, extended: 1, shortened: 22 });
 		await harness.close(context);
 	});
 

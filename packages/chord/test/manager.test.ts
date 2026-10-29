@@ -8,7 +8,14 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { describe, it, onTestFinished, vi } from "vitest";
 import { createHost, ipcLink, isChordError } from "../src/index.ts";
-import { type ControlMessage, createHostManager, type Driver, forkDriver, processLock } from "../src/manager.ts";
+import {
+	type ControlMessage,
+	createHostManager,
+	type Driver,
+	forkDriver,
+	type Instance,
+	processLock,
+} from "../src/manager.ts";
 import { Echo } from "./fixtures/echo.ts";
 
 const entry = fileURLToPath(new URL("./fixtures/worker.ts", import.meta.url));
@@ -183,6 +190,32 @@ describe("host manager forced tree cleanup", () => {
 });
 
 describe("host manager (real child processes)", () => {
+	for (const terminal of ["fatal", "link"] as const) {
+		it(`${terminal} after readiness retires a real worker and creates a usable replacement on demand`, async () => {
+			const manager = createHostManager({ driver: driver(), grace: 0 });
+			const server = createHost({ self: { kind: "host" }, name: "server", onError: () => {} });
+			onTestFinished(async () => {
+				await manager.stop();
+				await server.close();
+			});
+			const first = await manager.start();
+			if (terminal === "fatal") {
+				const reported = Promise.withResolvers<void>();
+				first.onControl((message) => {
+					if (message.type === "fatal") reported.resolve();
+				});
+				first.send({ type: "init", value: "fatal-after-ready" });
+				await reported.promise;
+			} else first.link.close("reconciliation failed");
+			const fresh = await manager.start();
+			assert.notEqual(fresh.pid, first.pid);
+			assert.equal(alive(first.pid), false);
+			server.accept(fresh.link, { principal: { worker: "w1" }, kind: "host", name: "w1" });
+			const echo = server.hold(Echo, {});
+			assert.equal(await echo.echo("replacement"), `hi replacement from ${fresh.pid}`);
+		});
+	}
+
 	// A child host that forks its own children used to pass its CHORD2_LOCK on, so they failed with "locked".
 	it("a child without a lock does not inherit the parent's lock", async () => {
 		const name = `chord2-test-${process.pid}-inherited`;
@@ -318,6 +351,134 @@ describe("host manager (real child processes)", () => {
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		assert.equal(manager.status, "stopped");
 		assert.equal(exits.length, 1);
+	});
+});
+
+// Controlled OS-exit acknowledgement lets these tests distinguish requested termination from joined exit.
+function controlledDriver() {
+	const spawned: {
+		instance: Instance;
+		emit(message: ControlMessage): void;
+		finish(): void;
+		readonly killed: boolean;
+		readonly shutdown: boolean;
+	}[] = [];
+	let notify = Promise.withResolvers<void>();
+	const driver: Driver = {
+		spawn() {
+			const exit = Promise.withResolvers<{ code: number; signal: null }>();
+			const controls = new Set<(message: ControlMessage) => void>();
+			let killed = false;
+			let shutdown = false;
+			const instance: Instance = {
+				pid: spawned.length + 1,
+				link: ipcLink({ connected: true, send: () => true, on: () => undefined, off: () => undefined }),
+				exited: exit.promise,
+				send: () => {
+					shutdown = true;
+				},
+				killTree: () => {
+					killed = true;
+				},
+				onControl: (listener) => {
+					controls.add(listener);
+				},
+			};
+			spawned.push({
+				instance,
+				emit: (message) => {
+					for (const listener of controls) listener(message);
+				},
+				finish: () => exit.resolve({ code: 0, signal: null }),
+				get killed() {
+					return killed;
+				},
+				get shutdown() {
+					return shutdown;
+				},
+			});
+			notify.resolve();
+			notify = Promise.withResolvers<void>();
+			return instance;
+		},
+	};
+	return { driver, spawned, next: () => notify.promise };
+}
+
+describe("manager terminal lifetime", () => {
+	for (const terminal of ["fatal", "link"] as const) {
+		it(`${terminal} after ready invalidates reuse and joins exit before an already queued start`, async () => {
+			const controlled = controlledDriver();
+			const manager = createHostManager({ driver: controlled.driver, grace: 0 });
+			const adopted = controlled.next();
+			const starting = manager.start();
+			await adopted;
+			const old = controlled.spawned[0]!;
+			old.emit({ type: "ready" });
+			await starting;
+			const replacementSpawned = controlled.next();
+			// This start is queued first; the terminal event must synchronously make the old instance ineligible.
+			const replacement = manager.start();
+			if (terminal === "fatal") old.emit({ type: "fatal", message: "terminal upstream failure" });
+			else old.instance.link.close("reconciliation failed");
+			assert.equal(manager.status, "stopping");
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			assert.equal(controlled.spawned.length, 1);
+			assert.equal(old.killed, true);
+			old.finish();
+			await replacementSpawned;
+			const fresh = controlled.spawned[1]!;
+			fresh.emit({ type: "ready" });
+			assert.equal(await replacement, fresh.instance);
+			old.emit({ type: "fatal", message: "late old failure" });
+			old.emit({ type: "status", activeCalls: 99 });
+			assert.equal(manager.status, "running");
+			assert.equal(manager.liveness.activeCalls, 0);
+			const stopped = manager.stop();
+			fresh.instance.link.close("normal shutdown");
+			fresh.finish();
+			await stopped;
+			assert.equal(controlled.spawned.length, 2);
+			assert.equal(manager.status, "stopped");
+		});
+
+		it(`${terminal} immediately after ready cannot publish a failed instance`, async () => {
+			const controlled = controlledDriver();
+			const manager = createHostManager({ driver: controlled.driver });
+			const adopted = controlled.next();
+			const started = manager.start();
+			const rejected = assert.rejects(started, /child (failed|link closed)/);
+			await adopted;
+			const child = controlled.spawned[0]!;
+			child.emit({ type: "ready" });
+			if (terminal === "fatal") child.emit({ type: "fatal", message: "activation failed" });
+			else child.instance.link.close("protocol error");
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			assert.equal(child.killed, true);
+			child.finish();
+			await rejected;
+			await manager.stop();
+			assert.equal(manager.status, "stopped");
+			assert.equal(manager.liveness.booting, false);
+		});
+	}
+
+	it("link failure before ready rejects startup and joins the actual exit", async () => {
+		const controlled = controlledDriver();
+		const manager = createHostManager({ driver: controlled.driver });
+		const adopted = controlled.next();
+		const started = manager.start();
+		const rejected = assert.rejects(started, /child link closed: handshake failed/);
+		await adopted;
+		const child = controlled.spawned[0]!;
+		child.instance.link.close("handshake failed");
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(child.killed, true);
+		assert.equal(manager.status, "stopping");
+		child.finish();
+		await rejected;
+		await manager.stop();
+		assert.equal(manager.status, "stopped");
 	});
 });
 

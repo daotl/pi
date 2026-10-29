@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
@@ -19,7 +19,7 @@ import {
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { estimateTokens } from "../../src/core/compaction/index.ts";
+import { estimateProjectedContextTokens, estimateTokens } from "../../src/core/compaction/index.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { createHarness, getUserTexts, type Harness } from "./harness.ts";
 
@@ -139,6 +139,313 @@ describe("AgentSession compaction characterization", () => {
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
+	});
+
+	// Finding #23: current size belongs to the request's selected summaries, not its billed receipt.
+	it.each(["decrease", "increase"] as const)(
+		"invalidates %s summary-budget usage across reopen without changing billing",
+		async (direction) => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-summary-usage-"));
+			let harness: Harness | undefined;
+			try {
+				const initialBudget = direction === "decrease" ? 20000 : 0;
+				const nextBudget = direction === "decrease" ? 0 : 20000;
+				const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+				manager.appendMessage({ role: "user", content: "old input", timestamp: 1 });
+				manager.appendCompaction(`OLDER:${"x".repeat(40000)}`, null, 100);
+				manager.appendCompaction("NEWEST", null, 100);
+				harness = await createHarness({
+					cwd,
+					sessionManager: manager,
+					models: [{ id: "faux-1", contextWindow: 100000 }],
+					settings: { compaction: { enabled: false, summaryBlockMaxTokens: initialBudget } },
+					extensionFactories: [
+						(pi) => {
+							pi.on("session_before_compact", () => ({ cancel: true }));
+						},
+					],
+				});
+				harness.session.refreshContext();
+				const measured = direction === "decrease" ? 9001 : 100;
+				harness.session.agent.streamFunction = (model, context) => {
+					expect(JSON.stringify(context.messages).includes("OLDER:")).toBe(direction === "decrease");
+					const stream = createAssistantMessageEventStream();
+					queueMicrotask(() =>
+						stream.push({
+							type: "done",
+							reason: "stop",
+							message: {
+								...fauxAssistantMessage("measured", { timestamp: 1 }),
+								api: model.api,
+								provider: model.provider,
+								model: model.id,
+								usage: {
+									...createUsage(measured),
+									cost: { input: 0.25, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.25 },
+								},
+							},
+						}),
+					);
+					return stream;
+				};
+				await harness.session.prompt("measure selected summaries");
+				expect(harness.session.getContextUsage()?.tokens).toBe(measured);
+				// A state-only revision is not a request-context invalidation.
+				manager.appendCustomEntry("unrelated", { value: 1 });
+				expect(harness.session.getContextUsage()?.tokens).toBe(measured);
+				if (initialBudget > 0) {
+					harness.settingsManager.applyOverrides({ compaction: { summaryBlockMaxTokens: initialBudget + 1000 } });
+					expect(harness.session.getContextUsage()?.tokens).toBe(measured);
+				}
+				const billed = harness.session.getSessionStats();
+				const receipts = structuredClone(manager.getEntries());
+				harness.settingsManager.applyOverrides({
+					compaction: {
+						enabled: true,
+						reserveTokens: 91000,
+						keepRecentTokens: 1,
+						summaryBlockMaxTokens: nextBudget,
+					},
+				});
+				// Do not read the footer/projection first: the direct pre-prompt path must synchronize the setting itself.
+				const currentResponse = harness.session.agent.state.messages.findLast(
+					(message) => message.role === "assistant",
+				);
+				if (currentResponse?.role !== "assistant") throw new Error("Missing measured response");
+				await (harness.session as unknown as SessionWithCompactionInternals)._checkCompaction(
+					currentResponse,
+					false,
+				);
+				expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toEqual(
+					direction === "increase" ? ["threshold"] : [],
+				);
+				harness.settingsManager.applyOverrides({ compaction: { enabled: false } });
+				expect(harness.session.getContextUsage()?.tokens).toBeNull();
+				const estimate = estimateProjectedContextTokens(manager.buildSessionProjection(), manager.getBranch());
+				expect(estimate.lastUsageIndex).toBeNull();
+				expect(estimate.tokens > 9000).toBe(direction === "increase");
+				expect(manager.getEntries()).toEqual(receipts);
+				expect(harness.session.getSessionStats()).toMatchObject({ tokens: billed.tokens, cost: billed.cost });
+				const file = manager.getSessionFile()!;
+				harness.cleanup();
+				harness = await createHarness({
+					cwd,
+					sessionManager: SessionManager.open(file),
+					models: [{ id: "faux-1", contextWindow: 100000 }],
+					settings: {
+						compaction: {
+							enabled: true,
+							reserveTokens: 91000,
+							keepRecentTokens: 1,
+							summaryBlockMaxTokens: nextBudget,
+						},
+					},
+					extensionFactories: [
+						(pi) => {
+							pi.on("session_before_compact", () => ({ cancel: true }));
+						},
+					],
+				});
+				harness.session.refreshContext();
+				expect(harness.session.getContextUsage()?.tokens).toBeNull();
+				const response = harness.session.messages.findLast((message) => message.role === "assistant");
+				if (response?.role !== "assistant") throw new Error("Missing measured response");
+				await (harness.session as unknown as SessionWithCompactionInternals)._checkCompaction(response, false);
+				expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toEqual(
+					direction === "increase" ? ["threshold"] : [],
+				);
+				expect(harness.session.getSessionStats()).toMatchObject({ tokens: billed.tokens, cost: billed.cost });
+				harness.settingsManager.applyOverrides({ compaction: { enabled: false } });
+				useSummaryStreamFn(harness, "fresh selected-context answer");
+				await harness.session.prompt("measure the new selection");
+				expect(harness.session.getContextUsage()?.tokens).toBe(10);
+			} finally {
+				harness?.cleanup();
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it("retains request-owned summary provenance when the budget changes before response publication", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { enabled: false, summaryBlockMaxTokens: 20000 } },
+		});
+		harnesses.push(harness);
+		harness.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+		harness.sessionManager.appendCompaction("OLDER", null, 10);
+		harness.sessionManager.appendCompaction("NEWEST", null, 10);
+		harness.session.refreshContext();
+		useSummaryStreamFn(harness, "response", (context) => {
+			expect(JSON.stringify(context.messages)).toContain("OLDER");
+			harness.settingsManager.applyOverrides({ compaction: { summaryBlockMaxTokens: 0 } });
+			harness.session.getContextUsage();
+		});
+		await harness.session.prompt("measure old selection");
+		expect(harness.session.getContextUsage()?.tokens).toBeNull();
+		harness.settingsManager.applyOverrides({ compaction: { summaryBlockMaxTokens: 20000 } });
+		expect(harness.session.getContextUsage()?.tokens).toBe(10);
+	});
+
+	it("retains billed failed-publication usage with its original summary selection", async () => {
+		let rejectedResponses = 0;
+		const harness = await createHarness({ settings: { compaction: { enabled: false } } });
+		harnesses.push(harness);
+		harness.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+		harness.sessionManager.appendCompaction("OLDER", null, 10);
+		harness.sessionManager.appendCompaction("NEWEST", null, 10);
+		harness.session.refreshContext();
+		harness.session.subscribe((event) => {
+			if (event.type === "message_end" && event.message.role === "assistant" && rejectedResponses++ < 2) {
+				throw new Error("response publication failed");
+			}
+		});
+		useSummaryStreamFn(harness, "paid response", () => {
+			harness.settingsManager.applyOverrides({ compaction: { summaryBlockMaxTokens: 0 } });
+		});
+		await expect(harness.session.prompt("paid request")).rejects.toThrow("response publication failed");
+		harness.session.flushPendingUsage();
+		expect(harness.session.getSessionStats().tokens.input).toBe(10);
+		expect(harness.session.getContextUsage()?.tokens).toBeNull();
+		harness.settingsManager.applyOverrides({ compaction: { summaryBlockMaxTokens: 16384 } });
+		expect(harness.session.getContextUsage()?.tokens).toBeNull();
+		harness.session.flushPendingUsage();
+		expect(harness.session.getSessionStats().tokens.input).toBe(10);
+	});
+
+	it("distinguishes unknown request selection from direct helper measurements without changing charges", async () => {
+		const harness = await createHarness({ settings: { compaction: { enabled: false } } });
+		harnesses.push(harness);
+		const manager = harness.sessionManager;
+		manager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+		manager.appendCompaction("checkpoint", null, 10);
+		const measured = createAssistant(harness, { stopReason: "stop", totalTokens: 100 });
+		const knownId = manager.appendMessage(measured);
+		harness.session.refreshContext();
+		expect(harness.session.getContextUsage()?.tokens).toBe(100);
+		manager.appendMessage({ ...measured, usage: createUsage(200) }, undefined, null);
+		harness.session.refreshContext();
+		expect(harness.session.getContextUsage()?.tokens).toBeNull();
+		expect(harness.session.getSessionStats().tokens.input).toBe(300);
+		const replacement = { ...measured, usage: createUsage(400) };
+		manager.branch(knownId);
+		manager.replaceAssistantContinuation(knownId, replacement, null);
+		harness.session.refreshContext();
+		expect(harness.session.getContextUsage()?.tokens).toBeNull();
+		expect(harness.session.getSessionStats().tokens.input).toBe(700);
+		manager.appendMessage({ ...measured, usage: createUsage(500) });
+		harness.session.refreshContext();
+		expect(harness.session.getContextUsage()?.tokens).toBe(500);
+		expect(harness.session.getSessionStats().tokens.input).toBe(1200);
+	});
+
+	it("refreshes summary provenance for a newly billed continuation without reviving replayed usage", async () => {
+		const harness = await createHarness({ settings: { compaction: { enabled: false, summaryBlockMaxTokens: 0 } } });
+		harnesses.push(harness);
+		const manager = harness.sessionManager;
+		manager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+		manager.appendCompaction("OLDER", null, 10);
+		manager.appendCompaction("NEWEST", null, 10);
+		const original = createAssistant(harness, { stopReason: "aborted", totalTokens: 50, timestamp: 1 });
+		const prefixId = manager.appendMessage(original);
+		manager.appendCustomEntry("retained-state", { value: 1 });
+		const replacement = { ...original, stopReason: "stop" as const, usage: createUsage(100) };
+		const replacementId = manager.replaceAssistantContinuation(prefixId, replacement);
+		harness.session.refreshContext();
+		expect(harness.session.getContextUsage()?.tokens).toBe(100);
+		expect(harness.session.getSessionStats().tokens.input).toBe(150);
+		harness.settingsManager.applyOverrides({ compaction: { summaryBlockMaxTokens: 16384 } });
+		expect(harness.session.getContextUsage()?.tokens).toBeNull();
+		manager.appendMessage(replacement, replacementId);
+		harness.session.refreshContext();
+		expect(harness.session.getContextUsage()?.tokens).toBeNull();
+		expect(harness.session.getSessionStats().tokens.input).toBe(150);
+	});
+
+	it("treats legacy summary usage conservatively after reopen while retaining its billed charge", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-legacy-summary-usage-"));
+		let harness: Harness | undefined;
+		try {
+			const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+			manager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+			manager.appendCompaction("OLDER", null, 10);
+			manager.appendCompaction("NEWEST", null, 10);
+			const response = { ...fauxAssistantMessage("legacy measured"), usage: createUsage(500) };
+			const id = manager.appendMessage(response);
+			const entries = structuredClone(manager.getEntries());
+			const legacy = entries.find((entry) => entry.id === id);
+			if (legacy?.type !== "message") throw new Error("Missing legacy response");
+			delete legacy.usageSummaryIds;
+			// Load exactly the JSONL representation older writers persisted.
+			const file = manager.getSessionFile()!;
+			writeFileSync(file, `${[manager.getHeader(), ...entries].map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+			const reopened = SessionManager.open(file);
+			harness = await createHarness({ cwd, sessionManager: reopened, settings: { compaction: { enabled: false } } });
+			harness.session.refreshContext();
+			expect(harness.session.getContextUsage()?.tokens).toBeNull();
+			expect(
+				estimateProjectedContextTokens(reopened.buildSessionProjection(), reopened.getBranch()).lastUsageIndex,
+			).toBeNull();
+			expect(harness.session.getSessionStats().tokens.input).toBe(500);
+			expect(reopened.getEntry(id)).toMatchObject({ message: { usage: createUsage(500) } });
+			const uncompacted = SessionManager.inMemory(cwd, undefined, [
+				manager.getHeader()!,
+				{
+					...legacy,
+					parentId: null,
+				},
+			]);
+			expect(
+				estimateProjectedContextTokens(uncompacted.buildSessionProjection(), uncompacted.getBranch()).usageTokens,
+			).toBe(500);
+		} finally {
+			harness?.cleanup();
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	// Finding #27: failed durable navigation leaves both the runtime and cached usage on the outgoing branch.
+	it("keeps context usage and next parentage after tree summary persistence fails", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { enabled: false } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_tree", () => ({ summary: { summary: "branch checkpoint" } }));
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("shared"), fauxAssistantMessage("outgoing")]);
+		await harness.session.prompt("shared question");
+		const target = harness.sessionManager.getLeafId()!;
+		await harness.session.prompt("abandoned question");
+		const manager = harness.sessionManager;
+		const leaf = manager.getLeafId();
+		const revision = manager.getContextRevision();
+		const projection = structuredClone(manager.buildSessionProjection());
+		const messages = structuredClone(harness.session.messages);
+		const usage = harness.session.getContextUsage();
+		const failure = new Error("branch persistence rejected");
+		vi.spyOn(manager, "_persist").mockImplementationOnce(() => {
+			throw failure;
+		});
+		await expect(harness.session.navigateTree(target, { summarize: true })).rejects.toThrow(failure);
+		expect(manager.getLeafId()).toBe(leaf);
+		expect(manager.getContextRevision()).toBe(revision);
+		expect(manager.buildSessionProjection()).toEqual(projection);
+		expect(harness.session.messages).toEqual(messages);
+		expect(harness.session.getContextUsage()).toEqual(usage);
+		expect(harness.session.isIdle).toBe(true);
+		harness.setResponses([fauxAssistantMessage("continued on outgoing branch")]);
+		await harness.session.prompt("next question");
+		const next = manager
+			.getBranch()
+			.find(
+				(entry) =>
+					entry.type === "message" &&
+					entry.message.role === "user" &&
+					JSON.stringify(entry.message.content).includes("next question"),
+			);
+		expect(next?.parentId).toBe(leaf);
 	});
 
 	it("manually compacts using an extension-provided summary", async () => {
@@ -795,6 +1102,9 @@ describe("AgentSession compaction characterization", () => {
 	it("compacts and resumes after a length stop below the desired output limit", async () => {
 		const harness = await createHarness({
 			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
+			// Default tool declarations alone can exceed this deliberately small window.
+			// This recovery has no tool calls; keep the resumed request genuinely in budget.
+			tools: [],
 			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
@@ -824,6 +1134,9 @@ describe("AgentSession compaction characterization", () => {
 			willRetry: true,
 		});
 		expect(harness.session.getLastAssistantText()).toBe("completed response");
+		const completed = harness.session.messages.findLast((message) => message.role === "assistant");
+		if (completed?.role !== "assistant") throw new Error("Missing recovered response");
+		expect(completed.usage.totalTokens).toBeLessThan(harness.session.model!.contextWindow);
 	});
 
 	// Regression coverage for #8133: model overrides must also apply between assistant turns.

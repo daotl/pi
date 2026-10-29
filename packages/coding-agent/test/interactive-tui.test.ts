@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { FullscreenExitOutput, TuiMode } from "../src/core/settings-manager.ts";
+import { createBashToolDefinition } from "../src/core/tools/bash.ts";
 import {
 	BranchSummaryStatusIndicator,
 	CompactionStatusIndicator,
@@ -13,6 +14,7 @@ import {
 	type StatusIndicatorKind,
 	WorkingStatusIndicator,
 } from "../src/modes/interactive/components/status-indicator.ts";
+import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.ts";
 import {
 	createInteractiveTui,
 	createInteractiveTuiReference,
@@ -578,6 +580,122 @@ describe("clear-on-shrink status spacing", () => {
 			expect(defaultEditor.setWorkingStatusIndicator).toHaveBeenCalledWith(undefined);
 			expect(customEditor.setWorkingStatusIndicator).not.toHaveBeenCalled();
 			expect(context.statusContainer.children).toHaveLength(expectedChildren);
+		}
+	});
+});
+
+describe("InteractiveMode tool-row ownership", () => {
+	it("keeps a live shell clock updating through temporary renderer handoff", () => {
+		initTheme("dark");
+		vi.useFakeTimers();
+		const terminal = new RecordingTerminal(40, 10);
+		const renderer = createInteractiveTui({
+			tuiMode: "regular",
+			showHardwareCursor: false,
+			logDirectory: "/tmp",
+			terminal,
+		});
+		const context = Object.assign(Object.create(InteractiveMode.prototype), {
+			runtimeHost: {
+				session: {
+					settingsManager: {
+						getFullscreenCopyOnSelect: () => true,
+						getFullscreenWheelScrollLines: () => "auto",
+					},
+				},
+			},
+			renderer,
+			options: { tuiMode: "regular" },
+			themeController: { rebindTui: () => {} },
+			extensionTerminalInputSubscriptions: new Set(),
+		});
+		const ui = createInteractiveTuiReference(() => context.renderer);
+		context.ui = ui;
+		const row = new ToolExecutionComponent(
+			"bash",
+			"handoff",
+			{ command: "sleep 10" },
+			{},
+			createBashToolDefinition(process.cwd(), { exposeSessionEnvironment: false }),
+			ui,
+			process.cwd(),
+		);
+		row.markExecutionStarted();
+		row.updateResult({ content: [], isError: false }, true);
+		renderer.addChild(row);
+		context.fullscreenLayoutRoot = row;
+		try {
+			const switchMode = InteractiveMode.prototype as unknown as {
+				switchTuiMode(this: typeof context, mode: TuiMode, progress: boolean): boolean;
+			};
+			expect(switchMode.switchTuiMode.call(context, "fullscreen", false)).toBe(true);
+			vi.advanceTimersByTime(2000);
+			expect(row.render(40).join("\n")).toContain("Elapsed 2.0s");
+			expect(context.renderer.children).toContain(row);
+		} finally {
+			row.dispose();
+			context.renderer.stop();
+			vi.useRealTimers();
+		}
+	});
+
+	it("stops clocks in both owned containers and detached pending rows before unsubscribing", () => {
+		initTheme("dark");
+		vi.useFakeTimers();
+		const requestRender = vi.fn();
+		const ui = { requestRender } as unknown as TUI;
+		const rows = ["chat", "pending", "detached"].map((id) => {
+			const row = new ToolExecutionComponent(
+				"bash",
+				id,
+				{ command: "sleep 10" },
+				{},
+				createBashToolDefinition(process.cwd(), { exposeSessionEnvironment: false }),
+				ui,
+				process.cwd(),
+			);
+			row.markExecutionStarted();
+			row.updateResult({ content: [{ type: "text", text: "partial" }], isError: false }, true);
+			return row;
+		});
+		const chatContainer = new Container();
+		chatContainer.addChild(rows[0]!);
+		const pendingMessagesContainer = new Container();
+		pendingMessagesContainer.addChild(rows[1]!);
+		const pendingTools = new Map([
+			["chat", rows[0]!],
+			["detached", rows[2]!],
+		]);
+		const context = {
+			settingsManager: { getShowTerminalProgress: () => false },
+			disposeActiveSelector: () => {},
+			clearScheduledMessages: () => {},
+			clearHeartbeats: () => {},
+			clearStatusIndicator: () => {},
+			clearExtensionTerminalInputListeners: () => {},
+			themeController: { disableAutoSync: () => {} },
+			footer: { dispose: () => {} },
+			footerDataProvider: { dispose: () => {} },
+			chatContainer,
+			pendingMessagesContainer,
+			pendingTools,
+			unsubscribe: () => expect(pendingTools.size).toBe(0),
+			isInitialized: false,
+			unregisterSignalHandlers: () => {},
+		};
+		try {
+			requestRender.mockClear();
+			vi.advanceTimersByTime(1000);
+			expect(requestRender.mock.calls.length).toBeGreaterThanOrEqual(3);
+			const stop = InteractiveMode.prototype.stop as unknown as (this: typeof context, output: string) => void;
+			stop.call(context, "transcript");
+			requestRender.mockClear();
+			vi.advanceTimersByTime(3000);
+			expect(requestRender).not.toHaveBeenCalled();
+			expect(pendingTools.size).toBe(0);
+		} finally {
+			for (const row of rows) row.dispose();
+			vi.useRealTimers();
 		}
 	});
 });

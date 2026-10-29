@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "@earendil-works/chord";
@@ -225,6 +225,70 @@ function randomOperation(next: () => number): { label: string; run: Operation } 
 }
 
 describe("RemoteExecutionEnv against NodeExecutionEnv", () => {
+	it.skipIf(process.platform !== "win32")(
+		"resolves argv from the same inherited case-folded PATH the child receives",
+		async () => {
+			const root = mkdtempSync(join(tmpdir(), "pi-env-path-parity-"));
+			dirs.push(root);
+			const trusted = join(root, "trusted");
+			const custom = join(root, "custom");
+			const cwd = join(root, "cwd");
+			for (const directory of [trusted, custom, cwd]) mkdirSync(directory);
+			const name = "pi-env-path-parity.exe";
+			for (const directory of [trusted, custom]) copyFileSync(process.execPath, join(directory, name));
+			// Control the daemon's inherited spelling without changing this test worker's process.env.
+			const launcher = `const {spawn}=require('node:child_process');
+				const env=Object.fromEntries(Object.entries(process.env).filter(([key])=>key.toUpperCase()!=='PATH'));
+				env.PATH=${JSON.stringify(trusted)};
+				const child=spawn(${JSON.stringify(daemon)},process.argv.slice(1),{env,stdio:'inherit'});
+				child.on('exit',code=>process.exit(code??1));`;
+			const isolated = new Connection({ command: [process.execPath, "-e", launcher] });
+			try {
+				const local = new NodeExecutionEnv({ cwd });
+				const remote = new RemoteExecutionEnv({ connection: isolated, id: "pi-env:path-parity", cwd });
+				const argv = [
+					name,
+					"-e",
+					"console.log(JSON.stringify({executable:process.execPath,path:process.env.PATH}))",
+				];
+				for (const inheritEnv of [true, false]) {
+					for (const spelling of ["Path", "PATH"]) {
+						const outputs: string[] = [];
+						const results = [];
+						for (const env of [local, remote]) {
+							let output = "";
+							results.push(
+								await env.exec(
+									argv,
+									{
+										inheritEnv,
+										env: {
+											...(env === local && inheritEnv ? { PATH: trusted } : {}),
+											[spelling]: custom,
+										},
+										onOutput: (text) => {
+											output += text;
+										},
+									},
+									context,
+								),
+							);
+							outputs.push(output);
+						}
+						expect(results[0]).toEqual({ ok: true, value: { exitCode: 0 } });
+						expect(results[1]).toEqual(results[0]);
+						const directory = inheritEnv && spelling === "Path" ? trusted : custom;
+						expect(JSON.parse(outputs[0]!)).toEqual({ executable: join(directory, name), path: directory });
+						expect(outputs[1]).toBe(outputs[0]);
+					}
+				}
+			} finally {
+				isolated.close();
+			}
+		},
+		30_000,
+	);
+
 	it("gives the same results for random file operation sequences", async () => {
 		for (let seed = 1; seed <= 60; seed++) {
 			const next = random(seed);

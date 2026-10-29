@@ -365,6 +365,9 @@ export class WebSocketLink extends BaseLink {
 	readonly #socket: WebSocketLike;
 	readonly #compress: boolean;
 	#outbox: (string | Uint8Array)[] = [];
+	#receiving = false;
+	#queuedFrames = 0;
+	#queuedBytes = 0;
 
 	constructor(socket: WebSocketLike, options: WebSocketLinkOptions = {}) {
 		super();
@@ -378,8 +381,14 @@ export class WebSocketLink extends BaseLink {
 		});
 		socket.addEventListener("message", (event) => {
 			try {
+				if (this.closed) return;
 				const data = event.data;
 				if (typeof data === "string") {
+					if (
+						!this.#receiving &&
+						!this.#reserve(data.length > 1024 * 1024 ? data.length : encoder.encode(data).byteLength)
+					)
+						return;
 					this.deliver(parseFrame(data, acceptPacked));
 					return;
 				}
@@ -391,6 +400,7 @@ export class WebSocketLink extends BaseLink {
 							? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
 							: undefined;
 				if (bytes === undefined) throw new TypeError("unknown message type");
+				if (!this.#reserve(bytes.byteLength)) return;
 				const { envelope, field, bytes: payload } = splitMessage(bytes);
 				if (zlib !== undefined) this.deliver({ ...envelope, [field]: new Packed(payload) } as Frame);
 				else this.deliverLater(inflate(payload).then((value) => ({ ...envelope, [field]: value }) as Frame));
@@ -399,6 +409,23 @@ export class WebSocketLink extends BaseLink {
 			}
 		});
 		socket.addEventListener("close", () => this.ended("socket closed"));
+	}
+
+	override receive(handler: (frame: Frame) => void): void {
+		this.#receiving = true;
+		this.#queuedFrames = 0;
+		this.#queuedBytes = 0;
+		super.receive(handler);
+	}
+
+	/** Bound unconsumed messages before parsing, particularly while the server authenticates a client. */
+	#reserve(bytes: number): boolean {
+		if (this.#receiving) return true;
+		this.#queuedFrames++;
+		this.#queuedBytes += bytes;
+		if (this.#queuedFrames <= 256 && this.#queuedBytes <= 1024 * 1024) return true;
+		this.close("receive queue overflow");
+		return false;
 	}
 
 	protected transmit(frame: Frame): number {

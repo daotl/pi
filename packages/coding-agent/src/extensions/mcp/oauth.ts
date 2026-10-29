@@ -35,6 +35,7 @@ import lockfile from "proper-lockfile";
 import { APP_NAME, getAgentDir } from "../../config.ts";
 import { type AuthStorageBackend, FileAuthStorageBackend } from "../../core/auth-storage.ts";
 import { mcpNamespace } from "../../core/mcp-servers.ts";
+import { raceWithAbortSignal } from "../../utils/abort.ts";
 
 const CALLBACK_HOST = "127.0.0.1";
 const CALLBACK_PATH = "/callback";
@@ -142,6 +143,7 @@ export class McpOAuthCredentialStore {
 	private readonly backend: AuthStorageBackend;
 	/** Directory for the refresh lock files. Without one, refreshes are only serialized in this process. */
 	private readonly lockDir: string | undefined;
+	private readonly refreshes = new Set<Promise<void>>();
 
 	constructor(backend?: AuthStorageBackend, lockDir?: string) {
 		this.backend = backend ?? new FileAuthStorageBackend(join(getAgentDir(), "mcp-auth.json"));
@@ -168,11 +170,27 @@ export class McpOAuthCredentialStore {
 		};
 	}
 
+	/** Join refresh ownership that outlives a canceled sign-in caller. */
+	async settled(): Promise<void> {
+		while (this.refreshes.size > 0) await Promise.all(this.refreshes);
+	}
+
 	/**
 	 * A lock file per server. When the process exits, proper-lockfile removes the locks it holds; when
 	 * it is killed, the lock goes stale because it is no longer renewed, and the next process takes it over.
 	 */
-	private async withRefreshLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+	private withRefreshLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+		const work = this.runWithRefreshLock(key, fn);
+		const settlement = work.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.refreshes.add(settlement);
+		void settlement.then(() => this.refreshes.delete(settlement));
+		return work;
+	}
+
+	private async runWithRefreshLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
 		if (!this.lockDir) return fn();
 		mkdirSync(this.lockDir, { recursive: true, mode: 0o700 });
 		const hash = createHash("sha256").update(key).digest("hex").slice(0, 16);
@@ -202,16 +220,18 @@ export class McpOAuthCredentialStore {
 		return (states[key] ?? states[legacyKey])?.tokens;
 	}
 
-	/** Returns whether credentials were stored for the server. Removes legacy state the server would take over. */
-	remove(name: string, serverUrl: string): boolean {
+	/** Wait for in-flight refresh persistence, then remove current or legacy credentials. */
+	async remove(name: string, serverUrl: string): Promise<boolean> {
 		const { key, legacyKey } = storeKeys(name, serverUrl);
-		return this.backend.withLock((current) => {
-			const states = parseStates(current);
-			const stored = key in states ? key : legacyKey in states ? legacyKey : undefined;
-			if (!stored) return { result: false };
-			delete states[stored];
-			return { result: true, next: serializeStates(states) };
-		});
+		return this.withRefreshLock(key, async () =>
+			this.backend.withLock((current) => {
+				const states = parseStates(current);
+				const stored = key in states ? key : legacyKey in states ? legacyKey : undefined;
+				if (!stored) return { result: false };
+				delete states[stored];
+				return { result: true, next: serializeStates(states) };
+			}),
+		);
 	}
 
 	private write(update: (states: StoredStates) => void): void {
@@ -467,12 +487,13 @@ async function listenForCallback(
 
 /**
  * Sign in to an MCP server. Uses the stored refresh token when possible; otherwise runs the browser
- * authorization code flow. Tokens are saved to `store`. Aborting `signal` stops the sign-in at any
- * step with `McpSignInCancelledError`; requests to the authorization server are also time-limited.
+ * authorization code flow. Tokens are saved to `store`. Aborting `signal` stops waiting with
+ * `McpSignInCancelledError`, but a dispatched refresh finishes and saves rotated tokens under the
+ * refresh lock. Discovery, registration and browser work remain cancellable; requests are time-limited.
  */
 export async function signInMcpServer(options: {
 	serverUrl: string;
-	store: McpOAuthStateStore;
+	store: McpOAuthServerStore;
 	settings: McpOAuthSettings;
 	challenge?: OAuthChallenge;
 	prompt: McpSignInPrompt;
@@ -497,23 +518,6 @@ export async function signInMcpServer(options: {
 	);
 	const redirectUrl = callbackOptions.fixedRedirectUrl ?? callback.redirectUrl;
 	try {
-		if (stored) {
-			const next: McpOAuthState = { ...stored };
-			// Every sign-in gets a fresh `state` parameter.
-			delete next.oauthState;
-			// A registered client cannot use another redirect URI, and its tokens belong to it. A Client ID
-			// Metadata Document is not stored, so with one, a stored client was registered before and is replaced.
-			const keepClient =
-				settings.clientId ||
-				(cimd ? !stored.clientInformation : registeredRedirectUrls(stored.clientInformation).includes(redirectUrl));
-			if (!keepClient) {
-				delete next.clientInformation;
-				delete next.tokens;
-				delete next.tokensExpireAt;
-			}
-			await store.save(next);
-		}
-
 		let authorizationUrl: URL | undefined;
 		const provider = createProvider(serverUrl, store, settings, redirectUrl, (url) => {
 			authorizationUrl = url;
@@ -522,6 +526,7 @@ export async function signInMcpServer(options: {
 			serverUrl,
 			fetch: timedFetch(),
 			signal,
+			refreshSignal: null,
 			resourceMetadataUrl: options.challenge?.resourceMetadataUrl,
 			authorizationServerMetadataUrl: settings.authServerMetadataUrl,
 			// A server asking for more scope gets it on top of the configured scope and, since the challenge
@@ -533,7 +538,34 @@ export async function signInMcpServer(options: {
 		};
 		// A refresh keeps the granted scope; a server asking for more needs the browser flow.
 		const skipRefresh = stepUp;
-		if ((await authorizeMcp(provider, { ...flow, skipRefresh })) === "AUTHORIZED") return;
+		const authorization = store.withRefreshLock(async () => {
+			if (signal?.aborted) throw new McpSignInCancelledError();
+			// Reload after acquiring ownership: another process may have rotated the stored tokens.
+			const current = await store.load();
+			if (current) {
+				const next: McpOAuthState = { ...current };
+				// Every sign-in gets a fresh `state` parameter.
+				delete next.oauthState;
+				// Registered clients and their tokens belong to their original redirect URI. A stored
+				// registration is also replaced when switching to a Client ID Metadata Document.
+				const keepClient =
+					settings.clientId ||
+					(cimd
+						? !current.clientInformation
+						: registeredRedirectUrls(current.clientInformation).includes(redirectUrl));
+				if (!keepClient) {
+					delete next.clientInformation;
+					delete next.tokens;
+					delete next.tokensExpireAt;
+				}
+				await store.save(next);
+			}
+			return authorizeMcp(provider, { ...flow, skipRefresh });
+		});
+		// Stop waiting without releasing refresh ownership before rotated tokens have been saved.
+		const result = await raceWithAbortSignal(authorization, signal);
+		if (signal?.aborted) throw new McpSignInCancelledError();
+		if (result === "AUTHORIZED") return;
 		if (!authorizationUrl) throw new Error("OAuth flow did not produce an authorization URL");
 
 		const state = await provider.state();

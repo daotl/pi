@@ -212,14 +212,17 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 
 	const tools = Object.create(null);
 	const allTools = [];
-	for (const { name, jsName, description } of parse(toolsJson)) {
-		const fn = caller("call", name);
-		// The first tool wins when two names normalize to the same identifier.
+	const declaredTools = parse(toolsJson);
+	for (const { name, jsName, description } of declaredTools) {
+		// Legacy execute() keeps the first tool when names normalize to the same identifier.
 		if (!(jsName in tools)) {
-			tools[jsName] = fn;
+			tools[jsName] = caller("call", name);
 			allTools.push(Object.freeze({ name: jsName, description }));
 		}
-		if (!(name in tools)) tools[name] = fn;
+	}
+	// Raw aliases must not claim another tool's declared script name.
+	for (const { name } of declaredTools) {
+		if (!(name in tools)) tools[name] = caller("call", name);
 	}
 	Object.freeze(tools);
 	Object.freeze(allTools);

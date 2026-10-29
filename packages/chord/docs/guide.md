@@ -37,12 +37,13 @@ Chord builds applications out of **objects** that live in several processes (a s
 
 ```ts
 import { Type } from "typebox";
-import { createHost, method, remote } from "@earendil-works/chord";
+import { createHost, hostNamed, method, remote } from "@earendil-works/chord";
 
 // contract.ts: shared by provider and consumers
 export const Counter = remote("demo.counter", {
 	version: 1,
 	input: Type.Object({ name: Type.String() }),
+	host: hostNamed("server"),
 	variants: {
 		default: {
 			state: { count: Type.Number() },
@@ -712,9 +713,11 @@ On the server, `host.reload(serverFacets, { remote: { "session:": workerFacets }
 ## Hosts and links
 
 ```ts
+import { acceptWebSockets } from "@earendil-works/chord";
+
 // server
 const server = createHost<Principal>({ name: "server", self: { kind: "host" }, principalKey });
-server.accept(webSocketLink(wss, { principal: (req) => authenticate(req) }));  // stamps owner or guest from cookies
+acceptWebSockets(wss, server, { principal: (req) => authenticate(req) });  // stamps owner or guest from cookies
 server.route("session:", {
 	authorize: (principal, host) => canReach(principal, host),  // before resolving or spawning
 	resolve: (host) => workers.ensure(host),  // a link to the worker, spawned if needed

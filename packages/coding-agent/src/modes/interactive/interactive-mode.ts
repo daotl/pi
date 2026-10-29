@@ -9636,6 +9636,14 @@ export class InteractiveMode {
 		this.clearExtensionTerminalInputListeners();
 		this.footer.dispose();
 		this.footerDataProvider.dispose();
+		const toolRows = new Set(this.pendingTools.values());
+		for (const container of [this.chatContainer, this.pendingMessagesContainer]) {
+			for (const child of container.children) {
+				if (child instanceof ToolExecutionComponent) toolRows.add(child);
+			}
+		}
+		for (const component of toolRows) component.dispose();
+		this.pendingTools.clear();
 		if (this.unsubscribe) {
 			this.unsubscribe();
 		}

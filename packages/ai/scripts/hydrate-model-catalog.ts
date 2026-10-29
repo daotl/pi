@@ -37,8 +37,15 @@ function isCatalogEntry(value: unknown): value is CatalogEntry {
 export function hydrateModelCatalog(
 	packageRoot: string,
 	catalogPath: string,
-	options: { validateOnly?: boolean } = {},
+	options: { generatedAt: string; validateOnly?: boolean },
 ): void {
+	if (
+		typeof options.generatedAt !== "string" ||
+		!Number.isFinite(Date.parse(options.generatedAt)) ||
+		new Date(options.generatedAt).toISOString() !== options.generatedAt
+	) {
+		throw new Error("Model catalog requires a canonical ISO generation timestamp");
+	}
 	const catalog: unknown = JSON.parse(readFileSync(catalogPath, "utf8"));
 	if (!isRecord(catalog)) throw new Error("Model catalog must be an object");
 
@@ -60,9 +67,8 @@ export function hydrateModelCatalog(
 		files[`${provider}.json`] = `${JSON.stringify(grouped.groups)}\n`;
 	}
 
-	// Public catalogs have no generation timestamp. Use a fixed stamp so hydration
-	// produces identical bytes for identical input, regardless of build time.
-	const manifest = createModelDataManifest(structure, files, "1970-01-01T00:00:00.000Z");
+	// The pin carries the immutable revision's publication time, not the build time.
+	const manifest = createModelDataManifest(structure, files, options.generatedAt);
 	const providersDir = join(packageRoot, "src", "providers");
 	const stagingRoot = mkdtempSync(join(providersDir, ".model-hydration-"));
 	const stagedData = join(stagingRoot, "data");
@@ -81,6 +87,8 @@ export function hydrateModelCatalog(
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-	if (process.argv.length !== 3) throw new Error("Usage: node hydrate-model-catalog.ts <models.all.json>");
-	hydrateModelCatalog(join(dirname(fileURLToPath(import.meta.url)), ".."), resolve(process.argv[2]));
+	if (process.argv.length !== 4) throw new Error("Usage: node hydrate-model-catalog.ts <models.all.json> <generated-at>");
+	hydrateModelCatalog(join(dirname(fileURLToPath(import.meta.url)), ".."), resolve(process.argv[2]), {
+		generatedAt: process.argv[3],
+	});
 }

@@ -387,10 +387,8 @@ export async function generateBranchSummary(
 			isContextClampingApi(requestModel.api) &&
 			isKnownApiProvider(requestModel.api));
 	const nativeHeadroom = (): boolean =>
-		usesAdapterOutputClamp(model) &&
-		(!agent || !streamFn || streamFn === agent.streamFunction) &&
-		clampMaxTokensToInput(model, 0, maxTokens) > 1;
-	let tokenBudget = contextWindow - reserveTokens;
+		usesAdapterOutputClamp(model) && (!agent || !streamFn || streamFn === agent.streamFunction);
+	const tokenBudget = contextWindow - reserveTokens;
 	const budgetFailure = (): BranchSummaryResult => ({
 		error: `Branch summarization failed: newest message group exceeds the token budget (${tokenBudget} tokens)`,
 	});
@@ -403,12 +401,11 @@ export async function generateBranchSummary(
 	) {
 		return { error: "Branch summarization context projection does not contain the retained entry" };
 	}
-	let preparation = selectBranchEntries(entries, tokenBudget, projection, true, false);
-	if (
-		preparation.messages.length === 0 ||
-		(preparation.budgetExceeded && preparation.messages.every((message) => message.role === "system"))
-	) {
-		return preparation.budgetExceeded ? budgetFailure() : { summary: "No content to summarize" };
+	// Arbitrary policy can shrink or expand history. Keep the full candidate until
+	// that policy has run once, then budget its owned converted representation.
+	const preparation = selectBranchEntries(entries, 0, projection, true, false);
+	if (preparation.messages.length === 0) {
+		return { summary: "No content to summarize" };
 	}
 
 	// Build prompt
@@ -427,65 +424,21 @@ export async function generateBranchSummary(
 		timestamp: Date.now(),
 	};
 	const promptBudget = contextWindow - maxTokens;
-	// Keep at least two output tokens rather than admitting the adapter's emergency floor.
-	const nativePromptBudget = clampMaxTokensToInput(model, 0, Number.POSITIVE_INFINITY) - 2;
-	let contextMessages: AgentMessage[];
-	while (true) {
-		const { messages } = preparation;
-		const firstMessageIndex = projection.messages.indexOf(messages[0]);
-		// Restore only preceding system state, never shared conversation. A standalone
-		// SDK slice can start with a patch; explicit projections/checkpoints stay authoritative.
-		const baseline = getCurrentSystemMessage(projection.messages.slice(0, Math.max(0, firstMessageIndex)));
-		const agentBaseline =
-			!baseline && !contextProjection && !projection.entries.some((entry) => entry.sourceEntry.type === "compaction")
-				? agent && getCurrentSystemMessage(agent.state.messages)
-				: undefined;
-		contextMessages = baseline
-			? [baseline, ...messages]
-			: agentBaseline
-				? [agentBaseline, ...messages.filter((message) => message.role !== "system")]
-				: messages;
-		const useNativeBudget = nativeHeadroom();
-		let requestTokens: number;
-		if (useNativeBudget) {
-			const requestMessages = convertToLlm([...contextMessages, instruction]);
-			if (requestMessages[0]?.role !== "system") {
-				requestMessages.unshift({
-					role: "system",
-					content: systemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT,
-					timestamp: 0,
-				});
-			}
-			requestTokens = requestMessages.reduce((total, message) => total + estimateMessageTokens(message), 0);
-		} else {
-			requestTokens =
-				contextMessages.reduce((total, message) => total + estimateTokens(message), 0) +
-				estimateTokens(instruction) +
-				(contextMessages[0]?.role === "system"
-					? 0
-					: estimateTokens({
-							role: "system",
-							content: systemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT,
-							timestamp: 0,
-						}));
-		}
-		const availablePromptBudget = useNativeBudget ? nativePromptBudget : promptBudget;
-		if (requestTokens <= availablePromptBudget) break;
-		// Re-select whole atomic groups before invoking arbitrary context hooks. Moving
-		// the cut can change the restored baseline, so size that new prefix again.
-		// A baseline that leaves no history budget may be removed by request policy;
-		// defer rejection until the single converted-request check below.
-		tokenBudget = preparation.totalTokens - (requestTokens - availablePromptBudget);
-		if (tokenBudget <= 0) break; // prepareBranchEntries(0) means unlimited.
-		const trimmed = selectBranchEntries(entries, tokenBudget, projection, false, false);
-		if (
-			!trimmed.messages.some((message) => message.role !== "system") ||
-			trimmed.messages.length >= messages.length
-		) {
-			break;
-		}
-		preparation = trimmed;
-	}
+	const nativePromptBudget = clampMaxTokensToInput(model, 0, Number.POSITIVE_INFINITY) - maxTokens;
+	const { messages } = preparation;
+	const firstMessageIndex = projection.messages.indexOf(messages[0]);
+	// Restore only preceding system state, never shared conversation. A standalone
+	// SDK slice can start with a patch; explicit projections/checkpoints stay authoritative.
+	const baseline = getCurrentSystemMessage(projection.messages.slice(0, Math.max(0, firstMessageIndex)));
+	const agentBaseline =
+		!baseline && !contextProjection && !projection.entries.some((entry) => entry.sourceEntry.type === "compaction")
+			? agent && getCurrentSystemMessage(agent.state.messages)
+			: undefined;
+	const contextMessages = baseline
+		? [baseline, ...messages]
+		: agentBaseline
+			? [agentBaseline, ...messages.filter((message) => message.role !== "system")]
+			: messages;
 	const source = structuredClone(contextMessages);
 	if (source[0]?.role !== "system" || (!agent && !contextProjection && systemPrompt !== undefined)) {
 		source.unshift({ role: "system", content: systemPrompt ?? SUMMARIZATION_SYSTEM_PROMPT, timestamp: 0 });
@@ -499,18 +452,55 @@ export async function generateBranchSummary(
 		if (agent && input[0]?.role === "system" && input[0].toolsAdded === undefined) {
 			input[0] = { ...input[0], toolsAdded: agent.state.tools.map(toToolDeclaration) };
 		}
-		const llmMessages = agent
+		const converted = agent
 			? await agent.convertForRequest(agent.transformContext ? await agent.transformContext(input, signal) : input)
 			: convertToLlm(input);
-		const context = normalizeContext({ messages: [...llmMessages, instruction] });
 		const useNativeBudget = nativeHeadroom();
-		const inputTokens = context.messages.reduce(
-			(total, message) => total + (useNativeBudget ? estimateMessageTokens(message) : estimateTokens(message)),
+		const count = useNativeBudget ? estimateMessageTokens : estimateTokens;
+		const availablePromptBudget = useNativeBudget ? nativePromptBudget : promptBudget;
+		// Systems stay in their original order, including patches between calls/results.
+		// Retention may discard conversation, never reintroduce policy removed by a hook.
+		const groups: number[][] = [];
+		let callIds = new Set<string>();
+		for (let index = 0; index < converted.length; index++) {
+			const message = converted[index];
+			if (message.role === "system") continue;
+			if (message.role === "toolResult" && callIds.has(message.toolCallId)) {
+				groups[groups.length - 1].push(index);
+				continue;
+			}
+			groups.push([index]);
+			callIds = new Set(
+				message.role === "assistant"
+					? message.content.flatMap((block) => (block.type === "toolCall" ? [block.id] : []))
+					: [],
+			);
+		}
+		const messageTokens = converted.map(count);
+		let inputTokens = count(instruction) + messageTokens.reduce((total, tokens) => total + tokens, 0);
+		let historyTokens = groups.reduce(
+			(total, group) => total + group.reduce((tokens, index) => tokens + messageTokens[index], 0),
 			0,
 		);
-		const outputTokens = useNativeBudget ? clampMaxTokensToInput(model, inputTokens, maxTokens) : maxTokens;
-		if (useNativeBudget ? outputTokens <= 1 : inputTokens > promptBudget) throw budgetError;
-		attemptOptions.maxTokens = outputTokens;
+		const removed = new Set<number>();
+		for (
+			let groupIndex = 0;
+			inputTokens > availablePromptBudget || (tokenBudget > 0 && historyTokens > tokenBudget);
+			groupIndex++
+		) {
+			// The newest atomic group must fit with the intended output allowance.
+			if (groupIndex >= groups.length - 1) throw budgetError;
+			for (const index of groups[groupIndex]) {
+				removed.add(index);
+				const tokens = messageTokens[index];
+				inputTokens -= tokens;
+				historyTokens -= tokens;
+			}
+		}
+		const llmMessages = converted.filter((_message, index) => !removed.has(index));
+		const context = normalizeContext({ messages: [...llmMessages, instruction] });
+		if (useNativeBudget && clampMaxTokensToInput(model, inputTokens, maxTokens) < maxTokens) throw budgetError;
+		attemptOptions.maxTokens = maxTokens;
 		fileOps = createFileOps();
 		attributable = canAttributeRequestHistory(model, agent, streamFn, options.requestHistoryPolicy);
 		if (attributable) {

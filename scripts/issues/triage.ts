@@ -180,6 +180,8 @@ export class Triage {
 			issue.attempt += 1;
 			issue.conversationId = 0;
 			issue.error = "";
+			issue.result = null;
+			issue.triagedAt = "";
 		});
 		this.enqueue(number);
 	}

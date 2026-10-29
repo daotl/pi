@@ -139,6 +139,7 @@ it("refreshes the footer when an asynchronous exact count finishes without anoth
 	const current = await fixture();
 	const component = footer(current);
 	const terminal = new VirtualTerminal(120, 24);
+	const frames: string[] = [];
 	const uiContext = {
 		isInitialized: true,
 		footer: component,
@@ -152,7 +153,7 @@ it("refreshes the footer when an asynchronous exact count finishes without anoth
 		rebuildChatFromMessages: () => {},
 		flushCompactionQueue: async () => {},
 		fireDueScheduledMessages: () => {},
-		ui: { requestRender: () => {}, terminal },
+		ui: { requestRender: () => frames.push(stripAnsi(component.render(120)[1])), terminal },
 	};
 	// This established prototype seam executes the real event consumer without launching a TUI.
 	const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
@@ -184,11 +185,13 @@ it("refreshes the footer when an asynchronous exact count finishes without anoth
 		]);
 		const leaf = current.manager.getLeafId();
 		expect(stripAnsi(component.render(120)[1])).toContain("?/");
+		frames.length = 0;
 		released.resolve();
 		expect(await outcome).toHaveProperty("result");
+		expect(eventWork).toHaveLength(1);
 		await Promise.all(eventWork);
 		expect(current.manager.getLeafId()).toBe(leaf);
-		expect(stripAnsi(component.render(120)[1])).toContain("100/");
+		expect(frames.some((frame) => frame.includes("100/"))).toBe(true);
 	} finally {
 		released.resolve();
 		await outcome;
@@ -332,12 +335,15 @@ it("replaces the exact checkpoint count with native continued response usage bef
 	current.session.refreshContext();
 	await current.session.compact({ keepRecentMessages: 2 });
 	expect(current.session.getContextUsage()?.tokens).toBe(100);
-	current.setResponses([fauxAssistantMessage("partial completed")]);
+	const completedText = "partial completed";
+	current.setResponses([fauxAssistantMessage(completedText)]);
 	await current.session.continue();
 	expect(
 		estimateProjectedContextTokens(current.manager.buildSessionProjection(), current.manager.getBranch()).usageTokens,
-	).toBe(12);
-	expect(current.session.getSessionStats().contextUsage?.tokens).toBeGreaterThanOrEqual(12);
+	).toBe(10 + Math.ceil(completedText.length / 4));
+	expect(current.session.getSessionStats().contextUsage?.tokens).toBeGreaterThanOrEqual(
+		10 + Math.ceil(completedText.length / 4),
+	);
 	expect(stripAnsi(footer(current).render(160)[1])).not.toContain("?/");
 	const request = JSON.parse(current.summaries.at(-1)!.body) as { messages: Array<{ role: string; content: string }> };
 	expect(request.messages.at(-1)).toMatchObject({ role: "assistant", content: "partial" });

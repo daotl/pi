@@ -960,6 +960,64 @@ describe("TUI differential rendering", () => {
 });
 
 describe("TUI overlays over native-reflow content", () => {
+	it("paints disjoint overlays on Kitty anchor and continuation rows without touching the placement", async () => {
+		const terminal = new LoggingVirtualTerminal(20, 5);
+		const tui = new TuiMainScreen(terminal);
+		const base = new TestComponent();
+		base.lines = [encodeKitty("AAAA", { columns: 2, rows: 3, imageId: 92, moveCursor: false }), "", "", "after"];
+		tui.addChild(base);
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			const before = terminal.getScrollBuffer();
+			for (const row of [0, 1]) {
+				terminal.clearWrites();
+				const overlay = new InputComponent();
+				overlay.lines = ["X"];
+				const handle = tui.showOverlay(overlay, { width: 1, row, col: 10 });
+				await terminal.waitForRender();
+				assert.strictEqual(terminal.getViewport()[row].trimEnd(), "          X");
+				terminal.sendInput("Y");
+				await terminal.waitForRender();
+				assert.strictEqual(terminal.getViewport()[row].trimEnd(), "          Y");
+				handle.hide();
+				await terminal.waitForRender();
+				assert.deepStrictEqual(terminal.getScrollBuffer(), before);
+				assert.ok(!terminal.getWrites().includes("\x1b_G"), "disjoint text must not alter graphics");
+				assert.ok(!terminal.getWrites().includes("\x1b[3J"));
+			}
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("restores a retained Kitty placement after an overlapping overlay closes", async () => {
+		const terminal = new LoggingVirtualTerminal(20, 5);
+		const tui = new TuiMainScreen(terminal);
+		const base = new TestComponent();
+		base.lines = [encodeKitty("AAAA", { columns: 2, rows: 3, imageId: 93, moveCursor: false }), "", "", "after"];
+		tui.addChild(base);
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			const before = terminal.getScrollBuffer();
+			terminal.clearWrites();
+			const handle = tui.showOverlay(new Text("X", 0, 0), { width: 1, row: 1, col: 1 });
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[1].trimEnd(), " X");
+			assert.ok(terminal.getWrites().includes("\x1b_Ga=d,d=i,i=93,q=2\x1b\\"));
+			assert.ok(!terminal.getWrites().includes(deleteKittyImage(93)), "retained image data must survive");
+			terminal.clearWrites();
+			handle.hide();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getScrollBuffer(), before);
+			assert.ok(terminal.getWrites().includes("\x1b_Ga=p,i=93,c=2,r=3,C=1,q=2\x1b\\"));
+			assert.ok(!terminal.getWrites().includes("\x1b[3J"));
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("keeps content after reserved Kitty placeholders when an overlay opens and closes", async () => {
 		const terminal = new LoggingVirtualTerminal(20, 5);
 		const tui = new TuiMainScreen(terminal);

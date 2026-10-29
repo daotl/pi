@@ -717,7 +717,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			const connection = server.connection;
 			const url = connection?.oauthUrl;
 			if (!connection || !url) return false;
-			const removed = getCredentials(await loadMcpRuntime()).remove(server.entry.name, url);
+			const removed = await getCredentials(await loadMcpRuntime()).remove(server.entry.name, url);
 			await connection.signOut();
 			return removed;
 		};
@@ -1260,6 +1260,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			servers = [];
 			emitChange();
 			await Promise.all([...backgroundActions, ...closing.map((connection) => connection.close())]);
+			await credentials?.settled();
 		});
 
 		pi.registerCommand("mcp", {

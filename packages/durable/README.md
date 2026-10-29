@@ -257,6 +257,9 @@ registry.install(createCodingTools({ images: await createNodePhotonImages() }));
 
 A model without image input sees a placeholder instead of the image, and `read` says so in a diagnostic. `/images/node` prepares images in a worker thread, so a large photo (a second or two of work) never blocks the event loop; the worker exits after 30 s without images, freeing Photon's WebAssembly memory (`createNodePhotonImages({ worker: false, idleMs })`). Elsewhere, `createPhotonImages()` and `/images/cloudflare` work on the calling thread, and decoding takes the image's full size in WebAssembly memory, which does not shrink again; leave the processor out on memory-constrained hosts such as Cloudflare Workers unless images stay small.
 
+Idle image workers retire once; an eventual exit notification from a retired worker cannot evict the worker serving
+later reads.
+
 Define your own tool with a TypeBox schema. `defineTool()` types `args` from `parameters`, which the Harness validates before `execute()`. `api.output()` streams running output, which becomes the result when `execute()` returns no `output`:
 
 ```typescript
@@ -363,6 +366,23 @@ import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 registry.install(createCodemodeExtension({ sandbox: new CodemodeSandbox({ memoryLimitBytes: 256 * 1024 * 1024 }) }));
 ```
 
+For a custom extension using the standalone factory, install its model companions in the same selected extension:
+
+```typescript
+import { createCodemodeTool, createModelTools } from "@earendil-works/pi-durable/codemode";
+
+registry.install(defineExtension({
+	name: "scripts",
+	tools: [createCodemodeTool({ sandbox }), ...createModelTools()],
+}));
+```
+
+The standalone factory returns one registration, not an extension, and does not install siblings or the prompt section.
+For tools-only scripts, use `createCodemodeTool({ sandbox, models: false })` without companions.
+Distinct raw tool names that normalize alike (such as `get-item` and `get_item`) receive deterministic, reserved-suffix
+bindings. Prompt declarations, discovery, and persisted scripts use those same bindings; bracket access by raw name
+continues to address the original tool.
+
 The extension also adds a `codemode` prompt section listing the tools scripts can call, as TypeScript declarations within a token budget; scripts find the others with `searchTools()`, `describeTool()`, and `describeNamespace()`. Group tools by name prefix with `namespaces: [{ name, description, prefix }]`, for example an MCP server's `mcp__github__`. The result reads like the coding agent's: a header, the script's output, and on failure the calls already made; text past `max_output_tokens` is cut, with the full text in a temp file. Scripts also get `models.*`: the model catalog, `models.classify()`, and `models.generateImages()`, which run as nested calls of internal tools (`models: false` turns them off). On Cloudflare, pass a `RemoteCodemodeSandbox` instead. Closing the sandbox while a script runs (for example when shutting down) is not an outcome: the script resumes with the next process's sandbox. A failed nested call rejects in the script with its error text, unless the tool declares a schema and returned its own value with the error: `tools.bash` resolves with `{ output, exitCode, ... }` also for a nonzero exit, so scripts check `exitCode`. `store(key, value)` and `load(key)` keep JSON values per conversation; a fork sees them as they were at its entry.
 
 How it survives a restart: the sandbox runs the script deterministically (a virtual clock, seeded randomness, UTC), and the tool writes each result the script gets to a journal before handing it over. After a restart, the tool runs the script again and hands it the journaled results in the same order, so it makes the same calls with the same arguments; these reattach to their nested calls by key, and then the script continues. A rerun ends the call with an error instead when the script takes another path than before, when the sandbox's fingerprint or the code mode version changed, or when its `timeout_ms` passed meanwhile. A nested call running at the restart follows its own replay policy.
@@ -423,6 +443,10 @@ const harness = await Harness.open(storage, {
 	},
 }, context);
 ```
+
+Context retention maintenance follows only the ownership scopes touched by a task change. Idle contexts share an
+ordered expiry queue and one background timer; live retention changes shift their deadlines without scanning every
+cached range on each transition. Foreground work in owned conversations keeps ancestor contexts busy too.
 
 ## Environment
 
@@ -581,6 +605,10 @@ When a provider rejects a request because the context is too long, generation co
 When a compaction that a generation waits for at the blocking threshold fails, the generation fails too, without sending a request: its inputs settle `unanswered` with `model_error` and detail `Compaction failed: <error>`. One that finds nothing to compact or is declined lets the request go ahead.
 
 Running compactions are listed in `docs["pi.live"].compactions` with their reason, attempt, and retry backoff. The newest failure stays in `docs["pi.live"].compactionFailure` (task, reason, error) until a compaction produces a summary. The agent events add `compaction_start` and `compaction_end` (with `error` when the compaction failed), and `compactions` and `compactionFailure` fields in the snapshot.
+
+Context sizing uses committed entry order, not timestamps, to decide whether an assistant's reported usage includes a
+leading system baseline. If the first baseline arrived after an older answer, preparation estimates the whole current
+context (including on retry) until a later answer measures that baseline.
 
 ## Agent Events (Experimental)
 

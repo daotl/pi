@@ -99,10 +99,15 @@ function misplacedOptionsLine(input: string): number | undefined {
 	let index = 0;
 	let template = false;
 	let expressionStart = true;
-	const braces: boolean[] = [];
-	const parentheses: boolean[] = [];
+	// A block ends a statement; an object or function expression still permits division.
+	const braces: ("block" | "object" | "function" | "template")[] = [];
+	const parentheses: ("control" | "expression" | "declaration" | "function")[] = [];
+	let statementStart = true;
+	let functionParameters: "declaration" | "function" | undefined;
+	let nextBrace: "block" | "function" | undefined;
 	let control = false;
 	let member = false;
+	let label = false;
 	while (index < input.length) {
 		const char = input[index];
 		if (char === "\n") line++;
@@ -114,14 +119,17 @@ function misplacedOptionsLine(input: string): number | undefined {
 		if (char === "`") {
 			template = !template;
 			expressionStart = false;
+			statementStart = false;
+			nextBrace = undefined;
 			index++;
 			continue;
 		}
 		if (template) {
 			if (char === "$" && input[index + 1] === "{") {
-				braces.push(true);
+				braces.push("template");
 				template = false;
 				expressionStart = true;
+				statementStart = false;
 				index += 2;
 			} else index++;
 			continue;
@@ -144,6 +152,14 @@ function misplacedOptionsLine(input: string): number | undefined {
 			index += 2;
 			continue;
 		}
+		if (/\s/.test(char)) {
+			index++;
+			continue;
+		}
+		const body = nextBrace;
+		nextBrace = undefined;
+		const labelColon = label && char === ":";
+		label = false;
 		if (char === '"' || char === "'" || (char === "/" && expressionStart)) {
 			const delimiter = char;
 			let characterClass = false;
@@ -158,41 +174,73 @@ function misplacedOptionsLine(input: string): number | undefined {
 				else if (next === delimiter && !characterClass) break;
 			}
 			expressionStart = false;
+			statementStart = false;
+			member = false;
 			continue;
 		}
 		if ((char === "+" || char === "-") && input[index + 1] === char) {
 			index += 2;
 			continue;
 		}
+		if (char === "=" && input[index + 1] === ">") {
+			nextBrace = "function";
+			expressionStart = true;
+			statementStart = false;
+			index += 2;
+			continue;
+		}
 		if (char === "(") {
-			parentheses.push(control);
+			parentheses.push(functionParameters ?? (control ? "control" : "expression"));
+			functionParameters = undefined;
 			control = false;
 			expressionStart = true;
+			statementStart = false;
 			index++;
 			continue;
 		}
 		if (char === ")") {
-			expressionStart = parentheses.pop() ?? false;
+			const context = parentheses.pop();
+			expressionStart = context === "control";
+			statementStart = expressionStart;
+			if (context === "control" || context === "declaration") nextBrace = "block";
+			else if (context === "function") nextBrace = "function";
 			index++;
 			continue;
 		}
 		if (/[\w$]/.test(char)) {
 			const start = index++;
 			while (index < input.length && /[\w$]/.test(input[index])) index++;
+			const word = input.slice(start, index);
+			label = statementStart && !member;
+			if (!member && word === "function") {
+				functionParameters = statementStart ? "declaration" : "function";
+			}
+			const statementKeyword = !member && /^(?:else|do|try|finally|catch)$/.test(word);
 			expressionStart =
-				!member &&
-				/^(?:return|throw|case|delete|void|typeof|new|in|of|yield|await|instanceof)$/.test(
-					input.slice(start, index),
-				);
-			control = !member && /^(?:if|while|for|with|switch|catch)$/.test(input.slice(start, index));
+				statementKeyword ||
+				(!member && /^(?:return|throw|case|delete|void|typeof|new|in|of|yield|await|instanceof)$/.test(word));
+			control = !member && /^(?:if|while|for|with|switch|catch)$/.test(word);
+			// async can precede a function declaration without changing its statement context.
+			statementStart = statementKeyword || (!member && word === "async" && statementStart);
 			member = false;
 			continue;
 		}
-		if (char === "{") braces.push(false);
-		if (char === "}" && braces.pop()) template = true;
-		if (!/\s/.test(char)) control = false;
-		if (!/\s/.test(char)) member = char === ".";
-		if (!/\s/.test(char)) expressionStart = !/[)\]}.]/.test(char);
+		if (char === "{") {
+			const context = body ?? (statementStart ? "block" : "object");
+			braces.push(context);
+			expressionStart = true;
+			statementStart = context !== "object";
+		} else if (char === "}") {
+			const context = braces.pop();
+			template = context === "template";
+			expressionStart = context === "block";
+			statementStart = expressionStart;
+		} else {
+			expressionStart = char !== "]" && char !== ".";
+			statementStart = char === ";" || labelColon;
+		}
+		control = false;
+		member = char === ".";
 		index++;
 	}
 	return undefined;

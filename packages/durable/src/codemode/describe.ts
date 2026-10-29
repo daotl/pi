@@ -47,6 +47,36 @@ export function codemodeDescription(models: boolean): string {
 	].join("\n\n");
 }
 
+/** Allocate against the whole callable set, reserving raw aliases and normal spellings before adding suffixes. */
+export function scriptNames(tools: readonly ToolRegistration[]): ReadonlyMap<string, string> {
+	const groups = new Map<string, string[]>();
+	const reserved = new Set<string>();
+	for (const tool of tools) {
+		const id = toCodemodeIdentifier(tool.name);
+		const group = groups.get(id) ?? [];
+		group.push(tool.name);
+		groups.set(id, group);
+		reserved.add(tool.name);
+		reserved.add(id);
+	}
+	const names = new Map<string, string>();
+	for (const [id, group] of [...groups].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+		if (group.length === 1) {
+			names.set(group[0]!, id);
+			continue;
+		}
+		let suffix = 2;
+		for (const name of group.sort()) {
+			let candidate: string;
+			do candidate = `${id}_${suffix++}`;
+			while (reserved.has(candidate));
+			reserved.add(candidate);
+			names.set(name, candidate);
+		}
+	}
+	return names;
+}
+
 /** What a script sees of a tool: its declaration. Tools without an output schema resolve to their text output. */
 export function declarationOf(tool: ToolRegistration): {
 	name: string;
@@ -63,8 +93,8 @@ export function declarationOf(tool: ToolRegistration): {
 }
 
 /** `toolSample` of a tool: its description and TypeScript declaration. */
-export function sampleOf(tool: ToolRegistration): string {
-	return renderToolSample(declarationOf(tool));
+export function sampleOf(tool: ToolRegistration, jsName = toCodemodeIdentifier(tool.name)): string {
+	return renderToolSample({ ...declarationOf(tool), name: jsName });
 }
 
 /** The namespace of a tool: the one with the longest prefix its name starts with. */
@@ -79,10 +109,9 @@ export function namespaceOf(name: string, namespaces: readonly CodemodeNamespace
 }
 
 /** `### \`id\` (\`raw name\`)` followed by the tool's description and declaration. */
-function renderToolSection(tool: ToolRegistration): string {
-	const id = toCodemodeIdentifier(tool.name);
+function renderToolSection(tool: ToolRegistration, id: string): string {
 	const heading = id === tool.name ? `### \`${id}\`` : `### \`${id}\` (\`${tool.name}\`)`;
-	return `${heading}\n${sampleOf(tool).trim()}`;
+	return `${heading}\n${sampleOf(tool, id).trim()}`;
 }
 
 type CatalogEntry = { name: string; section: string; cost: number };
@@ -121,13 +150,16 @@ export function codemodeSection(
 	budget: number,
 ): string | undefined {
 	if (tools.length === 0) return undefined;
+	const names = scriptNames(tools);
 	const groups = new Map<string, CatalogGroup>([["", { namespace: undefined, entries: [] }]]);
 	for (const tool of tools) {
+		// Allocate before omitting deferred tools, so prompt and runtime keep identical bindings.
+		if (tool.deferred === true) continue;
 		const namespace = namespaceOf(tool.name, namespaces);
 		const key = namespace ? `ns:${namespace.name}` : "";
 		const group = groups.get(key) ?? { namespace, entries: [] };
 		groups.set(key, group);
-		const section = renderToolSection(tool);
+		const section = renderToolSection(tool, names.get(tool.name)!);
 		group.entries.push({ name: tool.name, section, cost: Math.ceil(section.length / CHARS_PER_TOKEN) });
 	}
 	const ordered = [...groups.values()].sort((a, b) =>

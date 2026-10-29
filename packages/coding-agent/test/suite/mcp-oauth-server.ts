@@ -17,11 +17,18 @@ function json(response: ServerResponse, status: number, body: unknown, headers: 
  * `iss` is sent as the `iss` parameter of authorization responses (RFC 9207). `issParameter` advertises
  * that parameter and sends the server's issuer. `cimd` advertises Client ID Metadata Documents.
  * `redirectPath` replaces the path of the redirect URI, like a mixed-up authorization server.
+ * `beforeRefreshResponse` delays a successful refresh response after its old token has been consumed.
  * The MCP endpoint assigns a session, so closing a connection sends a DELETE. Paths added to `stall`
  * accept requests and never answer them, like an unresponsive server.
  */
 export async function startOAuthMcpServer(
-	options: { iss?: string; issParameter?: boolean; cimd?: boolean; redirectPath?: string } = {},
+	options: {
+		iss?: string;
+		issParameter?: boolean;
+		cimd?: boolean;
+		redirectPath?: string;
+		beforeRefreshResponse?: () => Promise<void>;
+	} = {},
 ) {
 	const log: string[] = [];
 	const registrations: Record<string, unknown>[] = [];
@@ -141,7 +148,9 @@ export async function startOAuthMcpServer(
 				const refresh = params.get("refresh_token") ?? "";
 				if (!refreshTokens.delete(refresh)) return json(response, 400, { error: "invalid_grant" });
 				log.push("token refresh");
-				return json(response, 200, issueTokens());
+				const tokens = issueTokens();
+				await options.beforeRefreshResponse?.();
+				return json(response, 200, tokens);
 			}
 			default:
 				response.writeHead(404).end();

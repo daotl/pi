@@ -81,6 +81,62 @@ describe("parseCodemodeSource", () => {
 		}
 	});
 
+	it("rejects misplaced deadlines after statement-block and statement-keyword regexps", () => {
+		for (const prefix of [
+			"if (true) {} /`/.test('x');",
+			"if (false) {} else {} /`/.test('x');",
+			"try {} catch (error) {} /`/.test('x');",
+			"try {} finally {} /`/.test('x');",
+			"try {} catch {} /`/.test('x');",
+			"function declared() {} /`/.test('x');",
+			"async function declared() {} /`/.test('x');",
+			"function* declared() {} /`/.test('x');",
+			"{ function declared() {} /`/.test('x'); }",
+			"label: {} /`/.test('x');",
+			"if (true) { const value = {}; } /`/.test('x');",
+			"if (false) {} else /`/.test('x');",
+			"do /`/.test('x'); while (false);",
+			"do {} while (false); /`/.test('x');",
+		]) {
+			const input = `${prefix}\n// @options: {"timeout_ms": 1}\nwhile (true) {}`;
+			expect(() => parseCodemodeSource(input), prefix).toThrow(CodemodeSourceError);
+			expect(() => parseCodemodeSource(input), prefix).toThrow("found one on line 2");
+			const literal = `${prefix}\nconst source = \`example\n// @options: {}\n\`; return source;`;
+			expect(parseCodemodeSource(literal), prefix).toEqual({ code: literal, options: {} });
+		}
+	});
+
+	it("keeps division after object, function-expression, and arrow-expression braces", () => {
+		for (const expression of [
+			"const value = {}",
+			"const value = { nested: {} }",
+			"const value = function() {}",
+			"const value = function named() {}",
+			"const value = async function() {}",
+			"const value = true ? {} : function() {}",
+			"const value = false ? function() {} : (() => {})",
+			"const value = function*() {}",
+			"const value = (() => {})",
+			"const value = (async () => {})",
+			"const value = (() => ({}))",
+			"const value = (function() {})",
+		]) {
+			const input = `${expression} / 2;\n// @options: {"timeout_ms": 1}\nwhile (true) {}`;
+			expect(() => parseCodemodeSource(input), expression).toThrow(CodemodeSourceError);
+			expect(() => parseCodemodeSource(input), expression).toThrow("found one on line 2");
+			const literal = `${expression} / \`example\n// @options: {}\n\`; return value;`;
+			expect(parseCodemodeSource(literal), expression).toEqual({ code: literal, options: {} });
+		}
+	});
+
+	it("finds deadlines after block-following regexps inside template interpolations", () => {
+		const input =
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: testing JavaScript inside a template expression.
+			"const source = `value ${(() => { if (true) {} /`/.test('x');\n// @options: {\"timeout_ms\": 1}\nreturn 1; })()}`";
+		expect(() => parseCodemodeSource(input)).toThrow(CodemodeSourceError);
+		expect(() => parseCodemodeSource(input)).toThrow("found one on line 2");
+	});
+
 	// #10631: an options line after the first line used to be ignored, so its timeout never applied.
 	it("rejects an options line that is not the first line", () => {
 		const cases: [string, number][] = [

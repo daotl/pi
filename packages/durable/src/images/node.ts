@@ -33,8 +33,8 @@ export async function createNodePhotonImages(options: NodePhotonImagesOptions = 
 		async prepare(bytes, mimeType, limits) {
 			if (fallback !== undefined) return (await fallback).prepare(bytes, mimeType, limits);
 			try {
-				thread ??= new PhotonThread(idleMs, () => {
-					thread = undefined;
+				thread ??= new PhotonThread(idleMs, (retired) => {
+					if (thread === retired) thread = undefined;
 				});
 				return await thread.prepare(bytes, mimeType, limits);
 			} catch (error) {
@@ -60,13 +60,14 @@ class PhotonThread {
 	readonly #worker: Worker;
 	readonly #pending = new Map<number, PromiseWithResolvers<PreparedImage | undefined>>();
 	readonly #idleMs: number;
-	readonly #onExit: () => void;
+	readonly #onExit: (thread: PhotonThread) => void;
 	#nextId = 0;
 	#idle: ReturnType<typeof setTimeout> | undefined;
 	/** Whether the worker answered once: a failure before that means it is unavailable. */
 	#started = false;
+	#retired = false;
 
-	constructor(idleMs: number, onExit: () => void) {
+	constructor(idleMs: number, onExit: (thread: PhotonThread) => void) {
 		this.#idleMs = idleMs;
 		this.#onExit = onExit;
 		// Run from source under a TypeScript runtime, as in tests; built, the worker sits next to this file as JS.
@@ -129,8 +130,10 @@ class PhotonThread {
 	}
 
 	#exit(): void {
+		if (this.#retired) return;
+		this.#retired = true;
 		if (this.#idle !== undefined) clearTimeout(this.#idle);
 		this.#idle = undefined;
-		this.#onExit();
+		this.#onExit(this);
 	}
 }

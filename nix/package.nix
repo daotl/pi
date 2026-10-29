@@ -44,7 +44,7 @@ let
 
     buildPhase = ''
       runHook preBuild
-      node packages/ai/scripts/hydrate-model-catalog.ts ${modelCatalog}
+      node packages/ai/scripts/hydrate-model-catalog.ts ${modelCatalog} ${lib.escapeShellArg modelCatalogPin.generatedAt}
       npm run build:offline
       runHook postBuild
     '';

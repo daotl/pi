@@ -796,6 +796,10 @@ export class Agent {
 		}
 
 		const abortController = new AbortController();
+		// Internal failures stop provider work without canceling mandatory settlement.
+		// Explicit caller cancellation still reaches both signals.
+		const providerAbortController = new AbortController();
+		abortController.signal.addEventListener("abort", () => providerAbortController.abort(), { once: true });
 		let resolvePromise = () => {};
 		const promise = new Promise<void>((resolve) => {
 			resolvePromise = resolve;
@@ -807,10 +811,10 @@ export class Agent {
 		this._state.errorMessage = undefined;
 
 		try {
-			await executor(abortController.signal);
+			await executor(providerAbortController.signal);
 		} catch (error) {
 			const aborted = abortController.signal.aborted;
-			if (!aborted) abortController.abort();
+			providerAbortController.abort();
 			await this.handleRunFailure(error, aborted, execution);
 		} finally {
 			this.finishRun();

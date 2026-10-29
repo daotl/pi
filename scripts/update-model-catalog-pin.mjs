@@ -21,7 +21,12 @@ async function fetchRevision(revision) {
 	if (!response.ok) throw new Error(`Catalog revision ${revision} is unavailable: HTTP ${response.status}`);
 	const bytes = Buffer.from(await response.arrayBuffer());
 	if (sha256(bytes) !== revision) throw new Error(`Catalog revision ${revision} does not match its content`);
-	return bytes;
+	const lastModified = response.headers.get("last-modified");
+	const timestamp = lastModified === null ? NaN : Date.parse(lastModified);
+	if (!Number.isFinite(timestamp) || new Date(timestamp).toUTCString() !== lastModified) {
+		throw new Error(`Catalog revision ${revision} has an invalid or missing Last-Modified timestamp`);
+	}
+	return { bytes, generatedAt: new Date(timestamp).toISOString() };
 }
 
 /**
@@ -61,7 +66,7 @@ function modelApiGroups(root, bytes) {
 }
 
 /** Hydrate the checkout's model data from catalog bytes, as the Nix build does. */
-export function hydrateModelCatalogBytes(root, bytes, options = {}) {
+export function hydrateModelCatalogBytes(root, bytes, options) {
 	const directory = mkdtempSync(join(tmpdir(), "pi-model-catalog-pin-"));
 	try {
 		const catalogPath = join(directory, "models.all.json");
@@ -73,9 +78,9 @@ export function hydrateModelCatalogBytes(root, bytes, options = {}) {
 }
 
 /** Return why the catalog cannot hydrate this checkout, or undefined if it can. */
-function hydrationProblem(root, bytes) {
+function hydrationProblem(root, bytes, generatedAt) {
 	try {
-		hydrateModelCatalogBytes(root, bytes, { validateOnly: true });
+		hydrateModelCatalogBytes(root, bytes, { generatedAt, validateOnly: true });
 		return undefined;
 	} catch (error) {
 		return error instanceof Error ? error.message : String(error);
@@ -90,12 +95,18 @@ function hydrationProblem(root, bytes) {
  */
 export async function updateModelCatalogPin(root, { ifStale = false } = {}) {
 	const pinPath = join(root, "nix/model-catalog.json");
-	const current = JSON.parse(readFileSync(pinPath, "utf8")).revision;
+	const { revision: current, generatedAt: currentGeneratedAt } = JSON.parse(readFileSync(pinPath, "utf8"));
+	if (
+		typeof current !== "string" || !REVISION_RE.test(current) ||
+		typeof currentGeneratedAt !== "string" || !Number.isFinite(Date.parse(currentGeneratedAt)) ||
+		new Date(currentGeneratedAt).toISOString() !== currentGeneratedAt
+	) throw new Error(`Invalid pin revision or generatedAt in ${pinPath}`);
 	let currentBytes;
 	if (ifStale) {
-		if (typeof current !== "string" || !REVISION_RE.test(current)) throw new Error(`Invalid pin in ${pinPath}`);
-		currentBytes = await fetchRevision(current);
-		const problem = hydrationProblem(root, currentBytes);
+		const pinned = await fetchRevision(current);
+		if (pinned.generatedAt !== currentGeneratedAt) throw new Error(`Pinned catalog ${current} publication timestamp does not match its immutable response`);
+		currentBytes = pinned.bytes;
+		const problem = hydrationProblem(root, currentBytes, currentGeneratedAt);
 		if (problem) {
 			console.error(`Pinned model catalog is stale: ${problem}`);
 			currentBytes = undefined;
@@ -104,7 +115,7 @@ export async function updateModelCatalogPin(root, { ifStale = false } = {}) {
 
 	const revision = await fetchLiveCatalog();
 	// Do not record a pin until its immutable URL serves a catalog this checkout can build with.
-	const bytes = await fetchRevision(revision);
+	const { bytes, generatedAt } = await fetchRevision(revision);
 	if (currentBytes) {
 		// The live catalog is generated from main. Main's code may depend on a model
 		// group the pin lacks, e.g. after a provider gained classifier models or
@@ -113,17 +124,17 @@ export async function updateModelCatalogPin(root, { ifStale = false } = {}) {
 		const live = modelApiGroups(root, bytes);
 		const missing = [...live].filter((group) => !pinned.has(group)).sort();
 		const extra = [...pinned].filter((group) => !live.has(group)).sort();
-		if (missing.length === 0 && extra.length === 0) return { revision: current, updated: false, bytes: currentBytes };
+		if (missing.length === 0 && extra.length === 0) return { revision: current, generatedAt: currentGeneratedAt, updated: false, bytes: currentBytes };
 		const differences = [
 			missing.length > 0 ? `missing ${missing.join(", ")}` : "",
 			extra.length > 0 ? `extra ${extra.join(", ")}` : "",
 		].filter(Boolean);
 		console.error(`Pinned model catalog is stale: model groups differ (${differences.join("; ")})`);
 	}
-	const problem = hydrationProblem(root, bytes);
+	const problem = hydrationProblem(root, bytes, generatedAt);
 	if (problem) throw new Error(`Live model catalog ${revision} cannot hydrate this checkout: ${problem}`);
-	writeFileSync(pinPath, `${JSON.stringify({ revision }, null, 2)}\n`);
-	return { revision, updated: revision !== current, bytes };
+	writeFileSync(pinPath, `${JSON.stringify({ revision, generatedAt }, null, 2)}\n`);
+	return { revision, generatedAt, updated: revision !== current || generatedAt !== currentGeneratedAt, bytes };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

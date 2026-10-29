@@ -394,13 +394,17 @@ describe("defaultTools setting", () => {
 			return sessionManager;
 		}
 
-		async function resume(sessionManager: SessionManager, options: ToolOptions = {}) {
+		async function resume(
+			sessionManager: SessionManager,
+			options: ToolOptions = {},
+			extensions: InlineExtension[] = [],
+		) {
 			const settingsManager = SettingsManager.inMemory();
 			const resourceLoader = new DefaultResourceLoader({
 				cwd: tempDir,
 				agentDir,
 				settingsManager,
-				extensionFactories: [extensionTools],
+				extensionFactories: [extensionTools, ...extensions],
 			});
 			await resourceLoader.reload();
 			return (
@@ -437,6 +441,73 @@ describe("defaultTools setting", () => {
 			const session = await resume(sessionManager);
 			expect(session.getActiveToolNames().sort()).toEqual(["grep", "inactive_tool", "read"]);
 			session.dispose();
+		});
+
+		// Finding #24: a checkpoint can be the only owner of the effective declaration.
+		it("restores checkpoint-only tools on reopen and replays visible later deltas", async () => {
+			const manager = SessionManager.create(tempDir, join(tempDir, "sessions"));
+			manager.appendMessage({ role: "user", content: "before checkpoint", timestamp: 1 });
+			const checkpointId = manager.appendCompaction("checkpoint", null, 100);
+			const checkpoint = manager.getEntry(checkpointId);
+			if (checkpoint?.type !== "compaction") throw new Error("Missing checkpoint");
+			checkpoint.systemMessage = {
+				role: "system",
+				content: "",
+				toolsAdded: toolReferences(["read", "inactive_tool"]),
+				timestamp: 2,
+			};
+			// Persist the supported checkpoint-only representation without ordinary system entries.
+			const file = manager.getSessionFile()!;
+			writeFileSync(
+				file,
+				`${[manager.getHeader(), ...manager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+			);
+			const reopened = SessionManager.open(file);
+			const session = await resume(reopened, { tools: ["+write", "-inactive_tool"] });
+			try {
+				expect(session.getActiveToolNames().sort()).toEqual(["active_tool", "read", "write"]);
+				recordLoadoutChange(reopened, ["grep"], ["read"]);
+				const deleted = recordLoadoutChange(reopened, ["bash"], ["grep"]);
+				reopened.softDeleteUnits([{ entryId: deleted }]);
+				const target = reopened.appendMessage({ role: "user", content: "target", timestamp: 3 });
+				session.setActiveToolsByName(["edit"]);
+				await session.navigateTree(target);
+				expect(session.getActiveToolNames().sort()).toEqual(["active_tool", "grep", "write"]);
+				await session.navigateTree(checkpointId);
+				expect(session.getActiveToolNames().sort()).toEqual(["active_tool", "read", "write"]);
+			} finally {
+				session.dispose();
+			}
+		});
+
+		it("keeps checkpoint tools pending until registration without activating removed extension tools", async () => {
+			const manager = createRecordedSession(["read", "active_tool"]);
+			recordLoadoutChange(manager, [], ["active_tool"]);
+			const checkpointId = manager.appendCompaction("checkpoint", null, 10);
+			const checkpoint = manager.getEntry(checkpointId);
+			if (checkpoint?.type !== "compaction" || !checkpoint.systemMessage) throw new Error("Missing checkpoint");
+			checkpoint.systemMessage.toolsAdded = toolReferences(["read", "late_tool"]);
+			const session = await resume(manager, {}, [
+				(pi) => {
+					pi.on("session_start", () =>
+						pi.registerTool({
+							name: "late_tool",
+							label: "Late",
+							description: "Restored late tool",
+							parameters: Type.Object({}),
+							defaultActive: false,
+							execute: async () => ({ content: [{ type: "text", text: "late result" }], details: {} }),
+						}),
+					);
+				},
+			]);
+			try {
+				expect(session.getActiveToolNames()).toEqual(["read"]);
+				await session.bindExtensions({});
+				expect(session.getActiveToolNames()).toEqual(["read", "late_tool"]);
+			} finally {
+				session.dispose();
+			}
 		});
 
 		// #11075

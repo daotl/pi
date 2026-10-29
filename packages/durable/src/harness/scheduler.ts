@@ -284,6 +284,13 @@ export class TaskScheduler {
 	 * first idle check after `settings.contextRetentionMs` of idleness, and at close.
 	 */
 	readonly #contexts = new Map<ConversationId, { range: ContextRange; idleSince: number | undefined }>();
+	/** Only scopes reached by changed ownership chains need their busy state checked. */
+	readonly #contextChecks = new Set<ConversationId>();
+	/** Ownership walk starts accumulated until publication/sweep, so shared ancestors are visited once per batch. */
+	readonly #contextScopes = new Set<Node>();
+	/** Idle contexts ordered by idleSince; one indexed heap slot per context, with no stale deadline entries. */
+	readonly #idleContexts: ConversationId[] = [];
+	readonly #idleContextPositions = new Map<ConversationId, number>();
 	/** Background timer for the earliest expiry of an idle context, unless the host declined it (see `#scheduleExpiry`). */
 	#expiry: { readonly at: number; readonly disarm: () => void } | undefined;
 	readonly #invocations = new Map<TaskId, Invocation>();
@@ -730,40 +737,116 @@ export class TaskScheduler {
 		}
 	}
 
-	/** Resolve idle waiters, and drop each kept context whose conversation has been idle for the retention period. */
+	/** Queue a changed ownership chain without walking it once for every record in a deep batch. */
+	#checkContextScopes(start: Up): void {
+		if (this.#contexts.size === 0) return;
+		this.#contextScopes.add("task" in start ? start.task : conversationNode(start.conversation));
+	}
+
+	/** Walk overlapping chains once, before a sweep can forget terminal owners and their conversation edges. */
+	#flushContextScopes(): void {
+		if (this.#contextScopes.size === 0) return;
+		const checked = new Set<Node>();
+		for (const start of this.#contextScopes) {
+			let at: Node | null | undefined = start;
+			while (at !== undefined && at !== null && !checked.has(at)) {
+				checked.add(at);
+				if (typeof at === "string") {
+					const conversationId = conversationOf(at);
+					if (this.#contexts.has(conversationId)) this.#contextChecks.add(conversationId);
+					at = this.#edges.get(conversationId);
+				} else {
+					const node = this.#node(at);
+					if (node === undefined || node.background) break;
+					// Task-owned tasks must share their owner's conversation. Skip that entire same-conversation
+					// chain: its conversation covers every candidate scope. An intervening background owner can
+					// only add a conservative check; #idle still decides the true foreground reach.
+					at = conversationNode(node.conversationId);
+				}
+			}
+		}
+		this.#contextScopes.clear();
+	}
+
+	/** Resolve waiters, expire due ranges, and update only scopes touched by ownership changes. */
 	#settleIdle(): void {
+		this.#flushContextScopes();
 		for (const conversationId of this.#idleWaiters.keys()) {
 			if (this.#idle(conversationId)) this.#idleWaiters.resolve(conversationId);
 		}
 		const now = this.#now();
 		const retention = this.#contextRetentionMs();
-		for (const [conversationId, kept] of this.#contexts) {
-			if (kept.idleSince !== undefined && now - kept.idleSince >= retention) {
-				this.#contexts.delete(conversationId);
-			} else if (!this.#idle(conversationId)) {
+		// Retention is live and shared: changing it shifts every deadline equally, without rebuilding the queue.
+		for (let id = this.#idleContexts[0]; id !== undefined; id = this.#idleContexts[0]) {
+			if (now - this.#contexts.get(id)!.idleSince! < retention) break;
+			this.#removeIdleContext(id);
+			this.#contexts.delete(id);
+		}
+		for (const conversationId of this.#contextChecks) {
+			const kept = this.#contexts.get(conversationId);
+			if (kept === undefined) continue;
+			if (!this.#idle(conversationId)) {
+				this.#removeIdleContext(conversationId);
 				kept.idleSince = undefined;
 			} else if (retention > 0) {
-				kept.idleSince ??= now;
+				if (kept.idleSince !== undefined) continue;
+				kept.idleSince = now;
+				this.#idleContextPositions.set(conversationId, this.#idleContexts.length);
+				this.#idleContexts.push(conversationId);
+				this.#orderIdleContext(this.#idleContexts.length - 1);
 			} else {
+				this.#removeIdleContext(conversationId);
 				this.#contexts.delete(conversationId);
 			}
 		}
-		this.#scheduleExpiry();
+		this.#contextChecks.clear();
+		this.#scheduleExpiry(retention);
 	}
 
-	/**
-	 * Run `#settleIdle()` when the earliest idle context expires, on a background timer, which never keeps the process
-	 * alive. Where the host declines it, as the default does in Cloudflare Workers, none is kept: a pending timer could
-	 * keep a Durable Object from being evicted, and eviction frees the contexts. There, task changes alone check expiry.
-	 */
-	#scheduleExpiry(): void {
-		const retention = this.#contextRetentionMs();
-		let at: number | undefined;
-		for (const kept of this.#contexts.values()) {
-			if (kept.idleSince !== undefined && (at === undefined || kept.idleSince + retention < at)) {
-				at = kept.idleSince + retention;
-			}
+	/** Repair one changed heap slot; comparing idle starts also handles a host clock that moved backwards. */
+	#orderIdleContext(index: number): void {
+		const queue = this.#idleContexts;
+		const before = (a: number, b: number) =>
+			this.#contexts.get(queue[a]!)!.idleSince! < this.#contexts.get(queue[b]!)!.idleSince!;
+		const swap = (a: number, b: number) => {
+			const id = queue[a]!;
+			queue[a] = queue[b]!;
+			queue[b] = id;
+			this.#idleContextPositions.set(queue[a]!, a);
+			this.#idleContextPositions.set(queue[b]!, b);
+		};
+		while (index > 0) {
+			const parent = (index - 1) >>> 1;
+			if (!before(index, parent)) break;
+			swap(index, parent);
+			index = parent;
 		}
+		for (;;) {
+			const left = index * 2 + 1;
+			if (left >= queue.length) break;
+			const right = left + 1;
+			const child = right < queue.length && before(right, left) ? right : left;
+			if (!before(child, index)) break;
+			swap(index, child);
+			index = child;
+		}
+	}
+
+	#removeIdleContext(id: ConversationId): void {
+		const index = this.#idleContextPositions.get(id);
+		if (index === undefined) return;
+		this.#idleContextPositions.delete(id);
+		const last = this.#idleContexts.pop()!;
+		if (index === this.#idleContexts.length) return;
+		this.#idleContexts[index] = last;
+		this.#idleContextPositions.set(last, index);
+		this.#orderIdleContext(index);
+	}
+
+	/** One background timer for the earliest idle deadline; declined timers are checked on task changes. */
+	#scheduleExpiry(retention: number): void {
+		const id = this.#idleContexts[0];
+		const at = id === undefined ? undefined : this.#contexts.get(id)!.idleSince! + retention;
 		if (this.#expiry !== undefined && this.#expiry.at === at) return;
 		this.#expiry?.disarm();
 		this.#expiry = undefined;
@@ -953,6 +1036,7 @@ export class TaskScheduler {
 			}
 		}
 		for (const id of passed) this.#unloaded.delete(id);
+		this.#checkContextScopes(start);
 	}
 
 	#setEdge(conversationId: ConversationId, owner: TaskId | null): void {
@@ -1001,6 +1085,7 @@ export class TaskScheduler {
 	 * last listed node.
 	 */
 	#sweep(): void {
+		this.#flushContextScopes();
 		for (const node of this.#dropQueue) {
 			if (this.#below.has(node)) continue;
 			if (typeof node === "string") {
@@ -1019,6 +1104,7 @@ export class TaskScheduler {
 	 * above it: one holding its outcome finalizes, an abort-marked one runs its abort handler; its waiters may run.
 	 */
 	#track(previous: AnyTaskRecord | undefined, record: AnyTaskRecord): void {
+		this.#checkContextScopes(parentOf(record));
 		const id = record.id;
 		const invocation = this.#invocations.get(id);
 		if (invocation !== undefined) invocation.record = record as TaskRecord<JsonValue, Checkpoint, JsonValue>;
@@ -1323,6 +1409,10 @@ export class TaskScheduler {
 		this.#taskWaiters.rejectAll(error);
 		this.#idleWaiters.rejectAll(error);
 		this.#contexts.clear();
+		this.#contextChecks.clear();
+		this.#contextScopes.clear();
+		this.#idleContexts.length = 0;
+		this.#idleContextPositions.clear();
 		this.#expiry?.disarm();
 		this.#expiry = undefined;
 		this.#timer?.disarm();
@@ -2275,6 +2365,7 @@ export class TaskScheduler {
 			}) as ErasedRuntime["entry"],
 			context: (conversationId, context, options) =>
 				this.#read(invocation, async () => {
+					this.#settleIdle();
 					const { view, range } = await readContextFrom(
 						this.#session,
 						this.#storage,
@@ -2291,13 +2382,9 @@ export class TaskScheduler {
 						!invocation.ended &&
 						(kept === undefined || kept.range.bounds.tail <= range.bounds.tail)
 					) {
-						// A read of another, idle conversation starts or continues its retention period.
-						if (!this.#idle(conversationId)) {
-							this.#contexts.set(conversationId, { range, idleSince: undefined });
-						} else if (this.#contextRetentionMs() > 0) {
-							this.#contexts.set(conversationId, { range, idleSince: kept?.idleSince ?? this.#now() });
-							this.#scheduleExpiry();
-						}
+						this.#contexts.set(conversationId, { range, idleSince: kept?.idleSince });
+						this.#contextChecks.add(conversationId);
+						this.#settleIdle();
 					}
 					return view;
 				}),

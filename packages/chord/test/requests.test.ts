@@ -17,6 +17,7 @@ import {
 	memoryLinkPair,
 	method,
 	opaque,
+	type Ref,
 	remote,
 	type StateEvent,
 } from "../src/index.ts";
@@ -528,6 +529,63 @@ describe("application requests", () => {
 				cleanup.open();
 				await closing;
 				await server.close();
+			}
+		});
+	}
+});
+
+describe("invocation entry ownership", () => {
+	for (const listener of [false, true]) {
+		it(`registers a ${listener ? "startup listener" : "method"} before it releases the only reference`, async () => {
+			const Busy = local("t.entry-owner", {
+				version: 1,
+				input: Type.Object({}),
+				members: { read: method(undefined, Type.String()) },
+			});
+			const host = createHost({ self: "host", onError: () => {} });
+			const entered = latch();
+			const finish = latch();
+			const settled = Promise.withResolvers<string>();
+			const log: string[] = [];
+			let ref: Ref<typeof Busy>;
+			host.serve(Busy, (_input, _principal, self) => {
+				const native = self.resource("native", {
+					version: 1,
+					open: () => "still open",
+					close: () => void log.push("closed"),
+				});
+				const run = async () => {
+					ref.release();
+					entered.open();
+					await finish.promise;
+					const value = native.value;
+					log.push("read");
+					settled.resolve(value);
+					return value;
+				};
+				if (listener) {
+					const value = self.state("value", Type.Number(), 0);
+					self.on("immediate", value, async () => {
+						await run();
+					});
+				}
+				return { read: run };
+			});
+			ref = host.hold(Busy, {});
+			const ready = ref.ready.catch(() => {});
+			try {
+				const invocation = listener ? settled.promise : ref.read();
+				await entered.promise;
+				await tick();
+				assert.deepEqual(log, [], "callback suspension retains its native resource");
+				finish.open();
+				assert.equal(await invocation, "still open");
+				await ready;
+				await host.close();
+				assert.deepEqual(log, ["read", "closed"]);
+			} finally {
+				finish.open();
+				await host.close();
 			}
 		});
 	}

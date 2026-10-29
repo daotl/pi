@@ -69,6 +69,7 @@ import {
 	DEFAULT_CODEMODE_INLINE_BUDGET,
 	namespaceOf,
 	sampleOf,
+	scriptNames,
 } from "./describe.ts";
 import {
 	CATALOG_GLOBALS,
@@ -238,6 +239,8 @@ const DEFAULT_SEARCH_LIMIT = 8;
 /**
  * The code mode tool. Scripts call the conversation's callable tools as `tools.<name>(args)`. Nested info/warn notices
  * reach the model once, prefixed with their tool's name, including when finished calls are reconstructed during replay.
+ * With models enabled (the default), install the companion `createModelTools()` registrations too, or use
+ * `createCodemodeExtension()` to install the complete bundle. Tools-only standalone callers set `models: false`.
  */
 export function createCodemodeTool(options: CodemodeToolOptions): ToolRegistration<typeof codemodeSchema> {
 	return defineTool({
@@ -263,10 +266,7 @@ export function createCodemodeExtension(options: CodemodeToolOptions): Extension
 		sections: [
 			section("codemode", (input) =>
 				codemodeSection(
-					// Deferred tools are found with `searchTools()`, as the coding agent leaves them out too.
-					input.agent.callable.filter(
-						(tool) => !tool.name.startsWith(CODEMODE_INTERNAL_PREFIX) && tool.deferred !== true,
-					),
+					input.agent.callable.filter((tool) => !tool.name.startsWith(CODEMODE_INTERNAL_PREFIX)),
 					options.namespaces ?? [],
 					options.inlineBudget ?? DEFAULT_CODEMODE_INLINE_BUDGET,
 				),
@@ -378,14 +378,15 @@ class CodemodeCall {
 		const { code, options: sourceOptions } = parseCodemodeSource(source);
 		const { api, context } = this;
 		const agent = await api.agent(context);
+		const callable = agent.callable.filter((tool) => !tool.name.startsWith(CODEMODE_INTERNAL_PREFIX));
+		const names = scriptNames(callable);
 		const tools: DeclaredTool[] = agent.callable.map((tool) => ({
 			name: tool.name,
-			jsName: toCodemodeIdentifier(tool.name),
-			description: sampleOf(tool),
+			jsName: names.get(tool.name) ?? toCodemodeIdentifier(tool.name),
+			description: sampleOf(tool, names.get(tool.name)),
 			...(tool.structuredOutputSchema === undefined ? {} : { structured: true as const }),
 			...(tool.name.startsWith(CODEMODE_INTERNAL_PREFIX) ? { hidden: true as const } : {}),
 		}));
-		const callable = agent.callable.filter((tool) => !tool.name.startsWith(CODEMODE_INTERNAL_PREFIX));
 		const models = this.options.models === false ? [] : [...CATALOG_GLOBALS, ...Object.keys(MODEL_CALLS)];
 		const globals = [
 			...DISCOVERY_GLOBALS.map((name) => ({ name, spread: true })),
@@ -946,11 +947,15 @@ class CodemodeCall {
 			if (typeof name !== "string") throw new Error("describeNamespace() expects a namespace name");
 			const namespace = namespaces.find((candidate) => matchesNamespace(candidate, name));
 			if (namespace === undefined) return undefined;
+			const scriptNameByRawName = new Map<string, string>();
+			for (const tool of tools) {
+				if (!scriptNameByRawName.has(tool.name)) scriptNameByRawName.set(tool.name, tool.jsName);
+			}
 			return {
 				name: namespace.name,
 				...(namespace.description === undefined ? {} : { description: namespace.description }),
 				...(namespace.instructions === undefined ? {} : { instructions: namespace.instructions }),
-				tools: namespace.tools.map((tool) => toCodemodeIdentifier(tool)),
+				tools: namespace.tools.map((name) => scriptNameByRawName.get(name)!),
 			};
 		}
 		const [query, options] = args as [unknown, { limit?: unknown; namespace?: unknown } | undefined];

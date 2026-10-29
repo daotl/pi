@@ -52,6 +52,7 @@ function createArtifactSet(t) {
 			exports: {
 				".": { types: "./dist/index.d.ts", import: "./dist/index.js" },
 				"./feature": { types: "./dist/feature.d.ts", import: "./dist/feature.js" },
+				"./package.json": "./package.json",
 			},
 			bin: { target: "./dist/cli.js" },
 			files: ["dist"],
@@ -119,6 +120,14 @@ test("wires multiple direct packages without registry fallbacks", (t) => {
 		/did not resolve from a local artifact/,
 	);
 	writeFileSync(lockPath, lockContents);
+
+	// The root still loads, and the declared feature exists, but its graph is broken.
+	const featurePath = join(consumerDirectory, "node_modules", "@pi-package-test", "target", "dist", "feature.js");
+	writeFileSync(featurePath, 'import "./missing-transitive.js";\nexport const feature = true;\n');
+	execFileSync(process.execPath, ["--input-type=module", "--eval", 'import "@pi-package-test/target";'], { cwd: consumerDirectory });
+	assert.throws(
+		() => smokeTestNpmConsumer({ artifactSet, directory: consumerDirectory, packageName: "@pi-package-test/target" }),
+	);
 
 	rmSync(join(consumerDirectory, "node_modules", "@pi-package-test", "target", "dist", "feature.js"));
 	assert.throws(

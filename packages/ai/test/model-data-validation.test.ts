@@ -93,13 +93,14 @@ describe("published model catalog hydration", () => {
 		writeFileSync(catalogPath, JSON.stringify({ "test-provider": models, "extra-provider": models }));
 		rmSync(dataDir, { recursive: true });
 
-		hydrateModelCatalog(packageRoot, catalogPath);
+		hydrateModelCatalog(packageRoot, catalogPath, { generatedAt: GENERATED_AT });
 		expect(() => validateModelDataDirectory(structure, dataDir)).not.toThrow();
 		expect(readModelDataStructure(packageRoot)).toEqual(structure);
 		expect(readFileSync(aggregatorPath, "utf8")).toBe(aggregator);
 		const manifest = readFileSync(join(dataDir, MODEL_DATA_MANIFEST_FILE), "utf8");
+		expect(JSON.parse(manifest).generatedAt).toBe(GENERATED_AT);
 		const provider = readFileSync(join(dataDir, "test-provider.json"), "utf8");
-		hydrateModelCatalog(packageRoot, catalogPath);
+		hydrateModelCatalog(packageRoot, catalogPath, { generatedAt: GENERATED_AT });
 		expect(readFileSync(join(dataDir, MODEL_DATA_MANIFEST_FILE), "utf8")).toBe(manifest);
 		expect(readFileSync(join(dataDir, "test-provider.json"), "utf8")).toBe(provider);
 	});
@@ -114,7 +115,7 @@ describe("published model catalog hydration", () => {
 				"test-provider": [model, { ...model, id: "model-b", api: "anthropic-messages" }],
 			}),
 		);
-		hydrateModelCatalog(packageRoot, catalogPath);
+		hydrateModelCatalog(packageRoot, catalogPath, { generatedAt: GENERATED_AT });
 		expect(readModelDataStructure(packageRoot)).toEqual({
 			"test-provider": { "chat:model-a": "openai-completions", "chat:model-b": "anthropic-messages" },
 		});
@@ -135,7 +136,7 @@ describe("published model catalog hydration", () => {
 		};
 		const catalogPath = join(packageRoot, "catalog.json");
 		writeFileSync(catalogPath, JSON.stringify({ "test-provider": [chatModel(values), image] }));
-		hydrateModelCatalog(packageRoot, catalogPath);
+		hydrateModelCatalog(packageRoot, catalogPath, { generatedAt: GENERATED_AT });
 		expect(readModelDataStructure(packageRoot)).toEqual({
 			"test-provider": { "chat:model-a": "openai-completions", "image:model-a": "openrouter-images" },
 		});
@@ -147,10 +148,12 @@ describe("published model catalog hydration", () => {
 		const catalogPath = join(packageRoot, "catalog.json");
 		const model = chatModel(values);
 		writeFileSync(catalogPath, JSON.stringify({ "test-provider": [model, { ...model, id: "model-b" }] }));
-		hydrateModelCatalog(packageRoot, catalogPath, { validateOnly: true });
+		hydrateModelCatalog(packageRoot, catalogPath, { generatedAt: GENERATED_AT, validateOnly: true });
 		expect(readFileSync(join(dataDir, "test-provider.json"), "utf8")).toBe(original);
 		writeFileSync(catalogPath, JSON.stringify({ "other-provider": [model] }));
-		expect(() => hydrateModelCatalog(packageRoot, catalogPath, { validateOnly: true })).toThrow(/missing provider/);
+		expect(() =>
+			hydrateModelCatalog(packageRoot, catalogPath, { generatedAt: GENERATED_AT, validateOnly: true }),
+		).toThrow(/missing provider/);
 	});
 
 	it.each([null, [], {}, { "test-provider": [] }, { "test-provider": {} }, { "test-provider": [{ id: "x" }] }])(
@@ -160,7 +163,7 @@ describe("published model catalog hydration", () => {
 			const catalogPath = join(packageRoot, "catalog.json");
 			const original = readFileSync(join(dataDir, MODEL_DATA_MANIFEST_FILE), "utf8");
 			writeFileSync(catalogPath, JSON.stringify(catalog));
-			expect(() => hydrateModelCatalog(packageRoot, catalogPath)).toThrow();
+			expect(() => hydrateModelCatalog(packageRoot, catalogPath, { generatedAt: GENERATED_AT })).toThrow();
 			expect(readFileSync(join(dataDir, MODEL_DATA_MANIFEST_FILE), "utf8")).toBe(original);
 		},
 	);
@@ -172,9 +175,21 @@ describe("published model catalog hydration", () => {
 		model[field] = null;
 		const catalogPath = join(packageRoot, "catalog.json");
 		writeFileSync(catalogPath, JSON.stringify({ "test-provider": [model] }));
-		expect(() => hydrateModelCatalog(packageRoot, catalogPath)).toThrow();
+		expect(() => hydrateModelCatalog(packageRoot, catalogPath, { generatedAt: GENERATED_AT })).toThrow();
 		expect(readFileSync(join(dataDir, "test-provider.json"), "utf8")).toBe(original);
 	});
+
+	it.each(["", "invalid", "2026-02-30T00:00:00.000Z", "2026-07-23"])(
+		"rejects invalid publication time %j before replacing data",
+		(generatedAt) => {
+			const { dataDir, packageRoot, values } = createFixture();
+			const original = readFileSync(join(dataDir, MODEL_DATA_MANIFEST_FILE), "utf8");
+			const catalogPath = join(packageRoot, "catalog.json");
+			writeFileSync(catalogPath, JSON.stringify({ "test-provider": [chatModel(values)] }));
+			expect(() => hydrateModelCatalog(packageRoot, catalogPath, { generatedAt })).toThrow(/generation timestamp/);
+			expect(readFileSync(join(dataDir, MODEL_DATA_MANIFEST_FILE), "utf8")).toBe(original);
+		},
+	);
 });
 
 describe("generated model data validation", () => {

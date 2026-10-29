@@ -22,7 +22,7 @@ describe("MCP OAuth credential store", () => {
 		expect((await store.forServer("work", SERVER_URL).load())?.tokens?.access_token).toBe("work-token");
 		expect((await store.forServer("personal", SERVER_URL).load())?.tokens?.access_token).toBe("personal-token");
 
-		expect(store.remove("work", SERVER_URL)).toBe(true);
+		expect(await store.remove("work", SERVER_URL)).toBe(true);
 		expect(await store.forServer("work", SERVER_URL).load()).toBeUndefined();
 		expect(store.tokens("personal", SERVER_URL)?.access_token).toBe("personal-token");
 	});
@@ -43,13 +43,13 @@ describe("MCP OAuth credential store", () => {
 		expect(storedKeys(backend)).toEqual([`mcp__my_work|${SERVER_URL}`]);
 	});
 
-	it("signs out of credentials stored by SERVER_URL", () => {
+	it("signs out of credentials stored by SERVER_URL", async () => {
 		const backend = new InMemoryAuthStorageBackend();
 		backend.withLock(() => ({ result: undefined, next: JSON.stringify({ [SERVER_URL]: state("legacy-token") }) }));
 		const store = new McpOAuthCredentialStore(backend);
 
-		expect(store.remove("work", SERVER_URL)).toBe(true);
+		expect(await store.remove("work", SERVER_URL)).toBe(true);
 		expect(storedKeys(backend)).toEqual([]);
-		expect(store.remove("work", SERVER_URL)).toBe(false);
+		expect(await store.remove("work", SERVER_URL)).toBe(false);
 	});
 });

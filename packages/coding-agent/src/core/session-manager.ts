@@ -90,6 +90,8 @@ export interface SessionMessageEntry extends SessionEntryBase {
 	message: AgentMessage;
 	/** Last retained entry included in a freshly billed canonical continuation request (legacy: latest edit/checkpoint). */
 	usageContextEntryId?: string;
+	/** Ordered checkpoint IDs selected for the freshly billed request; absent legacy records are unproven. */
+	usageSummaryIds?: readonly string[];
 	/**
 	 * Tool call blocks soft-deleted from this assistant message: toolCallId →
 	 * deletion timestamp. The message itself stays visible with the remaining
@@ -1425,6 +1427,9 @@ export class SessionManager {
 		if (clone.type === "message" && clone.usageContextEntryId !== undefined) {
 			clone.usageContextEntryId = idMap.get(clone.usageContextEntryId) ?? clone.usageContextEntryId;
 		}
+		if (clone.type === "message" && clone.usageSummaryIds !== undefined) {
+			clone.usageSummaryIds = clone.usageSummaryIds.map((summaryId) => idMap.get(summaryId) ?? summaryId);
+		}
 		if (clone.type === "compaction") {
 			clone.firstKeptEntryId =
 				idMap.get(clone.firstKeptEntryId) ?? boundaryIds?.get(clone.firstKeptEntryId) ?? clone.firstKeptEntryId;
@@ -1517,8 +1522,13 @@ export class SessionManager {
 	 * so it is easier to find them.
 	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
 	 * Pass usageSourceId only when replaying an already billed contribution, not for a new provider response.
+	 * Omit usageSummaryIds to capture the current selection; pass null when the request selection is unknown.
 	 */
-	appendMessage(message: Message | CustomMessage | BashExecutionMessage, usageSourceId?: string): string {
+	appendMessage(
+		message: Message | CustomMessage | BashExecutionMessage,
+		usageSourceId?: string,
+		usageSummaryIds?: readonly string[] | null,
+	): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.byId),
@@ -1526,6 +1536,16 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			message,
 			...(usageSourceId !== undefined ? { usageSourceId } : {}),
+			...(message.role === "assistant" && usageSourceId === undefined && usageSummaryIds !== null
+				? {
+						usageSummaryIds: [
+							...(usageSummaryIds ??
+								this.buildContextEntries()
+									.filter((entry) => entry.type === "compaction")
+									.map((entry) => entry.id)),
+						],
+					}
+				: {}),
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1535,13 +1555,23 @@ export class SessionManager {
 	 * Replace an assistant prefill at its canonical position with one newly billed response.
 	 * Preserve its complete active suffix and historical receipts, publishing nothing on failure.
 	 */
-	replaceAssistantContinuation(entryId: string, message: AssistantMessage): string {
+	replaceAssistantContinuation(
+		entryId: string,
+		message: AssistantMessage,
+		usageSummaryIds?: readonly string[] | null,
+	): string {
 		const path = this.getBranch();
 		const index = path.findIndex((entry) => entry.id === entryId);
 		const target = path[index];
 		if (target?.type !== "message" || target.message.role !== "assistant") {
 			throw new Error(`Assistant prefill ${entryId} is not on the active branch`);
 		}
+		const summaryIds =
+			usageSummaryIds === undefined
+				? this.buildContextEntries()
+						.filter((entry) => entry.type === "compaction")
+						.map((entry) => entry.id)
+				: usageSummaryIds;
 		const entries = this.fileEntries.slice();
 		const ids = new Set(this.byId.keys());
 		const idMap = new Map<string, string>();
@@ -1572,6 +1602,8 @@ export class SessionManager {
 				delete clone.deletedToolCalls;
 				delete clone.usageContextEntryId;
 				clone.usageContextEntryId = idMap.get(tail.at(-1)!.id)!;
+				if (summaryIds === null) delete clone.usageSummaryIds;
+				else clone.usageSummaryIds = summaryIds.map((id) => idMap.get(id) ?? id);
 				clone.timestamp = new Date().toISOString();
 			}
 			entries.push(clone);
@@ -2594,6 +2626,9 @@ export class SessionManager {
 			if (entry.type === "message" && entry.usageContextEntryId !== undefined) {
 				entry.usageContextEntryId = idMap.get(entry.usageContextEntryId) ?? entry.usageContextEntryId;
 			}
+			if (entry.type === "message" && entry.usageSummaryIds !== undefined) {
+				entry.usageSummaryIds = entry.usageSummaryIds.map((summaryId) => idMap.get(summaryId) ?? summaryId);
+			}
 			if (entry.type === "compaction") {
 				entry.firstKeptEntryId =
 					idMap.get(entry.firstKeptEntryId) ?? boundaryIds.get(entry.firstKeptEntryId) ?? entry.firstKeptEntryId;
@@ -2769,6 +2804,9 @@ export class SessionManager {
 			if (entry.type === "message" && entry.usageContextEntryId !== undefined) {
 				entry.usageContextEntryId = idMap.get(entry.usageContextEntryId) ?? entry.usageContextEntryId;
 			}
+			if (entry.type === "message" && entry.usageSummaryIds !== undefined) {
+				entry.usageSummaryIds = entry.usageSummaryIds.map((summaryId) => idMap.get(summaryId) ?? summaryId);
+			}
 			if (entry.type === "compaction" && entry.firstKeptEntryId) {
 				if (idMap.has(entry.firstKeptEntryId)) {
 					entry.firstKeptEntryId = idMap.get(entry.firstKeptEntryId)!;
@@ -2883,7 +2921,6 @@ export class SessionManager {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		const fromId = this.leafId ?? "root";
-		this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
 			id: generateId(this.byId),

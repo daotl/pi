@@ -81,8 +81,10 @@ export interface OAuthFlowOptions {
 	 */
 	authorizationServerMetadataUrl?: URL;
 	fetch?: McpFetch;
-	/** Aborts every request of the flow. Requests have no time limit of their own; combine with a timeout as needed. */
+	/** Aborts flow requests, except refresh requests with an explicit `refreshSignal`. Combine with a timeout as needed. */
 	signal?: AbortSignal;
+	/** Override the refresh request signal; `null` lets a started rotation finish independently of caller cancellation. */
+	refreshSignal?: AbortSignal | null;
 	skipIssuerValidation?: boolean;
 	/**
 	 * Go straight to the authorization redirect instead of refreshing stored tokens, for example when the
@@ -403,9 +405,12 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 	}
 	const existing = options.skipRefresh ? undefined : await provider.tokens();
 	if (existing?.refresh_token) {
+		// Cancellation before dispatch must not consume a stored refresh token.
+		options.signal?.throwIfAborted();
 		try {
 			const tokens = await refreshAuthorization(discovered.authorizationServerUrl, {
 				...tokenOptions,
+				signal: options.refreshSignal === null ? undefined : (options.refreshSignal ?? options.signal),
 				refreshToken: existing.refresh_token,
 			});
 			// A refresh without `scope` keeps the scope of the grant (RFC 6749 §6).
@@ -434,6 +439,8 @@ export async function authorizeMcp(provider: OAuthClientProvider, options: OAuth
 	try {
 		return await runFlow(provider, options);
 	} catch (error) {
+		// A cancelled caller must not start a fresh flow after a failed refresh.
+		if (options.signal?.aborted) throw error;
 		if (error instanceof OAuthError && ["invalid_client", "unauthorized_client"].includes(error.code)) {
 			await provider.invalidateCredentials?.("all");
 			return runFlow(provider, options);

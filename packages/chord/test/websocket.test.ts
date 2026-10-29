@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import type { IncomingMessage } from "node:http";
+import { runInNewContext } from "node:vm";
 import { deflateRawSync } from "node:zlib";
 import { Type } from "typebox";
 import { describe, it } from "vitest";
@@ -300,4 +301,144 @@ describe("WebSocket links: packed payloads", () => {
 			await new Promise<void>((resolve) => wss.close(() => resolve()));
 		}
 	});
+});
+
+describe("WebSocket authentication bounds", () => {
+	for (const limit of ["frames", "bytes"] as const) {
+		it(`closes synchronously on the first excess queued ${limit}`, () => {
+			const listeners = new Map<string, (event: { data: unknown }) => void>();
+			let closes = 0;
+			const socket: WebSocketLike = {
+				readyState: 1,
+				send: () => {},
+				close: () => {
+					closes++;
+				},
+				addEventListener: (type, listener) => {
+					listeners.set(type, listener);
+				},
+			};
+			const link = webSocketLink(socket, { acceptPacked: false });
+			let reason: string | undefined;
+			link.onClose((value) => {
+				reason = value;
+			});
+			const message = listeners.get("message")!;
+			const frame = JSON.stringify({ t: "ping", n: 0 });
+			const count = limit === "frames" ? 256 : 1;
+			const boundary =
+				limit === "frames" ? frame : frame + " ".repeat(1024 * 1024 - new TextEncoder().encode(frame).byteLength);
+			for (let index = 0; index < count; index++) message({ data: boundary });
+			assert.equal(link.closed, false);
+			assert.equal(closes, 0);
+			message({ data: limit === "frames" ? frame : " " });
+			assert.equal(link.closed, true);
+			assert.equal(closes, 1);
+			assert.equal(reason, "receive queue overflow");
+		});
+	}
+
+	for (const overflow of ["frames", "bytes", "deadline", "peer close"] as const) {
+		it(`fails closed on pre-authentication ${overflow}, ignores late success, and admits another client`, async () => {
+			const server = createHost({ self: "host", name: "server", onError: () => {} });
+			server.serve(Board, (_input, principal, self) => ({
+				variant: "main",
+				notes: self.state("notes", Type.Array(Type.String()), []),
+				add: () => {},
+				who: () => principal,
+			}));
+			const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+			await new Promise<void>((resolve) => wss.once("listening", resolve));
+			const authentication = Promise.withResolvers<string>();
+			let accepted = 0;
+			const accept = server.accept.bind(server);
+			server.accept = (link, options) => {
+				accepted++;
+				accept(link, options);
+			};
+			acceptWebSockets(wss as never, server, {
+				authenticationTimeout: overflow === "deadline" ? 20 : 2000,
+				principal: (request: IncomingMessage) => (request.url === "/pending" ? authentication.promise : "guest"),
+			});
+			const address = wss.address();
+			assert.ok(address !== null && typeof address === "object");
+			const url = `ws://127.0.0.1:${address.port}`;
+			const socket = new WebSocket(`${url}/pending`);
+			const closed = Promise.withResolvers<void>();
+			socket.addEventListener("close", () => closed.resolve());
+			try {
+				await new Promise<void>((resolve) => socket.addEventListener("open", () => resolve()));
+				if (overflow === "frames") {
+					for (let index = 0; index < 257; index++) socket.send(JSON.stringify({ t: "ping", n: index }));
+				} else if (overflow === "bytes") {
+					// Below the character limit but above 1 MiB of UTF-8 encoded bytes.
+					socket.send(JSON.stringify({ t: "ping", text: "é".repeat(600_000) }));
+				} else if (overflow === "peer close") socket.close();
+				await closed.promise;
+				authentication.resolve("late guest");
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				assert.equal(accepted, 0, "closed authentication links must never reach the host");
+				const client = createHost({
+					self: "host",
+					kind: "client",
+					onError: () => {},
+					upstream: {
+						link: webSocketLink(new WebSocket(`${url}/ok`) as unknown as WebSocketLike),
+						principal: "host",
+					},
+				});
+				try {
+					assert.equal(await (await client.get(Board, {})).who(), "guest");
+					assert.equal(accepted, 1);
+				} finally {
+					await client.close();
+				}
+			} finally {
+				socket.close();
+				authentication.resolve("late guest");
+				await server.close();
+				await new Promise<void>((resolve) => wss.close(() => resolve()));
+			}
+		});
+	}
+
+	for (const realm of ["native", "foreign"] as const) {
+		it(`preserves queued initial frames while assimilating a ${realm}-realm authentication promise`, async () => {
+			const server = createHost({ self: "host", name: "server" });
+			server.serve(Board, (_input, principal, self) => ({
+				variant: "main",
+				notes: self.state("notes", Type.Array(Type.String()), []),
+				add: () => {},
+				who: () => principal,
+			}));
+			const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+			await new Promise<void>((resolve) => wss.once("listening", resolve));
+			const authentication = Promise.withResolvers<string>();
+			const principal =
+				realm === "native"
+					? authentication.promise
+					: (runInNewContext("new Promise(resolve => gate.then(resolve))", {
+							gate: authentication.promise,
+						}) as Promise<string>);
+			acceptWebSockets(wss as never, server, { principal: () => principal });
+			const address = wss.address();
+			assert.ok(address !== null && typeof address === "object");
+			const socket = new WebSocket(`ws://127.0.0.1:${address.port}`);
+			const client = createHost({
+				self: "host",
+				kind: "client",
+				upstream: { link: webSocketLink(socket as unknown as WebSocketLike), principal: "host" },
+			});
+			try {
+				const ref = client.hold(Board, {});
+				await new Promise<void>((resolve) => socket.addEventListener("open", () => resolve()));
+				authentication.resolve("guest");
+				assert.equal(await ref.who(), "guest");
+			} finally {
+				await client.close();
+				await server.close();
+				await new Promise<void>((resolve) => wss.close(() => resolve()));
+			}
+		});
+	}
 });

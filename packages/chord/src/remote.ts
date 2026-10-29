@@ -1,6 +1,6 @@
 import { Value } from "typebox/value";
 import { HYDRATION, type Hydration } from "./cell.ts";
-import { type AnyContract, takesNoArgs } from "./contract.ts";
+import type { AnyContract } from "./contract.ts";
 import { applyImmutable, type Decoder, decoder } from "./delta/index.ts";
 import { ChordError, invalid } from "./errors.ts";
 import {
@@ -313,6 +313,8 @@ export class RemoteBinding {
 	gone(error: unknown): void {
 		if (this.ended) return;
 		this.status = "ended";
+		clearTimeout(this.lingerTimer);
+		this.lingerTimer = undefined;
 		this.error = error;
 		this.hold = undefined;
 		this.#pending = undefined;
@@ -361,7 +363,7 @@ export class RemoteBinding {
 	}
 
 	/** Calls `name` over the current hold, waiting for it while the binding (re)holds. */
-	async call(name: string, args: unknown, ctx: Ctx): Promise<unknown> {
+	async call(name: string, args: unknown, ctx: Ctx, given?: readonly unknown[]): Promise<unknown> {
 		for (;;) {
 			if (this.ended) throw this.terminalError();
 			if (this.status !== "live" || this.hold === undefined) await raceSignal(this.#live.promise, ctx.signal);
@@ -399,6 +401,15 @@ export class RemoteBinding {
 					"not_in_variant",
 					`${this.key}: ${name} is not a method of variant ${projection.variant}`,
 				);
+			if (given !== undefined) {
+				// Decode fresh/holder calls only after selecting the same method metadata used for dispatch.
+				const noArgs = method.args === undefined;
+				const context = noArgs ? given[0] : given[1];
+				if (context !== undefined && !(context instanceof CtxImpl))
+					throw invalid("foreign_ctx", "ctx must come from a Chord host");
+				context?.check(this.host);
+				args = noArgs ? undefined : given[0];
+			}
 			// Clean before the transport serializes: even an unknown bigint field must never cross the link.
 			const sent = method.args === undefined ? undefined : Value.Clean(method.args, Value.Clone(args));
 			return hold.channel.call(
@@ -701,26 +712,12 @@ export class RemoteRef implements RefCore {
 						this.#caller(name)(...given),
 					);
 				}
-				// An explicit root disambiguates send(ctx) from send(args, ctx), even after its variant was replaced.
-				// Holders still use the current overload because each call starts a fresh root.
-				const pinned = context !== undefined && !context.holder;
-				const noArgs = pinned ? given[0] === context : takesNoArgs(this.contract, name, this.variant);
-				const args = noArgs ? undefined : given[0];
-				const ctx = (pinned ? context : noArgs ? given[0] : given[1]) as Ctx | undefined;
-				// The same checks as a local reference's caller (RefImpl.caller and ObjectImpl.call): a ctx from another host
-				// or one not made by Chord would carry a root this host does not own over its link.
-				if (ctx !== undefined && !(ctx instanceof CtxImpl)) {
-					return Promise.reject(invalid("foreign_ctx", "ctx must come from a Chord host"));
+				// Explicit roots retain their overload; fresh/holder calls decode from current call projections,
+				// which may advance independently of the visible state shape.
+				if (context === undefined || context.holder) {
+					return host.root((root) => this.binding.call(name, undefined, root, given), { signal: context?.signal });
 				}
-				try {
-					ctx?.check(host);
-				} catch (error) {
-					return Promise.reject(error);
-				}
-				if (ctx === undefined || ctx.holder) {
-					return host.root((root) => this.#call(name, args, root), { signal: ctx?.signal });
-				}
-				return this.#call(name, args, ctx);
+				return this.#call(name, given[0] === context ? undefined : given[0], context);
 			};
 			this.#callers.set(name, caller);
 		}

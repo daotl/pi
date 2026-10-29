@@ -76,9 +76,11 @@ Clone the repository, install its dependencies, and run Pi from source:
 
 ```bash
 npm install --ignore-scripts
-npm run build:offline
+npm run build
 ./pi-test.sh
 ```
+
+After model data has been hydrated, use `npm run build:offline` to rebuild without refreshing provider catalogs.
 
 Then just talk to pi. By default, pi gives the model four tools: `read`, `write`, `edit`, and `bash`. The model uses these to fulfill your requests. Add capabilities via [skills](#skills), [prompt templates](#prompt-templates), [extensions](#extensions), or [pi packages](#pi-packages).
 

@@ -322,6 +322,10 @@ export class HostImpl implements Host, HostCore {
 	readonly #order = new Map<string, Map<string, number>>();
 	readonly #subscribers = new Map<string, Set<(table: RegistryTable<unknown>, codeVersion: number) => void>>();
 	#codeVersionSeq = 1;
+	#closing = false;
+	#closed = false;
+	#closePromise: Promise<void> | undefined;
+	readonly #closedReason = new ChordError("gone", "host closed");
 	#rootSeq = 0;
 
 	constructor(options: HostOptions) {
@@ -555,6 +559,7 @@ export class HostImpl implements Host, HostCore {
 		from?: ObjectImpl,
 		candidate = false,
 	): RefCore {
+		if (this.#closing) throw this.#closedReason;
 		const service = this.#bindingService(type.name, candidate);
 		// Application tokens may route elsewhere (including another member of a served host family). Received
 		// holds addressed here must first bind the registered provider, then normalize only with its trusted schema.
@@ -628,6 +633,7 @@ export class HostImpl implements Host, HostCore {
 	// ─── roots ───
 
 	async root<T>(fn: (ctx: Ctx) => T | Promise<T>, options: RootOptions = {}): Promise<T> {
+		if (this.#closed) throw this.#closedReason;
 		// The incarnation keeps root ids unique across restarts of a host with the same name.
 		const rootId = `${this.name}#${this.#incarnation}:${++this.#rootSeq}`;
 		this.#local.add(rootId);
@@ -799,7 +805,11 @@ export class HostImpl implements Host, HostCore {
 		const installed = object.implementations.get(codeVersion);
 		object.implementations.delete(codeVersion);
 		if (installed === undefined || installed.decls === object.decls) return;
-		const kept = object.allDecls();
+		const kept = new Set([
+			object.decls,
+			...object.pending,
+			...[...object.implementations.values()].map((implementation) => implementation.decls),
+		]);
 		const keep = <T>(pick: (decls: Decls) => Iterable<T>): Set<T> =>
 			new Set([...kept].flatMap((decls) => [...pick(decls)]));
 		const refs = keep((decls) => decls.refs.values());
@@ -811,13 +821,34 @@ export class HostImpl implements Host, HostCore {
 			.sort((a, b) => object.openOrder.indexOf(b) - object.openOrder.indexOf(a));
 		const releasing = [...installed.decls.refs.values()].filter((ref) => !refs.has(ref));
 		object.refreshSchemas();
-		runAll(
-			[
-				...closing.map((resource) => () => resource.close(object.openOrder)),
-				...releasing.map((ref) => () => ref.release()),
-			],
-			`${object.address}: retiring code version ${codeVersion} failed`,
-		).catch((error: unknown) => this.report(error));
+		// Keep retiring declarations visible to host teardown until their task owners and resource cleanup finish.
+		object.retiring.add(installed.decls);
+		const earlierCleanup = [...object.retirements];
+		const cleanup = (async () => {
+			if (closing.length > 0 || releasing.length > 0) {
+				try {
+					const stopped = object.joinStoppedTasks(this.taskStopDeadline, { resources: closing, refs: releasing });
+					if (stopped !== undefined) await stopped;
+				} catch (error) {
+					this.report(error);
+					// A missed deadline must not close a resource still in use. Retain it until its owner settles.
+					await object.joinStoppedTasks(Infinity, { resources: closing, refs: releasing });
+				}
+			}
+			if (earlierCleanup.length > 0) await Promise.allSettled(earlierCleanup);
+			await runAll(
+				[
+					...closing.map((resource) => () => resource.close(object.openOrder)),
+					...releasing.map((ref) => () => ref.release()),
+				],
+				`${object.address}: retiring code version ${codeVersion} failed`,
+			);
+		})().catch((error: unknown) => this.report(error));
+		object.retirements.add(cleanup);
+		void cleanup.finally(() => {
+			object.retiring.delete(installed.decls);
+			object.retirements.delete(cleanup);
+		});
 	}
 
 	// ─── registries ───
@@ -977,6 +1008,10 @@ export class HostImpl implements Host, HostCore {
 	// ─── links ───
 
 	accept(link: Link, options: AcceptOptions): void {
+		if (this.#closing) {
+			link.close("host closed");
+			return;
+		}
 		const kind = options.kind ?? "client";
 		if (kind === "host" && options.name === undefined) throw new TypeError("accepting a host link needs its name");
 		this.#addConnection(link, {
@@ -990,6 +1025,10 @@ export class HostImpl implements Host, HostCore {
 	}
 
 	connect(link: Link, options: ConnectOptions): void {
+		if (this.#closing) {
+			link.close("host closed");
+			return;
+		}
 		if (!("principal" in options))
 			throw new TypeError("connect needs `principal`: what the parent's own requests act as");
 		if (this.upstream?.open) this.upstream.link.close("replaced");
@@ -1162,7 +1201,7 @@ export class HostImpl implements Host, HostCore {
 		const bindWhenSynced = (connection: Promise<Connection>): void => {
 			connection.then(
 				(target) => {
-					if (!binding.ended && binding.hold === undefined) target.hold(binding, false);
+					if (!this.#closed && !binding.ended && binding.hold === undefined) target.hold(binding, false);
 				},
 				(error: unknown) => binding.gone(error),
 			);
@@ -1198,10 +1237,19 @@ export class HostImpl implements Host, HostCore {
 		const refuse = (): ChordError => new ChordError("forbidden", `${hostName} refused for this principal`);
 		const revoked = (): ChordError => new ChordError("gone", "principal invalidated while resolving");
 		if (!(await route.authorize(principal, hostName))) throw refuse();
+		if (this.#closing) throw this.#closedReason;
 		if (!still()) throw revoked();
 		const link = await route.resolve(hostName);
+		if (this.#closing) {
+			if (![...this.connections].some((connection) => connection.link === link)) link.close("host closed");
+			throw this.#closedReason;
+		}
 		if (!still()) throw revoked();
 		if (!(await route.authorize(principal, hostName))) throw refuse();
+		if (this.#closing) {
+			if (![...this.connections].some((connection) => connection.link === link)) link.close("host closed");
+			throw this.#closedReason;
+		}
 		if (!still()) throw revoked();
 		let connection = [...this.connections].find((candidate) => candidate.link === link);
 		connection ??= this.#addConnection(link, {
@@ -1210,6 +1258,7 @@ export class HostImpl implements Host, HostCore {
 			peer: { kind: "host", name: hostName },
 		});
 		await connection.whenSynced();
+		if (this.#closing) throw this.#closedReason;
 		if (!still()) throw revoked();
 		return connection;
 	}
@@ -1281,8 +1330,16 @@ export class HostImpl implements Host, HostCore {
 	 * Disposes every object (including cleanup already in progress), holders before what they reference: a resource's
 	 * `close` may still use the objects its object references, local or remote. Then closes the links.
 	 */
-	async close(): Promise<void> {
-		for (const binding of [...this.#lingering.values()]) binding.close();
+	close(): Promise<void> {
+		if (this.#closePromise !== undefined) return this.#closePromise;
+		this.#closing = true;
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		this.#closePromise = promise;
+		void this.#close().then(resolve, reject);
+		return promise;
+	}
+
+	async #close(): Promise<void> {
 		this.hostObjects.clear();
 		for (const name of [...this.#facetRuns.keys()]) this.facetRunChanged(name, undefined);
 		const reason = new ChordError("gone", `host ${this.name} closed`);
@@ -1293,6 +1350,8 @@ export class HostImpl implements Host, HostCore {
 				"host close: disposal failed",
 			);
 		} finally {
+			this.#closed = true;
+			for (const binding of [...this.bindings.values()]) binding.gone(reason);
 			for (const connection of [...this.connections]) connection.link.close("host closed");
 		}
 	}

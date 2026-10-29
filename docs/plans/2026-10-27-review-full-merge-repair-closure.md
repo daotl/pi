@@ -1093,3 +1093,264 @@ This section closes only full-review actionable findings **#1, #2, #3, #4, #9, #
 
 **All eight confirmed actionable findings and both validated repair followups are repaired; focused tests and mandatory checks pass.** No residual remains within that confirmed repair scope. Full-suite approval is withheld because of the unchanged image timing test failure. The original 32 unvalidated candidates, #31 testing gap and 439 insufficient-evidence paths remain explicitly unresolved. Changes are local, uncommitted and unpushed.
 
+
+## Complete maintained merge review - 554a0504
+
+**Scope:** `839dc79197595a4285d711e37d02fb623e5b6b7b` -> `554a0504a02fde0624fc07e9d402e12c16372174`; HEAD tree `be0dae6f9753a630fffbb832f6c5be7758691d09`; branch `fix/full-merge-review-8322aa1d`; **1532 changed paths**. Includes the complete maintained merge and every subsequent change, not only the latest repair commit.
+**Intent:** Find current reachable regressions while retaining Crystal history/edit/swipe/delete/restore/shred/id0 behavior, Harness/experimental/client/server consumers, multimodal/token counting, configured summary budgets, prompt/receipt ownership and native/storage safety.
+**Mode:** markdown report-only. No product fixes, commit or push. Earlier local repairs are committed at 554a0504; prior uncommitted wording is historical.
+
+**Reviewers:** 10 disjoint correctness domains; project-standards for written rules; testing for changed behavioral tests; maintainability for structural/type boundaries; agent-native for tools/commands; security for trust and authentication; performance for streaming/storage/cache work; api-contract for wire/public consumers; data-migration for actual legacy/SQLite transforms; reliability for lifecycle/error settlement; adversarial for cross-component and false-pass scenarios; julik-frontend-races for UI timers/requests; deployment-verification for risky forward-only storage operations. All 22 have usable terminal reports after recovery.
+
+### Triage Groups
+
+| Group | Findings | Context | Preferred Resolution | Why |
+| --- | --- | --- | --- | --- |
+| Host/process ownership - apply queue | #1, #2, #7, #10 | OS descendants, terminal child state and reentrant resource ownership | Fix P1 #1/#2 first; reserve invocation before callbacks #7 and fence retired worker identity #10 | Exit/cleanup must belong to exactly one live owner |
+| Durable invocation context - apply queue | #4, #24, #27 | Initial events and persisted session navigation can diverge from effective context | Initialize execution #4; restore checkpoint loadout #24; publish navigation only after persistence #27 | Keep callbacks, durable state and visible context on the same accepted transition |
+
+### P1 -- High
+
+| # | File | Issue | Reviewer | Confidence |
+| --- | --- | --- | --- | --- |
+| 1 | `packages/chord/src/manager.ts:219` | Clean Windows descendants on graceful and unexpected exits | reliability | 100 |
+| 2 | `packages/chord/src/manager.ts:404` | Handle fatal reports after the child becomes ready | reliability | 100 |
+| 3 | `packages/chord/src/websocket.ts:26` | Bound frames queued before WebSocket authentication completes | security | 75 |
+
+- **#1** - On Windows, a normally exiting or crashing managed child leaves its spawned subprocesses running, even though manager.stop() or instance.exited reports completion. The exit handler calls killGroup(), but that function returns immediately on Windows; taskkill tree cleanup only runs when an explicit forced kill happened before the leader exited. The existing graceful-exit test itself creates an independently running grandchild, so the missing lifetime cleanup is observable without requiring a malicious child.
+  - Response: Give each managed Windows child an owned process-tree lifetime mechanism, preferably a Windows Job Object with kill-on-close, and join/close that ownership on every exit path. A JavaScript-only alternative must track descendants before the leader disappears and terminate/join those recorded children on normal exit as well as forced stop; do not defer taskkill discovery until after leader exit.
+  - Evidence: packages/chord/src/manager.ts:219 -- if (pid <= 0 || process.platform === "win32") return; packages/chord/src/manager.ts:265-268 -- child.once("exit") only calls killGroup() and resolves immediately when treeTermination is undefined. packages/chord/src/manager.ts:237 -- taskkill must discover the descendants before their parent exits. Join it before reporting exit. packages/chord/src/manager.ts:351-359 -- doStop() invokes killTree() only when the graceful exit wait times out. packages/chord/test/manager.test.ts:244-253 -- graceful exit test starts a real grandchild, stops the manager, and expects that grandchild not to remain alive. packages/chord/test/fixtures/worker.ts:31-47 -- grandchild runs a persistent interval and disconnects IPC; shutdown exits the worker without explicitly stopping the grandchild. packages/chord/docs/spec.md:286 -- The manager kills the child process group on every exit path. reliability.diff:26864-26914 -- this platform-specific exit cleanup is newly introduced in the reviewed diff.
+  - Independent source validation: Source inspection confirms forkDriver's exit handler skips process-group cleanup on Windows and doStop invokes taskkill only after a grace timeout, so normally exiting workers can leave the fixture's independently running grandchild alive after exited resolves.
+
+- **#2** - A child that reports a terminal initialization or host failure after its initial ready message remains advertised as running, and later start() calls return that same failed instance. The fatal handler only rejects the readiness promise; after ready resolved it, rejecting it does nothing, so the killTree/exit cleanup never runs. This also breaks the documented two-stage startup flow, which explicitly tells workers to announce local readiness before awaiting upstream-dependent host activation and report a later failure through the fatal path.
+  - Response: Separate lifetime control handling from readiness settlement: reject readiness for fatal messages while starting, and schedule serialized termination of the matching current instance for fatal messages after readiness. Join its exit and leave the manager stopped so the next start can create a replacement; retain the instance identity fence.
+  - Evidence: packages/chord/src/manager.ts:406 -- reject(new ChordError("unavailable", `child failed: ${message.message}`, { reason: message.reason })), packages/chord/src/manager.ts:403 -- if (message.type === "ready") settle(resolve); packages/chord/src/manager.ts:419-423 -- killTree() and the joined exit are only in the readiness promise rejection catch; a previously resolved promise cannot reject again. packages/chord/src/manager.ts:365 -- if (instance !== undefined && status === "running") return instance; packages/chord/docs/guide.md:300-314 -- announces control readiness before await worker.ready(), and directs a later failure through the worker fatal/startup-error path. packages/chord/docs/spec.md:263 -- A terminal host failure is picked up by the host manager keepAlive or fatal path, not inside Chord. reliability.diff:27049-27068 -- the ready/fatal settlement and rejection-only process cleanup are added in BASE..HEAD.
+  - Independent source validation: The instance-fenced fatal handler only rejects the readiness promise, so a fatal report after ready cannot reach its rejection cleanup, while childControl.fatal only sends a message and subsequent start calls return the still-running failed instance.
+
+- **#3** - An unauthenticated WebSocket peer can consume unbounded process memory while an asynchronous authenticator is waiting. The newly installed link immediately parses and retains every incoming frame, but no receiver, protocol validation, flow-control accounting, or connection keepalive exists until authentication resolves; a stream of individually valid small frames therefore bypasses any per-message WebSocket size limit. Bounding the pre-authentication queue and closing on overflow prevents that concrete denial-of-service path without dropping legitimate initial frames.
+  - Response: Add a byte/count limit to frames buffered before a link receiver is installed and close the socket on overflow; apply a bounded authentication deadline in acceptWebSockets and do not call host.accept after that link has closed. Keep acceptPacked:false. Verify with an unresolved asynchronous authenticator, many small frames, and a separate successfully authenticated client.
+  - Evidence: packages/chord/src/websocket.ts:26 -- 		const link = webSocketLink(socket, { compress: true, acceptPacked: false }); packages/chord/src/websocket.ts:28-32 -- options.principal(request) may return a Promise; host.accept(link, ...) runs only after it resolves. packages/chord/src/link.ts:87 -- 		if (this.#handler === undefined) this.#queue.push(frame); packages/chord/src/link.ts:379-383 -- The WebSocket message listener calls parseFrame and delivers immediately, including before authentication has resolved. packages/chord/src/connection.ts:445-446,455-464 -- Frame validation/receiver and keepalive are installed by Connection after host.accept; they cannot bound the earlier queue. Source-only constructible scenario: principal returns a pending external-auth Promise; an unauthenticated peer sends repeated JSON ping frames. Each decoded frame remains in BaseLink.#queue until the Promise settles or the socket closes. No runtime experiment was performed, as required.
+  - Independent source validation: acceptWebSockets installs WebSocketLink before awaiting the asynchronous principal callback, and BaseLink retains every parsed non-bye frame without a count or byte cap until host.accept installs Connection's receiver and keepalive.
+
+### P2 -- Moderate
+
+| # | File | Issue | Reviewer | Confidence |
+| --- | --- | --- | --- | --- |
+| 4 | `packages/agent/src/agent-loop.ts:361` | Capture execution before initial subscriber callbacks | correctness-agent | 100 |
+| 7 | `packages/chord/src/object.ts:1653` | Register invocations before entering user callbacks | correctness-chord | 100 |
+| 10 | `packages/durable/src/images/node.ts:134` | Retire image workers once without clearing their replacement | maintainability | 100 |
+| 24 | `packages/coding-agent/src/core/agent-session.ts:3242` | Restore tools from checkpoint-only system state | correctness-session | 75 |
+| 27 | `packages/coding-agent/src/core/session-manager.ts:1507` | Keep branch selection unchanged when summary append fails | correctness-session | 75 |
+
+- **#4** - A stateful Agent subscriber that rejects agent_start, turn_start, or an initial prompt's message_start/message_end bypasses the newly added failure finalizer entirely. The execution context and invocation message list are initialized only after those awaited callbacks, so finishAgentLoopFailure returns without calling finishTurn, and agent_end reports only the synthetic failure rather than any initial messages already published. Initial publication failures therefore cannot use the same durable cleanup/finalization contract as request-preparation and provider failures.
+  - Response: Initialize execution.context and execution.newMessages in runAgentLoopInternal and runAgentLoopContinueInternal immediately after constructing their currentContext/newMessages and before the first emit. Retain the existing updates when request or next-turn preparation replaces the active context. Cover a one-shot rejecting initial subscriber after a prompt message has been accepted, asserting one finishTurn invocation and the correct invocation message list.
+  - Evidence: packages/agent/src/agent-loop.ts:361 -- 		execution.context = currentContext; packages/agent/src/agent-loop.ts:362 -- 		execution.newMessages = newMessages; packages/agent/src/agent-loop.ts:199-206 -- runAgentLoopInternal awaits agent_start, turn_start and both initial message events before calling runLoop, where the execution fields are first initialized. packages/agent/src/agent-loop.ts:243-246 -- runAgentLoopContinueInternal likewise awaits agent_start and turn_start before calling runLoop. packages/agent/src/agent.ts:937-938 -- processEvents awaits each public subscriber, so subscriber rejection exits either initial entry function before execution registration. packages/agent/src/agent-loop.ts:52 -- 	if (execution.finishTurnStarted || !execution.context) return; packages/agent/src/agent.ts:851 -- 		const newMessages = execution.newMessages ?? []; packages/agent/src/agent.ts:857-859 -- handleRunFailure calls finishAgentLoopFailure and emits agent_end with that fallback list. packages/agent/test/agent-loop.test.ts:2341-2351 -- the new failure-finalization matrix starts with steering/transform/convert/API-key/dispatch/iterator failures; all occur after runLoop registration and do not cover initial subscriber rejection.
+  - Independent source validation: Both loop entry functions await initial events before runLoop records execution.context and execution.newMessages, so an awaited Agent subscriber rejection there reaches handleRunFailure with no context, skips finishTurn, and loses the invocation's initial messages from agent_end.
+
+- **#7** - Releasing the last reference synchronously from a method or a state listener can start disposal while that same invocation is still running. The callback begins before its promise is inserted into #invocations, so disposal snapshots an empty invocation set and closes resources while the callback is suspended. On resumption a previously valid resource facade throws not_ready, contradicting the runtime's guarantee that methods and listeners retain their resources until settlement.
+  - Response: Install an invocation reservation before calling fn, then settle/remove it after fn resolves or throws. A deferred promise registered first can retain synchronous callback entry semantics without permitting #maybeIdle or forced disposal to miss the in-progress invocation. Cover both a direct method releasing its only external ref before an await and an immediate listener doing so before awaiting cleanup.
+  - Evidence: packages/chord/src/object.ts:1653 -- const invocation = (async () => fn())(); packages/chord/src/object.ts:1654 -- this.#invocations.add(invocation); packages/chord/src/object.ts:1677-1691 release removes the ref, #maybeIdle sees zero refs and zero invocations, and calls dispose(false) immediately when linger is zero. packages/chord/src/object.ts:1733 -- await Promise.allSettled([...this.#invocations]); packages/chord/src/object.ts:1743-1747 closes resources after that already-captured invocation snapshot; ResourceImpl.close at lines 263-270 clears its value before calling the native close handler. Trace: an async method calls ref.release() synchronously, then awaits a controlled pending promise, then reads db.value. #dispose reaches Promise.allSettled([]) before #invoke adds the method promise; disposal resumes and closes db while the method remains pending. The existing review.test.ts:240-289 releases only after ticks, when invocation registration already happened, and therefore misses the entry-window race. provenance: 0104fef1e Mario Zechner 2026-10-12 - invocation entry and registration at object.ts:1652-1654 originate in the merged chord2 runtime (targeted blame follows the former record.ts path).
+  - Independent source validation: ObjectImpl invokes user code synchronously before adding its promise to #invocations, allowing a last-reference release inside that callback to start disposal and snapshot an empty invocation set before the callback suspends, with no lease-based idle guard preventing resource closure.
+
+- **#10** - Image reads arriving while an idle worker is terminating can lose ownership of the replacement worker and start additional workers for later reads. The idle timer calls #exit() before terminate(), then the worker exit event calls fail() and #exit() again; both callbacks unconditionally clear the factory's shared thread variable. If a new read installed a replacement between those callbacks, the old worker clears that replacement. Make retirement a once-only transition and clear the shared slot only when it still refers to the retiring instance.
+  - Response: Add an idempotent retired/closed guard to PhotonThread.#exit(), set it before notifying #onExit(), and make the factory callback clear thread only when thread equals the instance that retired. Keep retirement-at-idle separate from the eventual Worker exit event so that a late old-worker event cannot mutate replacement ownership. Add a deterministic delayed-exit case that starts the replacement between the idle timeout and the old worker exit event.
+  - Evidence: packages/durable/src/images/node.ts:134: 		this.#onExit(); packages/durable/src/images/node.ts:36-38: thread ??= new PhotonThread(idleMs, () => { thread = undefined; }); packages/durable/src/images/node.ts:98: 		this.#worker.on("exit", (code) => fail(new Error(`The Photon image worker exited with code ${code}`))); packages/durable/src/images/node.ts:93-95: fail() rejects pending requests, clears #pending, and calls this.#exit(). packages/durable/src/images/node.ts:124-126: the idle timer calls this.#exit() and then void this.#worker.terminate(); #exit() has no once-only state. packages/durable/src/tools/read.ts:155-157: image reads invoke the configured processor.prepare(bytes, mimeType, limits). packages/durable/test/tools-images.test.ts:597-608: the restart test waits 100 ms before the replacement read; it does not interleave a replacement with delayed old-worker exit. provenance: cdaf6c227d Mario Zechner 2026-10-11 - feat(durable): prepare images in a worker thread in /images/node; git blame at reviewed HEAD attributes node.ts:121-135 to this commit.
+  - Independent source validation: The image worker's idle timeout calls #exit before asynchronous terminate, and the later worker exit calls the same unguarded #exit again, whose factory callback unconditionally clears thread even if an intervening prepare installed a replacement.
+
+- **#24** - A resumed or selected session whose effective tool declaration is stored in a compaction checkpoint loses that loadout when there are no ordinary system-message entries carrying it. Restoration now scans only raw message/system records and returns early, leaving startup defaults or the abandoned branch's tools active instead of the checkpoint's tools. The next request can therefore declare and expose different tools than the retained canonical context.
+  - Response: Seed tool restoration from the effective checkpoint in the canonical projection, then replay visible system deltas after that checkpoint; retain the current deleted-entry handling, pending-tool bookkeeping, invocation modifiers and new extension tool activation rules. Add a reopen/navigation case with declarations present only in CompactionEntry.systemMessage.
+  - Evidence: packages/coding-agent/src/core/agent-session.ts:3242 -- entry.deletedAt === undefined && entry.type === "message" && entry.message.role === "system" packages/coding-agent/src/core/agent-session.ts:3246 -- if (systemMessages.length === 0) return; packages/coding-agent/src/core/session-manager.ts:723-731 explicitly projects latestCompaction.systemMessage as the effective leading system message, independently of whether a raw system message survives in the tree. packages/coding-agent/test/session-manager/build-context.test.ts:233-280 constructs supported checkpoints carrying their own system state, including a latest checkpoint whose content overrides earlier state. packages/coding-agent/src/core/agent-session.ts:743-747 calls this restoration on default-tool resume, and lines 3449-3463 call it after selected-branch navigation. A checkpoint with toolsAdded=[read], no ordinary system messages and startup read/bash/edit/write reaches the early return and leaves all four defaults active. The supplied diff replaces the previous getCurrentSystemMessage(this.sessionManager.buildSessionContext().messages) restoration with this raw-branch-only collection; the earlier path did observe CompactionEntry.systemMessage. provenance: db3f2fd86 Nex 2026-10-27T22:54:46+08:00 - fix: close full-merge review findings and repair boundaries; targeted blame attributes the message-only/deleted-entry predicate at 3241-3245 to this commit.
+  - Independent source validation: Tool restoration now reads only undeleted raw message/system entries and returns when none exist, although the canonical projection independently restores latestCompaction.systemMessage, so checkpoint-only tool declarations are ignored on default-tool resume and branch navigation.
+
+- **#27** - If publishing a branch summary fails, the manager's selected leaf has already moved to the navigation target even though no summary or successful navigation was published. The new persist-before-publish append ordering throws before advancing the revision or updating entries, while branchWithSummary mutates leafId before invoking it. AgentSession.navigateTree then exits without refreshing agent state, so the UI/agent messages and cached context usage remain on the old branch while the next durable append silently attaches to the target branch.
+  - Response: Do not assign this.leafId in branchWithSummary before persistence: construct the entry with parentId=branchFromId and let the successful _appendEntry publish its ID as the leaf. Preserve fromId from the outgoing leaf. Verify failed append leaves selected leaf, revision, projection, cached usage and subsequent parentage unchanged.
+  - Evidence: packages/coding-agent/src/core/session-manager.ts:1507 -- this._persist(entry, !this.flushed && this.persist ? [...this.fileEntries, entry] : this.fileEntries); packages/coding-agent/src/core/session-manager.ts:2886 -- this.leafId = branchFromId; packages/coding-agent/src/core/session-manager.ts:2887-2898 builds parentId explicitly from branchFromId and calls _appendEntry. Thus the earlier leaf assignment is unnecessary for constructing the entry and remains changed when persistence throws. packages/coding-agent/src/core/session-manager.ts:1508-1511 publishes indexes, increments contextRevision and updates leaf only after _persist succeeds. The failure leaves leaf changed by the caller but contextRevision unchanged. packages/coding-agent/src/core/agent-session.ts:6984-6990 invokes branchWithSummary before lines 7010-7013 refresh finalized context; its finally at 7027-7029 only clears the branch summary controller and resolves idle waiters. provenance: ebae31160 Nex 2026-10-21T18:32:02+08:00 - fix(coding-agent): persist entries before publishing appends; blame attributes the new _persist-before-publish line to this commit, whereas the caller's leaf assignment is retained from c58d5f20a4. This finding concerns that changed ordering's interaction with the retained caller, not a claim that branchWithSummary was newly added.
+  - Independent source validation: branchWithSummary mutates leafId before the newly persist-first _appendEntry can throw, leaving the target leaf selected without publishing an entry or advancing contextRevision, and navigateTree's finally does not refresh or restore the abandoned agent context.
+
+### Actionable Findings
+
+| # | File | Issue | Route | Notes |
+| --- | --- | --- | --- | --- |
+| 1 | `packages/chord/src/manager.ts:219` | Clean Windows descendants on graceful and unexpected exits | `manual -> downstream-resolver` | suggested_fix present; source-independently validated; not applied |
+| 2 | `packages/chord/src/manager.ts:404` | Handle fatal reports after the child becomes ready | `gated_auto -> downstream-resolver` | suggested_fix present; source-independently validated; not applied |
+| 3 | `packages/chord/src/websocket.ts:26` | Bound frames queued before WebSocket authentication completes | `gated_auto -> downstream-resolver` | suggested_fix present; source-independently validated; not applied |
+| 4 | `packages/agent/src/agent-loop.ts:361` | Capture execution before initial subscriber callbacks | `gated_auto -> downstream-resolver` | suggested_fix present; source-independently validated; not applied |
+| 7 | `packages/chord/src/object.ts:1653` | Register invocations before entering user callbacks | `gated_auto -> downstream-resolver` | suggested_fix present; source-independently validated; not applied |
+| 10 | `packages/durable/src/images/node.ts:134` | Retire image workers once without clearing their replacement | `gated_auto -> downstream-resolver` | suggested_fix present; source-independently validated; not applied |
+| 24 | `packages/coding-agent/src/core/agent-session.ts:3242` | Restore tools from checkpoint-only system state | `gated_auto -> downstream-resolver` | suggested_fix present; source-independently validated; not applied |
+| 27 | `packages/coding-agent/src/core/session-manager.ts:1507` | Keep branch selection unchanged when summary append fails | `gated_auto -> downstream-resolver` | suggested_fix present; source-independently validated; not applied |
+
+### Unvalidated source candidates - not confirmed findings
+
+**31 candidates** remain outside the bounded independent batch. They are not confirmed defects and are not disproved. Selection included all three P1 plus five high-impact P2 covering failure settlement, resource identity, checkpoint loadout and failed navigation persistence; it was not simply the first five P2. Exact evidence and proposed fixes remain in unvalidated-candidates.json.
+
+| Candidate | Severity | File | Source claim |
+| --- | --- | --- | --- |
+| #5 | P2 | `packages/chord/docs/guide.md:45` | Declare host placement in the Chord quickstart |
+| #6 | P2 | `packages/chord/docs/guide.md:717` | Use the server WebSocket acceptance helper |
+| #8 | P2 | `packages/codemode/src/runtime/execution.ts:543` | Prevent raw aliases from stealing declared script names |
+| #9 | P2 | `packages/coding-agent/src/modes/interactive/interactive-mode.ts:9639` | Stop live tool clocks when interactive mode stops |
+| #11 | P2 | `packages/tui/src/tui-main-screen.ts:531` | Allow overlays beside and below Kitty image anchors |
+| #12 | P2 | `scripts/issues/ui.html:171` | Limit bulk none decisions to the displayed suggestion group |
+| #13 | P2 | `scripts/local-package-install.mjs:191` | Package smoke passes without loading declared subpath exports |
+| #14 | P2 | `packages/agent/src/agent.ts:813` | Do not cancel failure finalization on internal errors |
+| #15 | P2 | `packages/ai/scripts/hydrate-model-catalog.ts:65` | Preserve catalog freshness when hydrating reproducible builds |
+| #16 | P2 | `packages/chord/src/cell.ts:378` | Validate externally refreshed derivations before publishing |
+| #17 | P2 | `packages/chord/src/host.ts:1296` | Terminate externally held bindings when closing their host |
+| #18 | P2 | `packages/chord/src/manager.ts:378` | Retire managed children when their IPC link closes |
+| #19 | P2 | `packages/chord/src/reload.ts:516` | Join stopped tasks before replacing their native resources |
+| #20 | P2 | `packages/chord/src/remote.ts:707` | Decode implicit calls using current method projections |
+| #21 | P2 | `packages/codemode/src/source.ts:195` | Recognize regular expressions after statement blocks |
+| #22 | P2 | `packages/coding-agent/README.md:79` | Hydrate model data before the fresh checkout build |
+| #23 | P2 | `packages/coding-agent/src/core/agent-session.ts:1004` | Invalidate response usage when the summary budget changes |
+| #25 | P2 | `packages/coding-agent/src/core/compaction/branch-summarization.ts:431` | Near-window branch summaries exhaust two-token output caps |
+| #26 | P2 | `packages/coding-agent/src/core/compaction/branch-summarization.ts:480` | Raw-policy pruning discards history before redaction can shrink it |
+| #28 | P2 | `packages/coding-agent/src/extensions/mcp/oauth.ts:524` | Do not cancel in-flight refresh rotation during sign-in |
+| #29 | P2 | `packages/durable/src/codemode/codemode.ts:245` | Standalone codemode advertises unregistered model tools |
+| #30 | P2 | `packages/durable/src/codemode/codemode.ts:383` | Colliding normalized names disable all durable scripts |
+| #31 | P2 | `packages/durable/src/harness/context.ts:219` | Count late baselines outside the previous usage prefix |
+| #32 | P2 | `packages/durable/src/harness/scheduler.ts:740` | Avoid rescanning every cached context on each task transition |
+| #33 | P2 | `packages/env/daemon/src/sys/windows.rs:324` | Resolve Windows executables against the effective child PATH |
+| #34 | P2 | `packages/env/src/ssh.ts:482` | Use fish-compatible forwarding for login-shell daemon launches |
+| #35 | P2 | `packages/env/src/terminal.ts:114` | Contain terminal output callback failures |
+| #36 | P2 | `scripts/check-model-catalog-compat.mjs:97` | Accept package-keyed npm pack output in the catalog gate |
+| #37 | P2 | `scripts/issues/triage.ts:179` | Clear superseded results before starting another triage attempt |
+| #38 | P2 | `scripts/issues/ui.html:196` | Keep keyboard selection attached to the selected issue |
+| #39 | P2 | `scripts/issues/ui.html:78` | Reject stale issue snapshots before replacing live state |
+
+#5/#6/#22 concern current documentation recipes. #29/#30 depend on public standalone/custom tool loadouts; no normal repository collision was executed. #32 is source-derived scaling, not a benchmark. #25/#26 concern distinct summary output-headroom and post-conversion retention paths; no merge of their fix paths. These remain explicitly unvalidated rather than inflating the confirmed queue.
+
+### Advisory and testing dispositions
+
+- Raw count reconciliation: **45 = 39 source candidates + 1 semantic duplicate + 2 testing-only gaps + 2 released-history claims excluded + 1 standards-only advisory**. Of the 39 source candidates, **8 validated + 31 unvalidated**. No confidence/quote suppression or malformed findings.
+- Initial mechanical tool-clock entries described the same missing permanent InteractiveMode.stop disposal and were merged; current stable candidate #9 retains both reviewers. Stale issue-response overwrite (#39), unstable keyboard identity (#38), retained triage result (#37), and bulk eligibility (#12) have distinct triggers/fixes and were not collapsed.
+- Testing-only gaps: packages/coding-agent/test/native/tokenizer-count-ownership.test.ts:155 manually renders after a no-op requestRender; it does not prove completion-triggered repaint. packages/coding-agent/test/suite/agent-session-compaction-model-overrides.test.ts:206 drops the configured budget assertion during an awaited model change. Both moved to testing_gaps, not confirmed product defects.
+- Standards-only advisory: packages/ai/src/api/openai-decisions.lazy.ts:5 and easter-egg-3d.lazy.ts use dynamic imports contrary to the top-level-import rule. Lazy loading is intentional; no runtime defect is proved. Resolving that rule/design conflict remains report-only, not a request to remove functionality.
+- Deployment review suggested replacing retained-stack removal and model-output-limit-only claims in already released changelog sections. Those suggestions are excluded under immutable released-history rules; current fork behavior must be documented without rewriting historical release sections. No product code should be deleted to match upstream historical notes.
+
+### Deployment Notes
+
+- Quiesce overlapping SQLite writers and preserve exact namespace/prefix. Capture a coherent WAL-aware whole-database snapshot and rehearse restore with the actual rollback binary.
+- On quiescent baseline and migrated clones, run `SELECT name, sql FROM sqlite_master WHERE type IN ('table', 'index') ORDER BY name;`. Compare allocator/schema metadata, exact task JSON and identities, unrelated tables and indexes; require no temporary task table. Audit custom host schema objects, WAL/disk headroom and lock duration.
+- SQLite schema 2 is deliberately forward-only. A schema-1-only binary requires a coherent pre-upgrade snapshot; relabeling metadata or switching prefixes is not rollback. Account for later writes/external effects and sleeping-task recovery.
+- Before first v3-to-v4 JSONL write, retain originals and exclusive ownership. Compare selected leaf, IDs, usage, system/tool checkpoints and historical nodes through read-only open, first write, fork and reopen.
+- Observe telemetry flush/close rejection and dropped queue counters. Actual migration commands, production queries, backup recovery and workerd deployment were not executed this review. These are operational proposals, not observed passes.
+
+### Coverage
+
+- Correctness partitions reconcile all **1532 paths** exactly once: **846 semantically source-inspected / 686 insufficient-evidence paths**. Path inventory and hunk traversal are not semantic clearance.
+- Assigned/inspected/insufficient by domain: ai 209/126/83; agent 52/52/0; chord 123/89/34; durable 231/84/147; env 38/38/0; session 132/117/15; interactive 108/106/2; integrations 250/89/161; tooling 131/124/7; docs 258/21/237. Historical review/closure documents were not used as finding seeds. Exact arrays and per-path reasons remain in full reports.
+- Conditional assigned/inspected/insufficient: project-standards 1371/32/1339; testing 756/53/703; maintainability 574/71/503; agent-native 136/105/31; security 174/160/14; performance 111/92/19; api-contract 539/73/466; data-migration 36/36/0; reliability 578/71/507; adversarial 1371/74/1297; julik-frontend-races 146/84/62; deployment-verification-agent 33/33/0. Lens coverage does not close unrelated correctness gaps.
+- Infrastructure recovery: initial 22 launches each exhausted retries waiting for the first model event and produced no report. All reached terminal failure. One env recovery completed, then the remaining 21 recovered reports completed. No initial timeout was counted as clean or as a completed source review. Failure and recovery receipts are retained; no active review job remains.
+- Mechanics: 45 raw, zero malformed returns/findings, zero quote/confidence suppressions. Semantic decisions above reran mechanics before stable numbering. One independent validator batch accepted **#1/#2/#3/#4/#7/#10/#24/#27**, rejected zero. All P1 selected; zero cross-family shortcuts. 31 source candidates remain unvalidated, so overall review is **degraded**.
+- External cross-model not started: host serving family was unattested under the route contract. Local adversarial supplies the lens only, not serving-family independence. No external egress job or unresolved peer obligation.
+- Graph project discovery and coverage calls failed with `WeakMap keys must be objects or non-registered symbols`. Current source/history and available LSP are fallback; no exhaustive external/dynamic caller claim. Generic branch keywords did not establish a requirements plan; settlement suppression was not evaluated.
+- Current bounded runtime observation: public createHostManager with controlled driver reaches ready, receives fatal, remains running, returns the same instance on next start, and invokes zero kills before cleanup. Public acceptWebSockets with controlled pending authenticator retains 256 small frames without closing; all 256 reach receiver after authentication. This proves boundary behavior, not a real OS child, network attack, heap growth rate or production DoS. Windows descendant finding is source-only; Windows not executed.
+- No product source changes, paid provider calls, product build/lint/full-suite rerun. Earlier 11197/1/940 full-suite result and green repair checks belong to prior verification, not new review proof. The unchanged image timing threshold failure remains historical non-green evidence; it was not retried for this review.
+- Final post-append preservation checks bind HEAD/tree/branch, empty index, my-merge/crystal refs, exact only-ledger ownership, all 749 protected hashes, ASCII and report/append equality. Exact observed receipt is preservation.json.
+- Artifacts: `/tmp/compound-engineering-501/ce-code-review/20261029-full-554a0504-5c478b62`. Frozen full diff/inventory/provenance, all 22 reports, failed/recovered accounting, details, mechanics, semantic disposition, coverage, validator verdicts, bounded smoke, unvalidated candidates, advisory/deployment outputs, actionable queue, report and metadata.
+
+---
+
+### Verdict
+
+**Not ready.** Fix P1 #1 Windows descendant ownership, #2 fatal-after-ready manager retirement and #3 pre-authentication frame bounds first. Five independently validated P2 remain. This is a complete-scope but coverage/validation-degraded review, not clean merge approval. No fixes were applied.
+
+### Actionable Findings recap
+
+- #1 P1 `packages/chord/src/manager.ts:219` - Clean Windows descendants on graceful and unexpected exits; manual -> downstream-resolver; suggested_fix present; confidence 100.
+- #2 P1 `packages/chord/src/manager.ts:404` - Handle fatal reports after the child becomes ready; gated_auto -> downstream-resolver; suggested_fix present; confidence 100.
+- #3 P1 `packages/chord/src/websocket.ts:26` - Bound frames queued before WebSocket authentication completes; gated_auto -> downstream-resolver; suggested_fix present; confidence 75.
+- #4 P2 `packages/agent/src/agent-loop.ts:361` - Capture execution before initial subscriber callbacks; gated_auto -> downstream-resolver; suggested_fix present; confidence 100.
+- #7 P2 `packages/chord/src/object.ts:1653` - Register invocations before entering user callbacks; gated_auto -> downstream-resolver; suggested_fix present; confidence 100.
+- #10 P2 `packages/durable/src/images/node.ts:134` - Retire image workers once without clearing their replacement; gated_auto -> downstream-resolver; suggested_fix present; confidence 100.
+- #24 P2 `packages/coding-agent/src/core/agent-session.ts:3242` - Restore tools from checkpoint-only system state; gated_auto -> downstream-resolver; suggested_fix present; confidence 75.
+- #27 P2 `packages/coding-agent/src/core/session-manager.ts:1507` - Keep branch selection unchanged when summary append fails; gated_auto -> downstream-resolver; suggested_fix present; confidence 75.
+
+
+## Full findings repair - 554a0504 working tree
+
+Status: INCOMPLETE / BLOCKED. 38 of 39 source candidates repaired; 2 testing gaps repaired. Candidate #1 remains unfixed. Repair commit authorized by the latest user instruction; no push. This entry records pre-commit verification.
+
+The 31 source candidates previously labelled unvalidated were independently source-validated before edits. This supersedes their prior validation state without rewriting historical review records.
+
+### Candidate dispositions
+
+| Candidate | Issue | Disposition |
+|---|---|---|
+| #1 | Clean Windows descendants on graceful and unexpected exits | BLOCKED. No Windows ownership primitive integrated. Rejected isolated Job proposal: owner-close is not descendant-exit proof; bootstrap gate can escape assignment; ACTIVE_PROCESS_ZERO notification can be missed. Needs a live completion authority, atomic suspended-child assignment and Windows execution. |
+| #2 | Handle fatal reports after the child becomes ready | Fixed. Fatal after readiness invalidates reusable child and synchronously starts tree retirement before serialized actual-exit join. |
+| #3 | Bound frames queued before WebSocket authentication completes | Fixed. Pre-auth queue bounded at 256 frames / 1 MiB; authentication deadline defaults to 10000 ms; late authentication cannot acquire a closed socket. |
+| #4 | Capture execution before initial subscriber callbacks | Fixed. Initial subscriber callbacks receive the captured execution context and newMessages in both agent-loop entry paths. |
+| #5 | Declare host placement in the Chord quickstart | Fixed documentation. Quickstart declares hostNamed placement; public guide smoke observed count [0,2]. |
+| #6 | Use the server WebSocket acceptance helper | Fixed documentation. Server example imports/calls acceptWebSockets, not the client connector. |
+| #7 | Register invocations before entering user callbacks | Fixed. Invocation reservation precedes user callback entry, including synchronous callback reentrancy. |
+| #8 | Prevent raw aliases from stealing declared script names | Fixed. Declared script names are installed before non-conflicting raw aliases. |
+| #9 | Stop live tool clocks when interactive mode stops | Fixed. Permanent interactive stop disposes owned live tool clocks and pending map; temporary handoff remains intact. |
+| #10 | Retire image workers once without clearing their replacement | Fixed. Image worker retirement is once-only and exact-instance fenced against late old-worker exit. |
+| #11 | Allow overlays beside and below Kitty image anchors | Fixed. Overlay physical text rows and image coverage are separate; disjoint overlays preserve placement, overlap hides/restores placements. Real Kitty not exercised. |
+| #12 | Limit bulk none decisions to the displayed suggestion group | Fixed. Bulk none affects only visible done/none suggestions in the displayed category. |
+| #13 | Package smoke passes without loading declared subpath exports | Fixed. Consumer smoke imports literal exported subpaths; missing transitive module negative case is rejected. Browser-only exception stays bundler-checked. |
+| #14 | Do not cancel failure finalization on internal errors | Fixed. Internal provider cancellation does not cancel caller failure settlement; explicit caller abort still cancels both. |
+| #15 | Preserve catalog freshness when hydrating reproducible builds | Fixed. Immutable catalog generation timestamp is canonical and preserved through hydration/Nix/release, not replaced with build time. |
+| #16 | Validate externally refreshed derivations before publishing | Fixed. Externally refreshed derived values validate before publication. |
+| #17 | Terminate externally held bindings when closing their host | Fixed. Host close is terminal; late acquisitions are fenced and external remote bindings terminate after resource cleanup. |
+| #18 | Retire managed children when their IPC link closes | Fixed. Unexpected IPC close retires current instance and joins exit before replacement. |
+| #19 | Join stopped tasks before replacing their native resources | Fixed. Stopped tasks retain only their intersecting native resources until actual settlement; bounded restart gate and no-owner eager cleanup preserved. |
+| #20 | Decode implicit calls using current method projections | Fixed. Implicit-call decoding resolves arity from the current method projection. |
+| #21 | Recognize regular expressions after statement blocks | Fixed. Scanner distinguishes statement blocks from expression braces and recognizes regex after blocks/else/do without treating division as regex. |
+| #22 | Hydrate model data before the fresh checkout build | Fixed documentation. Fresh checkout uses npm run build for hydration; offline build requires prior hydration. |
+| #23 | Invalidate response usage when the summary budget changes | Fixed. Request-owned summary IDs determine context usage applicability. Unknown provenance stays unknown; historical billed usage is unchanged. |
+| #24 | Restore tools from checkpoint-only system state | Fixed. Tool restoration seeds from canonical checkpoint and replays visible later deltas. |
+| #25 | Near-window branch summaries exhaust two-token output caps | Fixed. Branch-summary input budget reserves the full target output allowance and native adapter safety. |
+| #26 | Raw-policy pruning discards history before redaction can shrink it | Fixed. Policy conversion runs once before atomic-group pruning; redaction can shrink retained history and system authority remains ordered. |
+| #27 | Keep branch selection unchanged when summary append fails | Fixed. Branch selection is published only after the summary append succeeds. |
+| #28 | Do not cancel in-flight refresh rotation during sign-in | Fixed. Dispatched refresh rotation persists under lock despite UI cancellation; discovery/browser remain cancellable. |
+| #29 | Standalone codemode advertises unregistered model tools | Fixed. Public createModelTools supports explicit standalone companion composition; tools-only callers set models:false. |
+| #30 | Colliding normalized names disable all durable scripts | Fixed. Collision-safe deterministic allocation is shared by persisted start, prompt, namespace/search/describe. Existing persisted maps remain authoritative. |
+| #31 | Count late baselines outside the previous usage prefix | Fixed. Entry identities invalidate old measurement after a late leading baseline, including fixed-clock timestamps. |
+| #32 | Avoid rescanning every cached context on each task transition | Fixed. Affected-scope maintenance, indexed idle heap and one earliest timer replace repeated global scans. Batched ancestry collapse handles cached 20000-deep chains. |
+| #33 | Resolve Windows executables against the effective child PATH | Fixed source. Windows resolution uses effective merged/deduplicated child PATH. Windows runtime unavailable; platform tests skipped. |
+| #34 | Use fish-compatible forwarding for login-shell daemon launches | Fixed source. Fish-compatible login forwarding and family-specific deployment/probe dispatch. Fish unavailable; platform tests skipped. |
+| #35 | Contain terminal output callback failures | Fixed. onData exception aborts only that terminal and exited preserves the exact first thrown value, including falsy values. |
+| #36 | Accept package-keyed npm pack output in the catalog gate | Fixed. npm pack accepts sole-array or exact expected-package-keyed result with validated name/filename and path safety. |
+| #37 | Clear superseded results before starting another triage attempt | Fixed. Retriage clears obsolete result/time before queuing without changing decisions. |
+| #38 | Keep keyboard selection attached to the selected issue | Fixed. Keyboard selection tracks issue identity across regrouping and clears on removal; pending decisions suppress duplicates. |
+| #39 | Reject stale issue snapshots before replacing live state | Fixed. Request generations and mutation invalidation reject obsolete issue snapshots. |
+
+### Testing gaps
+
+- Tokenizer completion now drives requestRender and captures the actual footer frame; the assertion no longer relies on an unrelated manual redraw.
+- Model switch across awaited authentication retains both model identity and maxTokens=1600 in the oracle.
+
+### Verification
+
+- Final post-followup isolated ./test.sh on all 90 owned paths plus this ledger: 12787 passed / 0 failed / 947 skipped, exit 0; artifact://12517, job bg_685, 230.80 seconds. External PI_ENV_DAEMON and CARGO_TARGET_DIR avoided protected target writes. Earlier pre-followup run was 12777/0/947 (artifact://12466). A 120-second tool deadline interrupted bg_684 before total output; it is not counted as a completed suite.
+- Initial full run: 11303 passed / 4 failed / 943 skipped; artifact://12451. Four integration regressions were corrected: no-owner retirement microtask delayed native unregister; honest native output usage changed the prefill oracle; repeated scheduler ancestor traversal timed out two 20000-deep chains. Latest full run is green. No timing threshold was changed.
+- Mandatory npm run check: 1979 files, No fixes applied; dependency/import/entry-graph/install-lock/type/browser-bundle checks passed. This check does not prove browser visual correctness.
+- Focused tests: manager 20 passed / 2 Windows skips; Chord 174 passed / 2 skips; agent 157; coding-agent 206; durable 259; scheduler deep/ownership/retention/index 85; codemode 199; OAuth 29; MCP 16; env 23 / 4 skipped; issues 6; interactive 27; TUI 43; release scripts 29; hydration 34; remote freshness 12; Rust 20. Counts are separate focused runs, not additive to the full-suite total.
+- Public guide runtime smoke returned {"count":[0,2]}. Catalog immutable HEAD returned 200 and Last-Modified matching pinned generatedAt.
+- Scheduler paired 10000-cycle measurement: baseline retained 50947 ms vs patched 18289 ms; zero-retention 18275 vs 18849 ms; late transition 21.487 vs 2.609 ms; heap 49.7 vs 50.2 MiB. One paired workload, not a platform-wide guarantee.
+- Simplification: 4 changes applied (abort-race reuse, one message-token count, attempt-local namespace name map, one overlay coverage computation); 2 suggestions rejected because task sets/maps have separate ownership roles and regression comments retain traceability.
+- No Windows, fish, real Kitty or Nix runtime. Windows PATH/fish implementations have skipped platform tests, not executed passes. Kitty has virtual-terminal/protocol proof, not real graphics proof. Browser helper failed with __omp_display__ runtime error; fallback CLI opened only about:blank then was closed. No actual issue-UI browser smoke is claimed.
+
+### Independent repair-diff review
+
+- Frozen scope: HEAD 554a0504 -> 86 owned repair paths, including complete new test additions; historical ledger excluded. All 11 selected reviewers reached usable terminal completion and reported exact 86-path source inspection. No failed reviewer, malformed finding, quote/confidence suppression or external peer job.
+- Nine raw candidates -> seven distinct after merging two semantic duplicate pairs with reviewer/evidence union. One fresh independent validator accepted five and rejected two as pre-existing coverage limitations. No cross-family shortcut. Full details: `/tmp/pi-full-findings-fix-4ca37d63/review`.
+- Applied review #1: shared credential-store settlement joins detached sign-in refreshes during session shutdown and CLI teardown. Settlement tracks finite promises, removes fulfilled/rejected operations and is not awaited inside lock callbacks. Regression proves cancellation returns while drain stays pending, then resolves after refresh-2 is saved.
+- Applied review #6: logout deletes credentials under the same per-server refresh lock; both CLI and interactive callers await removal. Delayed-refresh/logout regression failed before the fix with resurrected access-2/refresh-2, then passed.
+- Applied review #4: disable priority/category/bulk controls synchronously through authoritative refresh; event-entry guards preserve disabled semantics. Keyboard repeats remain suppressed. No implicit queued decision behavior added.
+- Applied review #5: root test:scripts now includes nested UI tests and runs triage through its existing source resolver. Observed 93 + 1 script tests passed, including all seven nested issue tests.
+- Applied review #2: deterministic WebSocketLike tests accept exactly 256 frames / 1 MiB and synchronously close on first excess with receive queue overflow. They do not depend on the authentication timer. Real-socket late-auth cases remain.
+- Rejected review #3: partial-viewport Kitty overlap was already skipped by opaque image-row composition at baseline; retained as pre-existing limitation. Rejected review #7: source-only Workers guard does not establish an installed-graph guarantee, but no new shipped failure was demonstrated; retained coverage limitation.
+- Post-followup validation: OAuth/store/CLI/extension 58 passed; WebSocket 14 passed; issue UI 6 passed; scripts 93 + 1 passed; npm run check passed with No fixes applied. Final isolated full suite: 12787/0/947, artifact://12517, exit 0. This supersedes the earlier pre-followup 12777/0/947 run.
+- Final product/test/docs inventory is now 90 owned paths plus this ledger, because followups added root test discovery and three MCP consumers/tests. No dependency version or lockfile change.
+- Self-review: one shared credential lifetime rather than per-caller duplicate trackers; asynchronous remove contract and all six LSP references migrated; no lock callback calls settled; shutdown aborts and joins outer actions before draining. Auth/concurrency changes remain priority diff-review surfaces despite green tests.
+
+### Remaining blocker and delivery status
+
+Original #1 is still P1 and unfixed. The isolated Windows Job prototype was not integrated: owner death lacks surviving descendant-exit join authority; the pre-assignment bootstrap gate can survive outside the job; completion-port ACTIVE_PROCESS_ZERO notification is not guaranteed. A safe atomic suspended-child/job assignment and independently surviving completion authority, exercised on Windows, remain prerequisites. Non-Windows suite success does not discharge this item.
+
+Status: INCOMPLETE / BLOCKED, not fix-all complete and not merge approval. A post-commit full merge plus subsequent-diff review was explicitly requested and will be appended separately.
+

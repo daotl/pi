@@ -345,7 +345,7 @@ export function createHostManager(options: HostManagerOptions): HostManager {
 			return;
 		}
 		status = "stopping";
-		if (timer !== undefined) clearInterval(timer);
+		clearInterval(timer);
 		current.send({ type: "shutdown" });
 		let graceTimer: ReturnType<typeof setTimeout> | undefined;
 		const graceful = await Promise.race([
@@ -358,11 +358,14 @@ export function createHostManager(options: HostManagerOptions): HostManager {
 		if (!graceful) current.killTree();
 		await current.exited;
 		if (instance === current) instance = undefined;
+		booting = false;
 		status = "stopped";
 	};
 
 	const doStart = async (): Promise<Instance> => {
 		if (instance !== undefined && status === "running") return instance;
+		// A terminal callback invalidates reuse synchronously, even if a start was already queued before it.
+		if (instance !== undefined) await doStop();
 		status = "starting";
 		booting = true;
 		report = { activeCalls: 0, viewers: 0, durableTasks: 0 };
@@ -376,15 +379,33 @@ export function createHostManager(options: HostManagerOptions): HostManager {
 			throw error;
 		}
 		instance = current;
+		let failure: ChordError | undefined;
+		let rejectReady: ((error: ChordError) => void) | undefined;
+		const retire = (error: ChordError): void => {
+			if (instance !== current || status === "stopping" || failure !== undefined) return;
+			failure = error;
+			rejectReady?.(error);
+			status = "stopping";
+			booting = false;
+			clearInterval(timer);
+			// Termination cannot wait behind a previously queued start that is itself joining this exit.
+			current.killTree();
+			void serialized(async () => {
+				if (instance !== current) return;
+				await current.exited;
+			});
+		};
 		current.exited.then((exit) => {
 			if (instance === current) {
 				instance = undefined;
 				status = "stopped";
-				if (timer !== undefined) clearInterval(timer);
+				booting = false;
+				clearInterval(timer);
 			}
 			options.onExit?.(exit);
 		});
 		await new Promise<void>((resolve, reject) => {
+			rejectReady = reject;
 			const timeout = setTimeout(
 				() => reject(new ChordError("unavailable", "child not ready in time")),
 				options.readyTimeout ?? 30_000,
@@ -401,11 +422,12 @@ export function createHostManager(options: HostManagerOptions): HostManager {
 			current.onControl((message) => {
 				if (instance !== current) return;
 				if (message.type === "ready") settle(resolve);
-				else if (message.type === "fatal")
-					settle(() =>
-						reject(new ChordError("unavailable", `child failed: ${message.message}`, { reason: message.reason })),
-					);
-				else if (message.type === "status") {
+				else if (message.type === "fatal") {
+					const error = new ChordError("unavailable", `child failed: ${message.message}`, {
+						reason: message.reason,
+					});
+					settle(() => retire(error));
+				} else if (message.type === "status") {
 					report = {
 						activeCalls: message.activeCalls ?? 0,
 						viewers: message.viewers ?? 0,
@@ -416,11 +438,23 @@ export function createHostManager(options: HostManagerOptions): HostManager {
 					else idleSince ??= Date.now();
 				}
 			});
+			current.link.onClose((reason) => {
+				if (status === "stopping") return;
+				settle(() => retire(new ChordError("unavailable", `child link closed: ${reason}`)));
+			});
 		}).catch(async (error: unknown) => {
+			rejectReady = undefined;
 			current.killTree();
 			await current.exited;
 			throw error;
 		});
+		rejectReady = undefined;
+		// A ready and terminal report may arrive in one turn, before this continuation resumes.
+		if (failure !== undefined) {
+			current.killTree();
+			await current.exited;
+			throw failure;
+		}
 		booting = false;
 		if (report.activeCalls + report.viewers + report.durableTasks === 0) idleSince ??= Date.now();
 		status = "running";

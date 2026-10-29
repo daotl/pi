@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	createModels,
 	createProvider,
@@ -9,6 +12,7 @@ import {
 	type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { hydrateModelCatalog } from "../../ai/scripts/hydrate-model-catalog.ts";
 import { VERSION } from "../src/config.ts";
 import {
 	type PersonalizeCatalog,
@@ -34,11 +38,11 @@ function model(id: string): Model<"openai-completions"> {
 	};
 }
 
-function builtinProvider(): Provider {
+function builtinProvider(builtinModels: Model<"openai-completions">[] = [model("static")]): Provider {
 	return createProvider({
 		id: "test-provider",
 		auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
-		models: [model("static")],
+		models: builtinModels,
 		api: {
 			stream: () => {
 				throw new Error("not used");
@@ -172,6 +176,53 @@ describe("remote catalog provider", () => {
 		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "newer"]);
 		expect(await store.read(provider.id)).toMatchObject({ lastModified: Date.parse(newerHeader) });
 	});
+
+	it.each([-60_000, 60_000])(
+		"uses hydrated freshness for an offline stored catalog offset by %i ms",
+		async (offset) => {
+			const root = mkdtempSync(join(tmpdir(), "pi-hydrated-freshness-"));
+			try {
+				const providers = join(root, "src/providers");
+				mkdirSync(providers, { recursive: true });
+				writeFileSync(
+					join(root, "src/models.generated.ts"),
+					'import { TEST_PROVIDER_CLASSIFIER_MODELS, TEST_PROVIDER_IMAGE_MODELS, TEST_PROVIDER_MODELS } from "./providers/test-provider.models.ts";\n',
+				);
+				writeFileSync(join(providers, "test-provider.models.ts"), "");
+				const generatedAt = "2026-10-21T12:12:47.000Z";
+				const builtin = { ...model("static"), type: "chat", contextWindow: 2000 };
+				const catalogPath = join(root, "catalog.json");
+				writeFileSync(catalogPath, JSON.stringify({ "test-provider": [builtin] }));
+				hydrateModelCatalog(root, catalogPath, { generatedAt });
+				const manifest = JSON.parse(readFileSync(join(providers, "data/.manifest.json"), "utf8")) as {
+					generatedAt: string;
+				};
+				const data = JSON.parse(readFileSync(join(providers, "data/test-provider.json"), "utf8")) as Record<
+					string,
+					Record<string, Model<"openai-completions">>
+				>;
+				const provider = withRemoteCatalog(
+					builtinProvider(Object.values(data["openai-completions"])),
+					"https://pi.dev",
+					Date.parse(manifest.generatedAt),
+				);
+				const store = new InMemoryModelsStore();
+				await store.write(provider.id, {
+					models: [model("static")],
+					checkedAt: 1,
+					lastModified: Date.parse(generatedAt) + offset,
+				});
+				const fetchSpy = vi.spyOn(globalThis, "fetch");
+				await refreshProvider(provider, store, { allowNetwork: false });
+				expect(provider.getModels().find((entry) => entry.id === "static")?.contextWindow).toBe(
+					offset < 0 ? 2000 : 1000,
+				);
+				expect(fetchSpy).not.toHaveBeenCalled();
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it("revalidates a stored catalog with its etag and keeps the overlay on 304", async () => {
 		const responses = [

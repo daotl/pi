@@ -26,7 +26,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { MINIMUM_PI_VERSION } from "./model-catalog-minimum-version.mjs";
 import { compareModelCatalogPiVersions } from "./model-catalog-protocol.ts";
@@ -94,9 +94,15 @@ function main() {
 		run("tar", ["xf", archive, "-C", temporaryDir], root);
 
 		// The built-in models users have: the data shipped in the published package.
-		const [{ filename }] = JSON.parse(
+		const parsed = JSON.parse(
 			run("npm", ["pack", `${PI_AI_PACKAGE}@${release}`, "--pack-destination", temporaryDir, "--json"], root),
 		);
+		const packed = Array.isArray(parsed) ? (parsed.length === 1 ? parsed[0] : undefined) : parsed?.[PI_AI_PACKAGE];
+		if (packed?.name !== PI_AI_PACKAGE || typeof packed.filename !== "string" || packed.filename.trim().length === 0 ||
+			!/^[^/\\]+\.tgz$/.test(packed.filename)) {
+			throw new Error(`npm pack returned an unexpected result for ${PI_AI_PACKAGE}`);
+		}
+		const { filename } = packed;
 		run("tar", ["xzf", join(temporaryDir, filename), "-C", temporaryDir, "package/dist/providers/data"], root);
 		const builtin = readBuiltinModels(join(temporaryDir, "package/dist/providers/data"));
 		const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
@@ -112,7 +118,13 @@ function main() {
 		}
 
 		console.log("Type-checking the release's pi-ai with the merged models...");
-		run(process.execPath, ["packages/ai/scripts/hydrate-model-catalog.ts", mergedPath], releaseDir);
+		const { generatedAt } = JSON.parse(readFileSync(join(temporaryDir, "package/dist/providers/data/.manifest.json"), "utf8"));
+		// Call the release's exported hydrator: older releases ignore the new option,
+		// while newer ones require it. Neither uses this type-check-only data at runtime.
+		const hydrator = pathToFileURL(join(releaseDir, "packages/ai/scripts/hydrate-model-catalog.ts")).href;
+		run(process.execPath, ["--input-type=module", "--eval",
+			`import { hydrateModelCatalog } from ${JSON.stringify(hydrator)}; hydrateModelCatalog(${JSON.stringify(join(releaseDir, "packages/ai"))}, ${JSON.stringify(mergedPath)}, ${JSON.stringify({ generatedAt })});`,
+		], releaseDir);
 		try {
 			run(process.execPath, ["node_modules/typescript/bin/tsc", "-p", "packages/ai/tsconfig.build.json", "--noEmit"], releaseDir);
 		} catch (error) {

@@ -105,7 +105,7 @@ async function pinAndBuildWithNewestModelCatalog() {
 		const pin = await updateModelCatalogPin(root);
 		revision = pin.revision;
 		console.log(`  Pinned model catalog ${revision}`);
-		hydrateModelCatalogBytes(root, pin.bytes);
+		hydrateModelCatalogBytes(root, pin.bytes, { generatedAt: pin.generatedAt });
 		console.log("$ npm run build:offline");
 		const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 		result = spawnSync(npm, ["run", "build:offline"], { stdio: "inherit" });

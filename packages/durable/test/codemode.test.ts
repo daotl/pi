@@ -26,6 +26,7 @@ import {
 	CodemodeJournalDoc,
 	CodemodeRunDoc,
 	type CodemodeToolDetails,
+	createCodemodeExtension,
 	createCodemodeTool,
 } from "../src/codemode/codemode.ts";
 import type { CodemodeNamespace } from "../src/codemode/describe.ts";
@@ -82,7 +83,7 @@ function codemodeChat(globals: CodemodeGlobal[] = [], namespaces: CodemodeNamesp
 		vm.onStart?.(run);
 		return run;
 	};
-	addTool(setup.registry, createCodemodeTool({ sandbox, globals, namespaces }));
+	addTool(setup.registry, createCodemodeTool({ sandbox, globals, namespaces, models: false }));
 	const echo = new Map<string, number>();
 	addTool(
 		setup.registry,
@@ -214,6 +215,37 @@ describe("durable code mode", () => {
 		await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
 		expect(await resultText(chat.setup, root)).toEqual({ text: '["echo a","echo b"]', isError: false });
 		expect(await nestedCount(harness)).toBe(2);
+		await harness.close(context);
+	});
+
+	it("replays persisted collision bindings after a new raw suffix name is installed", async () => {
+		const chat = codemodeChat();
+		const seen: string[] = [];
+		for (const name of ["a-b", "a_b"]) {
+			addTool(
+				chat.setup.registry,
+				tool(name, async () => {
+					seen.push(name);
+					return { output: [{ type: "text", text: name }] };
+				}),
+			);
+		}
+		const { harness, result } = await restart(
+			chat,
+			`const first = await tools.a_b_2({}); await tools.hold({});
+			return [first, await tools.a_b_3({}), await tools["a-b"]({}), await tools.a_b({})];`,
+			async () => {
+				addTool(
+					chat.setup.registry,
+					tool("a_b_2", async () => {
+						seen.push("new suffix tool");
+						return { output: [{ type: "text", text: "wrong tool" }] };
+					}),
+				);
+			},
+		);
+		expect(result).toEqual({ text: '["a-b","a_b","a-b","a_b"]', isError: false });
+		expect(seen).toEqual(["a-b", "a_b", "a-b", "a_b"]);
 		await harness.close(context);
 	});
 
@@ -618,7 +650,7 @@ describe("durable code mode", () => {
 		chat.holds.block = false;
 		addTool(
 			chat.setup.registry,
-			createCodemodeTool({ sandbox: new CodemodeSandbox({ memoryLimitBytes: 64 * 1024 * 1024 }) }),
+			createCodemodeTool({ sandbox: new CodemodeSandbox({ memoryLimitBytes: 64 * 1024 * 1024 }), models: false }),
 		);
 		opened = await openChat(await openNodeSqliteStorage(path), chat.setup);
 		opened.harness.resume();
@@ -1190,6 +1222,79 @@ describe("durable code mode output and tool search", () => {
 			chat,
 		);
 		expect(text).toContain('["later ran",true]');
+	});
+
+	it("runs trivial scripts with colliding normalized tools installed", async () => {
+		const chat = codemodeChat();
+		for (const name of ["a-b", "a_b"]) {
+			addTool(
+				chat.setup.registry,
+				tool(name, async () => ({ output: [{ type: "text", text: name }] })),
+			);
+		}
+		const { text, message } = await runScript("return 1;", chat);
+		expect(message.isError).toBe(false);
+		expect(text).toMatch(/Output:\n1$/);
+	});
+
+	it("uses one reserved collision mapping in prompts, discovery, namespaces and raw calls", async () => {
+		const chat = codemodeChat([], [{ name: "collision", prefix: "a" }]);
+		chat.setup.registry.install(
+			createCodemodeExtension({
+				sandbox: chat.sandbox,
+				models: false,
+				namespaces: [{ name: "collision", prefix: "a" }],
+			}),
+		);
+		const seen: string[] = [];
+		for (const name of ["a-b", "a_b", "a_b_2", "a_b_3"]) {
+			addTool(
+				chat.setup.registry,
+				defineTool({
+					name,
+					description: `collision ${name}`,
+					parameters: Type.Object({}),
+					...(name === "a_b" ? { deferred: true as const } : {}),
+					execute: async () => {
+						seen.push(name);
+						return { output: [{ type: "text", text: name }] };
+					},
+				}),
+			);
+		}
+		let prompt = "";
+		chat.setup.faux.setResponses([
+			(request) => {
+				prompt = request.messages
+					.filter((message) => message.role === "system")
+					.map((message) => JSON.stringify(message))
+					.join("\n");
+				return script(`const found = await searchTools("collision", { limit: 10 });
+				const namespace = await describeNamespace("collision");
+				return { values: [await tools["a-b"]({}), await tools.a_b({}),
+					await tools.a_b_4({}), await tools.a_b_5({}), await tools.a_b_2({}), await tools.a_b_3({})],
+					found: found.map((tool) => tool.name).sort(), namespace: namespace.tools.sort(),
+					all: ALL_TOOLS.filter((tool) => tool.name.startsWith("a_")).map((tool) => tool.name).sort(),
+					described: [(await describeTool("a-b")).includes("a_b_4(args:"),
+						(await describeTool("a_b_5")).includes("a_b_5(args:")] };`);
+			},
+			DONE,
+		]);
+		const { harness, root } = await openChat(await openNodeSqliteStorage(await sqlitePath()), chat.setup);
+		await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
+		const result = await resultText(chat.setup, root);
+		expect(result.isError).toBe(false);
+		expect(JSON.parse(result.text)).toEqual({
+			values: ["a-b", "a_b", "a-b", "a_b", "a_b_2", "a_b_3"],
+			found: ["a_b_2", "a_b_3", "a_b_4", "a_b_5"],
+			namespace: ["a_b_2", "a_b_3", "a_b_4", "a_b_5"],
+			all: ["a_b_2", "a_b_3", "a_b_4", "a_b_5"],
+			described: [true, true],
+		});
+		expect(seen).toEqual(["a-b", "a_b", "a-b", "a_b", "a_b_2", "a_b_3"]);
+		expect(prompt).toContain("a_b_4(args:");
+		expect(prompt).not.toContain("a_b_5(args:");
+		await harness.close(context);
 	});
 
 	it("reports a failed script with its error and the calls already made", async () => {

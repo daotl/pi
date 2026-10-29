@@ -1034,6 +1034,7 @@ export interface StagedListeners {
 interface RunningTask {
 	readonly controller: AbortController;
 	readonly done: Promise<void>;
+	readonly decls: Decls;
 }
 
 export interface ObjectIdentity {
@@ -1061,6 +1062,8 @@ export class ObjectImpl {
 	decls = new Decls();
 	/** Declarations of a factory run that has not been installed yet (activation or reload candidate). */
 	readonly pending = new Set<Decls>();
+	/** Retired factory runs whose resources/references still have asynchronous owners or cleanup. */
+	readonly retiring = new Set<Decls>();
 	readonly implementations = new Map<number, Installed>();
 	readonly refs = new Set<RefImpl>();
 	readonly leases = new Map<string, number>();
@@ -1075,6 +1078,9 @@ export class ObjectImpl {
 	#tasks = new Map<string, RunningTask>();
 	/** Aborted task runs that have not finished yet. */
 	readonly #stopped = new Set<Promise<void>>();
+	readonly #stoppedDecls = new Map<Promise<void>, Decls>();
+	/** Retiring declarations retain their resources/references until their asynchronous cleanup finishes. */
+	readonly retirements = new Set<Promise<void>>();
 	/** Bumped by every start and stop of the tasks: a delayed start that is no longer the latest is dropped. */
 	#taskRuns = 0;
 	#linger: ReturnType<typeof setTimeout> | undefined;
@@ -1344,7 +1350,7 @@ export class ObjectImpl {
 	}
 
 	allDecls(): Set<Decls> {
-		const result = new Set<Decls>([this.decls, ...this.pending]);
+		const result = new Set<Decls>([this.decls, ...this.pending, ...this.retiring]);
 		for (const installed of this.implementations.values()) result.add(installed.decls);
 		return result;
 	}
@@ -1497,7 +1503,7 @@ export class ObjectImpl {
 				if (this.#tasks.get(key)?.controller === controller) this.#tasks.delete(key);
 			}
 		})();
-		this.#tasks.set(key, { controller, done });
+		this.#tasks.set(key, { controller, done, decls: this.decls });
 	}
 
 	/**
@@ -1510,9 +1516,54 @@ export class ObjectImpl {
 			task.controller.abort(new ChordError("aborted", "task stopped"));
 			const done = task.done;
 			this.#stopped.add(done);
-			void done.finally(() => this.#stopped.delete(done));
+			this.#stoppedDecls.set(done, task.decls);
+			void done.finally(() => {
+				this.#stopped.delete(done);
+				this.#stoppedDecls.delete(done);
+			});
 		}
 		this.#tasks.clear();
+	}
+
+	/** Joins the task runs already stopped, without tearing down resources they may still own on timeout. */
+	joinStoppedTasks(
+		deadline = this.host.taskStopDeadline,
+		owned?: { readonly resources: readonly ResourceImpl[]; readonly refs: readonly RefCore[] },
+	): Promise<void> | undefined {
+		const stopped = [...this.#stopped].filter((done) => {
+			if (owned === undefined) return true;
+			const decls = this.#stoppedDecls.get(done);
+			return (
+				decls !== undefined &&
+				([...decls.resources.values()].some((resource) => owned.resources.includes(resource)) ||
+					[...decls.refs.values()].some((ref) => owned.refs.includes(ref)))
+			);
+		});
+		if (stopped.length === 0) return;
+		if (!Number.isFinite(deadline)) return Promise.allSettled(stopped).then(() => {});
+		return (async () => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				await Promise.race([
+					Promise.allSettled(stopped),
+					new Promise<never>((_, reject) => {
+						timer = setTimeout(
+							() =>
+								reject(
+									new ChordError(
+										"aborted",
+										`${this.address}: stopped tasks did not finish within ${deadline} ms`,
+										{ reason: "task_deadline" },
+									),
+								),
+							deadline,
+						);
+					}),
+				]);
+			} finally {
+				clearTimeout(timer);
+			}
+		})();
 	}
 
 	/**
@@ -1650,13 +1701,18 @@ export class ObjectImpl {
 
 	/** Runs an invocation (method or listener) that keeps the object alive until it settles. */
 	#invoke<T>(fn: () => T | Promise<T>): Promise<T> {
-		const invocation = (async () => fn())();
+		const { promise: invocation, resolve, reject } = Promise.withResolvers<T>();
 		this.#invocations.add(invocation);
 		const done = (): void => {
 			this.#invocations.delete(invocation);
 			if (this.#invocations.size === 0) this.#maybeIdle();
 		};
 		invocation.then(done, done);
+		try {
+			resolve(fn());
+		} catch (error) {
+			reject(error);
+		}
 		return invocation;
 	}
 
@@ -1731,6 +1787,7 @@ export class ObjectImpl {
 		this.stopTasks();
 		this.stopListeners();
 		await Promise.allSettled([...this.#invocations]);
+		await Promise.allSettled([...this.retirements]);
 		const registered = [...decls].some((set) => set.registrations.size > 0) && !this.deferredRuntime;
 		if (registered) this.host.registriesChanged();
 		const refs = new Set<RefCore>();

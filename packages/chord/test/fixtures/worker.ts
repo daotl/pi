@@ -1,4 +1,4 @@
-// Child host for manager tests. FIXTURE_MODE: normal | ignore-shutdown | fatal-tree | fatal.
+// Child host for manager tests; control init commands trigger post-readiness terminal failures.
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { createHost, type IpcChannel, ipcLink } from "../../src/index.ts";
@@ -48,4 +48,10 @@ if (mode === "fatal") {
 	});
 	if (mode === "fatal-tree") control.fatal(new Error("fixture tree refuses to start"));
 	else control.ready();
+	process.on("message", (message: unknown) => {
+		const command = (message as { chord2control?: { type?: string; value?: unknown } } | null)?.chord2control;
+		if (command?.type !== "init") return;
+		if (command.value === "fatal-after-ready") control.fatal(new Error("fixture failed after ready"));
+		if (command.value === "crash-after-ready") process.exit(23);
+	});
 }

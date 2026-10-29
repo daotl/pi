@@ -21,9 +21,11 @@ const model = {
 };
 const catalog = (models) => `${JSON.stringify({ "test-provider": models })}\n`;
 const revisionOf = (body) => `sha256-${createHash("sha256").update(body).digest("hex")}`;
-const pinFile = (revision) => `${JSON.stringify({ revision }, null, 2)}\n`;
+const generatedAtFor = (revision) => revision === currentRevision ? "2026-10-20T12:12:47.000Z" : "2026-10-21T12:12:47.000Z";
+const pinFile = (revision) => `${JSON.stringify({ revision, generatedAt: generatedAtFor(revision) }, null, 2)}\n`;
 const pinned = async (promise) => {
-	const { bytes, ...result } = await promise;
+	const { bytes, generatedAt, ...result } = await promise;
+	assert.equal(generatedAt, generatedAtFor(result.revision));
 	assert.equal(bytes.toString("utf8"), bodies.get(result.revision));
 	return result;
 };
@@ -81,7 +83,10 @@ function mockPiDev({ live = liveRevision, failure } = {}) {
 		const revision = /\/revisions\/(sha256-[0-9a-f]+)\?/.exec(url)?.[1];
 		if (revision) {
 			if (failure === "revision-http") return new Response(null, { status: 503 });
-			return new Response(failure === "revision-hash" ? "wrong" : bodies.get(revision));
+			const headers = failure === "revision-time-missing" ? {} : {
+				"last-modified": failure === "revision-time-invalid" ? "invalid" : new Date(generatedAtFor(revision)).toUTCString(),
+			};
+			return new Response(failure === "revision-hash" ? "wrong" : bodies.get(revision), { headers });
 		}
 		if (failure === "discovery-http") return new Response(null, { status: 503 });
 		return new Response(failure === "discovery-hash" ? "wrong" : bodies.get(live), {
@@ -157,8 +162,7 @@ test("refuses to pin a live catalog that cannot hydrate the checkout", async () 
 	await assert.rejects(updateModelCatalogPin(root), /cannot hydrate this checkout/);
 	assert.equal(readPin(), pinFile(currentRevision));
 });
-
-for (const failure of ["discovery-http", "discovery-revision", "discovery-hash", "revision-http", "revision-hash"]) {
+for (const failure of ["discovery-http", "discovery-revision", "discovery-hash", "revision-http", "revision-hash", "revision-time-missing", "revision-time-invalid"]) {
 	test(`keeps the old pin on ${failure} failure`, async () => {
 		mockPiDev({ failure });
 		await assert.rejects(updateModelCatalogPin(root));
@@ -170,4 +174,23 @@ test("does not treat an unreachable pinned revision as stale", async () => {
 	mockPiDev({ failure: "revision-http" });
 	await assert.rejects(updateModelCatalogPin(root, { ifStale: true }), /unavailable/);
 	assert.equal(readPin(), pinFile(currentRevision));
+});
+
+for (const generatedAt of [undefined, "invalid", "2026-02-30T00:00:00.000Z"]) {
+	test(`rejects invalid pin generation timestamp ${generatedAt} before fetching or writing`, async () => {
+		const original = JSON.stringify({ revision: currentRevision, generatedAt });
+		writeFileSync(join(root, "nix/model-catalog.json"), original);
+		const requests = mockPiDev();
+		await assert.rejects(updateModelCatalogPin(root, { ifStale: true }), /Invalid pin/);
+		assert.deepEqual(requests, []);
+		assert.equal(readPin(), original);
+	});
+}
+
+test("refuses a pin whose time disagrees with the immutable response", async () => {
+	const original = JSON.stringify({ revision: currentRevision, generatedAt: "2026-10-19T12:12:47.000Z" });
+	writeFileSync(join(root, "nix/model-catalog.json"), original);
+	mockPiDev();
+	await assert.rejects(updateModelCatalogPin(root, { ifStale: true }), /publication timestamp does not match/);
+	assert.equal(readPin(), original);
 });

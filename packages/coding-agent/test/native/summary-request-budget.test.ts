@@ -1,5 +1,6 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import {
+	createAssistantMessageEventStream,
 	createProvider,
 	fauxAssistantMessage,
 	type ImageContent,
@@ -16,6 +17,7 @@ import { estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
 import { afterEach, expect, it, vi } from "vitest";
 import {
 	completeSummarization,
+	generateBranchSummary,
 	generateSummaryWithUsage,
 	prepareBranchEntries,
 } from "../../src/core/compaction/index.ts";
@@ -306,11 +308,14 @@ it("preserves structured tool history for an arbitrary custom stream within its 
 	];
 	const contexts: Message[][] = [];
 	const requestedCaps: Array<number | undefined> = [];
-	const native = current.session.agent.streamFunction;
-	const stream: typeof native = (requestModel, context, options) => {
+	const stream: StreamFn = (_requestModel, context, options) => {
 		contexts.push(structuredClone(context.messages));
 		requestedCaps.push(options?.maxTokens);
-		return native(requestModel, context, options);
+		// This scenario exercises an arbitrary physical-window stream, not a native
+		// adapter that independently reserves its additional safety allowance.
+		const result = createAssistantMessageEventStream();
+		result.end(fauxAssistantMessage("custom checkpoint"));
+		return result;
 	};
 	await generateSummaryWithUsage(messages, model, 4096, "offline", undefined, undefined, undefined, undefined, stream);
 	const inputTokens = contexts[0].reduce((total, message) => total + estimateMessageTokens(message), 0);
@@ -403,7 +408,7 @@ it("reselects complete native branch groups to leave useful adapter output headr
 	const adapterSafetyTokens = selected.contextWindow - clampMaxTokensToInput(selected, 0, Number.POSITIVE_INFINITY);
 	const model = {
 		...selected,
-		contextWindow: Math.ceil((newestInputTokens + fullInputTokens) / 2) + adapterSafetyTokens,
+		contextWindow: Math.ceil((newestInputTokens + fullInputTokens) / 2) + adapterSafetyTokens + 4096,
 		maxTokens: 4096,
 	};
 	current.manager.branch(oldLeaf);
@@ -415,14 +420,249 @@ it("reselects complete native branch groups to leave useful adapter output headr
 	expect(result.summaryEntry?.summary).toContain("safe checkpoint");
 	expect(current.summaries).toHaveLength(1);
 	const wire = JSON.parse(current.summaries[0].body);
-	expect(wire.max_completion_tokens ?? wire.max_tokens).toBeGreaterThan(1);
+	expect(wire.max_completion_tokens ?? wire.max_tokens).toBe(4096);
 	expect(current.summaries[0].body).toContain("s".repeat(18000));
-	expect(visible.reduce((total, message) => total + estimateMessageTokens(message), instructionTokens)).toBe(
-		newestInputTokens,
-	);
+	expect(fullInputTokens + adapterSafetyTokens + 4096).toBeGreaterThan(model.contextWindow);
+	expect(newestInputTokens + adapterSafetyTokens + 4096).toBeLessThanOrEqual(model.contextWindow);
 	expect(current.summaries[0].body).toContain("NEWEST");
 	expect(current.summaries[0].body).not.toContain("OLDER");
 	for (const entry of before) expect(current.manager.getEntry(entry.id)).toEqual(entry);
+});
+
+it("trims converted branch groups without separating tool calls from their results or policy patches", async () => {
+	const current = await createNativeTokenizerFixture({ settings: { branchSummary: { reserveTokens: 1024 } } });
+	fixtures.push(current);
+	const selected = current.session.model;
+	if (!selected) throw new Error("Missing model");
+	const target = current.manager.getLeafId();
+	if (!target) throw new Error("Missing target");
+	current.manager.appendMessage({ role: "user", content: `OLDER ${"a".repeat(2000)}`, timestamp: 1 });
+	current.manager.appendMessage({
+		...fauxAssistantMessage({ type: "toolCall", id: "retained-atomic", name: "read", arguments: {} }),
+		api: selected.api,
+		provider: selected.provider,
+		model: selected.id,
+		stopReason: "toolUse",
+	});
+	current.manager.appendMessage({ role: "system", content: "RETAINED_POLICY_PATCH", timestamp: 2 });
+	current.manager.appendMessage({
+		role: "toolResult",
+		toolCallId: "retained-atomic",
+		toolName: "read",
+		content: [{ type: "text", text: `RETAINED_RESULT ${"b".repeat(500)}` }],
+		isError: false,
+		timestamp: 3,
+	});
+	current.session.refreshContext();
+	const oldLeaf = current.manager.getLeafId();
+	if (!oldLeaf) throw new Error("Missing old leaf");
+	const convert = current.session.agent.convertToLlm;
+	let visible: Message[] = [];
+	current.session.agent.convertToLlm = async (messages) => {
+		visible = structuredClone(await convert(messages));
+		return visible;
+	};
+	await current.session.navigateTree(target, { summarize: true });
+	const instruction = JSON.parse(current.summaries[0].body).messages.at(-1).content as string;
+	const instructionTokens = estimateMessageTokens({ role: "user", content: instruction, timestamp: 0 });
+	const fullTokens = visible.reduce((total, message) => total + estimateMessageTokens(message), instructionTokens);
+	const newestTokens = visible
+		.filter((message) => message.role !== "user" || !JSON.stringify(message.content).includes("OLDER"))
+		.reduce((total, message) => total + estimateMessageTokens(message), instructionTokens);
+	const safetyTokens = selected.contextWindow - clampMaxTokensToInput(selected, 0, Number.POSITIVE_INFINITY);
+	current.manager.branch(oldLeaf);
+	current.session.refreshContext();
+	await current.session.setModel({
+		...selected,
+		contextWindow: Math.ceil((fullTokens + newestTokens) / 2) + safetyTokens + 4096,
+	});
+	current.summaries.length = 0;
+	await current.session.navigateTree(target, { summarize: true });
+	expect(current.summaries).toHaveLength(1);
+	const body = current.summaries[0].body;
+	expect(body).not.toContain("OLDER");
+	expect(body).toContain("retained-atomic");
+	expect(body).toContain("RETAINED_RESULT");
+	expect(body).toContain("RETAINED_POLICY_PATCH");
+	expect(body).toContain('"role":"tool"');
+});
+
+it.each(["transform", "converter"] as const)(
+	"retains all fitting branch history after %s removes a large baseline",
+	async (stage) => {
+		const current = await createNativeTokenizerFixture({ settings: { branchSummary: { reserveTokens: 1024 } } });
+		fixtures.push(current);
+		const selected = current.session.model;
+		if (!selected) throw new Error("Missing model");
+		await current.session.setModel({ ...selected, contextWindow: 10000, maxTokens: 4096 });
+		current.manager.appendMessage({ role: "system", content: `PRIVATE_BASELINE ${"s".repeat(18000)}`, timestamp: 0 });
+		const target = current.manager.appendMessage({ role: "user", content: "shared target", timestamp: 1 });
+		current.manager.appendMessage({ role: "user", content: `OLDER ${"a".repeat(4000)}`, timestamp: 2 });
+		current.manager.appendMessage({ role: "user", content: `NEWEST ${"b".repeat(500)}`, timestamp: 3 });
+		current.session.refreshContext();
+		const convert = current.session.agent.convertToLlm;
+		const transform = current.session.agent.transformContext;
+		let policyCalls = 0;
+		let converterCalls = 0;
+		current.session.agent.transformContext = async (messages, signal) => {
+			policyCalls++;
+			const transformed = transform ? await transform(messages, signal) : messages;
+			return stage === "transform" ? transformed.filter((message) => message.role !== "system") : transformed;
+		};
+		current.session.agent.convertToLlm = async (messages) => {
+			converterCalls++;
+			const converted = await convert(messages);
+			return stage === "converter" ? converted.filter((message) => message.role !== "system") : converted;
+		};
+		const result = await current.session.navigateTree(target, { summarize: true });
+		expect(result.summaryEntry?.summary).toContain("safe checkpoint");
+		expect(policyCalls).toBe(1);
+		expect(converterCalls).toBe(1);
+		expect(current.summaries).toHaveLength(1);
+		const wire = JSON.parse(current.summaries[0].body) as { max_tokens?: number; max_completion_tokens?: number };
+		expect(wire.max_completion_tokens ?? wire.max_tokens).toBe(4096);
+		expect(current.summaries[0].body).toContain("OLDER");
+		expect(current.summaries[0].body).toContain("NEWEST");
+		expect(current.summaries[0].body).not.toContain("PRIVATE_BASELINE");
+	},
+);
+
+it("reconsiders full branch history after a retry policy removes the oversized baseline", async () => {
+	const current = await createNativeTokenizerFixture({
+		settings: { branchSummary: { reserveTokens: 1024 }, retry: { enabled: true, maxRetries: 1, baseDelayMs: 0 } },
+	});
+	fixtures.push(current);
+	const selected = current.session.model;
+	if (!selected) throw new Error("Missing model");
+	current.manager.appendMessage({
+		role: "system",
+		content: `RETRY_PRIVATE_BASELINE ${"s".repeat(4000)}`,
+		timestamp: 0,
+	});
+	const target = current.manager.appendMessage({ role: "user", content: "shared target", timestamp: 1 });
+	current.manager.appendMessage({ role: "user", content: `OLDER ${"a".repeat(2000)}`, timestamp: 2 });
+	current.manager.appendMessage({ role: "user", content: `NEWEST ${"b".repeat(500)}`, timestamp: 3 });
+	current.session.refreshContext();
+	const convert = current.session.agent.convertToLlm;
+	let converterCalls = 0;
+	let removeBaseline = false;
+	let visible: Message[] = [];
+	current.session.agent.convertToLlm = async (messages) => {
+		converterCalls++;
+		const converted = await convert(messages);
+		visible = structuredClone(converted);
+		return removeBaseline ? converted.filter((message) => message.role !== "system") : converted;
+	};
+	const oldLeaf = current.manager.getLeafId();
+	if (!oldLeaf) throw new Error("Missing old leaf");
+	await current.session.navigateTree(target, { summarize: true });
+	const instruction = JSON.parse(current.summaries[0].body).messages.at(-1).content as string;
+	const instructionTokens = estimateMessageTokens({ role: "user", content: instruction, timestamp: 0 });
+	const fullTokens = visible.reduce((total, message) => total + estimateMessageTokens(message), instructionTokens);
+	const newestTokens = visible
+		.filter((message) => message.role !== "user" || !JSON.stringify(message.content).includes("OLDER"))
+		.reduce((total, message) => total + estimateMessageTokens(message), instructionTokens);
+	const safetyTokens = selected.contextWindow - clampMaxTokensToInput(selected, 0, Number.POSITIVE_INFINITY);
+	current.manager.branch(oldLeaf);
+	current.session.refreshContext();
+	await current.session.setModel({
+		...selected,
+		contextWindow: Math.ceil((fullTokens + newestTokens) / 2) + safetyTokens + 4096,
+	});
+	converterCalls = 0;
+	current.summaries.length = 0;
+	current.session.subscribe((event) => {
+		if (event.type === "summarization_retry_scheduled") removeBaseline = true;
+	});
+	current.setResponses([
+		fauxAssistantMessage("", { stopReason: "error", errorMessage: "Connection error." }),
+		fauxAssistantMessage("safe checkpoint"),
+	]);
+	const result = await current.session.navigateTree(target, { summarize: true });
+	expect(result.summaryEntry?.summary).toContain("safe checkpoint");
+	expect(converterCalls).toBe(2);
+	expect(current.summaries).toHaveLength(2);
+	expect(current.summaries[0].body).toContain("NEWEST");
+	expect(current.summaries[0].body).not.toContain("OLDER");
+	expect(current.summaries[1].body).toContain("OLDER");
+	expect(current.summaries[1].body).toContain("NEWEST");
+	expect(current.summaries[1].body).not.toContain("RETRY_PRIVATE_BASELINE");
+});
+
+it("rejects a newest native branch group that leaves only two output tokens without dispatch", async () => {
+	const current = await createNativeTokenizerFixture();
+	fixtures.push(current);
+	const selected = current.session.model;
+	if (!selected) throw new Error("Missing model");
+	const model = { ...selected, contextWindow: 10000, maxTokens: 4096 };
+	await current.session.setModel(model);
+	const agent = current.session.agent;
+	const convert = agent.convertToLlm;
+	let visible: Message[] = [];
+	agent.convertToLlm = async (messages) => {
+		visible = structuredClone(await convert(messages));
+		return visible;
+	};
+	const entries = [
+		{
+			type: "message" as const,
+			id: "two-token-group",
+			parentId: null,
+			timestamp: new Date(0).toISOString(),
+			message: { role: "user" as const, content: "ATOMIC_NEWEST", timestamp: 0 },
+		},
+	];
+	const options = {
+		model,
+		agent,
+		streamFn: agent.streamFunction,
+		usesAdapterOutputClamp: (requestModel: Model<string>) =>
+			current.session.modelRuntime.usesAdapterOutputClamp(requestModel),
+		reserveTokens: 1024,
+		signal: new AbortController().signal,
+	};
+	expect((await generateBranchSummary(entries, options)).summary).toContain("safe checkpoint");
+	const instruction = JSON.parse(current.summaries[0].body).messages.at(-1).content as string;
+	const instructionTokens = estimateMessageTokens({ role: "user", content: instruction, timestamp: 0 });
+	const fixedTokens = visible
+		.filter((message) => message.role !== "user")
+		.reduce((total, message) => total + estimateMessageTokens(message), instructionTokens);
+	const targetInputTokens = clampMaxTokensToInput(model, 0, Number.POSITIVE_INFINITY) - 2;
+	const countUser = (characters: number) =>
+		estimateMessageTokens({ role: "user", content: "x".repeat(characters), timestamp: 0 });
+	let lower = 0;
+	let upper = targetInputTokens * 4;
+	while (lower < upper) {
+		const middle = Math.floor((lower + upper) / 2);
+		if (countUser(middle) + fixedTokens < targetInputTokens) lower = middle + 1;
+		else upper = middle;
+	}
+	entries[0].message.content = "x".repeat(lower);
+	expect(countUser(lower) + fixedTokens).toBe(targetInputTokens);
+	current.summaries.length = 0;
+	const before = structuredClone(current.manager.getEntries());
+	const leaf = current.manager.getLeafId();
+	expect((await generateBranchSummary(entries, options)).error).toMatch(/token budget/);
+	expect(current.summaries).toEqual([]);
+	expect(current.manager.getLeafId()).toBe(leaf);
+	expect(current.manager.getEntries()).toEqual(before);
+});
+
+it("makes the native fixture truncate a checkpoint exceeding its requested output cap", async () => {
+	const current = await createNativeTokenizerFixture();
+	fixtures.push(current);
+	const model = current.session.model;
+	if (!model) throw new Error("Missing model");
+	current.setResponses([fauxAssistantMessage("checkpoint requiring many output tokens")]);
+	const response = await completeSummarization(
+		model,
+		normalizeContext({ messages: [{ role: "user", content: "summarize", timestamp: 0 }] }),
+		{ apiKey: "offline", maxTokens: 2 },
+		current.session.agent.streamFunction,
+	);
+	expect(response.stopReason).toBe("length");
+	expect(response.usage.output).toBe(2);
+	expect(response.content).toContainEqual(expect.objectContaining({ type: "text", text: "checkpoi" }));
 });
 
 it.each(["atomic-result", "converted-expansion"] as const)(

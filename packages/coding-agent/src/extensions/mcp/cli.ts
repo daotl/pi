@@ -239,7 +239,7 @@ export async function runMcpCommand(args: string[], options: McpCommandOptions):
 				return 1;
 			}
 			if (command === "logout") {
-				const removed = credentials.remove(name, url);
+				const removed = await credentials.remove(name, url);
 				log(removed ? `Signed out of MCP server "${name}".` : `No stored credentials for MCP server "${name}".`);
 				return 0;
 			}
@@ -260,6 +260,7 @@ export async function runMcpCommand(args: string[], options: McpCommandOptions):
 				const closing = connection.close();
 				if (signal.aborted) void closing.catch(() => undefined);
 				else await closing;
+				await credentials.settled();
 			}
 		}
 		default:

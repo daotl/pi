@@ -330,7 +330,14 @@ export function summarizedMessages(view: ContextView, cut: number): Message[] {
  */
 export function estimateContext(view: ContextView, extra: readonly Message[]): number {
 	let measured: AssistantMessage | undefined;
-	const after = view.head?.id ?? Number.NEGATIVE_INFINITY;
+	let after = view.head?.id ?? Number.NEGATIVE_INFINITY;
+	// A late first baseline leads the messages but was not in any older assistant's request. Entry IDs, not clocks,
+	// establish which responses measured it (fixed host clocks can give every message the same timestamp).
+	const leading = view.messages[0];
+	if (leading?.role === "system") {
+		const owner = view.contributions.findIndex((messages) => messages.includes(leading));
+		if (owner >= 0) after = Math.max(after, view.entries[owner]!.id);
+	}
 	for (let index = view.entries.length - 1; index >= 0 && measured === undefined; index--) {
 		if (view.entries[index]!.id <= after) continue;
 		measured = view.contributions[index]!.findLast(

@@ -65,6 +65,23 @@ describe("code mode description and section", () => {
 		expect(section).not.toContain("## git\n");
 	});
 
+	it("reserves raw suffix aliases and allocates before hiding deferred declarations regardless of install order", () => {
+		const tools = [
+			tool("a-b", "Dash."),
+			tool("a_b", "Underscore.", { deferred: true }),
+			tool("a_b_2", "Reserved."),
+			tool("a_b_3", "Also reserved."),
+		];
+		for (const ordered of [tools, [...tools].reverse()]) {
+			const section = codemodeSection(ordered, [], 3000)!;
+			expect(section).toContain("### `a_b_4` (`a-b`)");
+			expect(section).toContain("a_b_4(args:");
+			expect(section).not.toContain("Underscore.");
+			expect(section).toContain("### `a_b_2`");
+			expect(section).toContain("### `a_b_3`");
+		}
+	});
+
 	it("renders the section from the conversation's callable tools into the system prompt", async () => {
 		const setup = chatSetup();
 		setup.registry.install(createCodemodeExtension({ sandbox: new CodemodeSandbox(), namespaces: [GITHUB] }));

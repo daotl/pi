@@ -63,7 +63,8 @@ pre{white-space:pre-wrap;word-break:break-word;font:12.5px/1.45 ui-monospace,Men
 </header>
 <main id="main"></main>
 <script>
-let data = null, view = "inbox", cat = "", sel = -1, openDetails = new Set();
+let data = null, view = "inbox", cat = "", selectedNumber = null, openDetails = new Set();
+let loadGeneration = 0, pendingMutations = 0, decisionPending = false;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 const gh = (n) => `https://github.com/${data.repo}/issues/${n}`;
@@ -73,15 +74,33 @@ const WARN = new Set(["theoretical", "AI-written", "third-party", "upstream", "m
 const BAD = new Set(["regression", "spam", "empty", "duplicate cluster"]);
 
 async function load() {
+	if (pendingMutations) return;
+	const generation = ++loadGeneration;
 	const res = await fetch("/api/state");
-	if (!res.ok) { $("main").innerHTML = `<p class="empty">${res.status}: ${esc(await res.text())}</p>`; return; }
-	data = await res.json();
+	if (!res.ok) {
+		const message = await res.text();
+		if (generation === loadGeneration && !pendingMutations) $("main").innerHTML = `<p class="empty">${res.status}: ${esc(message)}</p>`;
+		return;
+	}
+	const snapshot = await res.json();
+	if (generation !== loadGeneration || pendingMutations) return;
+	data = snapshot;
 	render();
 }
 
 async function post(path, body) {
-	await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-	await load();
+	const decision = path === "/api/decide";
+	if (decision && decisionPending) return;
+	if (decision) { decisionPending = true; render(); }
+	++loadGeneration;
+	pendingMutations++;
+	try {
+		await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+	} finally {
+		pendingMutations--;
+		try { await load(); }
+		finally { if (decision) { decisionPending = false; render(); } }
+	}
 }
 
 function visible() {
@@ -99,7 +118,7 @@ function groups(items) {
 	return [["Suggested p0", by.p0], ["Suggested p1", by.p1], ["Suggested none", by.none], ["Not triaged yet", by.pending]];
 }
 
-function card(it, idx) {
+function card(it) {
 	const r = it.triage?.result, d = it.decision, st = it.authorStats;
 	const meta = [
 		`<a href="${gh(it.number)}" target="_blank">#${it.number}</a>`,
@@ -120,14 +139,14 @@ function card(it, idx) {
 	} else {
 		body += `<p class="ai">${it.triage ? esc(it.triage.status) : "waiting"}…</p>`;
 	}
-	const pri = (p) => `<button class="btn ${p} ${d?.priority === p ? "on" : ""}" data-act="prio" data-p="${p}" data-n="${it.number}">${p}</button>`;
+	const pri = (p) => `<button class="btn ${p} ${d?.priority === p ? "on" : ""}" data-act="prio" data-p="${p}" data-n="${it.number}" ${decisionPending ? "disabled" : ""}>${p}</button>`;
 	const cats = data.categories.map((c) => `<option ${c.name === category(it) ? "selected" : ""}>${c.name}</option>`).join("");
-	return `<div class="card ${idx === sel ? "sel" : ""}" data-idx="${idx}">
+	return `<div class="card ${it.number === selectedNumber ? "sel" : ""}" data-n="${it.number}">
 		<div class="meta">${meta}</div>
 		<a class="title" href="${gh(it.number)}" target="_blank">${esc(it.title)}</a>
 		${body}
 		<div class="acts">${pri("p0")}${pri("p1")}${pri("none")}
-			<select data-act="cat" data-n="${it.number}">${r ? "" : "<option></option>"}${cats}</select>
+			<select data-act="cat" data-n="${it.number}" ${decisionPending ? "disabled" : ""}>${r ? "" : "<option></option>"}${cats}</select>
 		</div>
 		<details data-n="${it.number}" ${openDetails.has(it.number) ? "open" : ""}><summary>Issue text</summary>
 			<pre>${esc(it.body) || "(empty)"}</pre>
@@ -138,6 +157,7 @@ function card(it, idx) {
 
 function render() {
 	const items = visible();
+	if (!items.some((it) => it.number === selectedNumber)) selectedNumber = null;
 	const sel0 = $("cat").value;
 	$("cat").innerHTML = `<option value="">All categories</option>` + data.categories.map((c) => `<option value="${c.name}">${c.name}${c.owner ? ` (${c.owner})` : ""}</option>`).join("");
 	$("cat").value = sel0;
@@ -150,11 +170,11 @@ function render() {
 		data.sync.lastError ? `<span class="err">sync: ${esc(data.sync.lastError)}</span>` : "",
 		`${esc(data.model)} $${data.cost.toFixed(2)}`,
 	].filter(Boolean).join(" · ");
-	let html = "", idx = 0;
+	let html = "";
 	for (const [name, list] of groups(items)) {
 		if (!list.length) continue;
-		if (name) html += `<div class="grp"><span>${name} (${list.length})</span>${name === "Suggested none" ? `<button class="btn small" data-act="allnone">Mark all none</button>` : ""}</div>`;
-		for (const it of list) html += card(it, idx++);
+		if (name) html += `<div class="grp"><span>${name} (${list.length})</span>${name === "Suggested none" ? `<button class="btn small" data-act="allnone" ${decisionPending ? "disabled" : ""}>Mark all none</button>` : ""}</div>`;
+		for (const it of list) html += card(it);
 	}
 	$("main").innerHTML = html || `<p class="empty">Nothing here.</p>`;
 }
@@ -163,20 +183,22 @@ function flat() { return groups(visible()).flatMap(([, list]) => list); }
 
 document.addEventListener("click", (e) => {
 	const t = e.target.closest("[data-act]");
+	if (decisionPending && ["prio", "allnone"].includes(t?.dataset.act)) return;
 	if (t?.dataset.act === "prio") {
 		const it = data.items.find((x) => x.number == t.dataset.n);
 		post("/api/decide", { number: Number(t.dataset.n), priority: it.decision?.priority === t.dataset.p ? null : t.dataset.p });
 	} else if (t?.dataset.act === "retriage") post("/api/retriage", { number: Number(t.dataset.n) });
 	else if (t?.dataset.act === "allnone") {
-		const numbers = visible().filter((it) => it.triage?.result?.suggestion === "none").map((it) => it.number);
+		const numbers = visible().filter((it) => it.triage?.status === "done" && it.triage.result?.suggestion === "none").map((it) => it.number);
 		if (confirm(`Mark ${numbers.length} issues as none?`)) post("/api/decide", { numbers, priority: "none" });
 	}
 	const c = e.target.closest(".card");
-	if (c) { sel = Number(c.dataset.idx); document.querySelectorAll(".card").forEach((x) => x.classList.toggle("sel", x === c)); }
+	if (c) { selectedNumber = Number(c.dataset.n); document.querySelectorAll(".card").forEach((x) => x.classList.toggle("sel", x === c)); }
 });
 document.addEventListener("change", (e) => {
+	if (decisionPending && e.target.dataset.act === "cat") { render(); return; }
 	if (e.target.dataset.act === "cat") post("/api/decide", { number: Number(e.target.dataset.n), category: e.target.value });
-	if (e.target.id === "cat") { cat = e.target.value; sel = -1; render(); }
+	if (e.target.id === "cat") { cat = e.target.value; selectedNumber = null; render(); }
 });
 document.addEventListener("toggle", (e) => {
 	if (e.target.tagName !== "DETAILS") return;
@@ -184,7 +206,7 @@ document.addEventListener("toggle", (e) => {
 	e.target.open ? openDetails.add(n) : openDetails.delete(n);
 }, true);
 document.querySelectorAll(".tab").forEach((t) => t.onclick = () => {
-	view = t.dataset.view; sel = -1;
+	view = t.dataset.view; selectedNumber = null;
 	document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("on", x === t));
 	render();
 });
@@ -193,11 +215,12 @@ $("sync").onclick = () => post("/api/sync", {});
 // Keyboard: j/k select, 0/1/n decide, o open on GitHub.
 document.addEventListener("keydown", (e) => {
 	if (!data || e.target.tagName === "SELECT" || e.metaKey || e.ctrlKey) return;
-	const list = flat(), it = list[sel];
-	if (e.key === "j") sel = Math.min(sel + 1, list.length - 1);
-	else if (e.key === "k") sel = Math.max(sel - 1, 0);
+	const list = flat(), index = list.findIndex((it) => it.number === selectedNumber), it = list[index];
+	if (e.key === "j") selectedNumber = list[Math.min(index + 1, list.length - 1)]?.number ?? null;
+	else if (e.key === "k") selectedNumber = list[Math.max(index - 1, 0)]?.number ?? null;
 	else if (it && e.key === "o") { window.open(gh(it.number), "_blank"); return; }
 	else if (it && ["0", "1", "n"].includes(e.key)) {
+		if (e.repeat || decisionPending || pendingMutations) return;
 		const p = { 0: "p0", 1: "p1", n: "none" }[e.key];
 		post("/api/decide", { number: it.number, priority: p });
 		return;

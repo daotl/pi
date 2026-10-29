@@ -258,8 +258,19 @@ export function estimateProjectedContextTokens(
 			usageEntry?.type === "message" && usageEntry.usageContextEntryId !== undefined
 				? branchEntries.findIndex((entry) => entry.id === usageEntry.usageContextEntryId)
 				: -1;
+		const summaryIds = projection.entries
+			.filter((entry) => entry.sourceEntry.type === "compaction" && entry.messages.length > 0)
+			.map((entry) => entry.sourceEntry.id);
+		const measuredSummaryIds = usageEntry?.type === "message" ? usageEntry.usageSummaryIds : undefined;
+		// Legacy usage cannot prove which summaries a configurable budget selected, even after reopen.
+		const summariesMatch =
+			measuredSummaryIds === undefined
+				? !branchEntries.some((entry) => entry.type === "compaction")
+				: measuredSummaryIds.length === summaryIds.length &&
+					measuredSummaryIds.every((id, index) => id === summaryIds[index]);
 		if (
 			usageEntryIndex >= 0 &&
+			summariesMatch &&
 			(usageEntryIndex > latestInvalidatingEntryIndex || countedBoundaryIndex >= latestInvalidatingEntryIndex)
 		) {
 			if (countedBoundaryIndex <= usageEntryIndex) return estimate;

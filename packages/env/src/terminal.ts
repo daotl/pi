@@ -13,7 +13,7 @@ export interface TerminalOptions {
 	inheritEnv?: boolean;
 	cols: number;
 	rows: number;
-	/** The terminal's raw output, in order. */
+	/** The terminal's raw output, in order. A thrown error cancels this terminal and rejects `exited`. */
 	onData: (bytes: Uint8Array) => void;
 }
 
@@ -94,6 +94,8 @@ export function openTerminal(connection: Connection, options: TerminalOptions): 
 	const abort = new AbortController();
 	const started = Promise.withResolvers<RemoteTerminal>();
 	let request: { id: number; session: number } | undefined;
+	let callbackFailed = false;
+	let callbackError: unknown;
 	const exited = connection
 		.request(
 			"pty",
@@ -111,8 +113,16 @@ export function openTerminal(connection: Connection, options: TerminalOptions): 
 					request = { id, session };
 				},
 				onEvent: (json, payload) => {
-					if (json.kind === "output") options.onData(payload);
-					else if (json.kind === "started" && request) {
+					if (json.kind === "output") {
+						if (callbackFailed) return;
+						try {
+							options.onData(payload);
+						} catch (error) {
+							callbackFailed = true;
+							callbackError = error;
+							abort.abort();
+						}
+					} else if (json.kind === "started" && request) {
 						started.resolve(
 							new RemoteTerminal(connection, request.id, request.session, Number(json.pid), exited, abort),
 						);
@@ -120,7 +130,15 @@ export function openTerminal(connection: Connection, options: TerminalOptions): 
 				},
 			},
 		)
-		.then((reply) => Number(reply.json.exitCode));
+		.then(
+			(reply) => {
+				if (callbackFailed) throw callbackError;
+				return Number(reply.json.exitCode);
+			},
+			(error: unknown) => {
+				throw callbackFailed ? callbackError : error;
+			},
+		);
 	// Failing before it started rejects the open; afterwards, `exited` carries it.
 	exited.catch(started.reject);
 	return started.promise;

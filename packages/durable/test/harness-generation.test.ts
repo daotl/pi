@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
+	CompactionTask,
 	type Conversation,
 	createRegistry,
 	defineDoc,
@@ -29,7 +30,7 @@ import { describe, expect, it } from "vitest";
 import { resolveSettings } from "../src/harness/agent.ts";
 import type { SessionImpl } from "../src/session/session.ts";
 import { allEntries, type ChatSetup, chatSetup, openChat, textOf, unanswered, waitFor } from "./chat-support.ts";
-import { addSection } from "./harness-support.ts";
+import { addHooks, addSection } from "./harness-support.ts";
 import { ControlledStorage, context, observeCommits } from "./session-support.ts";
 
 const ERROR_503 = fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 Service Unavailable" });
@@ -213,6 +214,46 @@ describe("generation", () => {
 		expect(settled).toMatchObject({ status: "unanswered", reason: "model_error", detail: "503 Service Unavailable" });
 		expect((await allEntries(root)).map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant", "pi.assistant"]);
 		expect(setup.faux.getPendingResponseCount()).toBe(1);
+		await harness.close(context);
+	});
+
+	it("compacts a committed late baseline when preparing a transient retry on a fixed clock", async () => {
+		const setup = chatSetup({ models: [{ id: "faux-1", contextWindow: 3000, maxTokens: 300 }] });
+		setup.settings.compaction = { enabled: false, reserveTokens: 300, keepRecentTokens: 150, backgroundTokens: 0 };
+		setup.settings.retry = { enabled: true, maxRetries: 1, baseDelayMs: 0 };
+		const first = fauxAssistantMessage(`old answer ${"a".repeat(800)}`);
+		setup.faux.setResponses([first]);
+		setup.now = () => 1;
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		await (await root.submit({ type: "input", content: `first ${"u".repeat(800)}` }, context)).wait(context);
+		addSection(setup.registry, "plan", () => "x".repeat(12000));
+		let compactions = 0;
+		addHooks(setup.registry, CompactionTask, {
+			beforeCompact: () => {
+				compactions++;
+				return { summary: "Old exchange summarized." };
+			},
+		});
+		const requests: Message[][] = [];
+		setup.faux.setResponses([
+			(request) => {
+				requests.push([...request.messages]);
+				setup.settings.compaction = { ...setup.settings.compaction, enabled: true };
+				return ERROR_503;
+			},
+			(request) => {
+				requests.push([...request.messages]);
+				return fauxAssistantMessage("recovered");
+			},
+		]);
+		expect(
+			(await (await root.submit({ type: "input", content: `next ${"n".repeat(800)}` }, context)).wait(context))
+				.status,
+		).toBe("done");
+		expect(compactions).toBe(1);
+		expect(requests).toHaveLength(2);
+		expect(requests[1]!.some((message) => textOf(message)?.includes("Old exchange summarized."))).toBe(true);
+		expect(requests[1]!.some((message) => textOf(message)?.includes("old answer"))).toBe(false);
 		await harness.close(context);
 	});
 

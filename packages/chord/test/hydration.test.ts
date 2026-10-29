@@ -193,3 +193,59 @@ describe("local hydration", () => {
 		await c.worker.close();
 	});
 });
+
+it("validates reference-driven derivations atomically before publishing to local and linked subscribers", async () => {
+	const SourceNumber = remote("t.external-number", {
+		version: 1,
+		input: Type.Object({}),
+		host: hostNamed("server"),
+		variants: { main: { state: { n: Type.Number() }, methods: { set: method(Type.Number()) } } },
+	});
+	const Constrained = remote("t.external-constrained", {
+		version: 1,
+		input: Type.Object({}),
+		host: hostNamed("server"),
+		variants: { main: { state: { n: Type.Number({ maximum: 1 }), doubled: Type.Number() } } },
+	});
+	const errors: unknown[] = [];
+	const server = createHost({ self: "host", name: "server", dev: true, onError: (error) => errors.push(error) });
+	server.serve(SourceNumber, (_input, _principal, self) => {
+		const n = self.state("n", Type.Number(), 0);
+		return { variant: "main", n, set: (value, ctx) => n.replace(ctx, value) };
+	});
+	server.serve(Constrained, (_input, _principal, self) => {
+		const source = self.get(SourceNumber, {});
+		const n = self.derive([source.n], (value) => value);
+		return { variant: "main", n, doubled: self.derive([n], (value) => value * 2) };
+	});
+	const [down, up] = memoryLinkPair();
+	server.accept(down, { principal: "host" });
+	const browser = createHost({ self: "host", kind: "client", upstream: { link: up, principal: "host" } });
+	try {
+		const localRef = await server.get(Constrained, {});
+		const remoteRef = await browser.get(Constrained, {});
+		const seen: number[] = [];
+		const doubled: number[] = [];
+		localRef.n.subscribe((value) => seen.push(value));
+		remoteRef.doubled.subscribe((value) => doubled.push(value));
+		const source = await server.get(SourceNumber, {});
+		await source.set(2);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(source.n.value, 2);
+		assert.equal(localRef.n.value, 0);
+		assert.equal(localRef.doubled.value, 0);
+		assert.equal(remoteRef.n.value, 0);
+		assert.deepEqual(seen, [0]);
+		assert.deepEqual(doubled, [0]);
+		assert.ok(errors.some((error) => isChordError(error, "invalid") && error.reason === "state"));
+		await source.set(1);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(localRef.n.value, 1);
+		assert.equal(remoteRef.n.value, 1);
+		assert.deepEqual(seen, [0, 1]);
+		assert.deepEqual(doubled, [0, 2]);
+	} finally {
+		await browser.close();
+		await server.close();
+	}
+});

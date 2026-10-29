@@ -736,3 +736,215 @@ describe("reload", () => {
 		await assert.rejects(pinned, (error) => isChordError(error, "upgrade_conflict"));
 	});
 });
+
+it("publishes native registration replacement by reload completion without stopped owners", async () => {
+	const host = quiet();
+	const registrations = new Map<string, string>();
+	const facet = (version: number): Facet => ({
+		name: "native-registration",
+		setup: (api) =>
+			api.serve(Greeter, (_input, _principal, self) => {
+				self.resource("registration", {
+					version,
+					open: () => {
+						registrations.set(String(version), `registration ${version}`);
+						return String(version);
+					},
+					close: (key) => {
+						registrations.delete(key);
+					},
+				});
+				return { count: self.state("count", Type.Number(), 0), greet: (name: string) => name };
+			}),
+	});
+	try {
+		await host.install(facet(1));
+		await host.get(Greeter, {});
+		assert.deepEqual([...registrations.values()], ["registration 1"]);
+		await host.reload([facet(2)]);
+		assert.deepEqual([...registrations.values()], ["registration 2"]);
+	} finally {
+		await host.close();
+	}
+});
+
+describe("reload task resource ownership", () => {
+	for (const exclusive of [false, true]) {
+		it(`${exclusive ? "exclusive replacement" : "ungated retirement"} waits for asynchronous stopped-task cleanup`, async () => {
+			const host = createHost({ self: "host", taskStopDeadline: 1000, onError: () => {} });
+			const cleanup = latch();
+			const aborted = latch();
+			const log: string[] = [];
+			const facet = (version: number): Facet => ({
+				name: "owner",
+				setup: (api) => {
+					api.serve(Greeter, (_input, _principal, self) => {
+						const resource = self.resource("native", {
+							version,
+							exclusive,
+							open: () => {
+								log.push(`open ${version}`);
+								return version;
+							},
+							close: () => void log.push(`close ${version}`),
+						});
+						if (version === 1)
+							self.task(async (ctx) => {
+								await new Promise<void>((resolve) =>
+									ctx.signal.addEventListener("abort", () => resolve(), { once: true }),
+								);
+								aborted.open();
+								await cleanup.promise;
+								log.push(`cleanup ${resource.value}`);
+							});
+						return { count: self.state("count", Type.Number(), 0), greet: () => String(resource.value) };
+					});
+				},
+			});
+			await host.install(facet(1));
+			const ref = await host.get(Greeter, {});
+			try {
+				const reloading = host.reload([facet(2)]);
+				await aborted.promise;
+				await tick();
+				assert.equal(log.includes("close 1"), false);
+				if (exclusive) assert.equal(log.includes("open 2"), false);
+				cleanup.open();
+				await reloading;
+				await tick();
+				assert.ok(log.indexOf("cleanup 1") < log.indexOf("close 1"));
+				if (exclusive) assert.ok(log.indexOf("close 1") < log.indexOf("open 2"));
+				assert.equal(await ref.greet("read"), "2");
+			} finally {
+				cleanup.open();
+				await host.close();
+			}
+		});
+	}
+
+	it("aborts a destructive gate at the task deadline without closing the still-owned resource", async () => {
+		const errors: unknown[] = [];
+		const host = createHost({ self: "host", taskStopDeadline: 20, onError: (error) => errors.push(error) });
+		const cleanup = latch();
+		const started = latch();
+		const log: string[] = [];
+		let starts = 0;
+		const facet = (version: number): Facet => ({
+			name: "deadline-owner",
+			setup: (api) => {
+				api.serve(Greeter, (_input, _principal, self) => {
+					const resource = self.resource("native", {
+						version,
+						exclusive: true,
+						open: () => {
+							log.push(`open ${version}`);
+							return version;
+						},
+						close: () => void log.push(`close ${version}`),
+					});
+					self.task(async (ctx) => {
+						starts++;
+						started.open();
+						await new Promise<void>((resolve) =>
+							ctx.signal.addEventListener("abort", () => resolve(), { once: true }),
+						);
+						await cleanup.promise;
+						log.push(`cleanup ${resource.value}`);
+					});
+					return { count: self.state("count", Type.Number(), 0), greet: () => String(resource.value) };
+				});
+			},
+		});
+		await host.install(facet(1));
+		const ref = await host.get(Greeter, {});
+		await started.promise;
+		try {
+			await assert.rejects(
+				host.reload([facet(2)], { gateDeadline: 1000 }),
+				(error) => isChordError(error, "aborted") && error.reason === "task_deadline",
+			);
+			assert.deepEqual(log, ["open 1"]);
+			assert.equal(await ref.greet("still open"), "1");
+			cleanup.open();
+			await until(async () => starts === 2);
+			await host.close();
+			assert.equal(log.at(-1), "close 1");
+			assert.equal(log.filter((entry) => entry === "close 1").length, 1);
+		} finally {
+			cleanup.open();
+			await host.close();
+		}
+	});
+});
+
+for (const restartWithKeptResource of [false, true]) {
+	it(`retains overdue task resources across ${restartWithKeptResource ? "a compatible task restart" : "unchanged code versions"} and cleans up once after settlement`, async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		onTestFinished(() => {
+			vi.useRealTimers();
+		});
+		const errors: unknown[] = [];
+		const host = createHost({ self: "host", taskStopDeadline: 30, onError: (error) => errors.push(error) });
+		const cleanup = latch();
+		const aborted = latch();
+		const log: string[] = [];
+		const facet = (version: number): Facet => ({
+			name: "carried-owner",
+			setup: (api) => {
+				api.serve(Greeter, (_input, _principal, self) => {
+					const resource = self.resource("native", {
+						version,
+						open: () => version,
+						close: () => void log.push(`close ${version}`),
+					});
+					if (version === 1)
+						self.task(async (ctx) => {
+							await new Promise<void>((resolve) =>
+								ctx.signal.addEventListener("abort", () => resolve(), { once: true }),
+							);
+							aborted.open();
+							await cleanup.promise;
+							log.push(`cleanup ${resource.value}`);
+						});
+					return { count: self.state("count", Type.Number(), 0), greet: () => String(resource.value) };
+				});
+			},
+		});
+		await host.install(facet(1));
+		const ref = await host.get(Greeter, {});
+		try {
+			await host.reload([]);
+			await host.reload([]);
+			if (restartWithKeptResource) {
+				await host.reload([facet(1)]);
+				await vi.advanceTimersByTimeAsync(30);
+				await tick();
+			}
+			await host.reload([facet(2)]);
+			await aborted.promise;
+			await vi.advanceTimersByTimeAsync(30);
+			assert.deepEqual(log, [], "overdue stopped task still owns the old resource");
+			assert.equal(await ref.greet("new"), "2");
+			assert.equal(
+				errors.filter((error) => isChordError(error, "aborted") && error.reason === "task_deadline").length,
+				1,
+			);
+			cleanup.open();
+			await tick();
+			assert.deepEqual(
+				log,
+				restartWithKeptResource ? ["cleanup 1", "cleanup 1", "close 1"] : ["cleanup 1", "close 1"],
+			);
+			await host.close();
+			assert.deepEqual(
+				log,
+				restartWithKeptResource
+					? ["cleanup 1", "cleanup 1", "close 1", "close 2"]
+					: ["cleanup 1", "close 1", "close 2"],
+			);
+		} finally {
+			cleanup.open();
+			await host.close();
+		}
+	});
+}

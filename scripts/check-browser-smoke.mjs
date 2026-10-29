@@ -2,6 +2,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { build } from "esbuild";
+import { cloudflareRuntimeExports } from "./local-package-install.mjs";
 
 const outputPath = join(tmpdir(), "pi-browser-smoke.js");
 const durableOutputPath = join(tmpdir(), "pi-durable-browser-smoke.js");
@@ -51,6 +52,24 @@ try {
 		outfile: outputPath,
 		plugins: [generatedCatalogDataPlugin],
 	});
+
+	for (const specifier of cloudflareRuntimeExports) {
+		await build({
+			stdin: {
+				contents: `export * from ${JSON.stringify(specifier)};`,
+				resolveDir: process.cwd(),
+			},
+			bundle: true,
+			platform: "browser",
+			conditions: ["source"],
+			format: "esm",
+			// Workers provides this built-in and Wrangler's CompiledWasm module rule.
+			external: ["cloudflare:workers", "*.wasm"],
+			plugins: [generatedCatalogDataPlugin],
+			logLevel: "silent",
+			write: false,
+		});
+	}
 
 	const durableBuild = await build({
 		entryPoints: ["scripts/durable-browser-smoke-entry.ts"],

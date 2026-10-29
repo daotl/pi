@@ -49,7 +49,9 @@ async function run(mode: "codemode" | "plain", shape: Shape, n: number): Promise
 		models.setProvider(faux.provider);
 		const sandbox = new CodemodeSandbox({ memoryLimitBytes: 256 * 1024 * 1024 });
 		const registry = createRegistry();
-		registry.install(defineExtension({ name: "bench", tools: [echo, plain, createCodemodeTool({ sandbox })] }));
+		registry.install(
+			defineExtension({ name: "bench", tools: [echo, plain, createCodemodeTool({ sandbox, models: false })] }),
+		);
 		const code =
 			shape === "sequential"
 				? `for (let i = 0; i < ${n}; i++) await tools.echo({ i }); return "done";`

@@ -84,6 +84,7 @@ class BoundedTerminalWriter {
 interface KittyImageHeader {
 	ids: number[];
 	rows: number;
+	columns?: number;
 }
 
 function parseKittyImageHeader(line: string): KittyImageHeader | undefined {
@@ -95,6 +96,7 @@ function parseKittyImageHeader(line: string): KittyImageHeader | undefined {
 
 	const ids: number[] = [];
 	let rows = 1;
+	let columns: number | undefined;
 	for (const param of line.slice(paramsStart, paramsEnd).split(",")) {
 		const [key, value] = param.split("=", 2);
 		if (value === undefined) continue;
@@ -102,8 +104,9 @@ function parseKittyImageHeader(line: string): KittyImageHeader | undefined {
 		if (!Number.isInteger(numberValue) || numberValue <= 0 || numberValue > 0xffffffff) continue;
 		if (key === "i") ids.push(numberValue);
 		else if (key === "r") rows = numberValue;
+		else if (key === "c") columns = numberValue;
 	}
-	return { ids, rows };
+	return { ids, rows, columns };
 }
 
 function extractKittyImageIds(line: string): number[] {
@@ -240,6 +243,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private maxLinesRendered = 0;
 	private previousViewportTop = 0;
 	private overlaidRows: number[] = [];
+	private hiddenKittyImages = new Set<number>();
 	private baseCursor: { row: number; col: number; wrappedRow: number } | null = null;
 
 	captureRenderState(): TuiMainScreenRenderState {
@@ -276,6 +280,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.previousViewportTop = 0;
 		this.previousLayout = null;
 		this.overlaidRows = [];
+		this.hiddenKittyImages.clear();
 		this.baseCursor = null;
 	}
 
@@ -475,7 +480,11 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				.map((row) => previousTop + row - resizedTop)
 				.filter((row) => row >= 0 && row < height);
 			this.previousViewportTop = resizedTop;
-			this.paintViewportRows(this.physicalViewport(this.previousLines, this.previousLayout, width, height), rows);
+			this.paintViewportRows(
+				this.physicalViewport(this.previousLines, this.previousLayout, width, height),
+				rows,
+				true,
+			);
 			this.previousViewportTop = previousTop;
 		}
 		this.overlaidRows = [];
@@ -500,7 +509,25 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			if (composed[row] !== viewport[row]) this.overlaidRows.push(row);
 		}
 		const reset = this.applyLineResets(composed);
-		this.paintViewportRows(reset, this.overlaidRows);
+		const imageCoverage = this.kittyViewportCoverage();
+		for (const image of imageCoverage) {
+			if (image.row < this.previousViewportTop || image.row + image.rows > this.previousViewportTop + height)
+				continue;
+			if (
+				!this.renderedOverlayLayouts.some(
+					(overlay) =>
+						overlay.col < image.columns &&
+						overlay.col + overlay.width > 0 &&
+						this.previousViewportTop + overlay.row < image.row + image.rows &&
+						this.previousViewportTop + overlay.row + overlay.height > image.row,
+				)
+			)
+				continue;
+			// Lowercase i deletes placements only, retaining data for a=p on restore.
+			this.terminal.write(`\x1b_Ga=d,d=i,i=${image.id},q=2\x1b\\`);
+			this.hiddenKittyImages.add(image.id);
+		}
+		this.paintViewportRows(reset, this.overlaidRows, false, imageCoverage);
 		if (overlayCursor) {
 			this.positionHardwareCursor(overlayCursor, {
 				offsets: Array.from({ length: height }, (_, row) => this.previousViewportTop + row),
@@ -509,6 +536,21 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		} else {
 			this.positionHardwareCursor(this.isOverlayFocused() ? null : this.baseCursor, this.previousLayout);
 		}
+	}
+
+	private kittyViewportCoverage(): Array<{ id: number; row: number; rows: number; columns: number }> {
+		const images: Array<{ id: number; row: number; rows: number; columns: number }> = [];
+		if (!this.previousLayout) return images;
+		for (let index = 0; index < this.previousLines.length; index++) {
+			const header = parseKittyImageHeader(this.previousLines[index]);
+			const id = header?.ids[0];
+			if (id === undefined || !header) continue;
+			const row = this.previousLayout.offsets[index];
+			if (row + header.rows <= this.previousViewportTop || row >= this.previousViewportTop + this.terminal.rows)
+				continue;
+			images.push({ id, row, rows: header.rows, columns: header.columns ?? this.terminal.columns });
+		}
+		return images;
 	}
 
 	private physicalViewport(
@@ -526,9 +568,11 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			if (end <= start) continue;
 			if (start >= top + height) continue;
 			if (isImageLine(lines[i])) {
-				// The compositor leaves existing image placements untouched.
-				for (let row = Math.max(top, start); row < Math.min(top + height, end); row++) {
-					result[row - top] = lines[i];
+				// Kitty graphics occupy cells independently of the text layer. Keep other
+				// image protocols opaque, since they cannot restore a retained placement.
+				if (!parseKittyImageHeader(lines[i])?.ids.length) {
+					for (let row = Math.max(top, start); row < Math.min(top + height, end); row++)
+						result[row - top] = lines[i];
 				}
 				continue;
 			}
@@ -539,7 +583,12 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		return this.applyLineResets(result);
 	}
 
-	private paintViewportRows(lines: string[], rows: number[]): void {
+	private paintViewportRows(
+		lines: string[],
+		rows: number[],
+		restoring = false,
+		images = this.kittyViewportCoverage(),
+	): void {
 		if (rows.length === 0) return;
 		const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
 		output.append("\x1b[?2026h");
@@ -564,8 +613,27 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			const rowDelta = targetRow - this.hardwareCursorRow;
 			if (rowDelta > 0) output.append(`\x1b[${rowDelta}B`);
 			else if (rowDelta < 0) output.append(`\x1b[${-rowDelta}A`);
-			output.append(`\r\x1b[2K${lines[row]}`);
+			const coverage = images.find((image) => targetRow >= image.row && targetRow < image.row + image.rows);
+			if (coverage) {
+				// Never erase a graphics cell merely to paint text beside its placement.
+				const hidden = this.hiddenKittyImages.has(coverage.id);
+				const startCol = hidden ? 0 : coverage.columns;
+				const count = this.terminal.columns - startCol;
+				if (count > 0)
+					output.append(`\x1b[${startCol + 1}G\x1b[${count}X${sliceByColumn(lines[row], startCol, count, true)}`);
+			} else output.append(`\r\x1b[2K${lines[row]}`);
 			this.hardwareCursorRow = targetRow;
+		}
+		if (restoring) {
+			for (const image of images) {
+				if (!this.hiddenKittyImages.has(image.id)) continue;
+				const delta = image.row - this.hardwareCursorRow;
+				if (delta > 0) output.append(`\x1b[${delta}B`);
+				else if (delta < 0) output.append(`\x1b[${-delta}A`);
+				output.append(`\r\x1b_Ga=p,i=${image.id},c=${image.columns},r=${image.rows},C=1,q=2\x1b\\`);
+				this.hardwareCursorRow = image.row;
+			}
+			this.hiddenKittyImages.clear();
 		}
 		output.append("\x1b[?2026l");
 		output.flush();

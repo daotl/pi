@@ -7,6 +7,15 @@ import { execNpmSync } from "./npm-command.mjs";
 
 const dependencySections = ["dependencies", "devDependencies", "optionalDependencies"];
 
+// Workers built-ins and CompiledWasm imports cannot execute in Node. The browser
+// smoke guard bundles these explicitly with Workers' runtime imports external.
+export const cloudflareRuntimeExports = new Set([
+	"@earendil-works/chord/sqlite/cloudflare",
+	"@earendil-works/pi-codemode/cloudflare",
+	"@earendil-works/pi-durable/images/cloudflare",
+	"@earendil-works/pi-durable/storage/sqlite/cloudflare",
+]);
+
 function createFileSpecifier(fromDirectory, path) {
 	const relativePath = relative(fromDirectory, path);
 	return isAbsolute(relativePath) ? pathToFileURL(path).href : `file:./${relativePath.replaceAll("\\", "/")}`;
@@ -171,13 +180,14 @@ export function smokeTestNpmConsumer({ directory, artifactSet, packageName }) {
 	assertPackageFile(installedDirectory, manifest.main, `${packageName} main`);
 	assertPackageFile(installedDirectory, manifest.types, `${packageName} types`);
 
-	const runtimeSpecifiers = [];
+	const runtimeImports = new Map([[packageName, false]]);
 	for (const [subpath, value] of literalExports(manifest)) {
 		const runtime = runtimeTarget(value);
 		const types = typesTarget(value);
 		if (runtime) {
 			assertPackageFile(installedDirectory, runtime, `${packageName} export ${subpath}`);
-			runtimeSpecifiers.push(subpath === "." ? packageName : `${packageName}${subpath.slice(1)}`);
+			const specifier = subpath === "." ? packageName : `${packageName}${subpath.slice(1)}`;
+			if (!cloudflareRuntimeExports.has(specifier)) runtimeImports.set(specifier, runtime.endsWith(".json"));
 		}
 		if (types) assertPackageFile(installedDirectory, types, `${packageName} types export ${subpath}`);
 	}
@@ -188,11 +198,10 @@ export function smokeTestNpmConsumer({ directory, artifactSet, packageName }) {
 	if (!existsSync(join(directory, "package-lock.json"))) throw new Error(`npm consumer smoke test requires package-lock.json: ${directory}`);
 	verifyLocalResolutions(directory, artifactSet, packageName);
 	const smokePath = join(directory, "artifact-smoke.mjs");
-	const resolveChecks = runtimeSpecifiers.map((specifier) => `assert.ok(existsSync(fileURLToPath(import.meta.resolve(${JSON.stringify(specifier)}))));`).join("\n");
-	writeFileSync(
-		smokePath,
-		`import assert from "node:assert/strict";\nimport { existsSync } from "node:fs";\nimport { fileURLToPath } from "node:url";\nimport ${JSON.stringify(packageName)};\n${resolveChecks}\n`,
-	);
+	const importChecks = [...runtimeImports].map(([specifier, json]) =>
+		`import ${JSON.stringify(specifier)}${json ? ' with { type: "json" }' : ""};`,
+	).join("\n");
+	writeFileSync(smokePath, `${importChecks}\n`);
 	try {
 		execFileSync(process.execPath, [smokePath], { cwd: directory, stdio: "inherit", timeout: 300_000 });
 	} finally {

@@ -623,6 +623,9 @@ export class AgentSession {
 	private _abortDuringBeforeSettle = false;
 	private _isEmittingAgentSettled = false;
 	private readonly _deferredSettledActions: DeferredSettledAction[] = [];
+	/** Request selection captured before policy/auth awaits, then bound to the final response identity. */
+	private _requestUsageSummaryIds: readonly string[] | undefined;
+	private readonly _usageSummaryIdsByMessage = new WeakMap<object, readonly string[]>();
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
@@ -1032,6 +1035,7 @@ export class AgentSession {
 	private _installAgentRequestProjection(): void {
 		const previousPrepareRequest = this.agent.prepareRequest;
 		this.agent.prepareRequest = async (request, signal) => {
+			this._requestUsageSummaryIds = undefined;
 			this._flushPendingUsage();
 			if (this._deferUntrustedSnapshot) {
 				this._deferUntrustedSnapshot = false;
@@ -1049,6 +1053,9 @@ export class AgentSession {
 			const prepare = async () => {
 				this._syncSummaryBlockMaxTokens();
 				const projection = this._buildLiveProjection();
+				const usageSummaryIds = projection.entries
+					.filter((entry) => entry.sourceEntry.type === "compaction" && entry.messages.length > 0)
+					.map((entry) => entry.sourceEntry.id);
 				const canonicalContext = {
 					...request.context,
 					messages: prefill ? [...projection.messages, prefill] : projection.messages,
@@ -1064,9 +1071,9 @@ export class AgentSession {
 					},
 					signal,
 				);
-				return { previous, context: previous?.context ?? canonicalContext, projection };
+				return { previous, context: previous?.context ?? canonicalContext, projection, usageSummaryIds };
 			};
-			let { previous, context, projection } = await prepare();
+			let { previous, context, projection, usageSummaryIds } = await prepare();
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
 			const validatePrefillRoute = (physical: Model<string>): void => {
@@ -1083,6 +1090,7 @@ export class AgentSession {
 			};
 			if (!isVirtualModel(model)) {
 				validatePrefillRoute(model);
+				this._requestUsageSummaryIds = usageSummaryIds;
 				return { ...previous, context, model, thinkingLevel };
 			}
 
@@ -1111,8 +1119,9 @@ export class AgentSession {
 			// the projection.
 			if (this._exceedsCompactionThreshold(route.model, projection)) {
 				await this._runAutoCompaction("threshold", false);
-				({ previous, context } = await prepare());
+				({ previous, context, usageSummaryIds } = await prepare());
 			}
+			this._requestUsageSummaryIds = usageSummaryIds;
 			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
 		};
 	}
@@ -1416,6 +1425,11 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (event.type === "agent_start") this._requestUsageSummaryIds = undefined;
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			const ids = this._requestUsageSummaryIds;
+			if (ids) this._usageSummaryIdsByMessage.set(event.message, ids);
+		}
 		// An abort requested while the run was starting, e.g. during before_agent_start, stops it
 		// here. agent_start is awaited before the first request.
 		if (event.type === "agent_start" && this._agentRunAbortRequested) this.agent.abort();
@@ -1495,8 +1509,16 @@ export class AgentSession {
 				try {
 					entryId =
 						verifiedPrefill && event.message.role === "assistant" && this._prefillEntryId
-							? this.sessionManager.replaceAssistantContinuation(this._prefillEntryId, event.message)
-							: this.sessionManager.appendMessage(event.message);
+							? this.sessionManager.replaceAssistantContinuation(
+									this._prefillEntryId,
+									event.message,
+									this._usageSummaryIdsByMessage.get(event.message) ?? null,
+								)
+							: this.sessionManager.appendMessage(
+									event.message,
+									undefined,
+									this._usageSummaryIdsByMessage.get(event.message) ?? null,
+								);
 				} catch (error) {
 					if (event.message.role === "assistant") {
 						throw new TerminalResponseError(
@@ -3235,17 +3257,23 @@ export class AgentSession {
 	 */
 	private _restoreToolsFromTranscript(modifiers: readonly string[] = [], persist = true): void {
 		this._pendingToolNames.clear();
-		// Replay visible branch system deltas, including declarations preceding compaction.
-		const systemMessages = this.sessionManager
+		const branchSystemMessages = this.sessionManager
 			.getBranch()
 			.flatMap((entry) =>
 				entry.deletedAt === undefined && entry.type === "message" && entry.message.role === "system"
 					? [entry.message]
 					: [],
 			);
+		const projection = this.sessionManager.buildSessionProjection();
+		const checkpoint = getLatestCompactionEntry(projection.entries.map((entry) => entry.sourceEntry));
+		// Seed from the effective checkpoint, then replay retained later deltas. Legacy files have no seed.
+		const systemMessages = checkpoint?.systemMessage
+			? projection.messages.filter((message): message is SystemMessage => message.role === "system")
+			: branchSystemMessages;
 		if (systemMessages.length === 0) return;
+		// Earlier removals distinguish an intentionally disabled extension from a newly registered one.
 		const mentioned = new Set(
-			systemMessages.flatMap((message) =>
+			[...systemMessages, ...branchSystemMessages].flatMap((message) =>
 				[...(message.toolsAdded ?? []), ...(message.toolsRemoved ?? [])].map((tool) => tool.name),
 			),
 		);
@@ -4971,7 +4999,11 @@ export class AgentSession {
 			const entry =
 				receipt.kind === "terminal"
 					? this.sessionManager.getEntry(
-							this.sessionManager.appendMessage({ ...receipt.message, content: [{ type: "text", text: "" }] }),
+							this.sessionManager.appendMessage(
+								{ ...receipt.message, content: [{ type: "text", text: "" }] },
+								undefined,
+								this._usageSummaryIdsByMessage.get(receipt.message) ?? null,
+							),
 						)!
 					: this.sessionManager.appendUsage("compaction", receipt.provider, receipt.model, receipt.usage);
 			// Consume only after publication; a listener failure must not charge it again.
@@ -5622,6 +5654,7 @@ export class AgentSession {
 	 * @returns Whether the post-run loop should call `agent.continue()` for overflow recovery or queued messages
 	 */
 	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
+		this._syncSummaryBlockMaxTokens();
 		const settings = this.settingsManager.getCompactionSettings(this.model);
 		if (!settings.enabled) return false;
 
@@ -5640,9 +5673,20 @@ export class AgentSession {
 		// Skip compaction checks if this assistant message is older than the latest
 		// compaction boundary. This prevents a stale pre-compaction usage/error
 		// from retriggering compaction on the first prompt after compaction.
-		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const branch = this.sessionManager.getBranch();
+		const assistantEntryId = this._findPersistedMessageEntryId(assistantMessage);
+		const assistantIndex = assistantEntryId ? branch.findIndex((entry) => entry.id === assistantEntryId) : -1;
+		const compactionEntry = getLatestCompactionEntry(branch);
+		const source = assistantIndex >= 0 ? branch[assistantIndex] : undefined;
+		const countedBoundaryIndex =
+			source?.type === "message" && source.usageContextEntryId
+				? branch.findIndex((entry) => entry.id === source.usageContextEntryId)
+				: -1;
 		const assistantIsFromBeforeCompaction =
-			compactionEntry !== null && assistantMessage.timestamp <= new Date(compactionEntry.timestamp).getTime();
+			compactionEntry !== null &&
+			(assistantIndex >= 0
+				? Math.max(assistantIndex, countedBoundaryIndex) < branch.indexOf(compactionEntry)
+				: assistantMessage.timestamp <= new Date(compactionEntry.timestamp).getTime());
 		if (assistantIsFromBeforeCompaction) {
 			return false;
 		}
@@ -5651,7 +5695,6 @@ export class AgentSession {
 		// A length stop is recoverable when output ended below the model's original desired limit,
 		// independent of the configured context size or any context-clamped provider request limit.
 		const currentProjection = this.sessionManager.buildSessionProjection();
-		const assistantEntryId = this._findPersistedMessageEntryId(assistantMessage);
 		const assistantIsProjected =
 			assistantEntryId === undefined ||
 			currentProjection.entries.some(
@@ -5659,8 +5702,6 @@ export class AgentSession {
 					entry.sourceEntry.id === assistantEntryId &&
 					entry.messages.some((message) => message.role === "assistant"),
 			);
-		const branch = this.sessionManager.getBranch();
-		const assistantIndex = assistantEntryId ? branch.findIndex((entry) => entry.id === assistantEntryId) : -1;
 		const entriesAfterAssistant = assistantIndex >= 0 ? branch.slice(assistantIndex + 1) : [];
 		const hasPostAssistantContextEdit = entriesAfterAssistant.some((entry) => entry.type === "context_edit");
 		const latestAssistantEdit = entriesAfterAssistant
@@ -5672,7 +5713,11 @@ export class AgentSession {
 			assistantEntryId === undefined ||
 			(!entriesAfterAssistant.some((entry) => entry.type === "compaction") &&
 				latestAssistantEdit?.replacement !== null);
-		const assistantUsageMatchesProjection = assistantIsProjected && !hasPostAssistantContextEdit;
+		const projectedEstimate = estimateProjectedContextTokens(currentProjection, branch);
+		const assistantUsageMatchesProjection =
+			assistantIsProjected &&
+			!hasPostAssistantContextEdit &&
+			(assistantEntryId === undefined ? !compactionEntry : projectedEstimate.lastUsageIndex !== null);
 		const explicitOverflow = assistantMessage.stopReason === "error" && isContextOverflow(assistantMessage);
 		const contextOverflow =
 			sameModel &&
@@ -5727,8 +5772,10 @@ export class AgentSession {
 		const projection = currentProjection;
 		const hasContextEdits = projection.entries.some((entry) => entry.sourceEntry.type === "context_edit");
 		const directContextTokens = assistantMessage.usage ? calculateContextTokens(assistantMessage.usage) : 0;
-		if (hasContextEdits) {
-			contextTokens = estimateProjectedContextTokens(projection, branch).tokens;
+		// Without context edits, a valid response already measures the selected prefix.
+		// Leave trailing tool-result checks to the next request, preserving termination behavior.
+		if (hasContextEdits || (compactionEntry !== null && projectedEstimate.lastUsageIndex === null)) {
+			contextTokens = projectedEstimate.tokens;
 		} else if (assistantMessage.stopReason === "error" || directContextTokens === 0) {
 			const messages = this.agent.state.messages;
 			const estimate = estimateContextTokens(messages);

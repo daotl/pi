@@ -375,6 +375,7 @@ export class Derived<T> extends Source<T> {
 	refresh(): void {
 		try {
 			const next = this.compute((source) => source.value);
+			this.validate(next);
 			const dependents = computeDependents(this as Derived<unknown>, next);
 			holdPublications(() => {
 				this.install(next);

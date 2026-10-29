@@ -9,6 +9,7 @@ import {
 	createMcpAuthProvider,
 	McpOAuthCredentialStore,
 	type McpOAuthSettings,
+	McpSignInCancelledError,
 	type McpSignInPrompt,
 	signInMcpServer,
 } from "../src/extensions/mcp/oauth.ts";
@@ -21,22 +22,75 @@ describe("MCP OAuth refresh", () => {
 		while (cleanups.length > 0) await cleanups.pop()?.();
 	});
 
-	async function signedIn() {
+	for (const path of ["/.well-known/oauth-authorization-server", "/register"]) {
+		it(`still cancels sign-in requests to ${path}`, async () => {
+			const server = await startOAuthMcpServer();
+			cleanups.push(server.close);
+			server.stall.add(path);
+			const controller = new AbortController();
+			const opened: URL[] = [];
+			const login = signInMcpServer({
+				serverUrl: server.url,
+				store: new McpOAuthCredentialStore(new InMemoryAuthStorageBackend()).forServer("test", server.url),
+				settings: {},
+				signal: controller.signal,
+				prompt: {
+					showAuthorizationUrl: (url) => opened.push(url),
+					promptForRedirectUrl: async () => undefined,
+				},
+			}).catch((error: unknown) => error);
+			await expect.poll(() => server.stalled.map((entry) => entry.path)).toEqual([path]);
+			controller.abort();
+			expect(await login).toBeInstanceOf(McpSignInCancelledError);
+			await expect.poll(() => server.stalled[0]?.request.socket.destroyed).toBe(true);
+			expect(opened).toEqual([]);
+		});
+	}
+
+	it("still cancels sign-in while waiting for browser approval", async () => {
 		const server = await startOAuthMcpServer();
+		cleanups.push(server.close);
+		const controller = new AbortController();
+		const prompting = Promise.withResolvers<AbortSignal>();
+		const login = signInMcpServer({
+			serverUrl: server.url,
+			store: new McpOAuthCredentialStore(new InMemoryAuthStorageBackend()).forServer("test", server.url),
+			settings: {},
+			signal: controller.signal,
+			prompt: {
+				showAuthorizationUrl: () => {},
+				promptForRedirectUrl: (signal) => {
+					prompting.resolve(signal);
+					const cancelled = Promise.withResolvers<string | undefined>();
+					signal.addEventListener("abort", () => cancelled.resolve(undefined), { once: true });
+					return cancelled.promise;
+				},
+			},
+		}).catch((error: unknown) => error);
+		const promptSignal = await prompting.promise;
+		controller.abort();
+		expect(await login).toBeInstanceOf(McpSignInCancelledError);
+		expect(promptSignal.aborted).toBe(true);
+		expect(server.tokenRequests).toEqual([]);
+	});
+
+	async function signedIn(options: Parameters<typeof startOAuthMcpServer>[0] = {}) {
+		const server = await startOAuthMcpServer(options);
 		cleanups.push(server.close);
 		const lockDir = mkdtempSync(join(tmpdir(), "pi-mcp-refresh-"));
 		cleanups.push(() => rmSync(lockDir, { recursive: true, force: true }));
 		// Stores sharing the credential file and lock directory stand in for separate pi processes.
 		const backend = new InMemoryAuthStorageBackend();
 		const process = () => {
-			const store = new McpOAuthCredentialStore(backend, lockDir).forServer("test", server.url);
+			const credentials = new McpOAuthCredentialStore(backend, lockDir);
+			const store = credentials.forServer("test", server.url);
 			const provider = createMcpAuthProvider({
 				serverUrl: server.url,
 				store,
 				settings: () => ({}),
 				onChallenge: () => {},
 			});
-			return { store, provider };
+			return { store, provider, credentials };
 		};
 		await signInMcpServer({
 			serverUrl: server.url,
@@ -88,6 +142,117 @@ describe("MCP OAuth refresh", () => {
 		await provider.settled();
 		expect((await store.load())?.tokens?.access_token).toBe("access-2");
 		await refresh;
+	});
+
+	it("persists an already rotated sign-in refresh after cancellation before releasing its lock", async () => {
+		const consumed = Promise.withResolvers<void>();
+		const response = Promise.withResolvers<void>();
+		const { server, lockDir, process } = await signedIn({
+			beforeRefreshResponse: async () => {
+				consumed.resolve();
+				await response.promise;
+			},
+		});
+		const { store, credentials } = process();
+		const controller = new AbortController();
+		const opened: URL[] = [];
+		const next = process();
+		let waiter: Promise<void> | undefined;
+		let shutdown: Promise<void> | undefined;
+		let shutdownFinished = false;
+		const login = signInMcpServer({
+			serverUrl: server.url,
+			store,
+			settings: {},
+			signal: controller.signal,
+			prompt: {
+				showAuthorizationUrl: (url) => opened.push(url),
+				promptForRedirectUrl: async () => undefined,
+			},
+		}).catch((error: unknown) => error);
+		try {
+			await consumed.promise;
+			controller.abort();
+			// The caller stops waiting while the server still holds its replacement tokens.
+			expect(await login).toBeInstanceOf(McpSignInCancelledError);
+			expect((await store.load())?.tokens?.refresh_token).toBe("refresh-1");
+			expect(readdirSync(lockDir)).toHaveLength(1);
+			shutdown = credentials.settled().then(() => {
+				shutdownFinished = true;
+			});
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(shutdownFinished).toBe(false);
+			// A concurrent connection must wait rather than consume the now-invalid refresh-1.
+			waiter = next.provider.onUnauthorized?.({
+				response: new Response(null, { status: 401 }),
+				serverUrl: new URL(server.url),
+				fetch: globalThis.fetch,
+				token: "access-1",
+			});
+		} finally {
+			response.resolve();
+		}
+
+		expect(shutdown).toBeDefined();
+		expect(waiter).toBeDefined();
+		await shutdown;
+		expect(shutdownFinished).toBe(true);
+		expect((await store.load())?.tokens?.refresh_token).toBe("refresh-2");
+		// Another process can acquire ownership only after the rotated credentials have been saved.
+		await waiter;
+		await next.store.withRefreshLock(async () => {
+			expect((await next.store.load())?.tokens).toMatchObject({
+				access_token: "access-2",
+				refresh_token: "refresh-2",
+			});
+		});
+		expect(await next.provider.token()).toBe("access-2");
+		await next.provider.onUnauthorized?.({
+			response: new Response(null, { status: 401 }),
+			serverUrl: new URL(server.url),
+			fetch: globalThis.fetch,
+			token: "access-2",
+		});
+		expect(await next.provider.token()).toBe("access-3");
+		expect(server.tokenRequests.map((params) => params.get("refresh_token"))).toEqual([
+			null,
+			"refresh-1",
+			"refresh-2",
+		]);
+		expect(opened).toEqual([]);
+	});
+
+	it("keeps credentials removed after a canceled sign-in refresh settles", async () => {
+		const consumed = Promise.withResolvers<void>();
+		const response = Promise.withResolvers<void>();
+		const { server, process } = await signedIn({
+			beforeRefreshResponse: async () => {
+				consumed.resolve();
+				await response.promise;
+			},
+		});
+		const { store } = process();
+		const controller = new AbortController();
+		const login = signInMcpServer({
+			serverUrl: server.url,
+			store,
+			settings: {},
+			signal: controller.signal,
+			prompt: { showAuthorizationUrl: () => {}, promptForRedirectUrl: async () => undefined },
+		}).catch((error: unknown) => error);
+		try {
+			await consumed.promise;
+			controller.abort();
+			expect(await login).toBeInstanceOf(McpSignInCancelledError);
+			const logout = process().credentials.remove("test", server.url);
+			response.resolve();
+			expect(await logout).toBe(true);
+			await store.withRefreshLock(async () => {
+				expect(await store.load()).toBeUndefined();
+			});
+		} finally {
+			response.resolve();
+		}
 	});
 });
 

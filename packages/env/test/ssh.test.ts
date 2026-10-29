@@ -47,6 +47,75 @@ const sshd =
 	process.platform === "win32"
 		? undefined
 		: (which("sshd") ?? (existsSync("/usr/sbin/sshd") ? "/usr/sbin/sshd" : undefined));
+const fish = process.platform === "win32" ? undefined : which("fish");
+
+// #34: execute SSH's joined remote command in the actual shell, without requiring a running sshd.
+describe.skipIf(process.platform === "win32")("SSH remote shell compatibility", () => {
+	for (const shell of ["sh", "fish"] as const) {
+		it.skipIf(shell === "fish" && fish === undefined)(
+			`detects, deploys and forwards daemon arguments through ${shell}`,
+			async () => {
+				const root = mkdtempSync(join(tmpdir(), "pi-env-shell-"));
+				const home = join(root, "home 'with' \\slashes $and spaces");
+				const program = shell === "fish" ? fish! : which("sh")!;
+				const ssh = join(root, "ssh");
+				mkdirSync(join(home, ".config/fish"), { recursive: true });
+				writeFileSync(
+					join(home, ".config/fish/config.fish"),
+					"if status is-login; set -gx PI_ENV_FISH_LOGIN yes; end\n",
+				);
+				writeFileSync(
+					ssh,
+					[
+						`#!${process.execPath}`,
+						'const { spawnSync } = require("node:child_process");',
+						'const command = process.argv.slice(process.argv.indexOf("--") + 2).join(" ");',
+						`const result = spawnSync(${JSON.stringify(program)}, ["-c", command], {`,
+						'  stdio: "inherit",',
+						`  env: { ...process.env, HOME: ${JSON.stringify(home)}, SHELL: ${JSON.stringify(program)},`,
+						`    XDG_CONFIG_HOME: ${JSON.stringify(join(home, ".config"))}, PI_ENV_FISH_LOGIN: "" },`,
+						"});",
+						"if (result.error) throw result.error;",
+						"process.exit(result.status ?? 1);",
+					].join("\n"),
+					{ mode: 0o700 },
+				);
+				const target: SshTarget = {
+					host: "shell-test",
+					hostKeyAlias: "shell-test",
+					knownHostsFile: join(root, "known_hosts"),
+					ssh,
+				};
+				try {
+					for (const loginShell of [false, true]) {
+						const { connection, remote } = await connectSsh({ ...target, binary: daemon, loginShell });
+						try {
+							expect(remote.home).toBe(home);
+							// A real hello authenticates the forwarded serve/--token/token arguments.
+							expect((await connection.info()).home).toBe(home);
+							const env = new RemoteExecutionEnv({ connection, id: "pi-env:shell-test", cwd: home });
+							const output: string[] = [];
+							const result = getOrThrow(
+								await env.exec(
+									["sh", "-c", 'printf "%s" "$PI_ENV_FISH_LOGIN"'],
+									{ onOutput: (text) => output.push(text) },
+									context,
+								),
+							);
+							expect(result.exitCode).toBe(0);
+							expect(output.join("")).toBe(shell === "fish" && loginShell ? "yes" : "");
+						} finally {
+							connection.close();
+						}
+					}
+				} finally {
+					rmSync(root, { recursive: true, force: true });
+				}
+			},
+			60_000,
+		);
+	}
+});
 
 async function freePort(): Promise<number> {
 	return new Promise((resolve) => {
@@ -222,6 +291,8 @@ describe.skipIf(sshd === undefined)("SSH bootstrap", () => {
 		// The login shell is the account's shell: sh and bash read .profile, zsh (the macOS default) reads .zprofile.
 		writeFileSync(join(home, ".profile"), "export PI_ENV_LOGIN=yes\n");
 		writeFileSync(join(home, ".zprofile"), "export PI_ENV_LOGIN=yes\n");
+		mkdirSync(join(home, ".config/fish"), { recursive: true });
+		writeFileSync(join(home, ".config/fish/config.fish"), "if status is-login; set -gx PI_ENV_LOGIN yes; end\n");
 		const login = async (loginShell: boolean) => {
 			const { connection } = await connectSsh({ ...target, binary: daemon, loginShell });
 			try {
@@ -242,6 +313,59 @@ describe.skipIf(sshd === undefined)("SSH bootstrap", () => {
 		expect(await login(false)).toBe("");
 		expect(await login(true)).toBe("yes");
 	}, 60_000);
+
+	// #34: sshd's forced command supplies a fish remote shell without changing the account's login shell.
+	it.skipIf(fish === undefined)(
+		"starts a fish login shell over real SSH and preserves its environment",
+		async () => {
+			const fishHome = join(root, "fish-home");
+			mkdirSync(join(fishHome, ".config/fish"), { recursive: true });
+			writeFileSync(
+				join(fishHome, ".config/fish/config.fish"),
+				"if status is-login; set -gx PI_ENV_FISH_LOGIN yes; end\n",
+			);
+			const wrapper = join(root, "fish-remote");
+			const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+			writeFileSync(
+				wrapper,
+				[
+					"#!/bin/sh",
+					`export HOME=${quote(fishHome)}`,
+					`export XDG_CONFIG_HOME=${quote(join(fishHome, ".config"))}`,
+					`export SHELL=${quote(fish!)}`,
+					'exec "$SHELL" -c "$SSH_ORIGINAL_COMMAND"',
+				].join("\n"),
+				{ mode: 0o700 },
+			);
+			const authorized = join(root, "authorized_keys");
+			const original = readFileSync(authorized);
+			writeFileSync(authorized, `command="${wrapper}" ${original.toString("utf8")}`);
+			try {
+				await acceptHostKey(target, (await scanHostKey(target)).lines);
+				const { connection, remote } = await connectSsh({ ...target, binary: daemon, loginShell: true });
+				try {
+					expect(remote.home).toBe(fishHome);
+					expect((await connection.info()).home).toBe(fishHome);
+					const env = new RemoteExecutionEnv({ connection, id: "pi-env:fish-ssh", cwd: fishHome });
+					const output: string[] = [];
+					const result = getOrThrow(
+						await env.exec(
+							["sh", "-c", 'printf "%s" "$PI_ENV_FISH_LOGIN"'],
+							{ onOutput: (text) => output.push(text) },
+							context,
+						),
+					);
+					expect(result.exitCode).toBe(0);
+					expect(output.join("")).toBe("yes");
+				} finally {
+					connection.close();
+				}
+			} finally {
+				writeFileSync(authorized, original);
+			}
+		},
+		60_000,
+	);
 
 	it("connects lazily and reports a failed start as the error of the operation", async () => {
 		const lazyTarget = { ...target, knownHostsFile: join(root, "lazy_known_hosts") };

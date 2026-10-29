@@ -364,8 +364,9 @@ it.each(["faux", "native"] as const)("counts a continued policy suffix only once
 	const footerData = new FooterDataProvider(cwd);
 	try {
 		session.setCustomSystemPrompt("accepted policy ".repeat(200));
-		if (native) native.setResponses([fauxAssistantMessage("partial completed")]);
-		else harness.setResponses([fauxAssistantMessage("partial completed")]);
+		const completedText = "partial completed";
+		if (native) native.setResponses([fauxAssistantMessage(completedText)]);
+		else harness.setResponses([fauxAssistantMessage(completedText)]);
 		await session.continue();
 		const response = manager
 			.getBranch()
@@ -374,7 +375,7 @@ it.each(["faux", "native"] as const)("counts a continued policy suffix only once
 			throw new Error("Expected continued response");
 		const billed = response.message.usage.totalTokens;
 		if (native) {
-			expect(billed).toBe(12);
+			expect(billed).toBe(10 + Math.ceil(completedText.length / 4));
 			expect(native.summaries[0]?.body).toContain("accepted policy");
 			const request = JSON.parse(native.summaries[0]!.body) as {
 				messages: Array<{ role: string; content: string }>;

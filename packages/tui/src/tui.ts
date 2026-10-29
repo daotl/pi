@@ -529,7 +529,7 @@ export abstract class TuiBase extends Container implements TUI {
 	// Overlay stack for modal components rendered on top of base content
 	private focusOrderCounter = 0;
 	private overlayStack: OverlayStackEntry[] = [];
-	private renderedOverlayLayouts: RenderedOverlayLayout[] = [];
+	protected renderedOverlayLayouts: RenderedOverlayLayout[] = [];
 
 	get hasOverlayEntries(): boolean {
 		return this.overlayStack.length > 0;

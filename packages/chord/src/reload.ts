@@ -477,15 +477,16 @@ export class Reload {
 		this.gated = [...this.candidates.values()].filter(
 			(candidate) => candidate.reasons.length > 0 && candidate.object.status === "live",
 		);
+		const deadline = this.options.gateDeadline ?? 5000;
 		const drained = this.gated.map(({ object }) => {
 			const grandfathered = new Set(object.leases.keys());
-			return new Promise<void>((resolve) => {
+			const roots = new Promise<void>((resolve) => {
 				object.gate = { grandfathered, queue: [], drained: resolve };
 				object.stopTasks();
 				if (grandfathered.size === 0) resolve();
 			});
+			return Promise.all([roots, object.joinStoppedTasks(Math.min(deadline, this.host.taskStopDeadline))]);
 		});
-		const deadline = this.options.gateDeadline ?? 5000;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const timedOut = await raceSignal(
 			Promise.race([

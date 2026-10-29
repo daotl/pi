@@ -363,6 +363,190 @@ describe("Agent", () => {
 		expect(agent.state.errorMessage).toBe("provider exploded");
 	});
 
+	it.each(["agent_start", "turn_start", "message_start", "message_end"] as const)(
+		"finalizes accepted prompt messages after a one-shot %s subscriber rejection",
+		async (rejectedEvent) => {
+			const user = createUserMessage("accepted prompt");
+			const existing = createUserMessage("previous turn");
+			const finalized: AgentMessage[][] = [];
+			const terminal: AgentMessage[][] = [];
+			let rejected = false;
+			let dispatches = 0;
+			const agent = new Agent({
+				initialState: { messages: [existing] },
+				finishTurn: (context, signal) => {
+					signal?.throwIfAborted();
+					finalized.push([...context.context.messages]);
+				},
+				streamFn: () => {
+					dispatches++;
+					throw new Error("unexpected provider dispatch");
+				},
+			});
+			agent.subscribe(async (event, signal) => {
+				if (!rejected && event.type === rejectedEvent) {
+					rejected = true;
+					throw new Error(`subscriber rejected ${rejectedEvent}`);
+				}
+				if (event.type === "agent_end") {
+					signal.throwIfAborted();
+					terminal.push([...event.messages]);
+				}
+			});
+
+			await agent.prompt(user);
+			await agent.waitForIdle();
+
+			const failure = agent.state.messages.at(-1);
+			expect(failure).toMatchObject({
+				role: "assistant",
+				stopReason: "error",
+				errorMessage: `subscriber rejected ${rejectedEvent}`,
+			});
+			expect(dispatches).toBe(0);
+			expect(finalized).toEqual([[existing, user, failure]]);
+			expect(terminal).toEqual([[user, failure]]);
+			expect(agent.state.messages).toEqual(
+				rejectedEvent === "message_end" ? [existing, user, failure] : [existing, failure],
+			);
+			expect(agent.state.isStreaming).toBe(false);
+		},
+	);
+
+	it.each(["agent_start", "turn_start"] as const)(
+		"finalizes continuation after a one-shot %s subscriber rejection without republishing history",
+		async (rejectedEvent) => {
+			const existing = createUserMessage("continue this");
+			const finalized: AgentMessage[][] = [];
+			const terminal: AgentMessage[][] = [];
+			let rejected = false;
+			const agent = new Agent({
+				initialState: { messages: [existing] },
+				streamFn: unusedStreamFunction,
+				finishTurn: (context, signal) => {
+					signal?.throwIfAborted();
+					finalized.push([...context.context.messages]);
+				},
+			});
+			agent.subscribe((event, signal) => {
+				if (!rejected && event.type === rejectedEvent) {
+					rejected = true;
+					throw new Error(`subscriber rejected ${rejectedEvent}`);
+				}
+				if (event.type === "agent_end") {
+					signal.throwIfAborted();
+					terminal.push([...event.messages]);
+				}
+			});
+
+			await agent.continue();
+			await agent.waitForIdle();
+
+			const failure = agent.state.messages.at(-1);
+			expect(failure).toMatchObject({ stopReason: "error", errorMessage: `subscriber rejected ${rejectedEvent}` });
+			expect(finalized).toEqual([[existing, failure]]);
+			expect(terminal).toEqual([[failure]]);
+			expect(agent.state.messages).toEqual([existing, failure]);
+			expect(agent.state.isStreaming).toBe(false);
+		},
+	);
+
+	it.each(["preparation", "dispatch"] as const)(
+		"settles a thrown %s failure without canceling persistence or terminal delivery",
+		async (stage) => {
+			const terminalEntered = createDeferred();
+			const releaseTerminal = createDeferred();
+			let finishes = 0;
+			let terminalDelivered = false;
+			const agent = new Agent({
+				prepareRequest:
+					stage === "preparation"
+						? () => {
+								throw new Error("preparation failed");
+							}
+						: undefined,
+				streamFn: () => {
+					throw new Error("dispatch failed");
+				},
+				finishTurn: (_context, signal) => {
+					signal?.throwIfAborted();
+					finishes++;
+				},
+			});
+			agent.subscribe(async (event, signal) => {
+				if (event.type === "message_end" || event.type === "turn_end" || event.type === "agent_end") {
+					signal.throwIfAborted();
+				}
+				if (event.type === "agent_end") {
+					terminalEntered.resolve();
+					await releaseTerminal.promise;
+					signal.throwIfAborted();
+					terminalDelivered = true;
+				}
+			});
+			const prompt = agent.prompt("hello");
+			let idle = false;
+			const idlePromise = agent.waitForIdle().then(() => {
+				idle = true;
+			});
+			await terminalEntered.promise;
+			expect(finishes).toBe(1);
+			expect(agent.state.isStreaming).toBe(true);
+			expect(idle).toBe(false);
+			releaseTerminal.resolve();
+			await Promise.all([prompt, idlePromise]);
+			expect(terminalDelivered).toBe(true);
+			expect(finishes).toBe(1);
+			expect(agent.state.messages.at(-1)).toMatchObject({ stopReason: "error", errorMessage: `${stage} failed` });
+			expect(agent.state.isStreaming).toBe(false);
+		},
+	);
+
+	it("preserves explicit caller cancellation for provider work and finalization", async () => {
+		const dispatched = createDeferred();
+		let providerSignal: AbortSignal | undefined;
+		let finishSignal: AbortSignal | undefined;
+		let terminalSignal: AbortSignal | undefined;
+		let finishes = 0;
+		const agent = new Agent({
+			finishTurn: (_context, signal) => {
+				finishes++;
+				finishSignal = signal;
+			},
+			streamFn: (_model, _context, options) => {
+				providerSignal = options?.signal;
+				const stream = createAssistantMessageEventStream();
+				providerSignal?.addEventListener(
+					"abort",
+					() => {
+						stream.push({
+							type: "error",
+							reason: "aborted",
+							error: { ...createAssistantMessage(""), stopReason: "aborted", errorMessage: "caller canceled" },
+						});
+					},
+					{ once: true },
+				);
+				dispatched.resolve();
+				return stream;
+			},
+		});
+		agent.subscribe((event, signal) => {
+			if (event.type === "agent_end") terminalSignal = signal;
+		});
+		const prompt = agent.prompt("hello");
+		await dispatched.promise;
+		agent.abort();
+		await prompt;
+		await agent.waitForIdle();
+		expect(providerSignal?.aborted).toBe(true);
+		expect(finishSignal?.aborted).toBe(true);
+		expect(terminalSignal?.aborted).toBe(true);
+		expect(finishes).toBe(1);
+		expect(agent.state.messages.at(-1)).toMatchObject({ stopReason: "aborted" });
+		expect(agent.state.isStreaming).toBe(false);
+	});
+
 	it("should await async subscribers before prompt resolves", async () => {
 		const barrier = createDeferred();
 		const agent = new Agent({
@@ -1315,6 +1499,62 @@ describe("Agent", () => {
 			expect(agent.state.messages.at(-1)?.role).toBe("toolResult");
 			const continued = agent.state.messages.filter((m) => m.role === "assistant").at(-1) as AssistantMessage;
 			expect(continued.content.some((b) => b.type === "toolCall")).toBe(true);
+		});
+
+		it("cancels live provider work on a prefill mismatch without canceling failure settlement", async () => {
+			let providerSignal: AbortSignal | undefined;
+			let providerCanceled = false;
+			let finishes = 0;
+			const terminal: AgentMessage[][] = [];
+			const agent = new Agent({
+				initialState: { model: createCompletionsModel() },
+				finishTurn: (_context, signal) => {
+					signal?.throwIfAborted();
+					finishes++;
+				},
+				streamFn: (_model, _context, options) => {
+					providerSignal = options?.signal;
+					const stream = createAssistantMessageEventStream();
+					providerSignal?.addEventListener(
+						"abort",
+						() => {
+							providerCanceled = true;
+							const error = { ...createAssistantMessage(""), stopReason: "aborted" as const };
+							stream.push({ type: "error", reason: "aborted", error });
+						},
+						{ once: true },
+					);
+					queueMicrotask(() => {
+						const partial = createAssistantMessage("wrong prefix");
+						stream.push({ type: "start", partial });
+						stream.push({ type: "text_delta", contentIndex: 0, delta: "wrong prefix", partial });
+					});
+					return stream;
+				},
+			});
+			const user = createUserMessage("hello");
+			agent.state.messages = [user];
+			agent.subscribe((event, signal) => {
+				if (event.type === "agent_end") {
+					signal.throwIfAborted();
+					terminal.push([...event.messages]);
+				}
+			});
+
+			await agent.continue(createAssistantMessage("expected"));
+			await agent.waitForIdle();
+
+			const failure = agent.state.messages.at(-1);
+			expect(providerSignal?.aborted).toBe(true);
+			expect(providerCanceled).toBe(true);
+			expect(finishes).toBe(1);
+			expect(failure).toMatchObject({
+				stopReason: "error",
+				errorMessage: "Prefill echo mismatch: content does not match the prefill.",
+			});
+			expect(terminal).toEqual([[failure]]);
+			expect(agent.state.messages).toEqual([user, failure]);
+			expect(agent.state.isStreaming).toBe(false);
 		});
 
 		it("produces an error when the tool-call echo does not match", async () => {

@@ -222,6 +222,38 @@ describe.skipIf(process.platform === "win32")("openTerminal", () => {
 		await expect(terminal.exited).rejects.toMatchObject({ code: "aborted" });
 	});
 
+	it("contains a failing output callback and leaves other terminals on the connection running", async () => {
+		const { connection, cwd } = connect();
+		const output = collector();
+		const other = await openTerminal(connection, {
+			cwd,
+			argv: ["/bin/sh"],
+			cols: 80,
+			rows: 24,
+			onData: output.onData,
+		});
+		const failure = new Error("terminal consumer failed");
+		let calls = 0;
+		const terminal = await openTerminal(connection, {
+			cwd,
+			argv: ["/bin/sh", "-c", "read line; while :; do printf output; done"],
+			cols: 80,
+			rows: 24,
+			onData: () => {
+				calls++;
+				throw failure;
+			},
+		});
+		const rejected = expect(terminal.exited).rejects.toBe(failure);
+		terminal.write("start\n");
+		await rejected;
+		expect(calls).toBe(1);
+		await expect(terminal.foreground()).rejects.toMatchObject({ code: "EBADF" });
+		other.write("printf SURVIVED; exit 7\n");
+		expect(await other.exited).toBe(7);
+		expect(output.bytes().toString()).toContain("SURVIVED");
+	});
+
 	it("fails to open in a missing directory", async () => {
 		const { connection, cwd } = connect();
 		await expect(

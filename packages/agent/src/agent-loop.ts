@@ -195,6 +195,10 @@ async function runAgentLoopInternal(
 		...context,
 		messages: [...context.messages, ...initialMessages],
 	};
+	if (execution) {
+		execution.context = currentContext;
+		execution.newMessages = newMessages;
+	}
 
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
@@ -239,6 +243,10 @@ async function runAgentLoopContinueInternal(
 	const newMessages: AgentMessage[] = [];
 	const currentContext: AgentContext =
 		effectiveMessages.length !== context.messages.length ? { ...context, messages: effectiveMessages } : context;
+	if (execution) {
+		execution.context = currentContext;
+		execution.newMessages = newMessages;
+	}
 
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });

@@ -108,6 +108,15 @@ export async function createNativeTokenizerFixture(options: HarnessOptions = {})
 			const response = responses.shift() ?? fauxAssistantMessage("safe checkpoint");
 			if (response.stopReason === "error")
 				return Response.json({ error: { message: response.errorMessage } }, { status: 400 });
+			const request = JSON.parse(body) as { max_tokens?: number; max_completion_tokens?: number };
+			const cap = request.max_completion_tokens ?? request.max_tokens ?? Number.POSITIVE_INFINITY;
+			const text = response.content
+				.filter((part) => part.type === "text")
+				.map((part) => part.text)
+				.join("");
+			// Deterministic fixture tokenization: four text characters per output token.
+			const requiredTokens = Math.ceil(text.length / 4);
+			const completionTokens = Math.min(requiredTokens, cap);
 			const chunk = {
 				id: "summary",
 				object: "chat.completion.chunk",
@@ -118,15 +127,12 @@ export async function createNativeTokenizerFixture(options: HarnessOptions = {})
 						index: 0,
 						delta: {
 							role: "assistant",
-							content: response.content
-								.filter((part) => part.type === "text")
-								.map((part) => part.text)
-								.join(""),
+							content: text.slice(0, completionTokens * 4),
 						},
-						finish_reason: "stop",
+						finish_reason: requiredTokens > cap ? "length" : "stop",
 					},
 				],
-				usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+				usage: { prompt_tokens: 10, completion_tokens: completionTokens, total_tokens: 10 + completionTokens },
 			};
 			return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, {
 				headers: { "content-type": "text/event-stream" },

@@ -87,6 +87,33 @@ describe("atomic session file rewrite", () => {
 		);
 	});
 
+	// Finding #27: failure must not navigate before the summary is durable.
+	it.each([null, "ancestor"] as const)("keeps the outgoing branch after failed summary append to %s", (target) => {
+		const { session, user, file } = createSession();
+		const leaf = session.getLeafId();
+		const revision = session.getContextRevision();
+		const entries = structuredClone(session.getEntries());
+		const projection = structuredClone(session.buildSessionProjection());
+		const bytes = fs.readFileSync(file);
+		const destination = target === null ? null : user;
+		const failure = new Error("branch summary append failure");
+		vi.mocked(fs.appendFileSync).mockImplementationOnce(() => {
+			throw failure;
+		});
+
+		expect(() => session.branchWithSummary(destination, "checkpoint")).toThrow(failure);
+		expect(session.getLeafId()).toBe(leaf);
+		expect(session.getContextRevision()).toBe(revision);
+		expect(session.getEntries()).toEqual(entries);
+		expect(session.buildSessionProjection()).toEqual(projection);
+		expect(fs.readFileSync(file)).toEqual(bytes);
+		const next = session.appendMessage(userMsg("still on the outgoing branch"));
+		expect(session.getEntry(next)?.parentId).toBe(leaf);
+		const summary = session.branchWithSummary(destination, "retry checkpoint");
+		expect(session.getEntry(summary)).toMatchObject({ parentId: destination, fromId: next });
+		expect(SessionManager.open(file, dir, dir).getLeafId()).toBe(summary);
+	});
+
 	it.each(["initial", "flushed"] as const)("does not publish a failed %s append", (mode) => {
 		const session = SessionManager.create(dir, dir);
 		session.appendSystemPrompt("original");

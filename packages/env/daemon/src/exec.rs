@@ -279,7 +279,7 @@ fn run_with_shell(
         }
         (None, Some(argv)) => match argv.split_first() {
             Some((first, rest)) => (
-                sys::resolve_program(first, &request.cwd, &request.env)?,
+                sys::resolve_program(first, &request.cwd, &request.env, request.inherit_env)?,
                 rest.to_vec(),
                 None,
             ),

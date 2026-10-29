@@ -14,8 +14,8 @@ import {
 } from "@earendil-works/pi-ai";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 import { MemoryStorage, ToolResultEntry, UsageDoc } from "@earendil-works/pi-durable";
+import { createCodemodeExtension, createCodemodeTool, createModelTools } from "@earendil-works/pi-durable/codemode";
 import { describe, expect, it } from "vitest";
-import { createCodemodeExtension } from "../src/codemode/codemode.ts";
 import type { ExecutionEnv } from "../src/env/index.ts";
 import { NodeExecutionEnv } from "../src/env/node.ts";
 import { createReadTool } from "../src/tools/read.ts";
@@ -36,7 +36,7 @@ const USAGE = {
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
 /** A chat whose models also have a classifier and an image model of a test provider, and the code mode extension. */
-function modelsChat() {
+function modelsChat(standalone = false) {
 	const setup = chatSetup();
 	const calls = { classify: 0, images: 0, inFlight: 0, maxInFlight: 0 };
 	const classified: ClassifierContext[] = [];
@@ -122,7 +122,12 @@ function modelsChat() {
 			},
 		}),
 	);
-	setup.registry.install(createCodemodeExtension({ sandbox: new CodemodeSandbox() }));
+	const sandbox = new CodemodeSandbox();
+	setup.registry.install(
+		standalone
+			? { name: "scripts", tools: [createCodemodeTool({ sandbox }), ...createModelTools()] }
+			: createCodemodeExtension({ sandbox }),
+	);
 	return { setup, calls, classified, gate };
 }
 
@@ -145,6 +150,36 @@ async function run(chat: ReturnType<typeof modelsChat>, code: string, env?: Exec
 }
 
 describe("code mode models.*", () => {
+	it("runs classifier and image effects with explicitly composed standalone companions", async () => {
+		const chat = modelsChat(true);
+		const { text, message, usage } = await run(
+			chat,
+			`const judge = await models.getModelOfType("classifier", "test", "judge");
+			const classified = await models.classify(judge, {
+				state: {}, questions: { good: { type: "bool", instructions: "?", criteria: { true: "y", false: "n" } } },
+			});
+			const painter = await models.getModelOfType("image", "test", "painter");
+			const generated = await models.generateImages(painter, { input: [{ type: "text", text: "cat" }] });
+			image(generated.output[0]);
+			return [classified.answers.good.value, generated.stopReason,
+				ALL_TOOLS.some((tool) => tool.name.startsWith("pi.codemode.")),
+				(await searchTools("classify generate images")).length];`,
+		);
+		expect(text).toContain('[true,"stop",false,0]');
+		expect(message.content.filter((item) => item.type === "image")).toEqual([
+			{ type: "image", data: PNG, mimeType: "image/png" },
+		]);
+		expect(chat.calls.classify).toBe(1);
+		expect(chat.calls.images).toBe(1);
+		expect(usage?.tools["pi.codemode.models.classify"]?.cost.total).toBeCloseTo(0.0012);
+		// Tool execution creates these details in-process, alongside its output.
+		const details = message.details as { calls: { name: string; status: string }[] };
+		expect(details.calls).toMatchObject([
+			{ name: "models.classify", status: "ok" },
+			{ name: "models.generateImages", status: "ok" },
+		]);
+	});
+
 	it("shows a read PNG and passes the same image through code mode to a classifier", async () => {
 		const chat = modelsChat();
 		addTool(chat.setup.registry, createReadTool());
