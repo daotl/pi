@@ -230,9 +230,15 @@ function objectFits(sub: Schema, sup: Schema, mode: "value" | "cleaned-input"): 
 function arrayFits(sub: Schema, sup: Schema, mode: "value" | "cleaned-input"): boolean {
 	if (Array.isArray(sup.items)) {
 		if (!Array.isArray(sub.items) || sub.items.length !== sup.items.length) return false;
+		const subTail = sub.additionalItems ?? true;
+		const supTail = sup.additionalItems ?? true;
+		if (subTail !== false && (supTail === false || !fits(subTail, supTail, mode))) return false;
 		return sub.items.every((item, index) => fits(item, (sup.items as unknown[])[index], mode));
 	}
-	if (Array.isArray(sub.items)) return sub.items.every((item) => fits(item, sup.items, mode));
+	if (Array.isArray(sub.items)) {
+		if (sub.additionalItems !== false && !fits(sub.additionalItems, sup.items, mode)) return false;
+		return sub.items.every((item) => fits(item, sup.items, mode));
+	}
 	return fits(sub.items, sup.items, mode);
 }
 

@@ -63,4 +63,28 @@ describe("HTML export CJK emphasis", () => {
 	it("keeps CommonMark flanking rules for non-CJK text", () => {
 		expect(parse("**end.**Then next")).toBe("<p>**end.**Then next</p>\n");
 	});
+
+	it.each([
+		["- [ ] first\n- normal\n\n  [ ] literal", "first", "[ ] literal"],
+		["- [x] first\n- normal\n\n  [x] literal", "first", "[x] literal"],
+		["- [ ] first\n- [x] second\n\n  [ ] literal", "second", "[ ] literal"],
+		["- [x] outer\n  - [ ] inner\n- normal\n\n  [x] literal", "inner", "[x] literal"],
+		["> - [ ] first\n> - normal\n>\n>   [ ] literal", "first", "[ ] literal"],
+	])("keeps task labels and later literal markers in %j", (markdown, label, literal) => {
+		const html = parse(markdown);
+		expect(html).toMatch(new RegExp(`type="checkbox"[^>]*> ${label}`));
+		expect(html).toContain(`<p>${literal}</p>`);
+		expect(html).not.toContain("[ ] first");
+		expect(html).not.toContain("[x] first");
+		expect(html).not.toContain("[x] second");
+		expect(html).not.toContain("[x] outer");
+		expect(html).not.toContain("[ ] inner");
+	});
+
+	it("keeps task markers in unrelated quoted and code content", () => {
+		const html = parse("- [ ] **first**\n- normal\n\n  > [ ] quoted\n\n  `[x] code`");
+		expect(html).toContain('type="checkbox"> <strong>first</strong>');
+		expect(html).toContain("<p>[ ] quoted</p>");
+		expect(html).toContain("<code>[x] code</code>");
+	});
 });

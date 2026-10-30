@@ -1,6 +1,15 @@
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+	copyFileSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer, Socket } from "node:net";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
@@ -13,6 +22,7 @@ import { RemoteExecutionEnv } from "../src/remote-env.ts";
 import {
 	acceptHostKey,
 	connectSsh,
+	detectPlatform,
 	forgetHostKey,
 	HostKeyChangedError,
 	HostKeyUnknownError,
@@ -116,6 +126,87 @@ async function freePort(): Promise<number> {
 		});
 	});
 }
+
+describe.skipIf(process.platform === "win32")("Windows POSIX SSH shells", () => {
+	for (const system of ["MINGW64_NT-10.0", "MSYS_NT-10.0", "CYGWIN_NT-10.0"]) {
+		it(`launches the daemon through ${system} using native Windows platform details`, async () => {
+			const root = mkdtempSync(join(tmpdir(), "pi-env-windows-posix-"));
+			const home = "C:\\Users\\home 'quoted' with spaces";
+			const file = `${home.replaceAll("\\", "/")}/.pi/mobile/tools/${deployedName}.exe`;
+			const ssh = join(root, "ssh");
+			mkdirSync(join(root, file, ".."), { recursive: true });
+			copyFileSync(daemon, join(root, file));
+			writeFileSync(
+				ssh,
+				[
+					`#!${process.execPath}`,
+					'const { spawnSync } = require("node:child_process");',
+					'const command = process.argv.slice(process.argv.indexOf("--") + 2).join(" ");',
+					`if (command.startsWith("sh -c ")) { console.log(${JSON.stringify(`PI-ENV-PROBE\n${system}\nx86_64\n-\n/home/posix\n-\n-`)}); process.exit(0); }`,
+					`if (command.startsWith("powershell ")) { const script = Buffer.from(command.split(" ").at(-1), "base64").toString("utf16le"); console.log(script.includes("PI-ENV-PROBE") ? ${JSON.stringify(`PI-ENV-PROBE\nWindows\nARM64\n-\n${home}\n-\n-`)} : "present"); process.exit(0); }`,
+					'if (command === "echo %OS%") { console.log("%OS%"); process.exit(0); }',
+					"if (command.startsWith('\"PI-ENV-POWERSHELL-\"')) { process.exit(1); }",
+					`const result = spawnSync("sh", ["-c", command], { cwd: ${JSON.stringify(root)}, stdio: "inherit" });`,
+					"if (result.error) throw result.error; process.exit(result.status ?? 1);",
+				].join("\n"),
+				{ mode: 0o700 },
+			);
+			let connection: Connection | undefined;
+			try {
+				const connected = await connectSsh({
+					host: "windows-posix",
+					hostKeyAlias: "windows-posix",
+					knownHostsFile: join(root, "known_hosts"),
+					ssh,
+					binary: daemon,
+				});
+				connection = connected.connection;
+				expect(connected.remote).toMatchObject({ platform: "windows", arch: "arm64", home, shell: "posix" });
+				expect((await connection.info()).protocol).toBe(1);
+			} finally {
+				connection?.close();
+				rmSync(root, { recursive: true, force: true });
+			}
+		});
+	}
+	for (const shell of ["powershell", "cmd"] as const) {
+		it(`keeps the outer ${shell} shell when child sh reports MINGW`, async () => {
+			const root = mkdtempSync(join(tmpdir(), "pi-env-native-shell-"));
+			const ssh = join(root, "ssh");
+			const home = "C:\\Users\\native home";
+			writeFileSync(
+				ssh,
+				[
+					`#!${process.execPath}`,
+					'const command = process.argv.slice(process.argv.indexOf("--") + 2).join(" ");',
+					`if (command.startsWith("sh -c ")) { console.log("PI-ENV-PROBE\\nMINGW64_NT-10.0\\nx86_64\\n-\\n/home/child\\n-\\n-"); process.exit(0); }`,
+					`if (command.startsWith("powershell ")) { console.log(${JSON.stringify(`PI-ENV-PROBE\nWindows\nARM64\n-\n${home}\n-\n-`)}); process.exit(0); }`,
+					`if (command === "echo %OS%") { console.log(${JSON.stringify(shell === "cmd" ? "Windows_NT" : "%OS%")}); process.exit(0); }`,
+					`if (command.startsWith('"PI-ENV-POWERSHELL-"')) { console.log("PI-ENV-POWERSHELL-5"); process.exit(0); }`,
+					'console.error("Unexpected SSH command: " + command); process.exit(1);',
+				].join("\n"),
+				{ mode: 0o700 },
+			);
+			try {
+				expect(
+					await detectPlatform({
+						host: "native-shell",
+						hostKeyAlias: "native-shell",
+						knownHostsFile: join(root, "known_hosts"),
+						ssh,
+					}),
+				).toMatchObject({
+					platform: "windows",
+					arch: "arm64",
+					home,
+					shell,
+				});
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		});
+	}
+});
 
 async function waitForPort(port: number): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt++) {

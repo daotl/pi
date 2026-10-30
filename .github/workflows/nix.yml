@@ -55,6 +55,7 @@ jobs:
       revision: ${{ steps.pin.outputs.revision }}
       generatedAt: ${{ steps.pin.outputs.generatedAt }}
       updated: ${{ steps.pin.outputs.updated }}
+      sourceSha: ${{ steps.pin.outputs.sourceSha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -70,6 +71,7 @@ jobs:
         id: pin
         run: |
           set -euo pipefail
+          echo "sourceSha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
           # A release tag must build with its committed pin; it cannot be changed.
           if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
             node scripts/update-model-catalog-pin.mjs --if-stale
@@ -108,6 +110,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.pin.outputs.sourceSha }}
           persist-credentials: false
 
       - name: Use the resolved model catalog pin
@@ -168,14 +171,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: ${{ needs.pin.outputs.sourceSha }}
 
       - name: Commit and push the model catalog pin
         env:
           REVISION: ${{ needs.pin.outputs.revision }}
           GENERATED_AT: ${{ needs.pin.outputs.generatedAt }}
+          VERIFIED_SHA: ${{ needs.pin.outputs.sourceSha }}
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${VERIFIED_SHA}"
+          git fetch origin main
+          if [[ "$(git rev-parse origin/main)" != "${VERIFIED_SHA}" ]]; then
+            echo "Main advanced after verification; leaving its catalog pin unchanged."
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           printf '{\n  "revision": "%s",\n  "generatedAt": "%s"\n}\n' "${REVISION}" "${GENERATED_AT}" > nix/model-catalog.json
@@ -185,11 +195,12 @@ jobs:
             exit 0
           fi
           git commit -m "chore: update Nix model catalog pin"
-          for attempt in 1 2 3; do
-            if git push origin HEAD:main; then
+          if ! git push origin HEAD:main; then
+            git fetch origin main
+            if [[ "$(git rev-parse origin/main)" != "${VERIFIED_SHA}" ]]; then
+              echo "Main advanced during publication; reverify the new source before pinning."
               exit 0
             fi
-            sleep $((attempt * 5))
-            git pull --rebase origin main
-          done
-          exit 1
+            exit 1
+          fi
+          exit 0

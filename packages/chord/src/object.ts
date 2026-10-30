@@ -408,6 +408,10 @@ export class CtxImpl implements Ctx {
 	readonly principal: unknown;
 	/** Code holders (tasks): every call they make starts a fresh root. */
 	readonly holder: boolean;
+	/** Private initializer dispatch: only pending-only dependencies, never a public code version. */
+	readonly preparationCodeVersion: number | undefined;
+	readonly preparationInvocations: Set<Promise<unknown>> | undefined;
+	readonly preparationSignal: AbortSignal | undefined;
 	readonly #refs: RefCore[] = [];
 	readonly #release: () => void;
 	/** Aborted when the ctx closes: awaited `get`s give up. */
@@ -441,6 +445,9 @@ export class CtxImpl implements Ctx {
 			codeVersion: number;
 			principal: unknown;
 			holder?: boolean;
+			preparationCodeVersion?: number;
+			preparationInvocations?: Set<Promise<unknown>>;
+			preparationSignal?: AbortSignal;
 		},
 	) {
 		this.host = host;
@@ -451,6 +458,9 @@ export class CtxImpl implements Ctx {
 		this.codeVersion = fields.codeVersion;
 		this.principal = fields.principal;
 		this.holder = fields.holder ?? false;
+		this.preparationCodeVersion = fields.preparationCodeVersion;
+		this.preparationInvocations = fields.preparationInvocations;
+		this.preparationSignal = fields.preparationSignal;
 	}
 
 	async get<C extends AnyContract>(type: C, input: InputOf<C>, options?: GetOptions): Promise<Ref<C>> {
@@ -467,10 +477,16 @@ export class CtxImpl implements Ctx {
 	 */
 	child(object: ObjectImpl): CtxImpl {
 		return new CtxImpl(this.host, {
-			signals: [this.signal, object.callAbort.signal],
+			signals:
+				this.preparationSignal === undefined
+					? [this.signal, object.callAbort.signal]
+					: [this.signal, object.callAbort.signal, this.preparationSignal],
 			rootId: this.rootId,
 			codeVersion: this.codeVersion,
 			principal: this.host.principal,
+			preparationCodeVersion: this.preparationCodeVersion,
+			preparationInvocations: this.preparationInvocations,
+			preparationSignal: this.preparationSignal,
 		});
 	}
 
@@ -725,7 +741,10 @@ class MemberReadable implements Readable<unknown> {
 		this.#values.clear();
 		this.#events.clear();
 		this.#unseen.clear();
-		this.bind();
+		const upstream = this.#upstream;
+		this.#upstream = noop;
+		this.#source = undefined;
+		upstream();
 	}
 
 	#current(): Readable<unknown> | undefined {
@@ -853,9 +872,12 @@ export class RefImpl {
 		if (this.status === "released" || this.status === "gone") return;
 		this.status = "gone";
 		this.error = error;
-		this.#stopReadables();
-		this.#statusChanged();
-		for (const listener of [...this.goneListeners]) listener(error);
+		try {
+			this.#stopReadables();
+		} finally {
+			this.#statusChanged();
+			for (const listener of [...this.goneListeners]) listener(error);
+		}
 	}
 
 	shapeChanged(): void {
@@ -957,7 +979,12 @@ export class RefImpl {
 				try {
 					context?.check(this.object.host);
 					if (context !== undefined && !context.holder) {
-						const installed = this.object.implementations.get(context.codeVersion);
+						const installed =
+							this.object.implementations.get(context.codeVersion) ??
+							(context.preparationCodeVersion !== undefined &&
+							context.preparationCodeVersion === this.object.host.pendingCodeVersion()
+								? this.object.implementations.get(context.preparationCodeVersion)
+								: undefined);
 						if (installed !== undefined) variant = variantOf(this.viewOf(installed));
 					}
 				} catch (error) {
@@ -993,7 +1020,17 @@ export class RefImpl {
 	}
 
 	#stopReadables(): void {
-		for (const readable of this.readables.values()) readable.stop();
+		let errors: unknown[] | undefined;
+		for (const readable of this.readables.values()) {
+			try {
+				readable.stop();
+			} catch (error) {
+				errors ??= [];
+				errors.push(error);
+			}
+		}
+		if (errors?.length === 1) throw errors[0];
+		if (errors !== undefined) throw new AggregateError(errors, `${this.object.address}: readable cleanup failed`);
 	}
 }
 
@@ -1085,6 +1122,9 @@ export class ObjectImpl {
 	#taskRuns = 0;
 	#linger: ReturnType<typeof setTimeout> | undefined;
 	#disposal: Promise<void> | undefined;
+	/** Revoked link holds no longer release through Connection; retain their background error reporting. */
+	#reportRevokedDisposal = false;
+	readonly #revocationErrors: unknown[] = [];
 
 	constructor(host: HostCore, identity: ObjectIdentity) {
 		this.host = host;
@@ -1133,7 +1173,7 @@ export class ObjectImpl {
 			if (signal.aborted) throw abandoned();
 			await this.waitHydrated(run);
 			if (signal.aborted) throw abandoned();
-			await this.initCells(run, signal);
+			await this.initCells(run, signal, this.host.pendingCodeVersion());
 			if (signal.aborted) throw abandoned();
 			this.host.checkRegistrations(this, run.decls);
 			this.decls = run.decls;
@@ -1304,11 +1344,33 @@ export class ObjectImpl {
 	 * Fills the cells `run` created with `init`, each in a root of its own, in parallel; settles all before failing. Runs
 	 * after the run's resources are open and its references live, before anything reads the cells.
 	 */
-	async initCells(run: Run, signal: AbortSignal): Promise<void> {
+	async initCells(run: Run, signal: AbortSignal, preparationCodeVersion?: number): Promise<void> {
 		if (run.created.inits.length === 0) return;
 		const results = await Promise.allSettled(
 			run.created.inits.map(async ([cell, init]) => {
-				const value = await this.host.root((ctx) => init(ctx), { signal });
+				const value = await this.host.root(
+					async (root) => {
+						const lifetime = new AbortController();
+						const invocations = new Set<Promise<unknown>>();
+						const ctx = new CtxImpl(this.host, {
+							signals: [root.signal, lifetime.signal],
+							rootId: root.rootId,
+							codeVersion: root.codeVersion,
+							principal: root.principal,
+							preparationCodeVersion,
+							preparationInvocations: invocations,
+							preparationSignal: lifetime.signal,
+						});
+						try {
+							return await init(ctx);
+						} finally {
+							lifetime.abort(new ChordError("aborted", "initializer settled"));
+							ctx.close();
+							while (invocations.size > 0) await Promise.allSettled([...invocations]);
+						}
+					},
+					{ signal },
+				);
 				if (!signal.aborted) cell.initialize(value);
 			}),
 		);
@@ -1573,6 +1635,7 @@ export class ObjectImpl {
 	 */
 	#deliver(key: string, event: unknown): void {
 		enqueue(() => {
+			if (this.callAbort.signal.aborted) return;
 			if (this.gate !== undefined) {
 				this.gate.queue.push({ key, event });
 				return;
@@ -1641,13 +1704,18 @@ export class ObjectImpl {
 		ctx.check(this.host);
 		if (ref.status === "released" || ref.status === "gone") throw ref.terminalError();
 		if (ref.status === "loading") await raceSignal(ref.ready, ctx.signal);
+		if (this.callAbort.signal.aborted) throw this.callAbort.signal.reason;
 		if (ref.status !== "live" || this.status !== "live") {
 			throw ref.status === "live"
 				? new ChordError("gone", `${this.address} is ${this.status}`)
 				: ref.terminalError();
 		}
 		this.admit(ctx);
-		const installed = this.implementations.get(ctx.codeVersion);
+		const installed =
+			this.implementations.get(ctx.codeVersion) ??
+			(ctx.preparationCodeVersion !== undefined && ctx.preparationCodeVersion === this.host.pendingCodeVersion()
+				? this.implementations.get(ctx.preparationCodeVersion)
+				: undefined);
 		if (installed === undefined)
 			throw new ChordError(
 				"superseded",
@@ -1686,11 +1754,17 @@ export class ObjectImpl {
 		const child = ctx.child(this);
 		let result: unknown;
 		try {
-			result = await this.#invoke(() =>
+			const invocation = this.#invoke(() =>
 				takesArgs
 					? (fn as (args: unknown, ctx: Ctx) => unknown)(input, child)
 					: (fn as (ctx: Ctx) => unknown)(child),
 			);
+			ctx.preparationInvocations?.add(invocation);
+			try {
+				result = await invocation;
+			} finally {
+				ctx.preparationInvocations?.delete(invocation);
+			}
 		} finally {
 			child.close();
 		}
@@ -1726,6 +1800,7 @@ export class ObjectImpl {
 
 	addRef(ref: RefImpl): void {
 		this.refs.add(ref);
+		if (this.callAbort.signal.aborted) ref.gone(this.callAbort.signal.reason);
 		if (this.#linger !== undefined) clearTimeout(this.#linger);
 		this.#linger = undefined;
 	}
@@ -1760,12 +1835,39 @@ export class ObjectImpl {
 		disposal.catch((error: unknown) => this.host.report(error));
 	}
 
+	/** Ends principal authority synchronously, independently of holder-first resource cleanup. */
+	revoke(reason: unknown): void {
+		if (
+			this.#disposal === undefined &&
+			this.refs.size > 0 &&
+			[...this.refs].every((ref) => ref.owner === "connection" || ref.owner === "client")
+		) {
+			this.#reportRevokedDisposal = true;
+		}
+		// Fence reentrant acquisitions before any abort or gone observer can recover the reference.
+		const refs = [...this.refs];
+		this.callAbort.abort(reason);
+		this.activationAbort.abort(reason);
+		this.stopTasks();
+		for (const ref of refs) {
+			try {
+				ref.gone(reason);
+			} catch (error) {
+				this.#revocationErrors.push(error);
+			}
+		}
+	}
+
 	/**
 	 * Disposes the object. Forced: references become gone at once (new calls are rejected) and running invocations are
 	 * cancelled. Either way, resources close only after every invocation settled.
 	 */
 	dispose(forced: boolean, reason?: unknown): Promise<void> {
 		this.#disposal ??= this.#dispose(forced, reason);
+		if (this.#reportRevokedDisposal) {
+			this.#reportRevokedDisposal = false;
+			this.#background(this.#disposal);
+		}
 		return this.#disposal;
 	}
 
@@ -1785,7 +1887,8 @@ export class ObjectImpl {
 		for (const ref of this.refs) ref.gone(error);
 		const decls = this.allDecls();
 		this.stopTasks();
-		this.stopListeners();
+		const subscriptions = [...this.#subscriptions.values()];
+		this.#subscriptions.clear();
 		await Promise.allSettled([...this.#invocations]);
 		await Promise.allSettled([...this.retirements]);
 		const registered = [...decls].some((set) => set.registrations.size > 0) && !this.deferredRuntime;
@@ -1799,6 +1902,10 @@ export class ObjectImpl {
 		try {
 			await runAll(
 				[
+					...this.#revocationErrors.map((failure) => () => {
+						throw failure;
+					}),
+					...subscriptions.map((subscription) => () => subscription.unsubscribe()),
 					() => Promise.allSettled([...this.#stopped]),
 					...[...this.openOrder].reverse().map((resource) => () => resource.close(this.openOrder)),
 					...[...refs].map((ref) => () => ref.release()),

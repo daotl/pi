@@ -1,5 +1,4 @@
 import type { AssistantMessage, AssistantMessageEvent, TextContent, ThinkingContent, ToolCall } from "../types.ts";
-import { parseStreamingJson } from "./json-parse.ts";
 import { type JsonChange, ToolCallArgumentsStream } from "./streaming-json.ts";
 
 /**
@@ -40,8 +39,8 @@ type EncoderBlockState =
 	| {
 			kind: "toolCall";
 			caughtUp: boolean;
-			catchupJson: string;
-			snapshotArguments: string;
+			catchupArguments: ToolCallArgumentsStream | undefined;
+			snapshotArguments: ToolCall["arguments"] | undefined;
 			rawCoveredChars: number;
 			rawDeltaChars: number;
 	  };
@@ -112,14 +111,6 @@ function eventBlock(event: Exclude<AssistantMessageEvent, { type: "start" | "don
 	}
 	return block;
 }
-
-function serializedArguments(argumentsValue: ToolCall["arguments"]): string {
-	const serialized = JSON.stringify(argumentsValue);
-	if (serialized === undefined) throw new Error("Tool-call arguments are not JSON-serializable");
-	return serialized;
-}
-
-const EMPTY_PARSED_TOOL_ARGUMENTS = serializedArguments(parseStreamingJson<ToolCall["arguments"]>(""));
 
 function isJsonPrefix(snapshot: unknown, current: unknown): boolean {
 	if (typeof snapshot === "string") return typeof current === "string" && current.startsWith(snapshot);
@@ -232,13 +223,12 @@ export class AssistantMessageFrameEncoder {
 				if (content.type !== "toolCall") {
 					throw new Error(`toolcall_start event points to ${content.type} block at index ${event.contentIndex}`);
 				}
-				const snapshotArguments = serializedArguments(content.arguments);
-				const caughtUp = snapshotArguments === EMPTY_PARSED_TOOL_ARGUMENTS;
+				const caughtUp = Object.keys(content.arguments).length === 0;
 				this.startBlock(event.contentIndex, {
 					kind: "toolCall",
 					caughtUp,
-					catchupJson: "",
-					snapshotArguments: caughtUp ? "" : snapshotArguments,
+					catchupArguments: caughtUp ? undefined : new ToolCallArgumentsStream(),
+					snapshotArguments: caughtUp ? undefined : structuredClone(content.arguments),
 					rawCoveredChars: content.raw?.length ?? 0,
 					rawDeltaChars: 0,
 				});
@@ -261,18 +251,15 @@ export class AssistantMessageFrameEncoder {
 				let checkpoint: string | undefined;
 				if (!state.caughtUp) {
 					if (event.delta.length > 0) {
-						state.catchupJson += event.delta;
-						const argumentsValue = parseStreamingJson<ToolCall["arguments"]>(state.catchupJson);
+						const catchupArguments = state.catchupArguments!;
+						const argumentsValue = catchupArguments.append(event.delta);
 						// Legacy grammar calls may extend, rather than exactly reproduce, the
 						// initial argument snapshot when their JSON stream catches up.
-						if (
-							serializedArguments(argumentsValue) === state.snapshotArguments ||
-							isJsonPrefix(parseStreamingJson<ToolCall["arguments"]>(state.snapshotArguments), argumentsValue)
-						) {
+						if (isJsonPrefix(state.snapshotArguments, argumentsValue)) {
 							state.caughtUp = true;
-							state.snapshotArguments = "";
-							checkpoint = state.catchupJson;
-							state.catchupJson = "";
+							state.snapshotArguments = undefined;
+							checkpoint = catchupArguments.text;
+							state.catchupArguments = undefined;
 						}
 					}
 					delta = "";

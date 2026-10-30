@@ -32,12 +32,19 @@ function withDeploymentName<T extends StreamOptions>(model: Model<Api>, options:
 function azureStreams(streams: ProviderStreams): ProviderStreams {
 	const wrapped: ProviderStreams = {
 		stream: (model, context, options) =>
-			lazyStream(model, async () =>
-				streams.stream(resolveAzureModel(model, options), context, withDeploymentName(model, options)),
+			lazyStream(
+				model,
+				async () => streams.stream(resolveAzureModel(model, options), context, withDeploymentName(model, options)),
+				undefined,
+				options?.signal,
 			),
 		streamSimple: (model, context, options) =>
-			lazyStream(model, async () =>
-				streams.streamSimple(resolveAzureModel(model, options), context, withDeploymentName(model, options)),
+			lazyStream(
+				model,
+				async () =>
+					streams.streamSimple(resolveAzureModel(model, options), context, withDeploymentName(model, options)),
+				undefined,
+				options?.signal,
 			),
 	};
 	return isContextClampingApiStreams(streams) ? markContextClampingApi(wrapped) : wrapped;

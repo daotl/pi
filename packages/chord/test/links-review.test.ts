@@ -180,8 +180,13 @@ describe("links review: identity and stamping", () => {
 		const [down, raw] = memoryLinkPair();
 		c.server.accept(down, { principal: { guest: "g" } });
 		raw.receive(() => {});
-		raw.send({ t: "hello", name: "session:S9", kind: "host", codeVersion: 1 });
+		let reason = "";
+		raw.onClose((closed) => {
+			reason = closed;
+		});
+		raw.send({ t: "hello", protocol: PROTOCOL_VERSION, name: "session:S9", kind: "host", codeVersion: 1 });
 		await until(() => raw.closed);
+		assert.match(reason, /^protocol error: hello host session:S9 does not match the accepted client/);
 		// A host link must have a name and its hello must match it.
 		assert.throws(() => c.server.accept(memoryLinkPair()[0], { principal: {}, kind: "host" }), /needs its name/);
 	});
@@ -397,6 +402,51 @@ describe("links review: relay ownership", () => {
 		await doc.ready;
 		assert.deepEqual(doc.view.value, { text: "hi" });
 	});
+	for (const member of ["result", "state"] as const) {
+		it(`refuses tuple ${member} tails outside a linked consumer contract`, async () => {
+			const schema = Type.Tuple([Type.String()]);
+			const wider = Type.Tuple([Type.String()], { additionalItems: true });
+			const consumer = remote(`t.link-tuple-${member}`, {
+				version: 1,
+				input: Type.Object({}),
+				host: hostNamed("server"),
+				variants: {
+					main: {
+						state: { value: member === "state" ? schema : wider },
+						methods: { read: method(undefined, member === "result" ? schema : wider) },
+					},
+				},
+			});
+			const provider = remote(consumer.name, {
+				...consumer.def,
+				variants: { main: { state: { value: wider }, methods: { read: method(undefined, wider) } } },
+			});
+			const server = createHost({ self: "host", name: "server", onError: () => {} });
+			server.serve(provider, (_input, _principal, self) => ({
+				variant: "main",
+				value: self.state("value", wider, ["x"]),
+				read: () => ["x"],
+			}));
+			const [down, up] = memoryLinkPair();
+			server.accept(down, { principal: "guest" });
+			const browser = createHost({
+				self: "host",
+				name: "browser",
+				kind: "client",
+				upstream: { link: up, principal: "server" },
+				onError: () => {},
+			});
+			try {
+				await assert.rejects(
+					browser.get(consumer, {}),
+					(error) => isChordError(error, "upgrade_required") && error.message.includes(member),
+				);
+			} finally {
+				await browser.close();
+				await server.close();
+			}
+		});
+	}
 });
 
 describe("links review: cross-host reload", () => {

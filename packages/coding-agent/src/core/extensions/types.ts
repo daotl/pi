@@ -210,7 +210,7 @@ export interface ExtensionUIContext {
 	/** Set the terminal window/tab title. */
 	setTitle(title: string): void;
 
-	/** Show a custom component with keyboard focus. */
+	/** Show a custom component with keyboard focus. Resolves undefined when the extension UI is reset. */
 	custom<T>(
 		factory: (
 			tui: TUI,
@@ -225,7 +225,7 @@ export interface ExtensionUIContext {
 			/** Called with the overlay handle after the overlay is shown. Use to control visibility. */
 			onHandle?: (handle: OverlayHandle) => void;
 		},
-	): Promise<T>;
+	): Promise<T | undefined>;
 
 	/** Paste text into the editor, triggering paste handling (collapse for large content). */
 	pasteToEditor(text: string): void;

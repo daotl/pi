@@ -2,7 +2,7 @@ import { type Context, type JsonValue, Watch, type WatchHandle } from "@earendil
 import { BACKGROUND_CONTEXT, withoutAbortSignal } from "@earendil-works/chord/context";
 import { applyImmutable, type Op } from "@earendil-works/chord/delta";
 import { contained, type ObservedCommit, type SessionImpl } from "../session/session.ts";
-import type { ConversationId, JoinPolicy, Storage, TaskId, TaskOutcome, TaskRecord } from "../types.ts";
+import type { ConversationId, Cursor, JoinPolicy, Storage, TaskId, TaskOutcome, TaskRecord } from "../types.ts";
 import { type BlockedReason, type BlockedSubject, blockedSubject } from "./scheduler.ts";
 import { closedError, scanAll } from "./util.ts";
 
@@ -164,11 +164,19 @@ export class TaskGraphView {
 			);
 		}
 		records.sort((a, b) => a.id - b.id);
+		const owned = new Map<TaskId, ConversationId[]>(records.map((record) => [record.id, []]));
+		if (owned.size > 0) {
+			let cursor: Cursor | undefined;
+			do {
+				const page = await this.#storage.scanConversations({}, SCAN_PAGE_SIZE, cursor, context);
+				for (const conversation of page.items) {
+					if (conversation.owner !== undefined) owned.get(conversation.owner.taskId)?.push(conversation.id);
+				}
+				cursor = page.next;
+			} while (cursor !== undefined);
+		}
 		for (const record of records) {
-			const owned = await scanAll((cursor) =>
-				this.#storage.scanConversations({ ownerTaskId: record.id }, SCAN_PAGE_SIZE, cursor, context),
-			);
-			const conversations = owned.map((conversation) => conversation.id).sort((a, b) => a - b);
+			const conversations = owned.get(record.id)!;
 			const subject = blockedSubject(record);
 			tasks[String(record.id)] = nodeOf(record, conversations, this.#blocking.blocked(subject));
 			live.set(String(record.id), subject);

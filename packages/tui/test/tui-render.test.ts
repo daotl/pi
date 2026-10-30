@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import { Box } from "../src/components/box.ts";
+import { HStack } from "../src/components/h-stack.ts";
 import { Image } from "../src/components/image.ts";
 import { Input } from "../src/components/input.ts";
 import { Text } from "../src/components/text.ts";
@@ -967,6 +968,219 @@ describe("TUI differential rendering", () => {
 });
 
 describe("TUI overlays over native-reflow content", () => {
+	for (const hiddenRows of [1, 2]) {
+		it(`paints over a scrolled Kitty continuation and restores its visible crop (${hiddenRows} hidden rows)`, async () => {
+			setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+			const terminal = new LoggingVirtualTerminal(20, 5);
+			const tui = new TuiMainScreen(terminal);
+			const base = new TestComponent();
+			const imageId = 2800 + hiddenRows;
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (text) => text },
+				{ maxWidthCells: 3, maxHeightCells: 3, imageId },
+				{ widthPx: 45, heightPx: 90 },
+			);
+			const imageLines = image.render(20);
+			assert.strictEqual(imageLines.length, 3);
+			base.lines = [
+				`\x1b[3mab\x1b[23m\x1b[2C${imageLines[0]}`,
+				...imageLines.slice(1),
+				...Array.from({ length: hiddenRows + 2 }, (_, i) => `after${i}`),
+			];
+			tui.addChild(base);
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				assert.strictEqual(tui.captureRenderState().previousViewportTop, hiddenRows);
+				const before = terminal.getScrollBuffer();
+				terminal.clearWrites();
+				const overlay = tui.showOverlay(new Text("X", 0, 0), { width: 1, row: 0, col: 5 });
+				await terminal.waitForRender();
+				assert.strictEqual(terminal.getViewport()[0].trimEnd(), "     X");
+				assert.ok(terminal.getWrites().includes(`\x1b_Ga=d,d=i,i=${imageId},q=2\x1b\\`));
+				terminal.clearWrites();
+				overlay.hide();
+				await terminal.waitForRender();
+				assert.deepStrictEqual(terminal.getScrollBuffer(), before);
+				const writes = terminal.getWrites();
+				const placement = /\x1b_Ga=p,([^\x1b]+)\x1b\\/.exec(writes);
+				assert.ok(placement, "the visible crop must be placed again");
+				assert.ok(placement[1].includes(`y=${hiddenRows * 30}`));
+				assert.ok(placement[1].includes(`h=${(3 - hiddenRows) * 30}`));
+				assert.ok(placement[1].includes(`r=${3 - hiddenRows}`));
+				assert.ok(
+					writes.includes(`\x1b[5G${placement[0]}`),
+					"cursor-forward prefix fixes the actual placement column",
+				);
+				assert.ok(!writes.includes("\x1b[3J"), "registered crops preserve scrollback");
+			} finally {
+				tui.stop();
+				resetCapabilitiesCache();
+			}
+		});
+	}
+
+	it("preserves styled text beside a Kitty anchor through disjoint overlay changes", async () => {
+		const terminal = new LoggingVirtualTerminal(24, 5);
+		const tui = new TuiMainScreen(terminal);
+		const base = new TestComponent();
+		base.lines = [
+			`\x1b[3mleft\x1b[23m ${encodeKitty("AAAA", { columns: 3, rows: 2, imageId: 2900, moveCursor: false })}\x1b[3Cright`,
+			"",
+			"after",
+		];
+		tui.addChild(base);
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[0], "left    right");
+			const before = terminal.getScrollBuffer();
+			terminal.clearWrites();
+			const overlay = tui.showOverlay(new Text("X", 0, 0), { width: 1, row: 0, col: 18 });
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[0].trimEnd(), "left    right     X");
+			assert.notStrictEqual(getCellItalic(terminal, 0, 0), 0);
+			overlay.hide();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getScrollBuffer(), before);
+			assert.notStrictEqual(getCellItalic(terminal, 0, 0), 0);
+			assert.ok(!terminal.getWrites().includes("\x1b_G"), "disjoint repaint leaves graphics untouched");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("retains a built-in HStack label beside an Image when a disjoint overlay closes", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		const terminal = new LoggingVirtualTerminal(30, 5);
+		const tui = new TuiMainScreen(terminal);
+		const image = new Image(
+			"AAAA",
+			"image/png",
+			{ fallbackColor: (text) => text },
+			{ maxWidthCells: 3, maxHeightCells: 2 },
+			{ widthPx: 30, heightPx: 36 },
+		);
+		tui.addChild(
+			new HStack([
+				{ component: new Text("LABEL", 0, 0), basis: 8 },
+				{ component: image, basis: 8 },
+			]),
+		);
+		tui.addChild(new Text("footer", 0, 0));
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			assert.ok(terminal.getViewport()[0].startsWith("LABEL"));
+			const before = terminal.getScrollBuffer();
+			terminal.clearWrites();
+			const overlay = tui.showOverlay(new Text("X", 0, 0), { width: 1, row: 0, col: 25 });
+			await terminal.waitForRender();
+			assert.ok(terminal.getViewport()[0].startsWith("LABEL"));
+			assert.strictEqual(terminal.getViewport()[0][25], "X");
+			overlay.hide();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getScrollBuffer(), before);
+			assert.ok(!terminal.getWrites().includes("\x1b_G"));
+		} finally {
+			tui.stop();
+			resetCapabilitiesCache();
+		}
+	});
+
+	for (const format of ["png", "chunked-png", "rgb", "rgba"] as const) {
+		it(`restores a raw partial ${format} without replaying history across repeated overlays`, async () => {
+			const terminal = new LoggingVirtualTerminal(20, 5);
+			const shellHistory = ["shell-history-one", "shell-history-two", "shell-history-three"];
+			terminal.write(`${shellHistory.join("\r\n")}\r\n`);
+			await terminal.flush();
+			const tui = new TuiMainScreen(terminal);
+			const base = new TestComponent();
+			const transcript = Array.from({ length: 16 }, (_, i) => `transcript-${i}`);
+			const imageId = 3800 + ["png", "chunked-png", "rgb", "rgba"].indexOf(format);
+			// Valid 3x90 RGBA PNG: the source height determines the crop, not terminal cells.
+			const png =
+				"iVBORw0KGgoAAAANSUhEUgAAAAMAAABaCAYAAAB9qeyAAAAAGUlEQVR4nGP4z8DwH4YZRjmjnFHOKGcgOQB2mRoDbjkRtQAAAABJRU5ErkJggg==";
+			let image: string;
+			if (format === "png") {
+				image = encodeKitty(png, { columns: 3, rows: 3, imageId, moveCursor: false });
+			} else if (format === "chunked-png") {
+				image = `\x1b_Ga=T,f=100,q=2,C=1,c=3,r=3,i=${imageId},m=1;${png.slice(0, 32)}\x1b\\\x1b_Gm=0;${png.slice(32)}\x1b\\`;
+			} else {
+				const data = Buffer.alloc(3 * 90 * (format === "rgb" ? 3 : 4), 255).toString("base64");
+				image = `\x1b_Ga=T,f=${format === "rgb" ? 24 : 32},s=3,v=90,q=2,C=1,c=3,r=3,i=${imageId};${data}\x1b\\`;
+			}
+			base.lines = [...transcript, image, "", "", "one", "two", "three", "four"];
+			tui.addChild(base);
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				const before = terminal.getScrollBuffer();
+				assert.strictEqual(tui.captureRenderState().previousViewportTop, 18);
+				assert.deepStrictEqual(before.slice(0, shellHistory.length), shellHistory);
+				for (let cycle = 0; cycle < 3; cycle++) {
+					terminal.clearWrites();
+					const overlay = tui.showOverlay(new Text("X", 0, 0), { width: 1, row: 0, col: 1 });
+					await terminal.waitForRender();
+					assert.strictEqual(terminal.getViewport()[0].trimEnd(), " X");
+					assert.ok(terminal.getWrites().includes(`\x1b_Ga=d,d=i,i=${imageId},q=2\x1b\\`));
+					terminal.clearWrites();
+					overlay.hide();
+					await terminal.waitForRender();
+					assert.deepStrictEqual(terminal.getScrollBuffer(), before);
+					const writes = terminal.getWrites();
+					const placement = /\x1b_Ga=p,([^\x1b]+)\x1b\\/.exec(writes);
+					assert.ok(placement, "the retained raw image must be placed again");
+					assert.ok(placement[1].includes("y=60,h=30,r=1"));
+					assert.ok(!writes.includes("\x1b[2J"));
+					assert.ok(!writes.includes("\x1b[3J"));
+					assert.ok(!writes.includes(png), "restore must not retransmit the image");
+					for (const line of [...shellHistory, ...transcript]) {
+						assert.strictEqual(terminal.getScrollBuffer().filter((entry) => entry === line).length, 1);
+						assert.ok(!writes.includes(line), "offscreen history must not be replayed");
+					}
+				}
+			} finally {
+				tui.stop();
+			}
+		});
+	}
+
+	it("retains an unknown partial custom placement when no crop geometry is available", async () => {
+		const terminal = new LoggingVirtualTerminal(20, 5);
+		const tui = new TuiMainScreen(terminal);
+		const base = new TestComponent();
+		base.lines = [
+			...Array.from({ length: 16 }, (_, i) => `transcript-${i}`),
+			"\x1b_Ga=T,f=100,t=f,c=3,r=3,i=2804;L3RtcC9jdXN0b20ucG5n\x1b\\",
+			"",
+			"",
+			"one",
+			"two",
+			"three",
+			"four",
+		];
+		tui.addChild(base);
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			const before = terminal.getScrollBuffer();
+			terminal.clearWrites();
+			const overlay = tui.showOverlay(new Text("X", 0, 0), { width: 1, row: 0, col: 1 });
+			await terminal.waitForRender();
+			overlay.hide();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getScrollBuffer(), before);
+			assert.ok(!terminal.getWrites().includes("\x1b_Ga=d"), "unknown source dimensions cannot be restored safely");
+			assert.ok(!terminal.getWrites().includes("\x1b[2J"));
+			assert.ok(!terminal.getWrites().includes("transcript-"));
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("paints disjoint overlays on Kitty anchor and continuation rows without touching the placement", async () => {
 		const terminal = new LoggingVirtualTerminal(20, 5);
 		const tui = new TuiMainScreen(terminal);

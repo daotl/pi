@@ -263,9 +263,14 @@ describe("link flow control", () => {
 		const [down, raw] = memoryLinkPair();
 		server.accept(down, { principal: { user: "u" } });
 		raw.receive(() => {});
-		raw.send({ t: "hello", name: "raw", kind: "client", codeVersion: 0, acks: true });
+		let reason = "";
+		raw.onClose((closed) => {
+			reason = closed;
+		});
+		raw.send({ t: "hello", protocol: PROTOCOL_VERSION, name: "raw", kind: "client", codeVersion: 0, acks: true });
 		raw.send({ t: "ack", n: 99 });
 		await until(() => raw.closed);
+		assert.match(reason, /^protocol error: ack 99 outside 0\.\.\d+$/);
 		await server.close();
 	});
 });

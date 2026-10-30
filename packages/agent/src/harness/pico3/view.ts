@@ -24,6 +24,8 @@ export interface Watch {
 	readonly view: ConversationView;
 	readonly revision: number;
 	readonly closed: boolean;
+	/** Settles once, including projection and listener failures; never rejects. */
+	readonly ended: Promise<{ reason: "stopped" } | { reason: "failed"; error: Error }>;
 	start(listener: (envelope: Envelope) => void): void;
 	stop(): void;
 }
@@ -44,6 +46,7 @@ type Delivery = { envelope: Envelope; watchers: WatchImpl[] };
 export class ViewManager {
 	private readonly records = new Map<Id, ViewRecord>();
 	private readonly deliveries: Delivery[] = [];
+	private readonly failures: { watcher: WatchImpl; error: unknown }[] = [];
 	private readonly session: Session;
 	private readonly onReport: (error: unknown) => void;
 
@@ -129,19 +132,21 @@ export class ViewManager {
 				this.deliveries.push({ envelope, watchers: [...record.watchers] });
 			} catch (error) {
 				this.records.delete(record.conversationId);
-				for (const watcher of [...record.watchers]) watcher.fail(error);
+				for (const watcher of [...record.watchers]) this.failures.push({ watcher, error });
 			}
 		}
 	}
 
 	/** Runs after the Session line; listeners are synchronous and ordered. */
 	deliver(): void {
+		for (const { watcher, error } of this.failures.splice(0)) watcher.fail(error);
 		for (const delivery of this.deliveries.splice(0)) {
 			for (const watcher of delivery.watchers) watcher.accept(delivery.envelope);
 		}
 	}
 
 	close(): void {
+		for (const { watcher, error } of this.failures.splice(0)) watcher.fail(error);
 		const records = [...this.records.values()];
 		this.records.clear();
 		this.deliveries.length = 0;
@@ -265,6 +270,8 @@ type EntryList = ConversationView["entries"];
 
 class WatchImpl implements Watch {
 	readonly view: ConversationView;
+	private readonly terminal = Promise.withResolvers<{ reason: "stopped" } | { reason: "failed"; error: Error }>();
+	readonly ended = this.terminal.promise;
 	private readonly initialRevision: number;
 	private readonly onReport: (error: unknown) => void;
 	private readonly onStop: () => void;
@@ -300,14 +307,14 @@ class WatchImpl implements Watch {
 		this.stopped = true;
 		this.buffer.length = 0;
 		this.onStop();
+		this.terminal.resolve({ reason: "stopped" });
 	}
 
 	accept(envelope: Envelope): void {
 		if (this.stopped) return;
 		if (this.listener === undefined) {
 			if (this.buffer.length >= WATCH_CAPACITY) {
-				this.stop();
-				this.report(new Error(`watch capacity ${WATCH_CAPACITY} exceeded before start()`));
+				this.fail(new Error(`watch capacity ${WATCH_CAPACITY} exceeded before start()`));
 				return;
 			}
 			this.buffer.push(envelope);
@@ -325,8 +332,13 @@ class WatchImpl implements Watch {
 	}
 
 	fail(error: unknown): void {
-		this.stop();
-		this.report(error);
+		if (this.stopped) return;
+		const failure = error instanceof Error ? error : new Error(String(error));
+		this.stopped = true;
+		this.buffer.length = 0;
+		this.onStop();
+		this.terminal.resolve({ reason: "failed", error: failure });
+		this.report(failure);
 	}
 
 	private report(error: unknown): void {

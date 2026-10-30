@@ -74,7 +74,7 @@ test("Chord bridge publishes exactly once per Pico envelope and converges to a f
 	await foreignInput.wait(ctx);
 	const fresh = await env.root.watch(ctx);
 	fresh.stop();
-	const { commit: _commit, ...published } = bridge.view.value;
+	const { commit: _commit, publication: _publication, ...published } = bridge.view.value;
 	assert.deepEqual(published, fresh.view);
 	raw.stop();
 });
@@ -83,8 +83,11 @@ test("Chord publication failure closes only the bridge and never rejects the per
 	const env = await open({});
 	onTestFinished(() => env.close());
 	let reported: Error | undefined;
+	const failures: Error[] = [];
+	let publicationAttempts = 0;
+	const raw = await env.root.watch(ctx);
 	const bridge = await attachChordView(
-		env.root,
+		{ watch: async () => raw },
 		(initial) => {
 			const state = replicatedState(initial);
 			return {
@@ -93,9 +96,11 @@ test("Chord publication failure closes only the bridge and never rejects the per
 				},
 				subscribe: (listener) => state.subscribe(listener),
 				change() {
+					publicationAttempts++;
 					throw new Error("publish failed");
 				},
 				replace() {
+					publicationAttempts++;
 					throw new Error("publish failed");
 				},
 			};
@@ -104,6 +109,7 @@ test("Chord publication failure closes only the bridge and never rejects the per
 		{
 			onFailure: (error) => {
 				reported = error;
+				failures.push(error);
 			},
 		},
 	);
@@ -113,6 +119,179 @@ test("Chord publication failure closes only the bridge and never rejects the per
 	await sleep(0);
 	assert.equal(bridge.closed, true);
 	assert.match(reported?.message ?? "", /publish failed/);
+	assert.equal(raw.closed, true);
+	assert.deepEqual(failures, [reported]);
+	const attemptsAtFailure = publicationAttempts;
+	bridge.close();
+	await env.root.write({ kind: "after.publication.failure" }, ctx);
+	await sleep(0);
+	assert.equal(publicationAttempts, attemptsAtFailure, "a failed bridge must never attempt another publication");
+	assert.deepEqual(failures, [reported]);
+});
+
+test("an unexpected raw watch stop publishes one terminal fault and no later commits", async () => {
+	const env = await open({});
+	onTestFinished(() => env.close());
+	const raw = await env.root.watch(ctx);
+	const failures: Error[] = [];
+	const bridge = await attachChordView({ watch: async () => raw }, replicatedState, ctx, {
+		onFailure: (error) => {
+			assert.equal(raw.closed, true);
+			failures.push(error);
+		},
+	});
+	onTestFinished(() => bridge.close());
+	const publications: PublishedConversationView[] = [];
+	onTestFinished(
+		bridge.view.subscribe((value, _context, delivery) => {
+			if (delivery.kind === "update") publications.push(structuredClone(value));
+		}),
+	);
+	raw.stop();
+	await raw.ended;
+	await sleep(0);
+	assert.equal(bridge.closed, true);
+	assert.deepEqual(bridge.view.value.publication, { status: "failed", error: "Pico view watch stopped" });
+	assert.deepEqual(
+		publications.map((value) => value.publication),
+		[bridge.view.value.publication],
+	);
+	assert.deepEqual(bridge.view.value.commit.events, []);
+	assert.equal(failures.length, 1);
+	assert.equal(failures[0]!.message, "Pico view watch stopped");
+	const terminal = structuredClone(bridge.view.value);
+	raw.stop();
+	bridge.close();
+	await env.root.write({ kind: "after.unexpected.stop" }, ctx);
+	await sleep(0);
+	assert.deepEqual(bridge.view.value, terminal);
+	assert.equal(publications.length, 1);
+	assert.equal(failures.length, 1);
+});
+
+test("startup queue overflow faults the bridge without publishing a buffered prefix or later commits", async () => {
+	const env = await open({});
+	onTestFinished(() => env.close());
+	const raw = await env.root.watch(ctx);
+	for (let index = 0; index < 3; index++) {
+		await env.root.write({ kind: "startup.buffered", data: { index } }, ctx);
+	}
+	const failures: Error[] = [];
+	const publications: PublishedConversationView[] = [];
+	const bridge = await attachChordView(
+		{ watch: async () => raw },
+		(initial) => {
+			const state = replicatedState(initial);
+			onTestFinished(
+				state.subscribe((value, _context, delivery) => {
+					if (delivery.kind === "update") publications.push(structuredClone(value));
+				}),
+			);
+			return state;
+		},
+		ctx,
+		{
+			capacity: 2,
+			onFailure: (error) => {
+				assert.equal(raw.closed, true);
+				failures.push(error);
+			},
+		},
+	);
+	onTestFinished(() => bridge.close());
+	await sleep(0);
+	assert.equal(raw.closed, true);
+	assert.equal(bridge.closed, true);
+	assert.deepEqual(bridge.view.value.publication, {
+		status: "failed",
+		error: "Pico-to-Chord view queue exceeded 2 envelopes",
+	});
+	assert.deepEqual(bridge.view.value.entries, raw.view.entries);
+	assert.deepEqual(bridge.view.value.commit.events, []);
+	assert.deepEqual(
+		publications.map((value) => value.publication),
+		[bridge.view.value.publication],
+	);
+	assert.equal(failures.length, 1);
+	assert.equal(failures[0]!.message, "Pico-to-Chord view queue exceeded 2 envelopes");
+	const terminal = structuredClone(bridge.view.value);
+	await env.root.write({ kind: "after.startup.overflow" }, ctx);
+	await sleep(0);
+	assert.deepEqual(bridge.view.value, terminal);
+	assert.equal(publications.length, 1);
+	assert.equal(failures.length, 1);
+});
+
+test("intentional bridge close stops the raw watch without fault publication or later delivery", async () => {
+	const env = await open({});
+	onTestFinished(() => env.close());
+	const raw = await env.root.watch(ctx);
+	const failures: Error[] = [];
+	const bridge = await attachChordView({ watch: async () => raw }, replicatedState, ctx, {
+		onFailure: (error) => failures.push(error),
+	});
+	onTestFinished(() => bridge.close());
+	const publications: PublishedConversationView[] = [];
+	onTestFinished(
+		bridge.view.subscribe((value, _context, delivery) => {
+			if (delivery.kind === "update") publications.push(structuredClone(value));
+		}),
+	);
+	const beforeClose = structuredClone(bridge.view.value);
+	bridge.close();
+	bridge.close();
+	assert.equal(raw.closed, true);
+	assert.equal(bridge.closed, true);
+	assert.deepEqual(await raw.ended, { reason: "stopped" });
+	await env.root.write({ kind: "after.intentional.close" }, ctx);
+	await sleep(0);
+	assert.deepEqual(bridge.view.value, beforeClose);
+	assert.deepEqual(publications, []);
+	assert.deepEqual(failures, []);
+});
+
+test("projection failure faults a held native Chord conversation without rejecting durable writes", async () => {
+	const harness = await Harness.open(new MemoryStorage(), { models: fake({ respond: () => ({ text: "ok" }) }) }, ctx);
+	const root = await harness.createConversation({}, ctx);
+	const env = { h: harness, root, close: () => harness.close(ctx) };
+	onTestFinished(() => env.close());
+	const namespace = env.h.namespace<{ fail: boolean }>(
+		"test.chord-projection",
+		{ sticky: { fail: false } },
+		{
+			view: (slice) => {
+				if (slice.fail) throw new Error("projection failed");
+				return { ok: true };
+			},
+		},
+	);
+	const host = createHost({ name: "harness", self: null });
+	onTestFinished(() => host.close());
+	await host.install(createPicoHarnessFacet(env.h));
+	const ref = await host.get(PicoConversationService, { conversationId: env.root.id });
+	onTestFinished(() => ref.release());
+	assert.deepEqual(ref.view.value.publication, { status: "live" });
+	await env.root.commit((tx) => {
+		tx.plugins(namespace).fail = true;
+	}, ctx);
+	await sleep(0);
+	assert.deepEqual(ref.view.value.publication, { status: "failed", error: "projection failed" });
+	assert.equal((await env.root.sticky(ctx)).plugins[namespace.id]?.fail, true);
+	await host.root((call) => ref.write({ kind: "note", data: { afterFailure: true } }, call));
+	assert.ok(
+		(await env.h.entries({ conversationId: env.root.id, limit: 100 }, ctx)).some(
+			(entry) => entry.data?.afterFailure === true,
+		),
+	);
+	await env.root.commit((tx) => {
+		tx.plugins(namespace).fail = false;
+	}, ctx);
+	await sleep(0);
+	assert.equal(ref.view.value.publication.status, "failed");
+	const fresh = await attachChordView(env.root, replicatedState, ctx);
+	onTestFinished(() => fresh.close());
+	assert.deepEqual(fresh.view.value.publication, { status: "live" });
+	assert.ok(fresh.view.value.entries.some((entry) => entry.data?.afterFailure === true));
 });
 
 test("native Chord conversation objects retain keyed config and conversation scope", async () => {

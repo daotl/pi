@@ -531,7 +531,7 @@ An object lives while it's **referenced**, and every reference has an owner:
 | UI | `useObject` | unmount |
 
 - **Disposal** runs after the last reference is released, plus `linger`. Tasks are aborted, listeners removed, resources closed in reverse order (every close runs, and errors are collected), then the object's own references are released, which can dispose further objects.
-- **A resource's `close` may still use the objects its object references.** That holds for host shutdown and revocation too: `host.close()` and `invalidatePrincipal` dispose referrers before what they reference, and close links last. Bound remote calls in `close` with a signal: a call over a link that is already down waits for a reconnect.
+- **A resource's `close` may still use the objects its object references during shutdown.** `host.close()` disposes referrers before what they reference and closes links last. Revocation preserves resource-close order, but immediately revokes every matching reference and aborts calls: cleanup cannot invoke a dependency under revoked grants. Bound remote calls in `close` with a signal: a call over a link that is already down waits for a reconnect.
 - **Forced disposal** (revocation, archive) makes references `gone` at once and aborts in-flight calls.
 - **References must not form cycles.** Inside one host this is checked at `get`.
 

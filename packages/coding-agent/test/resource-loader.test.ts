@@ -87,17 +87,44 @@ describe("DefaultResourceLoader", () => {
 		// #11088
 		it("should warn and keep loading when a configured package cannot be installed", async () => {
 			vi.stubEnv("PI_OFFLINE", "");
+			const healthyPackages = ["healthy-before", "healthy-after"].map((name) => {
+				const packageRoot = join(tempDir, name);
+				mkdirSync(join(packageRoot, "extensions"), { recursive: true });
+				writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name, version: "1.0.0" }));
+				writeFileSync(
+					join(packageRoot, "extensions", "index.ts"),
+					`export default function(pi) {
+	pi.registerCommand(${JSON.stringify(name)}, {
+		description: ${JSON.stringify(`Activated ${name}`)},
+		handler: async () => {},
+	});
+}`,
+				);
+				return packageRoot;
+			});
 			const loader = new DefaultResourceLoader({
 				cwd,
 				agentDir,
 				settingsManager: SettingsManager.inMemory({
-					packages: ["npm:broken-package"],
+					packages: [healthyPackages[0], "npm:broken-package", healthyPackages[1]],
 					// Any non-zero exit stands in for an npm install that cannot reach the registry.
 					npmCommand: [process.execPath, "-e", "process.exit(1)"],
 				}),
 			});
 
 			await loader.reload();
+
+			const extensionsResult = loader.getExtensions();
+			expect(extensionsResult.errors).toEqual([]);
+			const runner = new ExtensionRunner(
+				extensionsResult.extensions,
+				extensionsResult.runtime,
+				cwd,
+				SessionManager.inMemory(),
+				await createModelRegistry(AuthStorage.inMemory()),
+			);
+			expect(runner.getCommand("healthy-before")?.description).toBe("Activated healthy-before");
+			expect(runner.getCommand("healthy-after")?.description).toBe("Activated healthy-after");
 
 			const warnings = loader.getExtensions().warnings ?? [];
 			expect(warnings).toHaveLength(1);

@@ -66,7 +66,7 @@ function queueFor(storage: DurableObjectSqliteStorage): SerialQueue {
 
 /** Durable Object SQL binds numbers as doubles: a `bigint` outside the safe integer range would lose precision. */
 function bindValue(value: SqliteValue): DurableObjectSqlValue {
-	if (value instanceof Uint8Array) return value.slice().buffer as ArrayBuffer;
+	if (value instanceof Uint8Array) return new Uint8Array(value).buffer;
 	if (typeof value !== "bigint") return value;
 	if (value < BigInt(Number.MIN_SAFE_INTEGER) || value > BigInt(Number.MAX_SAFE_INTEGER)) {
 		throw new RangeError(`Durable Object SQL cannot bind ${value} without losing precision`);

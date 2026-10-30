@@ -301,6 +301,114 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 	});
 
 	test.each([false, true])(
+		"cancels reactivation dialogs before mounting during signal=%s shutdown",
+		async (fromSignal) => {
+			const previous = {
+				pad: isPadLinesToWidth(),
+				wrap: isWrapLinesToWidth(),
+				background: isMessageBackground(),
+				separator: isMessageSeparator(),
+			};
+			let starts = 0;
+			let resourceOpen = false;
+			let failFlush = false;
+			let resourceUses = 0;
+			const answers: unknown[] = [];
+			const harness = await createHarness({
+				settings: { quietStartup: true, compaction: { enabled: false }, retry: { enabled: false } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_start", async (_event, ctx) => {
+							if (++starts > 1) {
+								answers.push(await ctx.ui.confirm("Reconnect?", "Restore resource?"));
+								answers.push(await ctx.ui.select("Resource", ["one", "two"]));
+								answers.push(await ctx.ui.input("Resource path"));
+								answers.push(await ctx.ui.editor("Resource configuration", "draft"));
+							}
+							resourceOpen = true;
+						});
+						pi.on("session_shutdown", () => {
+							resourceOpen = false;
+							failFlush = true;
+						});
+						pi.registerCommand("resource-state", {
+							handler: async () => {
+								if (!resourceOpen) throw new Error("Resource is closed");
+								resourceUses++;
+							},
+						});
+					},
+				],
+			});
+			const runtime = new AgentSessionRuntime(
+				harness.session,
+				{
+					cwd: harness.sessionManager.getCwd(),
+					agentDir: harness.tempDir,
+					modelRuntime: harness.session.modelRuntime,
+					settingsManager: harness.settingsManager,
+					resourceLoader: harness.session.resourceLoader,
+					diagnostics: [],
+				},
+				async () => {
+					throw new Error("Unexpected replacement");
+				},
+			);
+			const terminal = new VirtualTerminal(120, 40);
+			const mode = new InteractiveMode(runtime, { terminal });
+			const internal = mode as unknown as {
+				shutdown(options?: { fromSignal?: boolean }): Promise<void>;
+				isShuttingDown: boolean;
+				extensionDialogs: unknown[];
+				pushExtensionDialog(component: { handleInput?(data: string): void }, ...args: unknown[]): void;
+				showExtensionConfirm(title: string, message: string): Promise<boolean>;
+			};
+			const originalFlush = harness.session.flushPendingPersistence.bind(harness.session);
+			const flush = vi.spyOn(harness.session, "flushPendingPersistence").mockImplementation(() => {
+				if (failFlush) {
+					failFlush = false;
+					throw new Error("shutdown receipt unavailable");
+				}
+				originalFlush();
+			});
+			try {
+				await mode.init();
+				const push = internal.pushExtensionDialog.bind(internal);
+				const mount = vi.spyOn(internal, "pushExtensionDialog").mockImplementation((component, ...args) => {
+					push(component, ...args);
+					// Free an erroneously mounted real dialog so the pre-fix regression
+					// fails on the mount assertion instead of hanging the parent suite.
+					queueMicrotask(() => component.handleInput?.("\x1b"));
+				});
+				await internal.shutdown({ fromSignal });
+				await terminal.waitForRender();
+				expect(answers).toEqual([false, undefined, undefined, undefined]);
+				expect(mount).not.toHaveBeenCalled();
+				expect(internal.extensionDialogs).toEqual([]);
+				expect(internal.isShuttingDown).toBe(false);
+				expect(starts).toBe(2);
+				expect(resourceOpen).toBe(true);
+				expect(terminal.getViewport().join("\n")).toContain("shutdown receipt unavailable");
+				await harness.session.prompt("/resource-state");
+				expect(resourceUses).toBe(1);
+				mount.mockRestore();
+				const confirm = internal.showExtensionConfirm("Recovered", "Ordinary dialogs work again");
+				terminal.sendInput("\r");
+				await expect(confirm).resolves.toBe(true);
+			} finally {
+				flush.mockRestore();
+				mode.stop();
+				await runtime.dispose();
+				harness.cleanup();
+				setPadLinesToWidth(previous.pad);
+				setWrapLinesToWidth(previous.wrap);
+				setMessageBackground(previous.background);
+				setMessageSeparator(previous.separator);
+			}
+		},
+	);
+
+	test.each([false, true])(
 		"holds shutdown work until resource reactivation settles (reactivation fails: %s)",
 		async (failReactivation) => {
 			const previous = {

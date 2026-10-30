@@ -34,7 +34,7 @@ import type {
 	TaskQuery,
 	TaskRecord,
 } from "../types.ts";
-import { nextCursor, type ScanStart, scanStart } from "./scan.ts";
+import { nextCursor, type ScanStart, scanStart, validateScanLimit } from "./scan.ts";
 
 const DATABASE_VERSION = 1;
 const MAX_KEY = Number.MAX_SAFE_INTEGER;
@@ -473,7 +473,7 @@ export class IndexedDbStorage implements Storage {
 		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<ConversationRecord, Cursor>> {
-		const start = scanStart(query.order, cursor, "ascending");
+		const start = scanStart(query.order, cursor, "ascending", limit);
 		return this.transaction(STORES.conversations, "readonly", async (transaction) => {
 			const store = transaction.objectStore(STORES.conversations);
 			const accept = (row: ConversationRow) =>
@@ -580,7 +580,7 @@ export class IndexedDbStorage implements Storage {
 		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<EntryRecord, Cursor>> {
-		const start = scanStart(query.order, cursor, "descending");
+		const start = scanStart(query.order, cursor, "descending", limit);
 		return this.transaction([STORES.conversations, STORES.entries], "readonly", async (transaction) => {
 			const values =
 				start.order === "ascending"
@@ -606,7 +606,7 @@ export class IndexedDbStorage implements Storage {
 		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<StoredTask, Cursor>> {
-		const start = scanStart(query.order, cursor, "ascending");
+		const start = scanStart(query.order, cursor, "ascending", limit);
 		return this.transaction(STORES.tasks, "readonly", async (transaction) => {
 			const store = transaction.objectStore(STORES.tasks);
 			const accept = (row: TaskRow) =>
@@ -670,7 +670,7 @@ export class IndexedDbStorage implements Storage {
 		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<SubmissionRecord, Cursor>> {
-		const start = scanStart(query.order, cursor, "ascending");
+		const start = scanStart(query.order, cursor, "ascending", limit);
 		return this.transaction(STORES.submissions, "readonly", async (transaction) => {
 			const store = transaction.objectStore(STORES.submissions);
 			const accept = (row: SubmissionRow) =>
@@ -750,6 +750,7 @@ export class IndexedDbStorage implements Storage {
 		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<DocumentRecord, Cursor>> {
+		validateScanLimit(limit);
 		const after = cursorId<DocumentId>(cursor);
 		return this.transaction(STORES.documents, "readonly", async (transaction) => {
 			const scope = scopeColumns(query.scope);

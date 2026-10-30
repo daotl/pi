@@ -1,6 +1,7 @@
 import type { JsonValue } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Op } from "@earendil-works/chord/delta";
+import { StorageRequestError } from "../errors.ts";
 import { idFromNumber } from "../ids.ts";
 import {
 	type ConversationId,
@@ -377,6 +378,33 @@ export function createStorageConformance(options: StorageConformanceOptions): re
 			const second = await storage.scanEntries({ conversationId: rootId }, 2, first.next, context);
 			expect(second.items.map(({ id }) => id)).toEqual([oldestId]);
 			expect(second.next).toBeUndefined();
+		}),
+
+		createCase(options, "rejects invalid scan page sizes without damaging stored state", async (storage) => {
+			const rootId = await createRoot(storage);
+			for (const limit of [0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+				const scans = [
+					() => storage.scanConversations({}, limit, undefined, context),
+					() => storage.scanEntries({ conversationId: rootId }, limit, undefined, context),
+					() => storage.scanTasks({}, limit, undefined, context),
+					() => storage.scanSubmissions({}, limit, undefined, context),
+					() => storage.scanDocuments({ scope: { kind: "session" }, at: "current" }, limit, undefined, context),
+				];
+				for (const scan of scans) {
+					let rejection: unknown;
+					try {
+						await scan();
+					} catch (error) {
+						rejection = error;
+					}
+					expect(rejection instanceof StorageRequestError).toBe(true);
+				}
+			}
+			const entryId = await storage.mintId<EntryId>();
+			await storage.commit([{ type: "entry", value: entry(entryId, rootId) }], adopt, context);
+			expect(
+				(await storage.scanEntries({ conversationId: rootId }, 1, undefined, context)).items.map(({ id }) => id),
+			).toEqual([entryId]);
 		}),
 
 		createCase(options, "paginates conversations by opaque cursor in ascending ID order", async (storage) => {

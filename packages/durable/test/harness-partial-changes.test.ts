@@ -105,6 +105,25 @@ const ARGUMENTS = {
 };
 
 describe("PartialChanges", () => {
+	it("preserves authoritative nonempty start arguments through later deltas", () => {
+		const stream = setup();
+		stream.partial.content.push({ type: "toolCall", id: "c1", name: "write", arguments: { path: "src/a" } });
+		const changes = new PartialChanges();
+		changes.observe({ type: "toolcall_start", contentIndex: 1, partial: stream.partial });
+		const commit = () => {
+			const message = copyJson(stream.partial) as PartialMessage;
+			const taken = changes.take(message);
+			const change = stream.tracker.beginChange();
+			changes.commit(change.state.generation, message, taken);
+			stream.tracker.adopt(change.prepare());
+		};
+		commit();
+		expect(stream.committed().arguments).toEqual({ path: "src/a" });
+		stream.partial.content[1] = { type: "toolCall", id: "c1", name: "write", arguments: { path: "src/a.ts" } };
+		changes.observe({ type: "toolcall_delta", contentIndex: 1, delta: '.ts"}', partial: stream.partial });
+		commit();
+		expect(stream.committed().arguments).toEqual({ path: "src/a.ts" });
+	});
 	it("commits tool-call arguments equal to the final parse, at every piece size and commit rhythm", () => {
 		const text = JSON.stringify(ARGUMENTS);
 		for (const size of [1, 2, 3, 5, 7, 16]) {

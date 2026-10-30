@@ -32,7 +32,7 @@ import type {
 	TaskQuery,
 	TaskRecord,
 } from "../types.ts";
-import { nextCursor, type ScanStart, scanStart } from "./scan.ts";
+import { nextCursor, type ScanStart, scanStart, validateScanLimit } from "./scan.ts";
 
 type StoredTask = TaskRecord<JsonValue, JsonValue, JsonValue>;
 type TaskStatus = StoredTask["state"]["status"];
@@ -451,7 +451,7 @@ export class MemoryStorage implements Storage {
 				: query.ownerConversationId !== undefined
 					? (this.state.conversationIdsByOwnerConversation.get(query.ownerConversationId) ?? [])
 					: this.state.conversationIds;
-		const start = scanStart(query.order, cursor, "ascending");
+		const start = scanStart(query.order, cursor, "ascending", limit);
 		const values: ConversationRecord[] = [];
 		for (const index of scanIndexes(ids, start)) {
 			if (values.length > limit) break;
@@ -522,7 +522,7 @@ export class MemoryStorage implements Storage {
 		_context: Context,
 	): Promise<Page<EntryRecord, Cursor>> {
 		this.assertOpen();
-		const { order, after } = scanStart(query.order, cursor, "descending");
+		const { order, after } = scanStart(query.order, cursor, "descending", limit);
 		// The cursor narrows the bound on the side the scan moves away from.
 		let minEntryId: number | undefined = query.minEntryId;
 		let maxEntryId: number | undefined = query.maxEntryId;
@@ -553,7 +553,7 @@ export class MemoryStorage implements Storage {
 		_context: Context,
 	): Promise<Page<StoredTask, Cursor>> {
 		this.assertOpen();
-		const start = scanStart(query.order, cursor, "ascending");
+		const start = scanStart(query.order, cursor, "ascending", limit);
 		const ids = query.status === undefined ? this.state.taskIds : this.state.taskIdsByStatus[query.status];
 		const values: StoredTask[] = [];
 		for (const index of scanIndexes(ids, start)) {
@@ -581,7 +581,7 @@ export class MemoryStorage implements Storage {
 		_context: Context,
 	): Promise<Page<SubmissionRecord, Cursor>> {
 		this.assertOpen();
-		const start = scanStart(query.order, cursor, "ascending");
+		const start = scanStart(query.order, cursor, "ascending", limit);
 		const ids =
 			query.status === undefined ? this.state.submissionIds : this.state.submissionIdsByStatus[query.status];
 		const values: SubmissionRecord[] = [];
@@ -642,6 +642,7 @@ export class MemoryStorage implements Storage {
 		_context: Context,
 	): Promise<Page<DocumentRecord, Cursor>> {
 		this.assertOpen();
+		validateScanLimit(limit);
 		const ids = this.state.documentIdsByScope.get(scopeKey(query.scope)) ?? [];
 		const after = cursorId(cursor);
 		const start = after === undefined ? 0 : upperBound(ids, after);

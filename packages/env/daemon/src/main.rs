@@ -381,7 +381,11 @@ fn scan_lines(file: &File, path: &str, json: &Value, control: &Control) -> Resul
 fn kill_all(groups: &exec::Groups) -> io::Result<()> {
     #[cfg(unix)]
     {
-        for pid in groups.lock().unwrap().iter() {
+        let mut groups = groups
+            .lock()
+            .map_err(|_| io::Error::other("process ownership lock poisoned"))?;
+        groups.stopping = true;
+        for pid in &groups.pids {
             exec::kill_group(*pid);
         }
         Ok(())
@@ -643,11 +647,12 @@ fn serve(token: &str) -> io::Result<()> {
                 output.control(Frame::new(PING, 0, json!({})));
                 // A client that went silent (a phone that lost its network) leaves nothing running.
                 if now_ms().saturating_sub(last_seen.load(Ordering::Relaxed)) > SILENCE_LIMIT_MS {
-                    pty::kill_all(&terminals);
                     if let Err(error) = kill_all(&groups) {
+                        pty::kill_all(&terminals);
                         eprintln!("pi-env: failed to clean process trees: {error}");
                         std::process::exit(1);
                     }
+                    pty::kill_all(&terminals);
                     std::process::exit(0);
                 }
             }
@@ -662,8 +667,8 @@ fn serve(token: &str) -> io::Result<()> {
     );
     let result = serve_frames(&server, &mut input);
     // However input ended, the client is gone: stop everything it started.
-    pty::kill_all(&server.terminals);
     let cleanup = kill_all(&server.groups);
+    pty::kill_all(&server.terminals);
     output.close();
     let _ = writer.join();
     result.and(cleanup)
@@ -700,6 +705,40 @@ fn main() {
 mod tests {
     use super::*;
 
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_refuses_exec_and_terminal_requests_that_have_not_spawned() {
+        let root = sys::mkdtemp(&format!("{}/pi-env-shutdown-", sys::tmpdir())).unwrap();
+        let groups: exec::Groups = Arc::default();
+        let terminals: pty::Terminals = Arc::default();
+        let output = Arc::new(Output::default());
+        kill_all(&groups).unwrap();
+        let command = "printf leaked > after-shutdown";
+        let exec = exec::run(
+            1,
+            exec::ExecRequest::from_json(&json!({ "command": command, "cwd": root })).unwrap(),
+            &root,
+            &output,
+            &Control::default(),
+            &groups,
+        );
+        let terminal = pty::run(
+            2,
+            pty::PtyRequest::from_json(&json!({
+                "argv": ["/bin/sh", "-c", command], "cwd": root, "cols": 80, "rows": 24,
+            })).unwrap(),
+            &output,
+            &Control::default(),
+            &groups,
+            &terminals,
+        );
+        let leaked = std::path::Path::new(&root).join("after-shutdown").exists();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(!leaked, "a request spawned a child after shutdown");
+        assert_eq!(exec.unwrap_err().code, "spawn_error");
+        assert_eq!(terminal.unwrap_err().code, "spawn_error");
+    }
     #[test]
     fn directory_pages_fit_encoded_frames_without_losing_the_carried_entry() {
         let path = sys::mkdtemp(&format!(

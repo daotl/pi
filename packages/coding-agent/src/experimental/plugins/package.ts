@@ -76,14 +76,35 @@ async function bundlePluginPackage(packagePath: string, outdir: string): Promise
 		("version" in metadata && typeof metadata.version !== "string")
 	)
 		throw new Error(`Invalid plugin package ${directory}`);
+	let configuredFacets: Record<string, unknown> = {};
+	if ("chord" in metadata) {
+		const chord = metadata.chord;
+		if (chord === null || typeof chord !== "object" || Array.isArray(chord))
+			throw new Error(`Invalid chord metadata in plugin package ${directory}`);
+		if ("facets" in chord) {
+			if (chord.facets === null || typeof chord.facets !== "object" || Array.isArray(chord.facets))
+				throw new Error(`Invalid chord.facets in plugin package ${directory}`);
+			configuredFacets = chord.facets as Record<string, unknown>;
+		}
+	}
 	const entries: Record<string, FacetBundleEntry> = {};
 	await mkdir(outdir, { recursive: true });
-	for (const [name, relative] of Object.entries(DEFAULT_PLUGIN_FACETS)) {
-		const path = join(directory, relative);
+	for (const [name, conventional] of Object.entries(DEFAULT_PLUGIN_FACETS)) {
+		const relative = Object.hasOwn(configuredFacets, name) ? configuredFacets[name] : conventional;
+		if (relative === false) continue;
+		if (typeof relative !== "string" || relative.length === 0)
+			throw new Error(`Invalid chord.facets.${name} in plugin package ${directory}`);
+		const path = resolve(directory, relative);
 		try {
 			await stat(path);
 		} catch (error) {
-			if (error instanceof Error && "code" in error && error.code === "ENOENT") continue;
+			if (
+				error instanceof Error &&
+				"code" in error &&
+				error.code === "ENOENT" &&
+				!Object.hasOwn(configuredFacets, name)
+			)
+				continue;
 			throw error;
 		}
 		const result = await build({
@@ -118,7 +139,7 @@ async function bundlePluginPackage(packagePath: string, outdir: string): Promise
 		await writeFile(join(outdir, file), source, "utf8");
 	}
 	if (Object.keys(entries).length === 0)
-		throw new Error(`Plugin package ${directory} has no conventional session or tui entry`);
+		throw new Error(`Plugin package ${directory} has no enabled session or tui entry`);
 	const manifest: FacetBundleManifest = {
 		plugin: { id: metadata.name, ...("version" in metadata ? { version: metadata.version as string } : {}) },
 		entries,

@@ -134,7 +134,7 @@ function storeKeys(name: string, serverUrl: string): { key: string; legacyKey: s
 }
 
 export interface McpOAuthServerStore extends McpOAuthStateStore {
-	/** Run `fn` while no other process refreshes the server's tokens. */
+	/** Serialize `fn` in this store and, when configured, across processes refreshing the server's tokens. */
 	withRefreshLock<T>(fn: () => Promise<T>): Promise<T>;
 }
 
@@ -143,7 +143,7 @@ export class McpOAuthCredentialStore {
 	private readonly backend: AuthStorageBackend;
 	/** Directory for the refresh lock files. Without one, refreshes are only serialized in this process. */
 	private readonly lockDir: string | undefined;
-	private readonly refreshes = new Set<Promise<void>>();
+	private readonly refreshTails = new Map<string, Promise<void>>();
 
 	constructor(backend?: AuthStorageBackend, lockDir?: string) {
 		this.backend = backend ?? new FileAuthStorageBackend(join(getAgentDir(), "mcp-auth.json"));
@@ -172,21 +172,24 @@ export class McpOAuthCredentialStore {
 
 	/** Join refresh ownership that outlives a canceled sign-in caller. */
 	async settled(): Promise<void> {
-		while (this.refreshes.size > 0) await Promise.all(this.refreshes);
+		while (this.refreshTails.size > 0) await Promise.all(this.refreshTails.values());
 	}
 
 	/**
-	 * A lock file per server. When the process exits, proper-lockfile removes the locks it holds; when
-	 * it is killed, the lock goes stale because it is no longer renewed, and the next process takes it over.
+	 * Serialize ownership in this store, then acquire the per-server lock file when configured. When the
+	 * process exits, proper-lockfile removes its locks; after a kill, the next process takes over a stale lock.
 	 */
 	private withRefreshLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-		const work = this.runWithRefreshLock(key, fn);
+		const previous = this.refreshTails.get(key) ?? Promise.resolve();
+		const work = previous.then(() => this.runWithRefreshLock(key, fn));
 		const settlement = work.then(
 			() => undefined,
 			() => undefined,
 		);
-		this.refreshes.add(settlement);
-		void settlement.then(() => this.refreshes.delete(settlement));
+		this.refreshTails.set(key, settlement);
+		void settlement.then(() => {
+			if (this.refreshTails.get(key) === settlement) this.refreshTails.delete(key);
+		});
 		return work;
 	}
 

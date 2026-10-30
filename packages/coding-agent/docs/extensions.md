@@ -362,6 +362,7 @@ Register an entry or message renderer when custom stored content should appear i
 
 `ctx.ui` provides dialogs, notifications, status text, widgets, titles, editor access, and custom components.
 Use `ctx.ui.custom()` only when the interaction needs its own rendering and input.
+Its return type is `Promise<T | undefined>`: extension UI reset cancels the interaction with `undefined`. Check for this before using a custom result, including when your component already returns `null` or another cancellation value.
 See [Terminal UI](tui.md) for component, focus, overlay, theme, and performance guidance.
 
 Extensions load in interactive, RPC, JSON, and print modes.

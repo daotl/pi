@@ -297,7 +297,7 @@ export class Connection {
 		child.stderr.on("data", (chunk: Buffer) => this.#options.onLog?.(chunk.toString("utf8")));
 		child.on("error", () => this.#teardown(session, lost("pi-env connection lost")));
 		child.on("exit", () => this.#teardown(session, lost("pi-env connection lost")));
-		child.stdin.on("error", () => {});
+		child.stdin.on("error", () => this.#teardown(session, lost("pi-env connection write failed")));
 		session.timer = setInterval(() => {
 			this.#write(session, frame(PING, 0, {}));
 			if (Date.now() - session.lastSeen > SILENCE_LIMIT_MS) {

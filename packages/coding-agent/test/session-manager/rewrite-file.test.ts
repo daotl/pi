@@ -15,6 +15,7 @@ vi.mock("fs", async (importOriginal) => {
 		fsyncSync: vi.fn(actual.fsyncSync),
 		closeSync: vi.fn(actual.closeSync),
 		renameSync: vi.fn(actual.renameSync),
+		truncateSync: vi.fn(actual.truncateSync),
 	};
 });
 
@@ -29,6 +30,7 @@ describe("atomic session file rewrite", () => {
 		vi.mocked(fs.fsyncSync).mockReset().mockImplementation(actual.fsyncSync);
 		vi.mocked(fs.closeSync).mockReset().mockImplementation(actual.closeSync);
 		vi.mocked(fs.renameSync).mockReset().mockImplementation(actual.renameSync);
+		vi.mocked(fs.truncateSync).mockReset().mockImplementation(actual.truncateSync);
 		dir = fs.mkdtempSync(join(tmpdir(), "session-rewrite-"));
 	});
 
@@ -144,6 +146,83 @@ describe("atomic session file rewrite", () => {
 		const id = append();
 		expect(session.getLeafId()).toBe(id);
 		expect(SessionManager.open(file, dir, dir).getEntries()).toEqual(session.getEntries());
+	});
+
+	// Finding #1: retries must not concatenate a retained receipt onto failed append bytes.
+	it.each(["partial", "complete"] as const)(
+		"rolls back a %s append before retrying usage and its descendants",
+		async (fault) => {
+			const actual = await vi.importActual<typeof fs>("fs");
+			const { session, file } = createSession();
+			const entries = structuredClone(session.getEntries());
+			const leaf = session.getLeafId();
+			const revision = session.getContextRevision();
+			const bytes = fs.readFileSync(file);
+			const usage = assistantMsg("").usage;
+			const failure = new Error(`usage ${fault} append failure`);
+			vi.mocked(fs.appendFileSync).mockImplementationOnce((path, data) => {
+				if (typeof data !== "string") throw new Error("Expected a serialized session entry");
+				actual.appendFileSync(path, fault === "partial" ? data.slice(0, 60) : data);
+				throw failure;
+			});
+
+			expect(() => session.appendUsage("compaction", "anthropic", "test", usage)).toThrow(failure);
+			expect(session.getEntries()).toEqual(entries);
+			expect(session.getLeafId()).toBe(leaf);
+			expect(session.getContextRevision()).toBe(revision);
+			expect(fs.readFileSync(file)).toEqual(bytes);
+			const receipt = session.appendUsage("compaction", "anthropic", "test", usage);
+			const next = session.appendMessage(userMsg("after retained receipt"));
+			const reopened = SessionManager.open(file, dir, dir);
+			expect(reopened.getEntries()).toEqual(session.getEntries());
+			expect(reopened.getEntries().filter((entry) => entry.type === "usage")).toEqual([receipt]);
+			expect(reopened.getEntry(receipt.id)?.parentId).toBe(leaf);
+			expect(reopened.getEntry(next)?.parentId).toBe(receipt.id);
+			expect(reopened.getBranch()).toEqual(session.getBranch());
+			expect(reopened.getLeafId()).toBe(next);
+		},
+	);
+
+	it("blocks appends after failed rollback until a successful rewrite repairs the file", async () => {
+		const actual = await vi.importActual<typeof fs>("fs");
+		const { session, file } = createSession();
+		const entries = structuredClone(session.getEntries());
+		const leaf = session.getLeafId();
+		const revision = session.getContextRevision();
+		const bytes = fs.readFileSync(file);
+		const failure = new Error("partial append failure");
+		const rollbackFailure = new Error("rollback failure");
+		vi.mocked(fs.appendFileSync).mockImplementationOnce((path, data) => {
+			if (typeof data !== "string") throw new Error("Expected a serialized session entry");
+			actual.appendFileSync(path, data.slice(0, 60));
+			throw failure;
+		});
+		vi.mocked(fs.truncateSync).mockImplementationOnce(() => {
+			throw rollbackFailure;
+		});
+		expect(() => session.appendMessage(userMsg("retained output"))).toThrow(AggregateError);
+		const damaged = fs.readFileSync(file);
+		expect(damaged).not.toEqual(bytes);
+		expect(() => session.appendUsage("compaction", "anthropic", "test", assistantMsg("").usage)).toThrow(
+			AggregateError,
+		);
+		expect(fs.readFileSync(file)).toEqual(damaged);
+		expect(session.getEntries()).toEqual(entries);
+		expect(session.getLeafId()).toBe(leaf);
+		expect(session.getContextRevision()).toBe(revision);
+		vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+			throw new Error("repair rewrite failure");
+		});
+		expect(() => session.editMessages(() => {})).toThrow("repair rewrite failure");
+		expect(() => session.appendMessage(userMsg("still blocked"))).toThrow(AggregateError);
+		expect(fs.readFileSync(file)).toEqual(damaged);
+		session.editMessages(() => {});
+		expect(fs.readFileSync(file)).toEqual(bytes);
+		const restored = session.appendMessage(userMsg("retained output"));
+		const reopened = SessionManager.open(file, dir, dir);
+		expect(reopened.getEntries()).toEqual(session.getEntries());
+		expect(reopened.getEntry(restored)?.parentId).toBe(leaf);
+		expect(reopened.getBranch()).toEqual(session.getBranch());
 	});
 
 	it.each(["write", "write-after", "close"] as const)(

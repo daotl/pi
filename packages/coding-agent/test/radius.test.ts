@@ -5,7 +5,7 @@ import { InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
-import { RADIUS_PROVIDER_ID } from "../src/core/radius.ts";
+import { getRadiusMcpUrl, RADIUS_PROVIDER_ID } from "../src/core/radius.ts";
 import { allowNetwork, enableBuiltinProviders } from "./test-network-env.ts";
 
 function radiusOAuthCredential(gatewayBaseUrl: string) {
@@ -65,6 +65,7 @@ describe("Radius provider", () => {
 		expect(model).toMatchObject({ api: "pi-messages", baseUrl: "https://radius.example.com/v1" });
 		expect(runtime.getProvider(RADIUS_PROVIDER_ID)?.name).toBe("Radius");
 		expect(runtime.hasConfiguredAuth(RADIUS_PROVIDER_ID)).toBe(true);
+		expect(getRadiusMcpUrl(runtime.getProvider(RADIUS_PROVIDER_ID))).toBe("https://radius.pi.dev/mcp");
 	});
 
 	it("fetches and stores the catalog for configured Radius auth", async () => {
@@ -157,6 +158,26 @@ describe("Radius provider", () => {
 			baseUrl: "http://localhost:8788/v1",
 		});
 		expect(runtime.getProvider("radius-dev")?.name).toBe("Radius (dev)");
+		expect(getRadiusMcpUrl(runtime.getProvider("radius-dev"))).toBe("http://localhost:8788/mcp");
+	});
+
+	it("derives MCP from the configured Radius provider instead of its credential catalog", async () => {
+		const modelsPath = join(tempDir, "models.json");
+		writeFileSync(
+			modelsPath,
+			JSON.stringify({ providers: { radius: { oauth: "radius", baseUrl: "https://custom.example/v1/" } } }),
+		);
+		const runtime = await ModelRuntime.create({
+			credentials: AuthStorage.inMemory({ radius: radiusOAuthCredential("https://catalog.example/v1") }),
+			modelsStore: new InMemoryModelsStore(),
+			modelsPath,
+			allowModelNetwork: false,
+		});
+
+		expect(runtime.getModel("radius", "auto")?.baseUrl).toBe("https://catalog.example/v1");
+		expect(getRadiusMcpUrl(runtime.getProvider("radius"))).toBe("https://custom.example/mcp");
+		expect(getRadiusMcpUrl(undefined)).toBeUndefined();
+		expect(getRadiusMcpUrl({})).toBeUndefined();
 	});
 
 	it("requires baseUrl for custom Radius gateways", async () => {

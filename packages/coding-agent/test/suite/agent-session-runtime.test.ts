@@ -204,13 +204,11 @@ describe("AgentSessionRuntime characterization", () => {
 		const outgoingEntries = SessionManager.open(outgoingSession.sessionFile!)
 			.getEntries()
 			.filter((entry) => entry.type === "message");
-		expect(outgoingEntries.map((entry) => entry.message.role)).toEqual([
-			"system",
-			"user",
-			"assistant",
-			"toolResult",
-			"assistant",
-		]);
+		expect(outgoingEntries.map((entry) => entry.message.role)).toEqual(["system", "user", "assistant", "toolResult"]);
+		expect(outgoingEntries.at(-1)?.message).toMatchObject({
+			role: "toolResult",
+			content: [{ type: "text", text: "tool aborted" }],
+		});
 	});
 
 	it("settles the active tool before ordinary disposal cleanup observes the transcript", async () => {

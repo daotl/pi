@@ -100,11 +100,27 @@ function misplacedOptionsLine(input: string): number | undefined {
 	let template = false;
 	let expressionStart = true;
 	// A block ends a statement; an object or function expression still permits division.
-	const braces: ("block" | "object" | "function" | "template")[] = [];
-	const parentheses: ("control" | "expression" | "declaration" | "function")[] = [];
+	type Brace =
+		| "block"
+		| "object"
+		| "function"
+		| "template"
+		| "class-member"
+		| {
+				kind: "class-declaration" | "class-expression";
+				phase: "member" | "initializer";
+				parentheses: number;
+				brackets: number;
+		  };
+	const braces: Brace[] = [];
+	const parentheses: ("control" | "expression" | "declaration" | "function" | "method")[] = [];
+	let brackets = 0;
+	let lineBreak = false;
 	let statementStart = true;
 	let functionParameters: "declaration" | "function" | undefined;
-	let nextBrace: "block" | "function" | undefined;
+	let nextBrace: "block" | "function" | "class-member" | undefined;
+	const classBodies: { braces: number; parentheses: number; declaration: boolean }[] = [];
+	const objectBodies: { braces: number; parentheses: number; brackets: number; property: boolean }[] = [];
 	let control = false;
 	let member = false;
 	let label = false;
@@ -121,6 +137,7 @@ function misplacedOptionsLine(input: string): number | undefined {
 			expressionStart = false;
 			statementStart = false;
 			nextBrace = undefined;
+			lineBreak = false;
 			index++;
 			continue;
 		}
@@ -147,15 +164,57 @@ function misplacedOptionsLine(input: string): number | undefined {
 		if (char === "/" && input[index + 1] === "*") {
 			index += 2;
 			while (index < input.length && !(input[index] === "*" && input[index + 1] === "/")) {
-				if (input[index++] === "\n") line++;
+				const skipped = input[index++];
+				if (skipped === "\n") line++;
+				if (/[\r\n\u2028\u2029]/.test(skipped)) lineBreak = true;
 			}
 			index += 2;
 			continue;
 		}
 		if (/\s/.test(char)) {
+			if (/[\r\n\u2028\u2029]/.test(char)) lineBreak = true;
 			index++;
 			continue;
 		}
+		let wordEnd = index;
+		let word: string | undefined;
+		if (/[\w$]/.test(char)) {
+			while (wordEnd < input.length && /[\w$]/.test(input[wordEnd])) wordEnd++;
+			word = input.slice(index, wordEnd);
+		}
+		const enclosing = braces.at(-1);
+		const classBody =
+			typeof enclosing === "object" &&
+			enclosing.parentheses === parentheses.length &&
+			enclosing.brackets === brackets
+				? enclosing
+				: undefined;
+		const objectBody = objectBodies.at(-1);
+		const directObject =
+			objectBody?.braces === braces.length &&
+			objectBody.parentheses === parentheses.length &&
+			objectBody.brackets === brackets
+				? objectBody
+				: undefined;
+		// A newline ends an initialized field only when its expression has ended and the
+		// next token cannot continue it. Calls, indexing, tagged templates and division
+		// still continue across newlines; class/function headers are not complete values.
+		if (
+			classBody?.phase === "initializer" &&
+			lineBreak &&
+			!expressionStart &&
+			!member &&
+			!functionParameters &&
+			classBodies.at(-1)?.braces !== braces.length &&
+			((word !== undefined && word !== "in" && word !== "instanceof") ||
+				char === '"' ||
+				char === "'" ||
+				char === "#")
+		) {
+			classBody.phase = "member";
+			statementStart = false;
+		}
+		lineBreak = false;
 		const body = nextBrace;
 		nextBrace = undefined;
 		const labelColon = label && char === ":";
@@ -190,7 +249,14 @@ function misplacedOptionsLine(input: string): number | undefined {
 			continue;
 		}
 		if (char === "(") {
-			parentheses.push(functionParameters ?? (control ? "control" : "expression"));
+			parentheses.push(
+				functionParameters ??
+					(classBody?.phase === "member" || directObject?.property
+						? "method"
+						: control
+							? "control"
+							: "expression"),
+			);
 			functionParameters = undefined;
 			control = false;
 			expressionStart = true;
@@ -204,16 +270,28 @@ function misplacedOptionsLine(input: string): number | undefined {
 			statementStart = expressionStart;
 			if (context === "control" || context === "declaration") nextBrace = "block";
 			else if (context === "function") nextBrace = "function";
+			else if (context === "method") nextBrace = "class-member";
 			index++;
 			continue;
 		}
-		if (/[\w$]/.test(char)) {
-			const start = index++;
-			while (index < input.length && /[\w$]/.test(input[index])) index++;
-			const word = input.slice(start, index);
+		if (word !== undefined) {
+			index = wordEnd;
+			const classMember = classBody?.phase === "member";
+			if (classMember || directObject?.property) {
+				// Modifiers and keyword-named class/object members remain property names
+				// until a field initializer or object property value starts.
+				expressionStart = false;
+				statementStart = false;
+				control = false;
+				member = false;
+				continue;
+			}
 			label = statementStart && !member;
 			if (!member && word === "function") {
 				functionParameters = statementStart ? "declaration" : "function";
+			}
+			if (!member && word === "class") {
+				classBodies.push({ braces: braces.length, parentheses: parentheses.length, declaration: statementStart });
 			}
 			const statementKeyword = !member && /^(?:else|do|try|finally|catch)$/.test(word);
 			expressionStart =
@@ -221,26 +299,55 @@ function misplacedOptionsLine(input: string): number | undefined {
 				(!member && /^(?:return|throw|case|delete|void|typeof|new|in|of|yield|await|instanceof)$/.test(word));
 			control = !member && /^(?:if|while|for|with|switch|catch)$/.test(word);
 			// async can precede a function declaration without changing its statement context.
-			statementStart = statementKeyword || (!member && word === "async" && statementStart);
+			statementStart = statementKeyword || (!member && /^(?:async|export|default)$/.test(word) && statementStart);
 			member = false;
 			continue;
 		}
 		if (char === "{") {
-			const context = body ?? (statementStart ? "block" : "object");
-			braces.push(context);
+			const pendingClass = classBodies.at(-1);
+			const pendingBody =
+				pendingClass?.braces === braces.length && pendingClass.parentheses === parentheses.length
+					? classBodies.pop()
+					: undefined;
+			const context = pendingBody
+				? pendingBody.declaration
+					? "class-declaration"
+					: "class-expression"
+				: (body ?? (classBody?.phase === "member" ? "class-member" : statementStart ? "block" : "object"));
+			if (context === "class-declaration" || context === "class-expression") {
+				braces.push({ kind: context, phase: "member", parentheses: parentheses.length, brackets });
+			} else braces.push(context);
+			if (context === "object") {
+				objectBodies.push({ braces: braces.length, parentheses: parentheses.length, brackets, property: true });
+			}
 			expressionStart = true;
-			statementStart = context !== "object";
+			statementStart = context === "block" || context === "function" || context === "class-member";
 		} else if (char === "}") {
-			const context = braces.pop();
+			if (objectBodies.at(-1)?.braces === braces.length) objectBodies.pop();
+			const brace = braces.pop();
+			const context = typeof brace === "object" ? brace.kind : brace;
 			template = context === "template";
-			expressionStart = context === "block";
+			expressionStart = context === "block" || context === "class-declaration";
 			statementStart = expressionStart;
+			if (context === "class-member") {
+				const owner = braces.at(-1);
+				if (typeof owner === "object") owner.phase = "member";
+				statementStart = false;
+			}
 		} else {
-			expressionStart = char !== "]" && char !== ".";
-			statementStart = char === ";" || labelColon;
+			if (directObject) {
+				if (char === ",") directObject.property = true;
+				else if (char === ":" || (char === "." && input[index + 1] === ".")) directObject.property = false;
+			}
+			if (char === "[") brackets++;
+			else if (char === "]") brackets--;
+			if (classBody && char === ";") classBody.phase = "member";
+			else if (classBody?.phase === "member" && char === "=") classBody.phase = "initializer";
+			expressionStart = char !== "]" && char !== "." && char !== "#";
+			statementStart = (char === ";" && !classBody) || labelColon;
 		}
 		control = false;
-		member = char === ".";
+		member = char === "." || char === "#";
 		index++;
 	}
 	return undefined;

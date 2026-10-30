@@ -74,7 +74,10 @@ function parseRef(
 	const issueMatch = ref.match(ISSUE_URL_RE);
 	if (issueMatch) return { type: "issue", owner: issueMatch[1], repo: issueMatch[2], issue: issueMatch[3] };
 
-	if (/^https?:\/\/.*\.jsonl$/.test(ref)) return { type: "url", url: new URL(ref) };
+	if (/^https?:\/\//.test(ref)) {
+		const url = new URL(ref);
+		if (url.pathname.endsWith(".jsonl")) return { type: "url", url };
+	}
 
 	if (ref.endsWith(".html") || ref.endsWith(".jsonl")) {
 		return { type: "file", path: isAbsolute(ref) ? ref : resolve(cwd, ref) };

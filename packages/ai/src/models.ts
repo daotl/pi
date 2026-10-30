@@ -17,6 +17,7 @@ import type {
 	Credential,
 	CredentialStore,
 	LoginOptions,
+	ModelAuth,
 	ProviderAuth,
 } from "./auth/types.ts";
 import { InMemoryModelsStore, type ModelsStore, type ModelsStoreEntry } from "./models-store.ts";
@@ -83,6 +84,10 @@ export interface ModelsPublication {
 export interface RefreshModelsContext {
 	/** Effective configured credential. OAuth credentials are refreshed before network access. */
 	credential?: Credential;
+	/** Effective request auth, including configured header overrides; absent when cache auth cannot be derived safely. */
+	auth?: ModelAuth;
+	/** Request identity used for catalog personalization headers. */
+	identity?: ClientIdentity;
 	/** Immutable provider-scoped catalog snapshot captured before this refresh phase. */
 	stored?: Readonly<ModelsStoreEntry>;
 	/**
@@ -170,6 +175,13 @@ export interface Provider<TApi extends Api = Api> {
 	 * `Models.getAuth()` returns undefined when the provider is unconfigured.
 	 */
 	readonly auth: ProviderAuth;
+
+	/**
+	 * Optional cache-only auth derivation for credential-specific catalogs. Must only read the
+	 * supplied credential, static configuration and ctx.env; never run commands, access the network,
+	 * refresh OAuth or start interaction. Return undefined when the current auth cannot be proven.
+	 */
+	resolveCachedModelAuth?(credential: Credential | undefined, ctx: AuthContext): Promise<ModelAuth | undefined>;
 
 	/**
 	 * Current known chat models, sync. Static providers return their catalog;
@@ -549,16 +561,19 @@ class ModelsImpl implements MutableModels {
 		force: boolean | undefined,
 		generation: number,
 		signal: AbortSignal,
+		auth?: ModelAuth,
 	): Promise<void> {
 		const stored = await this.modelsStore.read(provider.id, { signal });
 		await provider.refreshModels({
 			credential,
+			auth,
+			identity: this.identity,
 			stored: stored ? withKnownModelTypes(structuredClone(stored)) : undefined,
 			publish: (publication) => this.publishProviderModels(provider.id, generation, signal, publication),
 			allowNetwork,
 			force: allowNetwork ? force : undefined,
 			signal,
-			baseUrl: provider.baseUrl,
+			baseUrl: auth?.baseUrl ?? provider.baseUrl,
 		});
 	}
 
@@ -586,14 +601,39 @@ class ModelsImpl implements MutableModels {
 						credentialError = error;
 					}
 
-					// Restore cached provider state before auth resolution or network access.
-					await this.runProviderRefreshPhase(provider, storedCredential, false, undefined, generation, signal);
+					// Generic catalogs restore before auth resolution. Personalized catalogs opt into a
+					// side-effect-free derivation, never the request auth resolver, for offline identity.
+					let cachedAuth: ModelAuth | undefined;
+					if (credentialError === undefined) {
+						try {
+							cachedAuth = await provider.resolveCachedModelAuth?.(storedCredential, this.authContext);
+						} catch {
+							// Unverifiable personalized state must not be restored for a different account.
+						}
+					}
+					await this.runProviderRefreshPhase(
+						provider,
+						storedCredential,
+						false,
+						undefined,
+						generation,
+						signal,
+						cachedAuth,
+					);
 					if (credentialError !== undefined) throw credentialError;
 					if (!allowNetwork || signal.aborted) return;
 
-					const credential = await this.resolveRefreshCredential(provider, storedCredential, signal);
-					if (!credential) return;
-					await this.runProviderRefreshPhase(provider, credential, true, options.force, generation, signal);
+					const resolved = await this.resolveRefreshCredential(provider, storedCredential, signal);
+					if (!resolved) return;
+					await this.runProviderRefreshPhase(
+						provider,
+						resolved.credential,
+						true,
+						options.force,
+						generation,
+						signal,
+						resolved.auth,
+					);
 				})();
 
 				try {
@@ -628,21 +668,26 @@ class ModelsImpl implements MutableModels {
 		provider: Provider,
 		stored: Credential | undefined,
 		signal: AbortSignal,
-	): Promise<Credential | undefined> {
+	): Promise<{ credential: Credential; auth: ModelAuth } | undefined> {
 		if (stored?.type === "oauth") {
 			const oauth = provider.auth.oauth;
 			if (!oauth) return undefined;
-			if (Date.now() < stored.expires) return stored;
+			let credential = stored;
 			if (signal.aborted) return undefined;
 			// A refresh that has started survives cancellation or a superseding model refresh, so a
 			// rotated refresh token is always persisted. A newer refresh then sees the fresh credential.
-			return refreshStoredOAuthCredential(
-				this.credentials,
-				provider.id,
-				oauth,
-				(current) => Date.now() >= current.expires,
-				signal,
-			);
+			if (Date.now() >= stored.expires) {
+				const refreshed = await refreshStoredOAuthCredential(
+					this.credentials,
+					provider.id,
+					oauth,
+					(current) => Date.now() >= current.expires,
+					signal,
+				);
+				if (!refreshed) return undefined;
+				credential = refreshed;
+			}
+			return { credential, auth: await oauth.toAuth(credential) };
 		}
 
 		const apiKey = provider.auth.apiKey;
@@ -650,7 +695,7 @@ class ModelsImpl implements MutableModels {
 		const credential = stored?.type === "api_key" ? stored : undefined;
 		const result = await apiKey.resolve({ ctx: this.authContext, credential, signal });
 		if (!result) return undefined;
-		return { type: "api_key", key: result.auth.apiKey, env: result.env };
+		return { credential: { type: "api_key", key: result.auth.apiKey, env: result.env }, auth: result.auth };
 	}
 
 	private async readCredential(providerId: string, signal: AbortSignal): Promise<Credential | undefined> {
@@ -915,6 +960,7 @@ class ModelsImpl implements MutableModels {
 				return provider.stream(requestModel, transcript, requestOptions as ApiStreamOptions<TApi>);
 			},
 			observeModelRequest(model, options, false),
+			options?.signal,
 		);
 	}
 
@@ -936,6 +982,7 @@ class ModelsImpl implements MutableModels {
 				return provider.streamSimple(requestModel, transcript, requestOptions as SimpleStreamOptions);
 			},
 			observeModelRequest(model, options, false),
+			options?.signal,
 		);
 	}
 
@@ -963,6 +1010,7 @@ class ModelsImpl implements MutableModels {
 				return provider.fetchDeferred(requestModel, handle, requestOptions as DeferredFetchOptions);
 			},
 			observeModelRequest(model, options, true),
+			options?.signal,
 		);
 	}
 
@@ -1175,16 +1223,21 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 
 	if (streams.some((entry) => entry.fetchDeferred !== undefined)) {
 		provider.fetchDeferred = (model, handle, options) =>
-			lazyStream(model, async () => {
-				const implementation = apiFor(model);
-				if (!implementation?.fetchDeferred) {
-					throw new ModelsError(
-						"provider",
-						`Provider ${input.id} does not support deferred responses for "${model.api}"`,
-					);
-				}
-				return implementation.fetchDeferred(model, handle, options);
-			});
+			lazyStream(
+				model,
+				async () => {
+					const implementation = apiFor(model);
+					if (!implementation?.fetchDeferred) {
+						throw new ModelsError(
+							"provider",
+							`Provider ${input.id} does not support deferred responses for "${model.api}"`,
+						);
+					}
+					return implementation.fetchDeferred(model, handle, options);
+				},
+				undefined,
+				options?.signal,
+			);
 	}
 	if (streams.some((entry) => entry.cancelDeferred !== undefined)) {
 		provider.cancelDeferred = async (model, handle, options) => {

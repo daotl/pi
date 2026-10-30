@@ -33,6 +33,38 @@ describe("contracts", () => {
 		);
 	});
 
+	it("tuple tails must fit consumer result and state policies", () => {
+		const wanted = Type.Tuple([Type.String()]);
+		const offered = Type.Tuple([Type.String()], { additionalItems: true });
+		const strings = Type.Tuple([Type.String()], { additionalItems: Type.String() });
+		assert.equal(Value.Check(offered, ["x", 1]), true);
+		assert.equal(Value.Check(wanted, ["x", 1]), false);
+		assert.equal(Value.Check(strings, ["x", 1]), false);
+		assert.equal(fits(offered, wanted), false);
+		assert.equal(fits(offered, strings), false);
+		assert.equal(fits(strings, Type.Array(Type.String())), true);
+		assert.equal(fits(offered, Type.Array(Type.String())), false);
+		assert.equal(fits(wanted, offered), true);
+		for (const member of ["result", "state"] as const) {
+			const contract = (schema: typeof wanted) =>
+				remote(`t.tuple-tail-${member}`, {
+					version: 1,
+					input: Type.Object({}),
+					host: hostNamed("server"),
+					variants: {
+						main:
+							member === "result"
+								? { methods: { read: method(undefined, schema) } }
+								: { state: { value: schema } },
+					},
+				});
+			assert.throws(
+				() => bind(contract(offered), undefined, contract(wanted)),
+				(error) => isChordError(error, "contract_mismatch") && error.message.includes(member),
+			);
+		}
+	});
+
 	it("union sibling constraints remain part of result and state coverage", () => {
 		const wanted = Type.Union([Type.Number(), Type.String()], { minimum: 1 });
 		const offered = Type.Number();

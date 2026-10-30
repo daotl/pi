@@ -33,9 +33,9 @@ type ToolCallState = { readonly parser: StreamingJsonParser; changes: JsonChange
  * - Text and thinking: the `text_delta` and `thinking_delta` events. The commit appends them where the committed string
  *   plus the deltas has the new string's length, and compares otherwise. A block's `*_end` event drops them, because
  *   providers may replace the text when a block ends.
- * - Tool-call arguments: a `StreamingJsonParser` per call, fed with the raw argument text of each `toolcall_delta`,
- *   reports what each piece changed. The commit applies those changes to the committed arguments in order and leaves
- *   the arguments out of the message assignment, so the committed arguments are exactly the parsed text so far.
+ * - Tool-call arguments starting empty: a `StreamingJsonParser` per call, fed with each `toolcall_delta`, reports what
+ *   each piece changed. The commit applies those changes and leaves arguments out of the message assignment.
+ *   Calls starting with nonempty arguments retain provider snapshots: subsequent deltas omit their initial prefix.
  *   `toolcall_end` ends the tracking; the call's last commit assigns its final arguments.
  */
 export class PartialChanges {
@@ -53,13 +53,20 @@ export class PartialChanges {
 				else this.#text.set(event.contentIndex, { field, text: event.delta });
 				return;
 			}
-			case "toolcall_start":
+			case "toolcall_start": {
+				const block = event.partial.content[event.contentIndex];
+				// The delta stream does not include a provider's initial prefix. Its snapshots remain authoritative.
+				if (block?.type !== "toolCall" || Object.keys(block.arguments).length > 0) {
+					this.#toolCalls.delete(event.contentIndex);
+					return;
+				}
 				this.#toolCalls.set(event.contentIndex, {
 					parser: new StreamingJsonParser(),
 					changes: [],
 					committed: false,
 				});
 				return;
+			}
 			case "toolcall_delta": {
 				const call = this.#toolCalls.get(event.contentIndex);
 				if (call === undefined) return;

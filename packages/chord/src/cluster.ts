@@ -14,6 +14,7 @@ import { type Frame, toWireError } from "./wire.ts";
 // A child that connects behind the server's code version is fenced and reconciled with the same protocol.
 
 let reloadSeq = 0;
+const RECONCILE_DEADLINE = 30_000;
 
 const modulesFor = (remote: ReloadOptions["remote"], hostName: string | undefined): string[] => {
 	let best: [string, readonly string[]] | undefined;
@@ -144,7 +145,7 @@ export async function reconcileChild(host: HostImpl, connection: Connection): Pr
 		// Before `prepare`: the child's prepare first retires its previous code version, which waits for this permission.
 		host.announceRetired(connection);
 		const id = ++reloadSeq;
-		const vote = awaitVote(connection, id, 30_000);
+		const vote = awaitVote(connection, id, RECONCILE_DEADLINE);
 		connection.send({
 			t: "prepare",
 			reload: id,
@@ -154,8 +155,21 @@ export async function reconcileChild(host: HostImpl, connection: Connection): Pr
 		});
 		await vote;
 		if (host.current.id !== codeVersion) {
-			// This host moved on meanwhile: abort and try again with the newer code version.
+			// The child owns its reload slot until rollback finishes, not merely until it receives abort.
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const aborted = new Promise<unknown>((resolve, reject) => {
+				connection.abortions.set(id, { resolve, reject });
+				timer = setTimeout(() => {
+					connection.abortions.delete(id);
+					reject(
+						new ChordError("aborted", `rollback missing after ${RECONCILE_DEADLINE} ms`, {
+							reason: "vote_deadline",
+						}),
+					);
+				}, RECONCILE_DEADLINE);
+			});
 			connection.send({ t: "abort", reload: id });
+			await aborted.finally(() => clearTimeout(timer));
 			continue;
 		}
 		connection.send({ t: "commit", reload: id });
@@ -167,7 +181,7 @@ export async function reconcileChild(host: HostImpl, connection: Connection): Pr
 interface ChildOperation {
 	readonly id: number;
 	reload: Reload | undefined;
-	state: "loading" | "preparing" | "prepared";
+	state: "loading" | "preparing" | "prepared" | "rolling-back";
 	cancelled: boolean;
 }
 
@@ -197,12 +211,16 @@ export class ChildReloads {
 			return;
 		}
 		const operation = this.#operation;
-		if (operation === undefined || operation.id !== frame.reload) return;
-		if (frame.t === "abort") {
-			this.#cancel(operation);
+		if (operation === undefined || operation.id !== frame.reload) {
+			// A failed prepare has already unwound before voting no; its abort is already complete.
+			if (frame.t === "abort") connection.send({ t: "aborted", reload: frame.reload });
 			return;
 		}
-		if (operation.state !== "prepared") return;
+		if (frame.t === "abort") {
+			this.#cancel(operation, connection);
+			return;
+		}
+		if (operation.cancelled || operation.state !== "prepared") return;
 		try {
 			operation.reload?.commit();
 		} catch (error) {
@@ -221,18 +239,23 @@ export class ChildReloads {
 		if (this.#operation !== undefined) this.#cancel(this.#operation);
 	}
 
-	#cancel(operation: ChildOperation): void {
+	#cancel(operation: ChildOperation, connection?: Connection): void {
+		if (operation.cancelled) return;
 		operation.cancelled = true;
 		if (operation.state !== "prepared") {
-			// Loading or preparing: make prepare fail now; #run unwinds when it settles.
+			// Loading or preparing: #run retains ownership and acknowledges only after unwind.
 			operation.reload?.rollback().catch((error: unknown) => this.#host.report(error));
 			return;
 		}
-		this.#operation = undefined;
-		operation.reload
+		operation.state = "rolling-back";
+		void operation.reload
 			?.rollback()
 			.catch((error: unknown) => this.#host.report(error))
-			.finally(() => endReload(this.#host));
+			.finally(() => {
+				if (this.#operation === operation) this.#operation = undefined;
+				endReload(this.#host);
+				if (connection?.open) connection.send({ t: "aborted", reload: operation.id });
+			});
 	}
 
 	async #run(
@@ -257,6 +280,7 @@ export class ChildReloads {
 			}
 			if (this.#operation === operation) this.#operation = undefined;
 			if (!operation.cancelled) connection.send({ t: "vote", reload: frame.reload, error: toWireError(error) });
+			else if (connection.open) connection.send({ t: "aborted", reload: frame.reload });
 		}
 	}
 }

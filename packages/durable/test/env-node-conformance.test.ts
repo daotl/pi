@@ -1,14 +1,30 @@
 import { execFileSync } from "node:child_process";
+import type * as Fs from "node:fs";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { rename, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { afterEach, describe, expect, it } from "vitest";
-import { getOrThrow, type WatchChange, type WatchTarget } from "../src/env/index.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { type FileWatcher, getOrThrow, type WatchChange, type WatchTarget } from "../src/env/index.ts";
 import { NodeExecutionEnv } from "../src/env/node.ts";
 import { registerEnvConformance } from "../src/testing/index.ts";
+
+const nativeEvents = vi.hoisted(() => ({ muted: false }));
+
+// Model events lost while libuv restarts the loop's shared FSEvents stream. Subscriptions, filesystem operations,
+// and settle scans stay real; only delivery is suppressed during the controlled restart window.
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof Fs>();
+	return {
+		...actual,
+		watch: (path: Fs.PathLike, options: Fs.WatchOptionsWithStringEncoding, listener: Fs.WatchListener<string>) =>
+			actual.watch(path, options, (event, filename) => {
+				if (!nativeEvents.muted) listener(event, filename);
+			}),
+	};
+});
 
 const windows = process.platform === "win32";
 const gitBash = join(process.env.ProgramFiles ?? "C:\\Program Files", "Git", "bin", "bash.exe");
@@ -231,6 +247,59 @@ describe("NodeExecutionEnv native watches through symlinked parents", () => {
 					await watcher.close(context);
 				}
 			} finally {
+				await removeTempDir(cwd);
+				await removeTempDir(real);
+			}
+		},
+		15_000,
+	);
+
+	it.skipIf(process.platform !== "darwin").each(["install", "close"])(
+		"rescans a settled relative-link target when another native watcher %ss",
+		async (operation) => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-durable-env-shared-stream-"));
+			const real = mkdtempSync(join(tmpdir(), "pi-durable-env-shared-real-"));
+			const env = new NodeExecutionEnv({ cwd, watch: { mode: "native" } });
+			const directory = join(real, "missing", "target");
+			const lexical = join(cwd, "link", "AGENTS.md");
+			const changes: WatchChange[] = [];
+			let first: FileWatcher | undefined;
+			let second: FileWatcher | undefined;
+			const expectLexicalChange = async (): Promise<void> => {
+				const deadline = Date.now() + 3000;
+				while (
+					!changes.some((change) => "paths" in change && change.paths.includes(lexical)) &&
+					Date.now() < deadline
+				) {
+					await delay(20);
+				}
+				expect(changes.some((change) => "paths" in change && change.paths.includes(lexical))).toBe(true);
+				expect(changes.some((change) => "error" in change || "overflow" in change)).toBe(false);
+			};
+			try {
+				getOrThrow(await env.createDir("other", undefined, context));
+				getOrThrow(await env.createDir(directory, undefined, context));
+				await symlink(relative(cwd, directory), join(cwd, "link"));
+				first = getOrThrow(await env.watch([{ path: lexical }], (change) => changes.push(change), context));
+				if (operation === "close") {
+					second = getOrThrow(await env.watch([{ path: "other" }], () => {}, context));
+				}
+				// The first watcher's own installations and settle scans are finished before the shared restart.
+				await delay(900);
+				changes.length = 0;
+				nativeEvents.muted = true;
+				if (operation === "install") {
+					second = getOrThrow(await env.watch([{ path: "other" }], () => {}, context));
+				} else {
+					await second!.close(context);
+				}
+				getOrThrow(await env.writeFile(join(directory, "AGENTS.md"), "created during shared restart", context));
+				await expectLexicalChange();
+				expect(first.mode).toBe("native");
+			} finally {
+				await first?.close(context);
+				await second?.close(context);
+				nativeEvents.muted = false;
 				await removeTempDir(cwd);
 				await removeTempDir(real);
 			}

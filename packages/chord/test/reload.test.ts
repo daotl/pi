@@ -355,8 +355,13 @@ describe("reload", () => {
 		assert.deepEqual(log, ["open cache 2", "close lock 1", "open lock 2", "close cache 1"]);
 	});
 
-	for (const failOpen of [false, true]) {
-		it(`closes exclusive dependents before dependencies and ${failOpen ? "restores dependencies before dependents on abort" : "commits their replacements"}`, async () => {
+	for (const [failOpen, exclusive] of [
+		[false, false],
+		[false, true],
+		[true, false],
+		[true, true],
+	] as const) {
+		it(`closes ${exclusive ? "exclusive" : "nonexclusive"} dependents before dependencies and ${failOpen ? "restores dependencies before dependents on abort" : "commits their replacements"}`, async () => {
 			const errors: unknown[] = [];
 			const host = createHost({ self: "host", onError: (error) => errors.push(error) });
 			const log: string[] = [];
@@ -375,7 +380,7 @@ describe("reload", () => {
 						});
 						const dependent = self.resource("dependent", {
 							version,
-							exclusive: true,
+							exclusive,
 							deps: [dependency],
 							open: () => {
 								log.push(`open dependent ${version} with ${dependency.value}`);

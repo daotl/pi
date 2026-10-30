@@ -28,6 +28,7 @@ import {
 	renameSync,
 	type Stats,
 	statSync,
+	truncateSync,
 	unlinkSync,
 	writeFileSync,
 } from "fs";
@@ -1166,6 +1167,7 @@ export class SessionManager {
 	private cwd: string;
 	private persist: boolean;
 	private flushed: boolean = false;
+	private appendRollbackError: Error | undefined;
 	private fileEntries: StoredFileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
 	private labelsById: Map<string, string> = new Map();
@@ -1213,6 +1215,7 @@ export class SessionManager {
 	}
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: StoredFileEntry[]): void {
+		const previousSessionFile = this.sessionFile;
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
 			const entries = preloadedFileEntries ?? loadStoredEntriesFromFile(this.sessionFile);
@@ -1238,6 +1241,7 @@ export class SessionManager {
 			this.newSession();
 			this.sessionFile = explicitPath; // preserve explicit path from --session flag
 		}
+		if (this.sessionFile !== previousSessionFile) this.appendRollbackError = undefined;
 	}
 
 	newSession(options?: NewSessionOptions): string | undefined {
@@ -1261,6 +1265,7 @@ export class SessionManager {
 		this.leafId = null;
 		this.contextRevision++;
 		this.flushed = false;
+		this.appendRollbackError = undefined;
 
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
@@ -1331,6 +1336,7 @@ export class SessionManager {
 			closeSync(fd);
 			fd = undefined;
 			renameSync(temporaryFile, destination);
+			this.appendRollbackError = undefined;
 		} catch (error) {
 			if (fd !== undefined) {
 				try {
@@ -1477,6 +1483,7 @@ export class SessionManager {
 
 	_persist(entry: SessionEntry, entries: StoredFileEntry[] = this.fileEntries): void {
 		if (!this.persist || !this.sessionFile) return;
+		if (this.appendRollbackError) throw this.appendRollbackError;
 
 		if (!this.flushed) {
 			if (!this._hasConversation(entries)) return;
@@ -1504,7 +1511,22 @@ export class SessionManager {
 			}
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			const data = `${JSON.stringify(entry)}\n`;
+			const size = statSync(this.sessionFile).size;
+			try {
+				appendFileSync(this.sessionFile, data);
+			} catch (error) {
+				try {
+					truncateSync(this.sessionFile, size);
+				} catch (rollbackError) {
+					this.appendRollbackError = new AggregateError(
+						[error, rollbackError],
+						`Session append rollback failed; repair the session file before appending: ${this.sessionFile}`,
+					);
+					throw this.appendRollbackError;
+				}
+				throw error;
+			}
 		}
 	}
 
@@ -3033,6 +3055,7 @@ export class SessionManager {
 				this.flushed = true;
 			} else {
 				this.flushed = false;
+				this.appendRollbackError = undefined;
 			}
 
 			return newSessionFile;

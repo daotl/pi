@@ -125,3 +125,52 @@ it.each(["error", "aborted"] as const)("never grants natural continuation for %s
 	expect(observed).toEqual([false]);
 	expect(requests).toBe(1);
 });
+
+it.each(["sequential", "parallel"] as const)(
+	"does not continue after cancellation during %s tools",
+	async (toolExecution) => {
+		const controller = new AbortController();
+		const schema = Type.Object({});
+		const tool: AgentTool<typeof schema> = {
+			name: "cancel",
+			label: "Cancel",
+			description: "Cancel the active turn",
+			parameters: schema,
+			execute: async () => {
+				controller.abort(new Error("caller cancelled"));
+				return { content: [{ type: "text", text: "cancelled" }], details: {} };
+			},
+		};
+		const observed: boolean[] = [];
+		let requests = 0;
+		await runAgentLoop(
+			[{ role: "user", content: "work", timestamp: 1 }],
+			{ messages: [], tools: [tool] },
+			{
+				model,
+				toolExecution,
+				convertToLlm: () => [],
+				finishTurn: (turn) => {
+					observed.push(turn.canContinue);
+					return { action: "continue" };
+				},
+			},
+			() => {},
+			controller.signal,
+			() => {
+				requests++;
+				if (requests > 1) throw new Error("provider dispatched after cancellation");
+				const message = {
+					...fauxAssistantMessage(""),
+					stopReason: "toolUse" as const,
+					content: [{ type: "toolCall" as const, id: "cancel", name: "cancel", arguments: {} }],
+				};
+				const stream = createAssistantMessageEventStream();
+				stream.push({ type: "done", reason: "toolUse", message });
+				return stream;
+			},
+		);
+		expect(observed).toEqual([false]);
+		expect(requests).toBe(1);
+	},
+);

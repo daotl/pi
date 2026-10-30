@@ -225,6 +225,8 @@ describe("post-login model discovery", () => {
 			if (!id) throw new Error("Missing provider default");
 			const selected = getBuiltinModels(providerId).find((model) => model.id === id);
 			if (!selected) throw new Error("Missing catalog default model");
+			const alternative = getBuiltinModels(providerId).find((model) => model.id !== id);
+			if (!alternative) throw new Error("Missing alternative catalog model");
 			const unknown = { ...harness.getModel(), id: "unknown", provider: "unknown", api: "unknown" };
 			session.agent.state.model = unknown;
 			session.modelRuntime.registerNativeProvider({
@@ -237,7 +239,7 @@ describe("post-login model discovery", () => {
 						resolve: async ({ credential }) => ({ auth: { apiKey: credential?.key }, source: "fixture" }),
 					},
 				},
-				getModels: () => [selected],
+				getModels: () => [alternative, selected],
 				stream: () => {
 					throw new Error("Unexpected provider dispatch");
 				},
@@ -248,6 +250,7 @@ describe("post-login model discovery", () => {
 			await harness.authStorage.modify(providerId, async () => ({ type: "api_key", key: "offline-first-login" }));
 			await session.modelRuntime.getAvailable(providerId);
 			expect(session.modelRuntime.getAvailableSnapshot().filter((model) => model.provider === providerId)).toEqual([
+				alternative,
 				selected,
 			]);
 			vi.spyOn(session.modelRuntime, "refresh").mockResolvedValue({ aborted: false, errors: new Map() });

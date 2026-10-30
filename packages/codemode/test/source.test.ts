@@ -106,6 +106,167 @@ describe("parseCodemodeSource", () => {
 		}
 	});
 
+	it("recognizes regexps after class declarations without breaking class-expression division", () => {
+		for (const prefix of [
+			"class A {} /`/.test('x');",
+			"class A extends Object {} /`/.test('x');",
+			"class A extends (class {}) {} /`/.test('x');",
+			"class A { method() { return {}; } } /`/.test('x');",
+			"export default class {} /`/.test('x');",
+		]) {
+			expect(
+				() => parseCodemodeSource(`${prefix}\n// @options: {"timeout_ms": 1}\nwhile (true) {}`),
+				prefix,
+			).toThrow("found one on line 2");
+			const literal = `${prefix}\nconst source = \`example\n// @options: {}\n\`;`;
+			expect(parseCodemodeSource(literal), prefix).toEqual({ code: literal, options: {} });
+		}
+		for (const prefix of ["const A = class {}", "const A = class Named extends Object {}", "const A = (class {})"]) {
+			const literal = `${prefix} / \`example\n// @options: {}\n\`;`;
+			expect(parseCodemodeSource(literal), prefix).toEqual({ code: literal, options: {} });
+		}
+	});
+
+	it("distinguishes object property names from class expressions", () => {
+		for (const properties of [
+			"class: 1,",
+			"class() {},",
+			"get class() { return 1; },",
+			"async class() {},",
+			"*class() {},",
+			"function() {}, class: 1,",
+			"value: class { class() {} }, class: 1,",
+			"value: class extends (class {}) {},",
+		]) {
+			const prefix = `const o = { ${properties} m() { if (true) {} /\`/.test('x'); } };`;
+			expect(() => parseCodemodeSource(`${prefix}\n// @options: {"timeout_ms": 1}\nwhile (true) {}`)).toThrow(
+				"found one on line 2",
+			);
+			const literal = `${prefix}\nconst source = \`example\n// @options: {}\n\`;`;
+			expect(parseCodemodeSource(literal)).toEqual({ code: literal, options: {} });
+		}
+		const division = "const o = { value: class {} / `example\n// @options: {}\n` };";
+		expect(parseCodemodeSource(division)).toEqual({ code: division, options: {} });
+	});
+
+	it("does not treat class member names as declaration keywords", () => {
+		for (const declaration of [
+			"class A { class = {} / 2; }",
+			"class A { class() { return {}; } }",
+			"class A { function = {} / 2; }",
+			"class A { static class = {} / 2; }",
+			"class A { method() { const B = class {}; } class = {} / 2; }",
+			"class A { x; class /* field */ = {} / 2; }",
+			"class A { x; function /* field */ = {} / 2; }",
+			"class A { x; class // field\n = {} / 2; }",
+			"class A { x; class\nother = {} / 2; }",
+			"class A { class\nfunction\nother = {} / 2; }",
+			"class A { field = class {}; class\nother = {} / 2; }",
+			"class A { #class = {} / 2; #function() { return {}; } }",
+			"class A { static function() {} static class() {} }",
+			"class A { async class() {} async function() {} }",
+			"class A { get class() { return {}; } set function(value) {} }",
+			"class A { *class() {} async *function() {} }",
+			"class A { static #class() {} get #function() { return {}; } }",
+			"class A { class /* field\n */ other = {} / 2; }",
+			"class A { class // field\n function\n other = {} / 2; }",
+			"class A { class\n = {} / 2; function\n = {} / 2; }",
+			"class A { field = 1\n class\n other = {} / 2; }",
+			"class A { field = {}\n function\n other = {} / 2; }",
+			"class A { field = 1 /* field\n */ class\n other = {} / 2; }",
+			"class A { field = 1 // field\n function\n other = {} / 2; }",
+			"class A { field = 1\r\n class\r\n other = {} / 2; }",
+			"class A { field = 1 /* field\u2028 */ class\n other = {} / 2; }",
+			"class A { field = 1 /* field\u2029 */ function\n other = {} / 2; }",
+			"class A { field = left\n / right; class = {} / 2; }",
+			"class A { field = left\n / right\n class\n other = {} / 2; }",
+			"class A { field =\n class Named {}; class = {} / 2; }",
+			"class A { field = class Named\n {}; function = {} / 2; }",
+			"class A { field = class extends Object\n {}; class = {} / 2; }",
+			"class A { field = class extends (class {}) {}; class = {} / 2; }",
+			"class A { field = class {};\n class\n other = {} / 2; }",
+			"class A { field = class {}\n class\n other = {} / 2; }",
+			"class A { field = true ?\n class {} :\n class Named {}; class = {} / 2; }",
+			"class A { field = function() {}; class = {} / 2; }",
+			"class A { field = function named() {}\n function\n other = {} / 2; }",
+			"class A { field = class { class() {} function = class {}; }\n class\n other = {} / 2; }",
+			"class A { field = function() { return class { class() {} }; }\n class\n other = {} / 2; }",
+			"class A { field = class extends class {} {}\n function\n other = {} / 2; }",
+			"class A { class(value = class {}) {} function\n other = {} / 2; }",
+			"class A { static class\n static function\n other = {} / 2; }",
+			"class A { field = 1\n #class\n #function = {} / 2; }",
+			"class A { field = function\n named() {}; class = {} / 2; }",
+			"class A { field = async function() {}; function = {} / 2; }",
+			"class A { field = (() => {})\n class\n other = {} / 2; }",
+			"class A { field = {} / 2\n class\n other = {} / 2; }",
+			"class A { method() { const B = class {}; } class = class {}; function = {} / 2; }",
+			"class A { static { const B = class {}; } function = function() {}; class = {} / 2; }",
+			"class A { static { const B = class {}; } class\n other = {} / 2; }",
+			"class A { method() { function declared() {} } function\n other = {} / 2; }",
+			"class A { ['class']() {} class\n other = {} / 2; }",
+		]) {
+			expect(
+				() => parseCodemodeSource(`${declaration}\n// @options: {"timeout_ms": 1}\nwhile (true) {}`),
+				declaration,
+			).toThrow(`found one on line ${declaration.split("\n").length + 1}`);
+			const prefix = `${declaration} /\`/.test('x');`;
+			expect(
+				() => parseCodemodeSource(`${prefix}\n// @options: {"timeout_ms": 1}\nwhile (true) {}`),
+				declaration,
+			).toThrow(`found one on line ${declaration.split("\n").length + 1}`);
+			const literal = `${prefix}\nconst source = \`example\n// @options: {}\n\`;`;
+			expect(parseCodemodeSource(literal), declaration).toEqual({ code: literal, options: {} });
+		}
+	});
+
+	it("keeps initializer division and multiline continuations inside class fields", () => {
+		for (const expression of [
+			"{}",
+			"class {}",
+			"class Named {}",
+			"class extends (class {}) {}",
+			"class { class() {} }",
+			"class extends class {} {}",
+			"function() {}",
+			"function named() {}",
+			"async function() {}",
+			"(() => {})",
+			"function*() {}",
+			"async function*() {}",
+			"async () => {}",
+			"(() => ({ value: class {} }))",
+		]) {
+			// The slash must remain division after an initializer body, not start a regexp.
+			const input = `class A { field = ${expression}\n / \`example\n// @options: {}\n\`; }`;
+			expect(parseCodemodeSource(input), expression).toEqual({ code: input, options: {} });
+		}
+		for (const continuation of [
+			"left\n / right",
+			"left\n in right",
+			"left\n instanceof Right",
+			"value\n .class",
+			"value\n .function()",
+			"value\n [key]",
+			"value\n (argument)",
+			"value\n `tagged`",
+			"value.\n class",
+			"value.\n function()",
+			"(class {})\n / other",
+			"[class {}, function() {}]",
+			"({ value: class {} })",
+			"value\n + other",
+			"value\n ? class {} : function() {}",
+		]) {
+			const declaration = `class A { field = ${continuation}\n class\n other = {} / 2; }`;
+			const prefix = `${declaration} /\`/.test('x');`;
+			expect(() => parseCodemodeSource(`${prefix}\n// @options: {}\nreturn 1;`), continuation).toThrow(
+				`found one on line ${declaration.split("\n").length + 1}`,
+			);
+			const literal = `${prefix}\nconst source = \`example\n// @options: {}\n\`;`;
+			expect(parseCodemodeSource(literal), continuation).toEqual({ code: literal, options: {} });
+		}
+	});
+
 	it("keeps division after object, function-expression, and arrow-expression braces", () => {
 		for (const expression of [
 			"const value = {}",

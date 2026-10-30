@@ -607,6 +607,40 @@ describe("MCP OAuth", () => {
 		expect(await run(refreshing)).toBe("/token");
 	});
 
+	it("does not redirect when a distinct refresh signal cancels", async () => {
+		const requested = Promise.withResolvers<void>();
+		const origin = await listen(async (_request, _response) => {
+			requested.resolve();
+		});
+		const provider = new TestOAuthProvider("http://127.0.0.1/callback");
+		provider.client = { client_id: "client" };
+		provider.tokenSet = { access_token: "a1", refresh_token: "r1", token_type: "Bearer" };
+		provider.discovery = {
+			authorizationServerUrl: origin,
+			authorizationServerMetadata: {
+				issuer: origin,
+				authorization_endpoint: `${origin}/authorize`,
+				token_endpoint: `${origin}/token`,
+				response_types_supported: ["code"],
+			},
+		};
+		const caller = new AbortController();
+		const refresh = new AbortController();
+		const flow = authorizeMcp(provider, {
+			serverUrl: `${origin}/mcp`,
+			signal: caller.signal,
+			refreshSignal: refresh.signal,
+		});
+		const settled = flow.catch((error: unknown) => error);
+		await requested.promise;
+		refresh.abort();
+		expect(await settled).toMatchObject({ name: "AbortError" });
+		expect(caller.signal.aborted).toBe(false);
+		expect(provider.authorizationUrl).toBeUndefined();
+		expect(provider.verifier).toBeUndefined();
+		expect(provider.tokenSet?.refresh_token).toBe("r1");
+	});
+
 	it("does not dispatch a detached refresh when its caller already cancelled", async () => {
 		const requests: string[] = [];
 		const origin = await listen(async (request, response) => {

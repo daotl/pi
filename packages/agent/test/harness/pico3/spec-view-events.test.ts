@@ -6,12 +6,14 @@ import type { AssistantMessage, AssistantMessageEvent } from "@earendil-works/pi
 import { onTestFinished, test } from "vitest";
 import type { ConversationHandle } from "../../../src/harness/pico3/harness.ts";
 import type { ConversationView, Envelope, Models, ViewEvent } from "../../../src/harness/pico3/types.ts";
+import { WATCH_CAPACITY, type Watch } from "../../../src/harness/pico3/view.ts";
 import { ctx, fake, Gate, model, open } from "./helpers.ts";
 
 type SpecWatch = {
 	readonly view: ConversationView;
 	readonly revision: number;
 	readonly closed: boolean;
+	readonly ended: Watch["ended"];
 	start(listener: (envelope: Envelope) => void): void;
 	stop(): void;
 };
@@ -198,7 +200,7 @@ test("a self-head commit rewrites one transcript entry with matching entry/head 
 	watch.stop();
 });
 
-test("a namespace projection failure closes its watches without failing the persisted writer", async () => {
+test("a namespace projection failure ends an unstarted watch without failing the persisted writer", async () => {
 	const reports: unknown[] = [];
 	const env = await open({ onReport: (error) => reports.push(error) });
 	onTestFinished(() => env.close());
@@ -213,11 +215,13 @@ test("a namespace projection failure closes its watches without failing the pers
 		},
 	);
 	const watch = await env.root.watch(ctx);
-	watch.start(() => {});
 	await env.root.commit((tx) => {
 		tx.plugins(namespace).fail = true;
 	}, ctx);
 	assert.equal(watch.closed, true);
+	const end = await watch.ended;
+	assert.equal(end.reason, "failed");
+	if (end.reason === "failed") assert.equal(end.error.message, "projection failed");
 	assert.match(String(reports[0]), /projection failed/);
 	assert.equal((await env.root.sticky(ctx)).plugins[namespace.id]?.fail, true);
 });
@@ -249,6 +253,8 @@ test("pre-start delivery is ordered, start is idempotent, and stop has a hard no
 	const env = await open({});
 	onTestFinished(() => env.close());
 	const watch = await specWatch(env.root);
+	const endings: Awaited<Watch["ended"]>[] = [];
+	void watch.ended.then((end) => endings.push(end));
 	await env.root.write({ kind: "buffered.one" }, ctx);
 	await env.root.write({ kind: "buffered.two" }, ctx);
 	const received: Envelope[] = [];
@@ -261,8 +267,12 @@ test("pre-start delivery is ordered, start is idempotent, and stop has a hard no
 	const countAtStop = received.length;
 	watch.stop();
 	watch.stop();
+	const end = await watch.ended;
+	assert.deepEqual(end, { reason: "stopped" });
 	await env.root.write({ kind: "after.stop" }, ctx);
 	assert.equal(received.length, countAtStop);
+	assert.deepEqual(endings, [end]);
+	assert.equal(await watch.ended, end, "later stop and commits preserve the original terminal result");
 });
 
 test("listener failure is isolated from persistence and from sibling watches", async () => {
@@ -272,8 +282,13 @@ test("listener failure is isolated from persistence and from sibling watches", a
 	const broken = await specWatch(env.root);
 	const healthy = await specWatch(env.root);
 	const healthyEvents: ViewEvent[][] = [];
+	const listenerError = new Error("listener failed");
+	const endings: Awaited<Watch["ended"]>[] = [];
+	void broken.ended.then((end) => endings.push(end));
+	let brokenDeliveries = 0;
 	broken.start(() => {
-		throw new Error("listener failed");
+		brokenDeliveries++;
+		throw listenerError;
 	});
 	healthy.start((envelope) => healthyEvents.push(envelope.events));
 	const persisted = await env.root.write({ kind: "survives.listener" }, ctx);
@@ -282,5 +297,40 @@ test("listener failure is isolated from persistence and from sibling watches", a
 	assert.equal(healthy.closed, false);
 	assert.equal(healthyEvents.length, 1);
 	assert.match(String(reports[0]), /listener failed/);
+	const end = await broken.ended;
+	assert.deepEqual(end, { reason: "failed", error: listenerError });
+	broken.stop();
+	broken.start(() => assert.fail("a failed watch must not restart"));
+	await env.root.write({ kind: "after.listener.failure" }, ctx);
+	assert.equal(brokenDeliveries, 1);
+	assert.equal(healthyEvents.length, 2);
+	assert.deepEqual(reports, [listenerError]);
+	assert.deepEqual(endings, [end]);
+	assert.equal(await broken.ended, end);
 	healthy.stop();
+});
+
+test("pre-start capacity failure settles once and discards buffered and later deliveries", async () => {
+	const reports: unknown[] = [];
+	const env = await open({ onReport: (error) => reports.push(error) });
+	onTestFinished(() => env.close());
+	const watch = await env.root.watch(ctx);
+	const endings: Awaited<Watch["ended"]>[] = [];
+	void watch.ended.then((end) => endings.push(end));
+	for (let index = 0; index <= WATCH_CAPACITY; index++) {
+		await env.root.write({ kind: "before.start", data: { index } }, ctx);
+	}
+	assert.equal(watch.closed, true);
+	const end = await watch.ended;
+	assert.equal(end.reason, "failed");
+	if (end.reason !== "failed") assert.fail("overflow must fail rather than stop the watch");
+	assert.match(end.error.message, /capacity .* exceeded before start/);
+	watch.start(() => assert.fail("overflowed watches must discard buffered delivery"));
+	watch.stop();
+	watch.stop();
+	const persisted = await env.root.write({ kind: "after.overflow" }, ctx);
+	assert.ok(persisted > 0, "overflow must not reject subsequent persisted writes");
+	assert.deepEqual(reports, [end.error]);
+	assert.deepEqual(endings, [end]);
+	assert.equal(await watch.ended, end);
 });

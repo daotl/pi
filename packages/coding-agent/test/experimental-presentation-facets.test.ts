@@ -2,13 +2,20 @@ import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHost, local, method } from "@earendil-works/chord";
+import { Type } from "typebox";
 import { afterEach, describe, expect, test } from "vitest";
 import {
 	activateBuiltinClientServices,
 	type ClientRuntime,
 	openClientRuntime,
 } from "../src/experimental/client-runtime.ts";
-import { createPresentationFacetData, loadPresentationFacets } from "../src/experimental/plugins/bundled.ts";
+import {
+	createPresentationFacetData,
+	type LoadedPluginFacets,
+	loadPresentationFacets,
+	loadSessionPluginFacets,
+} from "../src/experimental/plugins/bundled.ts";
 import {
 	createServerPluginPackage,
 	readFacetBundleManifest,
@@ -19,6 +26,33 @@ import { type RunningServer, startServer } from "../src/experimental/server.ts";
 const runtimes = new Set<ClientRuntime>();
 const runningServers = new Set<RunningServer>();
 const directories = new Set<string>();
+
+const GenerationProbe = local("test.presentation-generation", {
+	version: 1,
+	input: Type.Object({}),
+	members: { read: method(undefined, Type.String()) },
+});
+
+function presentationSource(generation: string): string {
+	return `import { defineFacet, local, method } from "@earendil-works/chord";
+import { Type } from "typebox";
+const Probe = local("test.presentation-generation", {
+	version: 1, input: Type.Object({}), members: { read: method(undefined, Type.String()) },
+});
+export default defineFacet(({ serve }) => serve(Probe, () => ({ read: () => ${JSON.stringify(generation)} })));
+`;
+}
+
+async function readPresentationGeneration(loaded: LoadedPluginFacets): Promise<string> {
+	const host = createHost({ name: "presentation", self: null });
+	try {
+		await host.load(loaded.facets);
+		const probe = await host.get(GenerationProbe, {});
+		return await host.root((ctx) => probe.read(ctx));
+	} finally {
+		await host.close();
+	}
+}
 
 afterEach(async () => {
 	await Promise.allSettled([...runtimes].map((runtime) => runtime.dispose()));
@@ -69,10 +103,7 @@ describe("server-selected presentation facets", () => {
 			})}\n`,
 		);
 		const sourcePath = join(packagePath, "src", "tui.ts");
-		await writeFile(
-			sourcePath,
-			'import { defineFacet } from "@earendil-works/chord"; export default defineFacet(() => { const generation = "built-a"; void generation; });\n',
-		);
+		await writeFile(sourcePath, presentationSource("built-a"));
 		const plugin = createServerPluginPackage(directory, serverId, packagePath);
 
 		const first = await plugin.build();
@@ -82,7 +113,7 @@ describe("server-selected presentation facets", () => {
 		);
 		expect(first[0]?.plugin).toEqual({ id: "@earendil-works/test-plugin", version: "1.0.0" });
 		const firstLoaded = await loadPresentationFacets(createPresentationFacetData(first));
-		expect(firstLoaded.facets.map(({ name }) => name)).toEqual(["@earendil-works/test-plugin/tui"]);
+		expect(await readPresentationGeneration(firstLoaded)).toBe("built-a");
 		await firstLoaded.dispose();
 		await expect(
 			loadPresentationFacets(
@@ -92,14 +123,10 @@ describe("server-selected presentation facets", () => {
 			),
 		).rejects.toThrow("integrity");
 
-		await writeFile(
-			sourcePath,
-			'import { defineFacet } from "@earendil-works/chord"; export default defineFacet(() => { const generation = "built-b"; void generation; });\n',
-		);
+		await writeFile(sourcePath, presentationSource("built-b"));
 		const second = await plugin.build();
-		expect(second[0]?.source).not.toBe(first[0]?.source);
 		const secondLoaded = await loadPresentationFacets(createPresentationFacetData(second));
-		expect(secondLoaded.facets.map(({ name }) => name)).toEqual(["@earendil-works/test-plugin/tui"]);
+		expect(await readPresentationGeneration(secondLoaded)).toBe("built-b");
 		await secondLoaded.dispose();
 
 		const secondPackagePath = join(directory, "second-plugin");
@@ -141,19 +168,66 @@ describe("server-selected presentation facets", () => {
 			"@earendil-works/test-plugin/tui",
 			"@earendil-works/second-test-plugin/tui",
 		]);
+		expect(await readPresentationGeneration(serverLoaded)).toBe("built-b");
 		await serverLoaded.dispose();
 
-		await writeFile(
-			sourcePath,
-			'import { defineFacet } from "@earendil-works/chord"; export default defineFacet(() => { const generation = "built-c"; void generation; });\n',
-		);
+		await writeFile(sourcePath, presentationSource("built-c"));
 		const data = await activated.server.host.root((ctx) => activated.plugins.reload(ctx));
 		const reloaded = await loadPresentationFacets(data);
-		expect(reloaded.facets.map(({ name }) => name)).toEqual([
-			"@earendil-works/test-plugin/tui",
-			"@earendil-works/second-test-plugin/tui",
-		]);
+		expect(await readPresentationGeneration(reloaded)).toBe("built-c");
 		await reloaded.dispose();
+	});
+
+	test("loads override-only facet entries selected by package metadata", async () => {
+		const directory = await mkdtemp("/tmp/pi-presentation-override-");
+		directories.add(directory);
+		const packagePath = join(directory, "custom-plugin");
+		await mkdir(join(packagePath, "src"), { recursive: true });
+		await writeFile(
+			join(packagePath, "package.json"),
+			JSON.stringify({
+				name: "test-custom-plugin",
+				chord: { facets: { session: "./src/worker.ts", tui: "./src/view.ts" } },
+			}),
+		);
+		await writeFile(join(packagePath, "src", "worker.ts"), presentationSource("session-override"));
+		await writeFile(join(packagePath, "src", "view.ts"), presentationSource("tui-override"));
+		const plugin = createServerPluginPackage(directory, randomUUID(), packagePath);
+		const artifacts = await plugin.build();
+		const presentation = await loadPresentationFacets(createPresentationFacetData(artifacts));
+		try {
+			expect(await readPresentationGeneration(presentation)).toBe("tui-override");
+		} finally {
+			await presentation.dispose();
+		}
+		const session = await loadSessionPluginFacets([plugin.manifestPath]);
+		try {
+			expect(await readPresentationGeneration(session)).toBe("session-override");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("does not build or distribute an explicitly disabled conventional facet", async () => {
+		const directory = await mkdtemp("/tmp/pi-presentation-disabled-");
+		directories.add(directory);
+		const packagePath = join(directory, "disabled-plugin");
+		await mkdir(join(packagePath, "src"), { recursive: true });
+		await writeFile(
+			join(packagePath, "package.json"),
+			JSON.stringify({ name: "test-disabled-plugin", chord: { facets: { tui: false } } }),
+		);
+		await writeFile(join(packagePath, "src", "session.ts"), presentationSource("session-default"));
+		await writeFile(join(packagePath, "src", "tui.ts"), "This disabled file must never be bundled.");
+		const plugin = createServerPluginPackage(directory, randomUUID(), packagePath);
+		expect(await plugin.build()).toEqual([]);
+		expect(Object.keys((await readFacetBundleManifest(plugin.manifestPath)).entries)).toEqual(["session"]);
+		const session = await loadSessionPluginFacets([plugin.manifestPath]);
+		try {
+			expect(await readPresentationGeneration(session)).toBe("session-default");
+		} finally {
+			await session.dispose();
+		}
 	});
 
 	test("builds the example plugin package without a package-owned build script", async () => {

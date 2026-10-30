@@ -106,6 +106,7 @@ describe("Transcript service", () => {
 					raw: "final",
 				},
 			];
+			const hydratedReplays: TranscriptReplay[] = [];
 			for (const frame of frames) {
 				reducer.apply(frame);
 				const message = structuredClone(reducer.message!);
@@ -135,8 +136,18 @@ describe("Transcript service", () => {
 				await vi.waitFor(() => expect(transcript.state.value.stream?.sequence).toBe(sequence));
 				expect(transcript.state.value.snapshot?.operation?.streamingMessage).toEqual(message);
 				expect(transcript.state.value.stream?.checkpoint).toEqual(reducer.checkpoint());
-				const hydrated = new TranscriptReplay();
-				expect(hydrated.read(transcript.state.value)).toEqual([]);
+				for (const replay of hydratedReplays) {
+					const events = replay.read(transcript.state.value);
+					expect(events).toHaveLength(1);
+					expect(events[0]).toMatchObject({ type: "message_update", runId: "run", entryId: "response" });
+					if (events[0]?.type !== "message_update") throw new Error("Expected hydrated assistant update");
+					expect(events[0].message).toEqual(copyJson(message, { omitUndefinedProperties: true }));
+				}
+				if (frame.type !== "toolcall_end") {
+					const hydrated = new TranscriptReplay();
+					hydrated.read(transcript.state.value);
+					hydratedReplays.push(hydrated);
+				}
 			}
 		} finally {
 			await host.close();
@@ -619,6 +630,114 @@ describe("Transcript service", () => {
 		}
 	});
 
+	test("commits a navigation reset before processing frames released by resnapshot", async () => {
+		let listener: EventListener | undefined;
+		const captured = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const replacement = laneSnapshot("new-tip");
+		const host = createHost({ name: "session", self: null });
+		const reducer = new AssistantMessageFrameReducer();
+		const start: AssistantMessageFrame = {
+			type: "start",
+			partial: fauxAssistantMessage([], { stopReason: "pending" }),
+		};
+		reducer.apply(start);
+		const initialMessage = structuredClone(reducer.message!);
+		const text: AssistantMessageFrame = {
+			type: "text_start",
+			contentIndex: 0,
+			content: { type: "text", text: "resumed" },
+		};
+		reducer.apply(text);
+		const continuedMessage = structuredClone(reducer.message!);
+		const handle: WatchHandle<LaneSnapshot> = {
+			snapshot: laneSnapshot(),
+			start(next) {
+				listener = next;
+			},
+			async resnapshot() {
+				captured.resolve();
+				await release.promise;
+				// A watch can release post-boundary events before its capture promise resolves.
+				void listener!({ type: "run_start", lane: "main", runId: "continued", startedAt: 3 }, BACKGROUND_CONTEXT);
+				void listener!(
+					{
+						type: "message_start",
+						lane: "main",
+						runId: "continued",
+						entryId: "response",
+						frameSequence: 1,
+						frame: start,
+						message: initialMessage,
+					},
+					BACKGROUND_CONTEXT,
+				);
+				void listener!(
+					{
+						type: "message_update",
+						lane: "main",
+						runId: "continued",
+						entryId: "response",
+						frameSequence: 2,
+						frame: text,
+						message: continuedMessage,
+						event: { type: "text_delta", contentIndex: 0, delta: "resumed", partial: continuedMessage },
+					},
+					BACKGROUND_CONTEXT,
+				);
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				return replacement;
+			},
+			unsubscribe() {},
+		};
+		try {
+			await host.load([createTranscriptServiceFacet({ watch: async () => handle } as unknown as AgentLane)]);
+			const transcript = await host.get(Transcript, {});
+			const replay = new TranscriptReplay();
+			replay.read(transcript.state.value);
+			await listener!(
+				{
+					type: "navigation_end",
+					lane: "main",
+					runId: "navigation",
+					status: "completed",
+					fromTipId: null,
+					tipId: "new-tip",
+					endedAt: 2,
+				},
+				BACKGROUND_CONTEXT,
+			);
+			await captured.promise;
+			release.resolve();
+			await vi.waitFor(() => expect(transcript.state.value.sequence).toBe(5));
+			expect(transcript.state.value.snapshot).toMatchObject({
+				tipId: "new-tip",
+				operation: { id: "continued", streamingMessage: continuedMessage },
+			});
+			expect(transcript.state.value.stream).toMatchObject({
+				runId: "continued",
+				messageId: "response",
+				sequence: 2,
+			});
+			expect(transcript.state.value.events.map(({ event }) => event.type)).toEqual([
+				"navigation_end",
+				"assistant_reset",
+				"run_start",
+				"assistant_frame",
+				"assistant_frame",
+			]);
+			expect(replay.read(transcript.state.value)).toMatchObject([
+				{ type: "navigation_end" },
+				{ type: "run_start", runId: "continued" },
+				{ type: "message_start", message: initialMessage },
+				{ type: "message_update", message: continuedMessage },
+			]);
+		} finally {
+			release.resolve();
+			await host.close();
+		}
+	});
+
 	test("publishes coherent state and rebases after navigation", async () => {
 		let listener: EventListener | undefined;
 		const replacement = laneSnapshot("replacement-tip");
@@ -1039,5 +1158,160 @@ test("catches up a credit-limited tool preview on the first delta after hydratio
 		}
 	} finally {
 		await host.close();
+	}
+});
+
+test("joins cancellation-aware navigation resnapshots when the host closes without publishing late state", async () => {
+	const repo = new MemorySessionRepo();
+	const session = await repo.create({}, BACKGROUND_CONTEXT);
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const { harness } = await AgentHarness.create({ session, models, model: faux.getModel() }, BACKGROUND_CONTEXT);
+	const lane = await harness.lane("main", BACKGROUND_CONTEXT);
+	await lane.appendMessage({ role: "user", content: "before navigation", timestamp: 1 }, BACKGROUND_CONTEXT);
+	const captured = Promise.withResolvers<AbortSignal | undefined>();
+	const cancelled = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	let resnapshotFinished = false;
+	const originalWatch = lane.watch.bind(lane);
+	let unsubscribe: (() => void) | undefined;
+	const watch = vi.spyOn(lane, "watch").mockImplementation(async (context) => {
+		const handle = await originalWatch(context);
+		unsubscribe = vi.spyOn(handle, "unsubscribe");
+		vi.spyOn(handle, "resnapshot").mockImplementation(async (resnapshotContext) => {
+			const signal = resnapshotContext.abortSignal;
+			const onAbort = () => cancelled.resolve();
+			if (signal?.aborted) onAbort();
+			else signal?.addEventListener("abort", onAbort, { once: true });
+			captured.resolve(signal);
+			try {
+				await cancelled.promise;
+				await release.promise;
+				throw signal?.reason ?? new Error("resnapshot cancelled");
+			} finally {
+				signal?.removeEventListener("abort", onAbort);
+				resnapshotFinished = true;
+			}
+		});
+		return handle;
+	});
+	const host = createHost({ name: "session", self: null, onError: () => {} });
+	const states: TranscriptState[] = [];
+	let stop: (() => void) | undefined;
+	let closing: Promise<void> | undefined;
+	try {
+		await host.load([createTranscriptServiceFacet(lane)]);
+		const transcript = await host.get(Transcript, {});
+		stop = transcript.state.subscribe((state) => states.push(state));
+		const navigation = await lane.navigateTree(null, undefined, BACKGROUND_CONTEXT);
+		if (!navigation.ok) throw navigation.error;
+		const signal = await captured.promise;
+		await vi.waitFor(() => expect(states.at(-1)?.events.at(-1)?.event.type).toBe("navigation_end"));
+		const beforeClose = states.slice();
+		let closed = false;
+		closing = host.close().then(() => {
+			closed = true;
+		});
+		await vi.waitFor(() => expect(signal?.aborted).toBe(true));
+		expect(closed).toBe(false);
+		await lane.appendMessage({ role: "user", content: "during close", timestamp: 2 }, BACKGROUND_CONTEXT);
+		release.resolve();
+		await closing;
+		expect(resnapshotFinished).toBe(true);
+		expect(unsubscribe).toHaveBeenCalledOnce();
+		await lane.appendMessage({ role: "user", content: "after close", timestamp: 3 }, BACKGROUND_CONTEXT);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(states).toEqual(beforeClose);
+	} finally {
+		cancelled.resolve();
+		release.resolve();
+		await (closing ?? host.close());
+		stop?.();
+		watch.mockRestore();
+		await harness.close(BACKGROUND_CONTEXT);
+		await session.close(BACKGROUND_CONTEXT);
+		await repo.close(BACKGROUND_CONTEXT);
+	}
+});
+
+test("reports a rejected navigation resnapshot and resumes queued and subsequent provider progress", async () => {
+	const repo = new MemorySessionRepo();
+	const session = await repo.create({}, BACKGROUND_CONTEXT);
+	const faux = fauxProvider({ tokenSize: { min: 4, max: 4 } });
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const { harness } = await AgentHarness.create({ session, models, model: faux.getModel() }, BACKGROUND_CONTEXT);
+	const lane = await harness.lane("main", BACKGROUND_CONTEXT);
+	await lane.appendMessage({ role: "user", content: "before navigation", timestamp: 1 }, BACKGROUND_CONTEXT);
+	const captured = Promise.withResolvers<void>();
+	const rejected = Promise.withResolvers<LaneSnapshot>();
+	const failure = new Error("navigation capture failed");
+	const originalWatch = lane.watch.bind(lane);
+	const watch = vi.spyOn(lane, "watch").mockImplementation(async (context) => {
+		const handle = await originalWatch(context);
+		vi.spyOn(handle, "resnapshot").mockImplementationOnce(() => {
+			captured.resolve();
+			return rejected.promise;
+		});
+		return handle;
+	});
+	const errors: unknown[] = [];
+	const host = createHost({ name: "session", self: null, onError: (error) => errors.push(error) });
+	let stop: (() => void) | undefined;
+	try {
+		await host.load([createTranscriptServiceFacet(lane)]);
+		const transcript = await host.get(Transcript, {});
+		const replay = new TranscriptReplay();
+		const boundaries: string[] = [];
+		const updates: string[] = [];
+		stop = transcript.state.subscribe((state) => {
+			for (const event of replay.read(state)) {
+				if (event.type === "run_end") boundaries.push(event.runId);
+				if (event.type === "message_update" && event.message.role === "assistant") {
+					const block = event.message.content[0];
+					if (block?.type === "text") updates.push(block.text);
+				}
+			}
+		});
+		const navigation = await lane.navigateTree(null, undefined, BACKGROUND_CONTEXT);
+		if (!navigation.ok) throw navigation.error;
+		await captured.promise;
+		const firstAnswer = "queued answer survives a failed capture";
+		faux.setResponses([fauxAssistantMessage(firstAnswer, { timestamp: 2 })]);
+		const first = await lane.prompt("queued question", undefined, BACKGROUND_CONTEXT);
+		if (!first.ok) throw first.error;
+		expect(boundaries).toEqual([]);
+		rejected.reject(failure);
+		await vi.waitFor(() => expect(errors).toEqual([failure]));
+		await vi.waitFor(() => expect(boundaries).toEqual([first.value.operationId]));
+		expect(updates.at(-1)).toBe(firstAnswer);
+		expect(updates.every((text) => firstAnswer.startsWith(text))).toBe(true);
+		expect(transcript.state.value.snapshot?.operation).toBeNull();
+		expect(transcript.state.value.snapshot?.transcript.at(-1)).toMatchObject({
+			message: { role: "assistant", content: [{ type: "text", text: firstAnswer }] },
+		});
+		updates.length = 0;
+		const nextAnswer = "subsequent progress still streams";
+		faux.setResponses([fauxAssistantMessage(nextAnswer, { timestamp: 3 })]);
+		const next = await lane.prompt("next question", undefined, BACKGROUND_CONTEXT);
+		if (!next.ok) throw next.error;
+		await vi.waitFor(() => expect(boundaries).toEqual([first.value.operationId, next.value.operationId]));
+		expect(updates.at(-1)).toBe(nextAnswer);
+		expect(updates.every((text) => nextAnswer.startsWith(text))).toBe(true);
+		expect(transcript.state.value.snapshot?.operation).toBeNull();
+		const recovered = await lane.navigateTree(null, undefined, BACKGROUND_CONTEXT);
+		if (!recovered.ok) throw recovered.error;
+		await vi.waitFor(() => expect(transcript.state.value.events.at(-1)?.event.type).toBe("assistant_reset"));
+		expect(transcript.state.value.snapshot).toMatchObject({ tipId: null, transcript: [], operation: null });
+		expect(errors).toEqual([failure]);
+	} finally {
+		rejected.resolve(laneSnapshot());
+		stop?.();
+		await host.close();
+		watch.mockRestore();
+		await harness.close(BACKGROUND_CONTEXT);
+		await session.close(BACKGROUND_CONTEXT);
+		await repo.close(BACKGROUND_CONTEXT);
 	}
 });

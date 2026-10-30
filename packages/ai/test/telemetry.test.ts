@@ -176,6 +176,56 @@ describe("AI telemetry", () => {
 		if (reason === "aborted") expect(JSON.stringify(span)).not.toContain("error-secret");
 	});
 
+	it.each(["stream", "streamSimple", "streamDeferred"] as const)(
+		"records cancellation during %s authentication as aborted without exporting the reason",
+		async (method) => {
+			const telemetry = new InMemoryTelemetryContext();
+			let authStarted: (() => void) | undefined;
+			const started = new Promise<void>((resolve) => {
+				authStarted = resolve;
+			});
+			const respond = vi.fn(() => new AssistantMessageEventStream());
+			const models = createModels();
+			models.setProvider(
+				createProvider({
+					id: model.provider,
+					models: [model],
+					auth: {
+						apiKey: {
+							name: "Test",
+							resolve: async () => {
+								authStarted?.();
+								return new Promise<never>(() => {});
+							},
+						},
+					},
+					api: { stream: respond, streamSimple: respond, fetchDeferred: respond },
+				}),
+			);
+			const controller = new AbortController();
+			const result = await telemetry.startSpan({ name: "caller" }, async (span) => {
+				const options = { telemetry: span, signal: controller.signal };
+				const stream =
+					method === "streamDeferred"
+						? models.streamDeferred(model, handle, options)
+						: models[method](model, { messages: [] }, options);
+				await started;
+				controller.abort(new Error("private-cancellation-reason"));
+				return stream.result();
+			});
+			expect(result.stopReason).toBe("aborted");
+			expect(respond).not.toHaveBeenCalled();
+			await settled(telemetry);
+			const [, span] = telemetry.getSpans();
+			expect(span.status).toEqual({ status: "ok" });
+			expect(span.attributes.stop).toBe("aborted");
+			expect(JSON.stringify(span)).not.toContain("private-cancellation-reason");
+			expect(
+				telemetry.getMetrics().find((metric) => metric.name === "pi.ai.request.duration")?.attributes.stop,
+			).toBe("aborted");
+		},
+	);
+
 	it.each([false, true])("bounds poll error messages, including missing messages (missing=%s)", async (missing) => {
 		const telemetry = new InMemoryTelemetryContext();
 		const result = message("error");

@@ -2,6 +2,7 @@
 //! and coalesced; text followed by more than the window (by a byte or a line) can never be in the caller's tail and is
 //! replaced by counts. Delivery follows the caller's commit pace, and waits while an earlier frame is still unsent.
 
+use crate::frame::MAX_PAYLOAD;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,9 @@ impl Window {
         })
     }
 }
+
+/// A fragmented delivery may end up to three bytes early at a UTF-8 boundary.
+const PROOF_HEADROOM: usize = 4;
 
 #[derive(Default)]
 struct Skipped {
@@ -87,8 +91,10 @@ impl Pending {
             _ => self.segments.push((stream, text)),
         }
         // Trimming costs a pass over the held text; do it once a few windows have accumulated.
-        if self.bytes > 4 * (self.window.max_bytes + 1)
-            || self.newlines > 4 * (self.window.max_lines + 1)
+        // A skip must prove exclusion in the first frame carrying it. Larger windows use ordinary chunks.
+        if self.window.max_bytes <= MAX_PAYLOAD - PROOF_HEADROOM
+            && (self.bytes > self.window.max_bytes.saturating_add(PROOF_HEADROOM).saturating_mul(4)
+                || self.newlines > self.window.max_lines.saturating_add(1).saturating_mul(4))
         {
             self.trim();
         }
@@ -122,7 +128,7 @@ impl Pending {
         let first = &self.segments[0].1;
         let mut cut = 0;
         // By bytes: keep more than `max_bytes` overall.
-        let keep_bytes = (self.window.max_bytes + 1).saturating_sub(rest_bytes);
+        let keep_bytes = self.window.max_bytes.saturating_add(PROOF_HEADROOM).saturating_sub(rest_bytes);
         if first.len() > keep_bytes {
             let mut index = first.len() - keep_bytes;
             while index > 0 && !first.is_char_boundary(index) {
@@ -131,7 +137,7 @@ impl Pending {
             cut = cut.max(index);
         }
         // By lines: keep more than `max_lines` newlines overall, starting at a newline of this segment.
-        let keep_newlines = (self.window.max_lines + 1).saturating_sub(rest_newlines);
+        let keep_newlines = self.window.max_lines.saturating_add(1).saturating_sub(rest_newlines);
         if keep_newlines > 0 {
             let positions: Vec<usize> = first
                 .bytes()
@@ -163,8 +169,12 @@ impl Pending {
         }
     }
 
-    /// Deliver everything held: one event carrying the skip and all text after it, or one event per segment.
+    /// Deliver bounded UTF-8 events; the first event carrying a skip contains its exclusion proof.
     pub fn take(&mut self) -> Vec<Event> {
+        if self.skipped.is_some() {
+            // Keep the proof in one frame even if more output accumulated since the previous trim.
+            self.trim();
+        }
         let segments = std::mem::take(&mut self.segments);
         let delivered = self.bytes;
         self.bytes = 0;
@@ -174,12 +184,9 @@ impl Pending {
             delivered.min(self.window.max_bytes) as f64 / self.window.bytes_per_second,
         );
         self.next_send = Instant::now() + self.window.min_interval.max(pace);
-        match self.skipped.take() {
+        let events: Vec<Event> = match self.skipped.take() {
             Some(skipped) => {
-                let stream = segments
-                    .last()
-                    .map(|(stream, _)| *stream)
-                    .unwrap_or("stdout");
+                let stream = segments.last().map(|(stream, _)| *stream).unwrap_or("stdout");
                 let text: String = segments.into_iter().map(|(_, text)| text).collect();
                 vec![Event {
                     stream,
@@ -191,15 +198,37 @@ impl Pending {
                     })),
                 }]
             }
-            None => segments
-                .into_iter()
-                .map(|(stream, text)| Event {
-                    stream,
-                    text,
-                    skipped: None,
-                })
-                .collect(),
+            None => segments.into_iter().map(|(stream, text)| Event {
+                stream,
+                text,
+                skipped: None,
+            }).collect(),
+        };
+        if events.iter().all(|event| event.text.len() <= MAX_PAYLOAD) {
+            return events;
         }
+        let mut fragments = Vec::new();
+        for event in events {
+            if event.text.len() <= MAX_PAYLOAD {
+                fragments.push(event);
+                continue;
+            }
+            let mut text = event.text.as_str();
+            let mut skipped = event.skipped;
+            while !text.is_empty() {
+                let mut end = text.len().min(MAX_PAYLOAD);
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                fragments.push(Event {
+                    stream: event.stream,
+                    text: text[..end].to_string(),
+                    skipped: skipped.take(),
+                });
+                text = &text[end..];
+            }
+        }
+        fragments
     }
 }
 
@@ -214,6 +243,50 @@ mod tests {
             min_interval: Duration::ZERO,
             bytes_per_second: 1e12,
         }
+    }
+
+    #[test]
+    fn fragments_large_utf8_output_without_losing_stream_order_or_skip_proof() {
+        let mut pending = Pending::new(window(10, usize::MAX / 8));
+        let text = "é😀".repeat(crate::frame::MAX_PAYLOAD / 3);
+        pending.push("stderr", text.clone());
+        let events = pending.take();
+        let (bytes, _, after) = total(&events);
+        assert_eq!(bytes, text.len() as u64);
+        assert!(text.ends_with(&after));
+        for event in &events {
+            assert!(event.text.len() <= crate::frame::MAX_PAYLOAD);
+            assert_eq!(event.stream, "stderr");
+            if event.skipped.is_some() {
+                assert!(event.text.len() > 10);
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_windows_deliver_all_text_in_bounded_ordered_events() {
+        let mut pending = Pending::new(window(crate::frame::MAX_PAYLOAD, usize::MAX / 8));
+        let stdout = "é😀".repeat(crate::frame::MAX_PAYLOAD);
+        pending.push("stdout", stdout.clone());
+        pending.push("stderr", "last".into());
+        let events = pending.take();
+        assert!(events.iter().all(|event| event.skipped.is_none()));
+        assert!(events.iter().all(|event| event.text.len() <= crate::frame::MAX_PAYLOAD));
+        let actual: String = events.iter().filter(|event| event.stream == "stdout").map(|event| event.text.as_str()).collect();
+        assert_eq!(actual, stdout);
+        assert_eq!(events.last().unwrap().stream, "stderr");
+        assert_eq!(events.last().unwrap().text, "last");
+    }
+
+    #[test]
+    fn a_skip_on_a_near_frame_sized_window_has_proof_in_its_first_fragment() {
+        let max_bytes = crate::frame::MAX_PAYLOAD - 4;
+        let mut pending = Pending::new(window(max_bytes, usize::MAX / 8));
+        pending.push("stdout", "😀".repeat(crate::frame::MAX_PAYLOAD * 2));
+        let events = pending.take();
+        assert!(events[0].skipped.is_some());
+        assert!(events[0].text.len() > max_bytes);
+        assert!(events.iter().all(|event| event.text.len() <= crate::frame::MAX_PAYLOAD));
     }
 
     /// Bytes and newlines delivered or skipped, and the text after the last skip.

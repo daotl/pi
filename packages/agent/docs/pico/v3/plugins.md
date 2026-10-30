@@ -435,7 +435,7 @@ Provided once by the coding agent, consumed by every feature:
 // session worker
 export const Harness = defineService<HarnessHandle>("pi.harness", { local: true });   // the in-process handle from §3; never remote
 export const ConversationService = defineService<{                                  // keyed by conversation id; remote
-  view: ReplicatedState<ConversationView>;                                            // view-and-events.md; one publish per commit, on the line
+  view: ReplicatedState<PublishedConversationView>;                                   // one publish per commit, off the Session line
   send(input: SendInput, ctx): Promise<Id>;  write(entry: NewEntry, ctx): Promise<Id>;
   inputAbort(id: Id, ctx): Promise<"aborted" | "already_placed" | "not_found">;
   configSet(patch: Partial<Config>, ctx): Promise<void>;
@@ -462,8 +462,10 @@ export const harnessSessionFacet = defineFacet({
 });
 ```
 
-`ConversationView` gains `commit: { events }` so events ride inside the
-replicated member; a subscriber reads `value.commit.events` after each delivery.
+`PublishedConversationView` extends `ConversationView` with `commit: { events }`
+and `publication: { status: "live" } | { status: "failed"; error: string }`.
+Events ride inside the replicated member; a subscriber reads
+`value.commit.events` after each delivery.
 No revision or storage sequence is placed in the view: Chord's
 `ReplicatedStateDelivery.sequence` is contiguous per member and plays that role.
 
@@ -472,11 +474,19 @@ source and subscriber listeners synchronously and a subscriber may throw or be
 slow. The bridge is a bounded ordered adapter: the kernel enqueues raw envelopes
 from its own view tracker; the adapter, off the line, applies one envelope's ops
 and sets `commit.events` inside one `view.change(ctx, callback)` transaction.
-One raw envelope = one change = one Chord sequence. If the queue overflows or `change` throws,
-close that keyed instance and respawn it with a fresh snapshot; a persisted Pico
-commit is never turned into a failure. Chord's subscription snapshot then gives
-late joiners the member at its current sequence, so §9 of
-`view-and-events.md` is implemented by Chord, not by us.
+One raw envelope = one change = one Chord sequence while the bridge is live.
+The bridge consumes the raw watch's terminal notification. A projection failure,
+unexpected watch stop, or queue overflow closes the bridge and publishes
+`publication: { status: "failed", error }`, clearing `commit.events`; the last
+successful view remains available but is explicitly stale. The native facet does
+not automatically reopen it. Its owner must release/respawn the keyed service
+after repairing the projection, acquiring a fresh watch and snapshot. Durable
+writes still succeed; a failed publication never rejects an already persisted
+Pico commit. If `change` itself throws, the bridge closes and invokes its
+`onFailure` callback; an owner providing a custom publication state must handle
+that callback because even the terminal state may be unpublishable.
+Chord's subscription snapshot gives late joiners the member's current status
+and sequence, so §9 of `view-and-events.md` is implemented by Chord, not by us.
 
 ### 6.2 A feature: contract + session facet + presentation facet
 

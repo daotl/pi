@@ -44,26 +44,37 @@ for (const kind of ["tag", "branch"]) {
 	});
 }
 
-test("Nix pin output survives commit-pin publication", () => {
+for (const advance of [false, true]) test(`Nix pin publication stays on its verified source (advance=${advance})`, () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-nix-publication-"));
 	try {
 		const work = join(root, "work"), remote = join(root, "remote.git");
+		const originalPin = { revision: `sha256-${"b".repeat(64)}`, generatedAt: "2026-10-20T00:00:00.000Z" };
 		mkdirSync(join(work, "nix"), { recursive: true });
-		writeFileSync(join(work, "nix/model-catalog.json"), JSON.stringify(pin));
+		writeFileSync(join(work, "nix/model-catalog.json"), JSON.stringify(originalPin));
 		run("git", ["init", "--bare", remote], root);
 		run("git", ["init", "-b", "main"], work);
 		run("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "add", "nix/model-catalog.json"], work);
 		run("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "initial"], work);
 		run("git", ["remote", "add", "origin", remote], work);
 		run("git", ["push", "-u", "origin", "main"], work);
+		const verified = run("git", ["rev-parse", "HEAD"], work).trim();
 		const output = join(root, "outputs");
 		const pinStep = workflow.jobs.pin.steps.find((step) => step.id === "pin");
 		run("bash", ["-eu", "-c", pinStep.run], work, { GITHUB_REF_TYPE: "tag", GITHUB_OUTPUT: output });
 		const values = Object.fromEntries(readFileSync(output, "utf8").trim().split("\n").map((line) => line.split(/=(.*)/s).slice(0, 2)));
-		assert.equal(values.generatedAt, pin.generatedAt);
-		writeFileSync(join(work, "nix/model-catalog.json"), JSON.stringify({ revision: `sha256-${"b".repeat(64)}`, generatedAt: "2026-10-20T00:00:00.000Z" }));
+		assert.equal(values.sourceSha, verified);
+		assert.equal(values.generatedAt, originalPin.generatedAt);
 		const commitStep = workflow.jobs["commit-pin"].steps.find((step) => step.name === "Commit and push the model catalog pin");
-		run("bash", ["-eu", "-c", commitStep.run], work, { REVISION: values.revision, GENERATED_AT: values.generatedAt });
-		assert.deepEqual(JSON.parse(run("git", ["--git-dir", remote, "show", "main:nix/model-catalog.json"], root)), pin);
+		if (advance) {
+			writeFileSync(join(work, "new-provider.txt"), "new source not verified with this catalog\n");
+			run("git", ["add", "new-provider.txt", "nix/model-catalog.json"], work);
+			run("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "new provider"], work);
+			run("git", ["push", "origin", "main"], work);
+			run("git", ["checkout", "--detach", verified], work);
+		}
+		const result = spawnSync("bash", ["-eu", "-c", commitStep.run], { cwd: work, env: { ...process.env, REVISION: pin.revision, GENERATED_AT: pin.generatedAt, VERIFIED_SHA: verified }, encoding: "utf8" });
+		assert.equal(result.status, 0, result.stderr || result.stdout);
+		assert.deepEqual(JSON.parse(run("git", ["--git-dir", remote, "show", "main:nix/model-catalog.json"], root)), advance ? originalPin : pin);
+		assert.equal(run("git", ["--git-dir", remote, "rev-list", "--count", "main"], root).trim(), "2");
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });

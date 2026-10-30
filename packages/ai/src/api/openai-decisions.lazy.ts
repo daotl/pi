@@ -1,6 +1,4 @@
 import type { ProviderClassifier } from "../types.ts";
+import { classify } from "./openai-decisions.ts";
 
-export const openAIDecisionsApi = (): ProviderClassifier => ({
-	classify: async (model, context, options) =>
-		(await import("./openai-decisions.ts")).classify(model, context, options),
-});
+export const openAIDecisionsApi = (): ProviderClassifier => ({ classify });

@@ -1,6 +1,13 @@
 import { StorageRequestError } from "../errors.ts";
 import type { Id, ScanOrder } from "../types.ts";
 
+/** Invalid page sizes are caller errors, not storage failures. */
+export function validateScanLimit(limit: number): void {
+	if (!Number.isSafeInteger(limit) || limit < 1) {
+		throw new StorageRequestError("Scan limit must be a positive safe integer");
+	}
+}
+
 /** Where a built-in storage scan starts: its order and the last ID a previous page returned. */
 export type ScanStart = {
 	readonly order: ScanOrder;
@@ -16,7 +23,9 @@ export function scanStart(
 	requested: ScanOrder | undefined,
 	cursor: Readonly<Record<string, unknown>> | undefined,
 	fallback: ScanOrder,
+	limit: number,
 ): ScanStart {
+	validateScanLimit(limit);
 	if (requested !== undefined && requested !== "ascending" && requested !== "descending") {
 		throw new StorageRequestError(`Invalid scan order: ${String(requested)}`);
 	}

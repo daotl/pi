@@ -9,7 +9,6 @@ import { expect, it, type MockInstance, vi } from "vitest";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
 import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
 import { type AgentSessionServices, createAgentSessionFromServices } from "../../src/core/agent-session-services.ts";
-import { RADIUS_MCP_URL } from "../../src/core/radius.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import type { TreeSelectorComponent } from "../../src/modes/interactive/components/tree-selector.ts";
 import {
@@ -120,7 +119,9 @@ async function createSchedulingMode(options: HarnessOptions = {}) {
 }
 
 it("preserves both occupied Radius names when accepting MCP setup", async () => {
-	const ui = await createSchedulingMode();
+	const ui = await createSchedulingMode({
+		modelsJson: { providers: { radius: { oauth: "radius", baseUrl: "https://custom-radius.example/v1" } } },
+	});
 	vi.stubEnv("PI_CODING_AGENT_DIR", ui.harness.tempDir);
 	const path = join(ui.harness.tempDir, "mcp.json");
 	const original = { radius: { url: "https://one.example/mcp" }, "radius-mcp": { url: "https://two.example/mcp" } };
@@ -141,7 +142,10 @@ it("preserves both occupied Radius names when accepting MCP setup", async () => 
 		if (!selector) throw new Error("Radius selector did not open");
 		selector.handleInput("\r");
 		expect(JSON.parse(fs.readFileSync(path, "utf8"))).toEqual({
-			mcpServers: { ...original, "radius-mcp-2": { url: RADIUS_MCP_URL, auth: { provider: "radius" } } },
+			mcpServers: {
+				...original,
+				"radius-mcp-2": { url: "https://custom-radius.example/mcp", auth: { provider: "radius" } },
+			},
 		});
 		expect(reload).toHaveBeenCalledOnce();
 	} finally {

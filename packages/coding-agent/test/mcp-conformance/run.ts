@@ -67,11 +67,12 @@ function runCommand(
 	command: string,
 	args: string[],
 	options: { cwd: string; env?: NodeJS.ProcessEnv; timeoutMs?: number },
-): Promise<{ code: number; stdout: string; stderr: string }> {
+): Promise<{ code: number; signal: NodeJS.Signals | null; timedOut: boolean; stdout: string; stderr: string }> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(command, args, { cwd: options.cwd, env: options.env ?? process.env, detached: true });
 		let stdout = "";
 		let stderr = "";
+		let timedOut = false;
 		child.stdout.on("data", (data: Buffer) => {
 			stdout += data.toString();
 		});
@@ -82,6 +83,7 @@ function runCommand(
 			options.timeoutMs === undefined
 				? undefined
 				: setTimeout(() => {
+						timedOut = true;
 						// The runner spawns the client and scenario servers; end the whole group.
 						if (child.pid !== undefined) {
 							try {
@@ -92,7 +94,7 @@ function runCommand(
 		child.on("error", reject);
 		child.on("close", (code, signal) => {
 			if (timer) clearTimeout(timer);
-			resolve({ code: code ?? (signal ? 128 : 1), stdout, stderr });
+			resolve({ code: code ?? (signal ? 128 : 1), signal, timedOut, stdout, stderr });
 		});
 	});
 }
@@ -165,6 +167,14 @@ async function runScenario(
 	);
 	if (verbose) process.stderr.write(run.stderr);
 
+	if (run.signal || run.timedOut || run.code > 1) {
+		record(
+			result,
+			"runner-termination",
+			"fail",
+			`Runner terminated: ${run.timedOut ? "timeout" : (run.signal ?? `exit ${run.code}`)}`,
+		);
+	}
 	const checksPath = findFile(scenarioDir, "checks.json");
 	if (!checksPath) {
 		record(result, "runner", "fail", `No checks.json (runner exit ${run.code}): ${run.stderr.trim().slice(-2000)}`);
@@ -183,6 +193,11 @@ async function runScenario(
 	let client: { success?: unknown; error?: unknown } = { error: "client.ts wrote no report" };
 	if (existsSync(reportPath)) client = JSON.parse(readFileSync(reportPath, "utf8")) as typeof client;
 	record(result, "pi-client", client.success === true ? "pass" : "fail", String(client.error ?? ""));
+	// Exit 1 is also the upstream suite's normal reported-check failure status.
+	// A failing exit with only successful reports instead indicates an incomplete runner.
+	if (run.code !== 0 && ![...result.checks.values()].includes("fail")) {
+		record(result, "runner-termination", "fail", `Runner exited ${run.code} without a reported scenario failure`);
+	}
 	return result;
 }
 
@@ -213,7 +228,7 @@ function evaluate(results: ScenarioResult[], baseline: Baseline): boolean {
 		const label = `${result.mode} ${result.scenario}`;
 		for (const [id, status] of result.checks) {
 			const message = result.messages.get(id);
-			if (status === "fail" && !expected?.failing.includes(id)) {
+			if (status === "fail" && (id === "runner-termination" || !expected?.failing.includes(id))) {
 				regressions.push(`${label}: ${id} fails${message ? `: ${message}` : ""}`);
 			}
 			if (status === "pass" && expected?.failing.includes(id)) fixed.push(`${label}: ${id}`);

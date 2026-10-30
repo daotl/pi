@@ -325,6 +325,7 @@ type ModelRef = {
 };
 
 type UserInput = UserMessage["content"];
+type InputEntry = { readonly kind: string; readonly data?: JsonValue };
 
 type SubmissionDraft = {
   readonly requestId?: string;
@@ -333,7 +334,7 @@ type SubmissionDraft = {
       readonly type: "input";
       readonly content: UserInput;
       readonly whenBusy?: "steer" | "followUp" | "reject";
-      readonly entry?: never;
+      readonly entry?: InputEntry;
     }
   | {
       readonly type: "write";
@@ -4367,6 +4368,11 @@ The run's inputs live in `pi.live.run`, not in the task input.
   most every `settings.progress.partialIntervalMs` (default 100 ms), deferred
   (section 4.1), so Storage gets them at the next commit that reads `pi.live`
   or within `settings.progress.persistWithinMs`.
+  Provider snapshots are authoritative: if `toolcall_start` already contains
+  nonempty arguments, partial commits retain those arguments and subsequent
+  snapshots through `toolcall_end` rather than reconstructing them from deltas
+  that omit the initial prefix. Close/recovery preserves the same received
+  argument snapshot in the interrupted assistant entry.
   Before streaming, the `beforeRequest` chain may
   replace the messages for this request only. Recovery resends the same
   committed messages with the same pinned model, thinking level, and stream
@@ -5167,10 +5173,11 @@ node that lists it; a later task there is a top-level node of that conversation.
 A UI that places it under its parent reads the conversation's owner edge from
 `ConversationRecord.owner`, which `ConversationView.conversation` also carries.
 
-The Harness keeps at most one graph mount. The first `watchTaskGraph()` builds its revision on the Session line from the committed
-live tasks and the conversations they own, one owner scan per live task, and
-holds the line while it does; the mount is dropped when its last observer
-detaches. It advances from `subscribeCommits()` publications like the
+The Harness keeps at most one graph mount. The first `watchTaskGraph()` builds
+its revision on the Session line from the committed live tasks and one paged
+scan of all conversations, grouping ownership only for live task nodes in
+ascending conversation ID order. It holds the line while it does; the mount is
+dropped when its last observer detaches. It advances from `subscribeCommits()` publications like the
 conversation view: one publication that changes a node yields one Chord batch
 that sets or deletes `tasks[id]`, or sets a node's `conversations`. A
 publication that changes no node creates no revision. Task and conversation
@@ -5329,6 +5336,10 @@ Every error a method throws is final for the Session (section 10.1), so a
 backend retries its own transient failures. A read throws `StorageRequestError`
 for an invalid request, with no durable effect; from `commit()` it is fatal like any
 other error.
+
+Every scan requires a positive safe-integer `limit`; built-in backends reject
+zero, negative, fractional, non-finite, and unsafe limits with `StorageRequestError`
+before backend work. A rejected scan leaves the Session usable.
 
 A `document.copy` reads committed pre-batch source state independent of command
 order. The source must be an alive conversation document at the selected point,

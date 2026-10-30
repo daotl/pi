@@ -1572,3 +1572,211 @@ The 18 previously unvalidated source candidates were independently source-valida
 
 The authorized repair commit contains only the exact owned paths and this ledger, including the prior post-commit review append whose prefix is preserved. No push. HEAD/branch/my-merge/crystal, staged ownership, all 749 protected hashes and absence of protocol-7 assets are checked before committing; exact final receipt is preservation-final.json.
 
+
+## Post-commit complete merge review - f3937b090
+
+Status: DEGRADED validation gate / NOT READY. This new review covers the complete original merge and every follow-on commit from 839dc79197595a4285d711e37d02fb623e5b6b7b through f3937b090f5b4dd9949786837b45d9dda84bc2c5: 1541 changed paths. It is not a review of only the latest 65-path repair. Candidate numbers in this section belong to a new review namespace.
+
+All 52 local reviewer jobs reached terminal completion. Aggregate changed-hunk inspection reached 1541/1541 paths after eight exact gap reviews covered the initial 211 omitted paths. Aggregate local adversarial inspection reached 1541/1541 through the initial 123 paths and 16 residual packets covering 1418. Individual security, standards, API and other risk lenses were prioritized and partial; complete path inspection is not exhaustive bug, unchanged-source, dynamic-caller or platform clearance. Graph project/generation discovery and coverage failed with the WeakMap error; source/history and available LSP fallback were used. No cross-model review ran because the host serving family was unattested.
+
+Mechanics: 71 raw findings -> 60 distinct candidates after 11 semantic duplicate removals. Ten testing-only observations were separated before validation. One fresh source/history validator returned every one of the remaining 50 stable IDs exactly once: 44 accepted, six rejected. No cross-family shortcut. The 50-item batch exceeded the normal cap of eight with only seven P1 inputs. The bounded validation gate is therefore DEGRADED, not complete; these 44 source-supported candidates are not presented as canonically validated or universally runtime-reproduced. No follow-on split batch or additional validation-independence claim is made.
+
+### Source-supported candidates - degraded validation
+
+| # | Priority | Location | Observable issue and response |
+|---|---|---|---|
+| 1 | P1 | `packages/coding-agent/src/core/session-manager.ts:1512` | Partial JSONL append failure can corrupt a successful retained-record retry. Restore the prior file boundary before retry and latch unrecoverable repair failures. |
+| 2 | P1 | `packages/env/daemon/src/exec.rs:327` | Unix shutdown can miss a process spawned before registration. Serialize exec/pty creation and registration against a stopping gate. |
+| 5 | P1 | `packages/ai/src/providers/openrouter.ts:31` | Catalog personalization ignores replacement auth headers and sends the original stored key to a configured proxy. Carry effective auth headers/baseUrl with inference-equivalent precedence. |
+| 6 | P1 | `packages/chord/src/host.ts:1217` | Pending remote bindings can resolve with an invalidated principal. Revoke pending bindings and fence route resolution before forwarding holds. |
+| 7 | P1 | `packages/chord/src/host.ts:1383` | A dependency retains revoked privileges while holder cleanup stalls. Revoke all matching references/calls synchronously before ordered cleanup. |
+| 8 | P2 | `packages/ai/src/api/openai-decisions.lazy.ts:5` | New inline dynamic import violates the active top-level import rule. Resolve the loader contract without inventing a blanket exception. |
+| 9 | P2 | `packages/ai/src/telemetry.ts:192` | Cancellation during authentication is reported as provider failure. Preserve aborted classification across setup and telemetry. |
+| 10 | P2 | `packages/ai/src/utils/assistant-message-frame.ts:265` | Encoder catch-up uses a parser that loses whitespace-preserving tool previews. Use matching incremental preview semantics. |
+| 11 | P2 | `packages/chord/src/object.ts:1311` | New dependency methods fail in reload cell initializers because roots use the old version. Give initialization the pending-version context. |
+| 12 | P2 | `packages/chord/src/reload.ts:423` | Exclusive dependency closes before its displaced nonexclusive dependent. Include affected dependents in reverse-open-order gate cleanup and rollback. |
+| 13 | P2 | `packages/chord/src/schema.ts:233` | Tuple compatibility ignores additionalItems. Compare permitted tail policies before accepting result/state compatibility. |
+| 14 | P2 | `packages/chord/src/sqlite/cloudflare.ts:69` | Buffer.slice exposes the pooled backing allocation as the blob. Copy the bounded Uint8Array view. |
+| 15 | P2 | `packages/chord/test/flow.test.ts:266` | ACK and peer-role tests close for protocol mismatch before reaching their guards. Negotiate PROTOCOL_VERSION and assert the intended close reason. |
+| 16 | P2 | `packages/codemode/src/source.ts:229` | A class-following regexp can hide a misplaced timeout directive. Track declaration-class closing braces as statement boundaries. |
+| 18 | P2 | `packages/coding-agent/src/core/radius.ts:6` | Custom Radius login offers MCP against the default gateway. Resolve the live provider endpoint. |
+| 19 | P2 | `packages/coding-agent/src/experimental/plugins/package.ts:81` | Plugin bundling ignores chord.facets overrides and false disables. Resolve configured entries before conventional fallbacks. |
+| 20 | P2 | `packages/coding-agent/src/extensions/mcp/oauth.ts:226` | Refresh can restore credentials after sign-out with a custom backend and no lockDir. Serialize refresh/remove ownership in process. |
+| 21 | P2 | `packages/coding-agent/src/modes/interactive/interactive-mode.ts:2913` | Reentrant dialog disposers mutate the iterated stack and skip cleanup. Detach the stack and settle/dispose entries idempotently. |
+| 23 | P2 | `packages/durable/test/examples/22-subagent-background.ts:151` | Background-subagent example returns removed content rather than output. Migrate its shared reply helper. |
+| 24 | P2 | `packages/env/daemon/src/exec.rs:397` | Large valid output windows create oversized frames and terminal E2BIG errors. Fragment output at UTF-8-safe payload boundaries with correct skipped metadata. |
+| 26 | P2 | `packages/mcp/src/oauth/flow.ts:420` | Refresh-only cancellation falls through to browser authorization. Check the effective refresh signal in recovery. |
+| 27 | P2 | `packages/tui/src/terminal.ts:529` | Abrupt exit leaves OSC 7501 status active. Include program-status clear in synchronous restoration. |
+| 28 | P2 | `packages/tui/src/tui-main-screen.ts:515` | Overlays disappear over partially offscreen Kitty placements. Handle visible intersections and safe crop restoration. |
+| 29 | P2 | `packages/tui/src/tui-main-screen.ts:580` | Overlay materialization discards text beside Kitty anchor controls. Preserve the text/style layer separately from graphics. |
+| 30 | P2 | `scripts/biome-check.mjs:72` | Android WASM checking reads indexed paths deleted from the working tree. Exclude missing paths and isolate ENOENT. |
+| 31 | P2 | `.github/workflows/nix.yml:171` | Pin publication can check out/rebase onto main newer than the verified source. Bind publication to the verified SHA and reverify advances. |
+| 32 | P2 | `.pi/extensions/import-repro.ts:77` | Signed JSONL URLs with query parameters are rejected. Test URL.pathname while preserving query parameters for fetching. |
+| 33 | P2 | `packages/agent/src/agent-loop.ts:514` | Tool-batch cancellation still reports canContinue true. Include the abort state in continuation eligibility. |
+| 34 | P2 | `packages/agent/src/harness/pico3/chord.ts:330` | Projection failure silently freezes a held native Chord view. Publish terminal/fault state or replace/resnapshot the failed watch. |
+| 36 | P2 | `packages/chord/src/cluster.ts:158` | Reconciliation retries prepare before asynchronous child rollback frees its reload slot. Add and await abort-completion ownership. |
+| 37 | P2 | `packages/coding-agent/src/core/export-html/vendor/marked.min.js:39` | Task-marker processing modifies a later paragraph instead of its own task label. Match the inline-queue entry by its token ownership. |
+| 38 | P2 | `packages/coding-agent/src/core/remote-catalog-provider.ts:210` | Cache-only refresh can restore a previous OpenRouter credential's personalized models/limits. Bind entries to credential and endpoint identity. |
+| 39 | P2 | `packages/coding-agent/src/experimental/services/transcript-provider.ts:98` | Void watch adaptation loses async ordering during navigation rebase. Preserve completion ownership before releasing resumed events. |
+| 40 | P2 | `packages/coding-agent/src/modes/interactive/interactive-mode.ts:1086` | Shutdown recovery can await dialogs while shutdown consumes all input. Cancel shutdown-time dialog requests rather than mounting unanswerable UI. |
+| 45 | P2 | `packages/coding-agent/test/mcp-conformance/run.ts:168` | Conformance can pass after runner timeout/crash if success files already exist. Fail abnormal termination independently of those files. |
+| 51 | P2 | `packages/durable/docs/spec.md:336` | Normative SubmissionDraft forbids supported custom InputEntry. Define and permit the implementation's entry contract. |
+| 52 | P2 | `packages/durable/src/harness/partial-changes.ts:102` | Partial persistence replaces nonempty toolcall_start arguments with empty reconstructed arguments. Preserve authoritative initial arguments until parser alignment. |
+| 53 | P2 | `packages/durable/src/harness/task-graph.ts:168` | Hydration scans conversations once per live task while holding the Session line. Scan pages once and group by owner. |
+| 54 | P2 | `packages/durable/src/session/session.ts:1297` | Zero-limit scan raises TypeError and permanently fails the Session. Validate positive safe-integer limits as isolated request errors. |
+| 55 | P2 | `packages/env/daemon/src/sys/unix.rs:270` | Relative configured shell can resolve to a different executable after cwd changes. Anchor the validated path against daemon cwd. |
+| 56 | P2 | `packages/env/daemon/src/sys/windows.rs:368` | Daemon legacy-WSL recognition ignores custom SystemRoot unlike Node. Match SystemRoot-aware launcher classification. |
+| 57 | P2 | `packages/env/src/connection.ts:300` | Ignored stdin failure can leave requests pending indefinitely while inbound pings continue. Tear down the failed write transport. |
+| 58 | P2 | `packages/env/src/ssh.ts:347` | Git Bash SSH detection chooses a PowerShell launcher. Preserve the POSIX-on-Windows shell family. |
+| 60 | P2 | `scripts/issues/ui.html:107` | Failed mutations are hidden by a successful state refresh. Check mutation status and preserve a separate visible mutation error. |
+
+Every candidate above has a concrete suggested fix and downstream-resolver route in `actionable-findings.json`; classification is not permission to apply and the validation gate remains degraded. Stable numbering intentionally has gaps for rejected and testing-only candidates.
+
+### Rejected candidates
+
+| Candidate # | Reason |
+|---|---|
+| 3 | Strict complete daemon assets for local artifact packing are intentional and explicitly documented; do not weaken production artifact validation. |
+| 4 | Bedrock unfinished-argument acceptance already exists at base 839dc791; no newly exposed behavior established by this finding. |
+| 17 | Manual swipe usage double counting already exists at base 839dc791; not introduced or newly exposed by this diff. |
+| 25 | External Cargo target restriction governs agent operations, not the product's documented default checkout build command. |
+| 50 | Error-output paragraph was misread; it preserves schema-less error output and scopes omission to schema-declaring tools. |
+| 59 | Disconnected handshake shutdown gap already exists at base 839dc791; no new interaction established. |
+
+### Testing-only observations
+
+These ten source-supported coverage observations were not put through the oversized validator and are not current product defects: #22 exported system rendering source-string assertions; #35 classifier offline cases skipped with cloud metadata; #41 presentation reload generation identity; #42 post-hydration multi-block continuation; #43 delayed clipboard completion after login transitions; #44 login timeout versus immediate failure; #46 replacement of an existing MCP cancellation handler; #47 healthy resources around a failed package install; #48 first-login configured model versus catalog order; #49 recovery summary/request byte limits. Full evidence and specific test responses are in `testing-only-candidates.json` and the report.
+
+### Verification, limitations and preserved blockers
+
+- Parent current-code smoke bg_799 ran the actual exported vendored parser in a VM. Input `- [ ] first` followed by a normal item and a `[ ] literal` continuation produced an extra task-label marker and removed the continuation marker, confirming #37. No product source changed. The prior committed-snapshot 12864/0/948 full suite and no-fix checks remain historical green receipts, not evidence that these new scenarios pass.
+- Some first-wave reviewers ran scoped tests/runtime despite the final no-runtime instruction. Those results are reviewer observations, not parent-executed proof. Subsequent gap/adversarial and validator passes were static-only. No tracked/index/ref changes were observed before this ledger append; ignored caches/output were not exhaustively inventoried. One reviewer JSON artifact required escaping literal control characters; its author repaired serialization without changing findings or coverage.
+- No fresh Windows, fish, Nix, real Kitty, actual browser graphics, production Cloudflare, live SSH or paid-provider verification. No implementation plan selected from ambiguous generic branch keywords. Ledger is historical output, not implementation requirements. Settlement suppression not evaluated. No PR previous-comments, Swift, migration or solutions-corpus lens.
+- Original Chord Windows manager ownership remains unfixed. Coordinated breaking reload proposal remains rolled back at protocol 6. Env Windows implementation remains without native runtime proof. New #36 is child reconciliation abort completion, not closure of the larger coordinated-reload blocker.
+- HEAD `f3937b090f5b4dd9949786837b45d9dda84bc2c5`, my-merge `cb3bee033ba853041609b874303dc625d5d30479`, and crystal `8322aa1d6808711a6e46bfbe67d8a788ca8cbd1e` are preserved. All 749 protected target hashes match. Only this requested ledger changed; no product fixes, new commit or push in this review.
+- Prior focused parser/frame counts 132 and later 134 are separate recorded epochs; final historical root total is 12864, not the sum of focused runs.
+- Complete diff, 52 reports, per-path ranges, normalized 1541/1541 ordinary/adversarial coverage, mechanics, 11 semantic merges, 50 verdicts, six rejection reasons, ten testing-only observations and degraded lifecycle metadata: `/tmp/compound-engineering-501/ce-code-review/20261030-postcommit-f3937b090`.
+
+### Verdict
+
+**NOT READY / VALIDATION DEGRADED.** Five P1 and 39 P2 source-supported candidates remain; no fixes applied. Resolve persistence #1, process shutdown #2 and authority/credentials #5/#6/#7 first. The oversized single-validator result does not constitute a canonical bounded validation pass. Existing Windows/protocol blockers remain. This section preserves the full scope and honest limitations rather than claiming fix-all or merge approval.
+
+
+## Fix-all repair closure after f3937b090
+
+User authorization: fix all findings from the preceding complete merge review. This is a repair batch, not a second 1541-path review. The historical sections above remain byte-for-byte unchanged.
+
+### Disposition of all 44 source candidates
+
+All 44 have retained implementations. Forty-three have focused local behavioral proof; #56 has Windows GNU test compilation only and remains blocked on native execution. The six rejected candidates from the preceding review remain rejected; no rejected behavior was silently implemented.
+
+| # | Retained repair | Verification status |
+|---|---|---|
+| 1 | Rollback failed JSONL append bytes before retry; poison on rollback failure until atomic rewrite. | Focused behavior verified; final root receipt below |
+| 2 | Serialize Unix exec/PTY creation and registration against shutdown stopping state. | Focused behavior verified; final root receipt below |
+| 5 | Catalog refresh carries resolved auth headers/endpoint; null/case-insensitive precedence preserved. | Focused behavior verified; final root receipt below |
+| 6 | Fence unresolved and active remote bindings, force-end calls, block reentrant acquisitions during invalidation. | Focused behavior verified; final root receipt below |
+| 7 | Fence all authority before callbacks; collect every readable/listener cleanup error and dispose holders first. | Focused behavior verified; final root receipt below |
+| 8 | Static top-level Decisions classifier binding after graph inspection. | Focused behavior verified; final root receipt below |
+| 9 | Preserve setup cancellation through every lazy/Models/ModelRuntime/provider boundary. | Focused behavior verified; final root receipt below |
+| 10 | Catch-up uses identical incremental tool argument semantics. | Focused behavior verified; final root receipt below |
+| 11 | Private initializer context permits pending-only dependencies, joins descendants; current implementations win. | Focused behavior verified; final root receipt below |
+| 12 | Gate closes displaced nonexclusive dependents before exclusive dependencies and restores dependency order. | Focused behavior verified; final root receipt below |
+| 13 | Compare tuple tail additionalItems constraints. | Focused behavior verified; final root receipt below |
+| 14 | Copy exact Uint8Array/Buffer view bounds. | Focused behavior verified; final root receipt below |
+| 15 | Protocol fixtures negotiate actual protocol and assert intended guard rejection. | Focused behavior verified; final root receipt below |
+| 16 | Class/member/initializer and object/property lexical phases avoid phantom class headers. | Focused behavior verified; final root receipt below |
+| 18 | MCP endpoint comes from live Radius provider, not default/catalog. | Focused behavior verified; final root receipt below |
+| 19 | Honor configured facet strings and false disables. | Focused behavior verified; final root receipt below |
+| 20 | One in-process per-key refresh ownership queue, plus optional cross-process lock. | Focused behavior verified; final root receipt below |
+| 21 | Detach/cancel every dialog idempotently, including custom deferred factories/overlays. | Focused behavior verified; final root receipt below |
+| 23 | Background example returns output under current tool contract. | Focused behavior verified; final root receipt below |
+| 24 | UTF-8 frame fragmentation; oversized windows use bounded passthrough/backpressure without invalid omission proof. | Focused behavior verified; final root receipt below |
+| 26 | Respect effective refresh-specific cancellation without browser fallback. | Focused behavior verified; final root receipt below |
+| 27 | Synchronous exit clears OSC7501 program status. | Focused behavior verified; final root receipt below |
+| 28 | Restore supported partial Kitty placements by visible crop; no transcript replay. | Focused behavior verified; final root receipt below |
+| 29 | Retain styled text beside image anchors and actual terminal columns. | Focused behavior verified; final root receipt below |
+| 30 | Skip absent indexed files, propagate other WASM read errors. | Focused behavior verified; final root receipt below |
+| 31 | Verify exact pin source SHA; never rebase unverified main; negative old-script fixture fails. | Focused behavior verified; final root receipt below |
+| 32 | Signed JSONL URLs use pathname while preserving query/fragment. | Focused behavior verified; final root receipt below |
+| 33 | Cancelled tool turns report no natural continuation and stop before explicit continuation/queue arbitration. | Focused behavior verified; final root receipt below |
+| 34 | Watch terminal notification publishes explicit failed native view; version2 cutover, no automatic fake recovery. | Focused behavior verified; final root receipt below |
+| 36 | Protocol7 aborted acknowledgement joins stale child reconciliation rollback; ordinary abort contract unchanged. | Focused behavior verified; final root receipt below |
+| 37 | Rebuild pinned readable Marked source with small task-token ownership backport; vendor not hand-edited. | Focused behavior verified; final root receipt below |
+| 38 | Persist non-secret auth/endpoint identity digest; offline pure derivation restores matching account only. | Focused behavior verified; final root receipt below |
+| 39 | Own full async transcript handler/reset ordering and join shutdown tail. | Focused behavior verified; final root receipt below |
+| 40 | Shutdown-time dialogs cancel before mount, preventing reactivation deadlock. | Focused behavior verified; final root receipt below |
+| 45 | Abnormal runner completion cannot pass from previously written success reports; expected check failures remain baselined. | Focused behavior verified; final root receipt below |
+| 51 | Normative InputEntry type matches actual custom input API. | Focused behavior verified; final root receipt below |
+| 52 | Preserve authoritative nonempty tool start arguments through partial persistence/recovery. | Focused behavior verified; final root receipt below |
+| 53 | One streamed paginated conversation scan, grouped by live task owner; no N+1 or all-record retention. | Focused behavior verified; final root receipt below |
+| 54 | All scan families reject invalid limits as StorageRequestError without failing Session. | Focused behavior verified; final root receipt below |
+| 55 | Anchor configured Unix shell before changing cwd. | Focused behavior verified; final root receipt below |
+| 56 | SystemRoot-aware WSL launcher parity with native subprocess test matrix; not executed on Windows. | Cross-compiled; native Windows execution blocked |
+| 57 | Write-pipe failure tears down session and reconnects next operation. | Focused behavior verified; final root receipt below |
+| 58 | Detect actual outer cmd/PowerShell independently from child sh uname, retaining POSIX Windows startup. | Focused behavior verified; final root receipt below |
+| 60 | Mutation failures remain visible independently of successful state refresh. | Focused behavior verified; final root receipt below |
+
+### Disposition of all ten original testing-only gaps
+
+| # | Executed behavioral coverage |
+|---|---|
+| 22 | Execute exported-viewer system-entry rendering; source-string assertions removed. |
+| 35 | Run synthetic classifier, mocked routing and credential cases offline; remove incidental generated-catalog assertion rather than repinning it. |
+| 41 | Activate generation-specific presentation fixtures after build/load/reload. |
+| 42 | Retain hydrated replay instances and assert subsequent corrected multi-block frames. |
+| 43 | Deferred clipboard success/failure across cancellation, focus and authentication transitions. |
+| 44 | Await a real initialize request, assert login is pending and the deadline factory receives 50 ms, then abort that controlled deadline and assert its specific diagnostic. Other timeout signals retain native behavior. |
+| 46 | Replace an existing cancellable status and prove its previous callback is removed. |
+| 47 | Activate healthy local resources before and after a failing offline package installation. |
+| 48 | Select the configured post-login default from an alternative-first catalog. |
+| 49 | Bound Copilot overflow-summary normalized context to 32 MiB; retain the newest fitting distinct images and leave stored history unchanged. This is not an exact wire-body guarantee. |
+
+### Independent repair review and followups
+
+- Eighteen local reviewers completed the frozen 114-product-path repair review. Every assigned path was reported inspected; no reported insufficient path. Subsequent source/caller/test changes received narrow independent audits; the initial snapshot is not claimed to cover future edits.
+- Fifteen raw findings became ten distinct after five semantic merges: seven source findings and three testing-only observations. A single bounded validator batch of seven, below the normal cap of eight, accepted all seven source findings. The earlier oversized full-merge validator remains historically degraded; this smaller pass does not rewrite that history.
+- All seven were applied: active remote-call revocation, fallible readable cleanup, reentrant gone/abort authority fences, public custom-result cancellation types, Kitty viewport-only restoration without history duplication, object-property scanner phases, and SSH outer-shell classification.
+- Further independent checks exposed and closed fresh-root dispatch from abort observers, reentrant local/remote acquisition during revocation, custom onHandle cleanup, unbounded output-window buffering, native watch registration after stop, and scanner class/member edge cases.
+- The three new testing gaps now cover all Pico watch terminal outcomes, distinct chronological Copilot image retention, and transcript failed-resnapshot/close ordering. Narrow final audits report no remaining new actionable finding. These are local independent reviews, not cross-model certification.
+- Full-suite failures prompted semantic fixture repairs, not skipped tests or larger test timeouts: journal synchronization now awaits actual failed Harness closure; restart timeout asserts the naturally persisted deadline and advances the injected clock; resize uses a proportionally smaller image with explicit limits and the same coordinate mapping. The reviewer rejected manufacturing a stored deadline; that intermediate fixture was replaced and the final audit is correct.
+
+### Public cutovers and maintenance decisions
+
+- Chord protocol 7 adds child abort-completion acknowledgement solely for stale reconciliation retry. Ordinary abort rejection semantics are unchanged. This does not implement the larger coordinated breaking-reload candidate protocol.
+- Pico conversation publication is version 2 and explicitly live or failed. A failed watch cannot advertise its last revision as live; no automatic fake recovery. Owners reacquire.
+- Extension custom UI returns Promise<T | undefined>; runner, RPC/mock implementations, maintained examples and documentation all migrate together. Shutdown and late factories settle cancellation and dispose mounted surfaces.
+- Marked remains pinned to 18.0.11. A reproducible generator reads readable upstream Tokenizer source from its installed source map, verifies source SHA 2140b1d34433b175421ca86d8d847e429a48556cc40be7b853e45d697699335a, applies the task-token ownership backport, and bundles with the existing esbuild dependency. The vendored output is generated, not hand-edited; no new dependency or viewer inline-queue hook.
+- OpenRouter cache identity is a non-secret digest of effective authentication and endpoint. Offline restore uses a pure cached-auth resolver, never arbitrary commands, network or OAuth refresh.
+- Supported Kitty PNG/RGB/RGBA and registered geometry use viewport-only cropped restoration. Unknown custom placements without recoverable geometry are retained rather than deleted/replaying scrollback; overlays cannot fully occlude those placements. Real Kitty graphics were not executed.
+- Non-main branch: no changelog entries. Existing public/API documentation is updated in the owning package.
+
+### Verification receipts
+
+- Exact final authoritative command: `PI_ENV_DAEMON=/tmp/pi-fixall-f3937b090/cargo-target/debug/pi-env ./test.sh`, through rtk proxy. bg_901 / artifact://14373: **13034 passed, 0 failed, 938 skipped**, exit 0, 379 seconds. Isolated HOME/credentials/network policy; cloud providers disabled. No concurrent parent check or other test. All 130 product-path SHA-256 values match the pre-run freeze.
+- `npm run check` bg_900: **No fixes applied**; pinned/runtime dependencies, relative imports, entry graphs, install-lock, TypeScript and browser smoke all passed. The commit hook repeats this against the docs-inclusive candidate.
+- Earlier root epochs remain failures: bg_887 13000/3/938, bg_897 13023/11/938. The latter overlapped parent check and showed startup/worker/benchmark timing failures; resource contention is an inference, not a proven sole cause. No unrelated benchmark threshold or subprocess timeout was relaxed. Exact final isolated run is the green receipt.
+- Native Rust bg_851: 31 passed. Final `cargo clippy --all-targets -- -D warnings` bg_902 passed. Windows GNU `cargo check --tests` bg_889 passed; no Windows binary was executed. Cargo used the external scratch target, never the protected checkout target.
+- Latest focused followups: authority 18, custom UI 51, TUI 69, Pico terminal outcomes 20, transcript shutdown/failure 14, Copilot retention 3, scanner 15, natural-deadline/journal 2, bounded real-image resize 1, controlled login deadline 1. These are separate runs and are not added to the root total.
+- Real Chromium loaded the actual issues UI against a controlled local server: mutation HTTP 503 stays visible after a successful refresh; successful retry clears it; desktop and 390px viewport had no console errors or horizontal overflow. Tab/server closed. This is not production GitHub proof.
+- Actual offline background-subagent example bg_896 executed spawn/send/stop/status/missing-name operations and restart. Status and “No subagent named missing” reached the model-visible result. Faux provider only; no paid requests.
+- Generated Marked check bg_891 and browser-global/CommonJS/AMD runtime contracts passed; six export tests passed 84 cases. Final commit does not hand-edit generated vendor bytes.
+- Full receipts and 44-source/10-gap dispositions: `/tmp/pi-fixall-f3937b090`. Independent repair report: `/tmp/pi-fixall-f3937b090/ce-code-review-final/report.md`. Final exact source freeze: `exact-final-product-hashes.json`.
+
+### Preserved limitations and blockers
+
+1. Original Chord Windows manager ownership is still unfixed. PID/taskkill enumeration does not establish atomic descendant ownership or manager-crash cleanup. No incomplete shim or failed historical prototype was landed.
+2. Larger coordinated breaking reload is still unimplemented. Private remote candidate references and cross-host activation/commit-abort ownership require a coherent contract; protocol 7 reconciliation acknowledgement is not that contract.
+3. Env Windows native execution remains unavailable on this Darwin arm64 host, with no configured SSH runner. GNU compilation is not native proof. #56 SystemRoot-aware WSL classification is implemented with authored native regressions but shares this missing execution proof.
+
+No fresh native Windows, real Kitty, fish, Nix publication, production Cloudflare or live SSH certification. Controlled browser/VM/subprocess/faux-provider results are scoped to the actual scenarios below, not substitute native evidence. Graph project/coverage tools failed with WeakMap errors; exact source, history and available LSP references were used, without claiming external or dynamic callers exhaustive. Cross-model review was not started because the host serving family was unattested.
+
+### Preservation and verdict
+
+- Base HEAD before this repair commit: `f3937b090f5b4dd9949786837b45d9dda84bc2c5`; branch `fix/full-merge-review-8322aa1d`.
+- `my-merge` remains `cb3bee033ba853041609b874303dc625d5d30479`; `crystal` remains `8322aa1d6808711a6e46bfbe67d8a788ca8cbd1e`.
+- All 749 protected target-file hashes matched. The preceding 333163-byte ledger prefix remains unchanged. No dependency version or lockfile changes, no changelog changes, no unrelated staged paths.
+- Commit candidate: 130 explicitly owned product/docs/test paths plus this append-only ledger. Product hashes match the green full-suite epoch; commit hook checks the docs-inclusive candidate. No push or PR.
+
+**NOT COMPLETE / NOT MERGE APPROVAL.** All reachable reviewed repairs and regression gaps are integrated, but the original Windows manager and larger coordinated reload remain unfixed, and native Windows proof is missing. A local repair commit does not close those blockers. No push or PR.
+

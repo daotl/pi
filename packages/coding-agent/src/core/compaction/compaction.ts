@@ -845,6 +845,8 @@ export async function generateSummaryWithUsage(
 		(!streamFn || streamFn === streamSimple) &&
 		isContextClampingApi(requestModel.api) &&
 		isKnownApiProvider(requestModel.api),
+	/** Recovery-only normalized-context bound; provider wire payloads can differ. */
+	maxContextBytes?: number,
 ): Promise<{ text: string; usage: Usage; fileOps: FileOperations }> {
 	const maxTokens = Math.min(
 		Math.floor(0.8 * (reserveTokens ?? DEFAULT_COMPACTION_SETTINGS.reserveTokens)),
@@ -892,7 +894,9 @@ export async function generateSummaryWithUsage(
 			hasAdapterHeadroom &&
 			outputTokens !== undefined &&
 			clampMaxTokensToInput(model, inputTokens, outputTokens) === 1;
-		if (hasToolHistory && (outputTokens === undefined || exhaustedHeadroom)) {
+		const exceedsByteBudget =
+			maxContextBytes !== undefined && Buffer.byteLength(JSON.stringify(context)) >= maxContextBytes;
+		if ((hasToolHistory && (outputTokens === undefined || exhaustedHeadroom)) || exceedsByteBudget) {
 			// Bound only converted, replay-eligible history; never restore raw data or
 			// move the committed retention boundary to accommodate a smaller model.
 			const baseline = getCurrentSystemMessage(llmMessages);
@@ -914,6 +918,26 @@ export async function generateSummaryWithUsage(
 					instruction,
 				],
 			});
+			if (maxContextBytes !== undefined) {
+				// Base64 size is unrelated to vision token estimates. Retain bounded
+				// text and as many recent images as fit, without modifying saved history.
+				let contextBytes = Buffer.byteLength(JSON.stringify(context));
+				for (const message of context.messages) {
+					if (!Array.isArray(message.content)) continue;
+					for (let index = 0; index < message.content.length && contextBytes >= maxContextBytes; ) {
+						const block = message.content[index];
+						if (block.type !== "image") {
+							index++;
+							continue;
+						}
+						contextBytes -= Buffer.byteLength(JSON.stringify(block)) + (message.content.length > 1 ? 1 : 0);
+						message.content.splice(index, 1);
+					}
+				}
+				if (contextBytes >= maxContextBytes) {
+					throw new Error("Summarization failed: converted history exceeds the recovery context byte budget");
+				}
+			}
 			const boundedInputTokens = context.messages.reduce(
 				(total, message) => total + estimateMessageTokens(message),
 				0,
@@ -926,7 +950,7 @@ export async function generateSummaryWithUsage(
 				throw new Error("Summarization failed: converted history exceeds the token budget");
 			}
 		}
-		if (hasToolHistory) attemptOptions.maxTokens = outputTokens;
+		if (hasToolHistory || exceedsByteBudget) attemptOptions.maxTokens = outputTokens;
 		fileOps = createFileOps();
 		attributable = canAttributeRequestHistory(model, agent, streamFn, requestHistoryPolicy);
 		if (attributable) {
@@ -1275,6 +1299,8 @@ export async function compact(
 	agent?: Agent,
 	requestHistoryPolicy?: RequestHistoryPolicy,
 	usesAdapterOutputClamp?: (model: Model<Api>) => boolean,
+	/** Recovery-only bound on serialized normalized context, not provider wire bytes. */
+	maxContextBytes?: number,
 ): Promise<CompactionResult> {
 	const { firstKeptEntryId, messagesToSummarize, turnPrefixMessages, isSplitTurn, tokensBefore, settings } =
 		preparation;
@@ -1307,6 +1333,7 @@ export async function compact(
 		agent,
 		requestHistoryPolicy,
 		usesAdapterOutputClamp,
+		maxContextBytes,
 	);
 	let summary = result.text;
 	const summaryUsage = result.usage;

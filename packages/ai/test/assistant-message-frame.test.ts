@@ -469,6 +469,28 @@ describe("assistant message frames", () => {
 		]);
 	});
 
+	it.each([" ", "\n", "\\q"])("preserves queued tool preview progress containing %j before interruption", (suffix) => {
+		const partial = seed();
+		const encoder = new AssistantMessageFrameEncoder();
+		const frames: AssistantMessageFrame[] = [frame(encoder, { type: "start", partial })];
+		const toolCall = { type: "toolCall" as const, id: "call", name: "write", arguments: { content: `x${suffix}` } };
+		partial.content.push(toolCall);
+		frames.push(frame(encoder, { type: "toolcall_start", contentIndex: 0, partial }));
+		const queued = encoder.encode({
+			type: "toolcall_delta",
+			contentIndex: 0,
+			delta: `{"content":"x${suffix}`,
+			partial,
+		});
+		if (queued) frames.push(queued);
+		toolCall.arguments = { content: `x${suffix}more` };
+		const next = encoder.encode({ type: "toolcall_delta", contentIndex: 0, delta: "more", partial });
+		if (next) frames.push(next);
+		partial.stopReason = "error";
+		encoder.encode({ type: "error", reason: "error", error: partial });
+		expect(reduceAssistantMessageFrames(frames)?.content).toEqual(partial.content);
+	});
+
 	it("resumes legacy grammar tool JSON from initial arguments", () => {
 		const partial = seed();
 		const encoder = new AssistantMessageFrameEncoder();

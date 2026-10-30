@@ -393,10 +393,10 @@ export default function questionnaire(pi: ExtensionAPI) {
 				};
 			});
 
-			if (result.cancelled) {
+			if (result === undefined || result.cancelled) {
 				return {
 					content: [{ type: "text", text: "User cancelled the questionnaire" }],
-					details: result,
+					details: result ?? { questions, answers: [], cancelled: true },
 				};
 			}
 

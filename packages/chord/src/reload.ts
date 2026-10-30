@@ -60,7 +60,7 @@ interface Candidate {
 	readonly reasons: string[];
 	/** New exclusive resources and their new dependents, opened at the gate. */
 	readonly atGate: ResourceImpl[];
-	/** Old exclusive resources closed at the gate. */
+	/** Displaced exclusive resources and their dependents, closed at the gate. */
 	readonly replaced: ResourceImpl[];
 	readonly migrated: Map<Cell<unknown>, unknown>;
 	/** Values of the run's derivations over the candidate (migrated) values, validated. */
@@ -420,7 +420,15 @@ export class Reload {
 		for (const resource of deferred) {
 			candidate.atGate.push(resource);
 			const old = object.decls.resources.get(resource.key);
-			if (resource.exclusive && old?.exclusive && old.state === "open") candidate.replaced.push(old);
+			if (old?.state === "open") candidate.replaced.push(old);
+		}
+		// Removed or reconfigured old dependents still need their dependency during close.
+		for (const old of object.openOrder) {
+			if (
+				!candidate.replaced.includes(old) &&
+				old.deps.some((dep) => candidate.replaced.includes(dep as ResourceImpl))
+			)
+				candidate.replaced.push(old);
 		}
 		if (deferred.size > 0) candidate.reasons.push("exclusive resource replaced");
 		await object.open(
@@ -434,7 +442,7 @@ export class Reload {
 		// Cells this reload adds read their first value once the new resources are open (gated objects: at the gate);
 		// the derivations over them are checked after.
 		if (candidate.reasons.length === 0) {
-			await object.initCells(run, this.abort.signal);
+			await object.initCells(run, this.abort.signal, this.host.pending?.id);
 			this.#alive();
 			dryRun(candidate);
 		}
@@ -520,7 +528,7 @@ export class Reload {
 			}
 			await object.open(candidate.atGate, [], this.abort.signal);
 			this.#alive();
-			await object.initCells(candidate.run, this.abort.signal);
+			await object.initCells(candidate.run, this.abort.signal, this.host.pending?.id);
 			this.#alive();
 		}
 		for (const candidate of this.gated) this.migrate(candidate);

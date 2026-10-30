@@ -53,9 +53,9 @@ type Scan = {
 
 const DEBOUNCE_MS = 50;
 /**
- * On macOS, `fs.watch` returns before libuv's FSEvents stream is live, and changes in between are never reported
- * (about 2% of changes made right after the call, none after 100 ms). A rescan this long after installing watchers
- * catches them.
+ * On macOS, libuv restarts the loop's shared FSEvents stream whenever any native directory watcher is added or
+ * closed. `fs.watch` returns before that stream is live, so changes in between may never be reported. A one-shot
+ * rescan of every active native watcher after each topology change catches them.
  */
 const FSEVENTS_SETTLE_MS = 500;
 const DEFAULT_POLL_MS = 2000;
@@ -145,6 +145,12 @@ function excluded(target: ResolvedTarget, name: string): boolean {
  * before they are scanned again, so nothing written into them before the watcher existed is missed.
  */
 export class NodeFileWatcher implements FileWatcher {
+	static readonly #darwinWatchers = new Set<NodeFileWatcher>();
+
+	static #scheduleDarwinSettle(): void {
+		for (const watcher of NodeFileWatcher.#darwinWatchers) watcher.#scheduleSettle();
+	}
+
 	readonly #targets: readonly ResolvedTarget[];
 	readonly #onChange: (change: WatchChange) => void;
 	readonly #pollIntervalMs: number;
@@ -196,6 +202,10 @@ export class NodeFileWatcher implements FileWatcher {
 		const watcher = new NodeFileWatcher(resolved, onChange, mode, options);
 		try {
 			await watcher.#sync(false);
+			if (!watcher.#closed && process.platform === "darwin" && watcher.#mode === "native") {
+				NodeFileWatcher.#darwinWatchers.add(watcher);
+				if (watcher.#watchers.size > 0) watcher.#scheduleSettle();
+			}
 		} catch (error) {
 			watcher.#stop();
 			if (error instanceof BudgetExceeded) throw new FileError("invalid", error.message);
@@ -217,13 +227,19 @@ export class NodeFileWatcher implements FileWatcher {
 
 	#stop(): void {
 		this.#closed = true;
+		NodeFileWatcher.#darwinWatchers.delete(this);
 		clearTimeout(this.#timer);
 		this.#timer = undefined;
 		clearTimeout(this.#settleTimer);
 		this.#settleTimer = undefined;
-		for (const { watcher } of this.#watchers.values()) watcher.close();
+		for (const { watcher } of this.#watchers.values()) this.#closeNativeWatcher(watcher);
 		this.#watchers.clear();
 		this.#resolvedParents = new Map();
+	}
+
+	#closeNativeWatcher(watcher: FSWatcher): void {
+		watcher.close();
+		NodeFileWatcher.#scheduleDarwinSettle();
 	}
 
 	#deliver(change: WatchChange): void {
@@ -252,7 +268,7 @@ export class NodeFileWatcher implements FileWatcher {
 	}
 
 	#scheduleSettle(): void {
-		if (this.#closed) return;
+		if (this.#closed || this.#mode !== "native") return;
 		clearTimeout(this.#settleTimer);
 		this.#settleTimer = setTimeout(() => {
 			this.#settleTimer = undefined;
@@ -302,7 +318,6 @@ export class NodeFileWatcher implements FileWatcher {
 			this.#snapshot = next;
 			this.#resolvedParents = scan.resolvedParents;
 			if (this.#mode === "polling" || !this.#reconcileWatchers(scan)) break;
-			if (process.platform === "darwin") this.#scheduleSettle();
 			// Something written into a new directory before its watcher existed shows up in the next round.
 			report = true;
 		}
@@ -497,7 +512,7 @@ export class NodeFileWatcher implements FileWatcher {
 			const entry = resolvedParents.get(path)?.entry ?? linkedDirectories.get(path) ?? snapshot.get(path);
 			// Gone, or replaced: a watcher follows the directory it was installed on, not the path.
 			if (!wanted.has(path) || entry === undefined || entry.dev !== installed.dev || entry.ino !== installed.ino) {
-				installed.watcher.close();
+				this.#closeNativeWatcher(installed.watcher);
 				this.#watchers.delete(path);
 			}
 		}
@@ -516,11 +531,13 @@ export class NodeFileWatcher implements FileWatcher {
 				});
 				// A watched directory that disappears or fails: rescan, which also replaces the watcher.
 				watcher.on("error", () => {
-					watcher.close();
-					if (this.#watchers.get(path)?.watcher === watcher) this.#watchers.delete(path);
+					if (this.#watchers.get(path)?.watcher !== watcher) return;
+					this.#closeNativeWatcher(watcher);
+					this.#watchers.delete(path);
 					this.#scheduleFlush();
 				});
 				this.#watchers.set(path, { watcher, dev: entry.dev, ino: entry.ino });
+				NodeFileWatcher.#scheduleDarwinSettle();
 				added = true;
 			} catch (error) {
 				// Out of watches or unsupported: compare snapshots from now on, and say coverage was uncertain.
@@ -536,7 +553,10 @@ export class NodeFileWatcher implements FileWatcher {
 	#switchToPolling(): void {
 		if (this.#mode === "polling") return;
 		this.#mode = "polling";
-		for (const { watcher } of this.#watchers.values()) watcher.close();
+		NodeFileWatcher.#darwinWatchers.delete(this);
+		clearTimeout(this.#settleTimer);
+		this.#settleTimer = undefined;
+		for (const { watcher } of this.#watchers.values()) this.#closeNativeWatcher(watcher);
 		this.#watchers.clear();
 		this.#resolvedParents = new Map();
 		this.#deliver({ overflow: true });

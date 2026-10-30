@@ -6,6 +6,8 @@ import { envApiKeyAuth, lazyOAuth } from "../auth/helpers.ts";
 import { loadOpenRouterOAuth } from "../auth/oauth/load.ts";
 import { createProvider, type Provider, type RefreshModelsContext } from "../models.ts";
 import type { AnyModel } from "../types.ts";
+import { providerHeadersToRecord } from "../utils/headers.ts";
+import { getIdentityHeaders } from "../utils/identity.ts";
 import { isModelType } from "../utils/model-operations.ts";
 import { OPENROUTER_CLASSIFIER_MODELS, OPENROUTER_IMAGE_MODELS, OPENROUTER_MODELS } from "./openrouter.models.ts";
 import { type OpenRouterModel, openRouterCost } from "./openrouter-api.ts";
@@ -16,8 +18,9 @@ const OPENROUTER_USER_MODELS_TIMEOUT_MS = 15_000;
 /**
  * Restrict an OpenRouter catalog to the chat models the key may use, with the key's limits and
  * prices from `GET /models/user`. Image and classifier models are returned unchanged. A missing
- * limit keeps the catalog value. The request uses the provider's configured base URL, so regional
- * endpoints such as `https://us.openrouter.ai/api/v1` apply their region's filtering. When the
+ * limit keeps the catalog value. Resolved auth headers override credential auth (including null
+ * removal), and the auth-resolved endpoint overrides the provider URL. Regional endpoints such as
+ * `https://us.openrouter.ai/api/v1` apply their region's filtering. When the
  * endpoint rejects the key (401/403) or does not exist (404), for example with a proxy configured
  * in models.json, the catalog is returned unchanged.
  */
@@ -25,10 +28,20 @@ export async function personalizeOpenRouterCatalog(
 	catalog: readonly AnyModel[],
 	context: RefreshModelsContext,
 ): Promise<readonly AnyModel[]> {
-	const key = context.credential?.type === "oauth" ? context.credential.access : context.credential?.key;
-	if (!key) return catalog;
-	const response = await fetch(`${(context.baseUrl ?? OPENROUTER_BASE_URL).replace(/\/+$/, "")}/models/user`, {
-		headers: { accept: "application/json", authorization: `Bearer ${key}` },
+	const key = context.auth
+		? context.auth.apiKey
+		: context.credential?.type === "oauth"
+			? context.credential.access
+			: context.credential?.key;
+	const baseUrl = context.auth?.baseUrl ?? context.baseUrl ?? OPENROUTER_BASE_URL;
+	const headers = providerHeadersToRecord(
+		getIdentityHeaders({ provider: "openrouter", baseUrl }, context.identity),
+		{ accept: "application/json", ...(key ? { authorization: `Bearer ${key}` } : {}) },
+		context.auth?.headers,
+	);
+	if (!key && !context.auth?.headers) return catalog;
+	const response = await fetch(`${baseUrl.replace(/\/+$/, "")}/models/user`, {
+		headers,
 		signal: AbortSignal.any([context.signal, AbortSignal.timeout(OPENROUTER_USER_MODELS_TIMEOUT_MS)]),
 	});
 	if (response.status === 401 || response.status === 403 || response.status === 404) return catalog;
@@ -60,7 +73,7 @@ export async function personalizeOpenRouterCatalog(
 }
 
 export function openrouterProvider(): Provider<"anthropic-messages" | "openai-completions"> {
-	return createProvider<"anthropic-messages" | "openai-completions">({
+	const provider = createProvider<"anthropic-messages" | "openai-completions">({
 		id: "openrouter",
 		name: "OpenRouter",
 		baseUrl: OPENROUTER_BASE_URL,
@@ -85,4 +98,11 @@ export function openrouterProvider(): Provider<"anthropic-messages" | "openai-co
 		// OpenRouter serves TypeSafe's System One protocol at /api/v1/systemone.
 		classifiers: { "typesafe-system-one": typesafeSystemOneApi() },
 	});
+	return {
+		...provider,
+		resolveCachedModelAuth: async (credential, ctx) => ({
+			apiKey:
+				credential?.type === "oauth" ? credential.access : credential?.key || (await ctx.env("OPENROUTER_API_KEY")),
+		}),
+	};
 }

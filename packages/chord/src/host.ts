@@ -318,6 +318,7 @@ export class HostImpl implements Host, HostCore {
 	readonly #dying = new Map<string, ObjectImpl>();
 	/** All unfinished disposals, including overlapping objects at the same address. Removed as soon as they settle. */
 	readonly #disposing = new Set<ObjectImpl>();
+	readonly #revocations: { readonly matches: (principal: unknown) => boolean; readonly reason: ChordError }[] = [];
 	readonly #touches = new Map<string, Set<ObjectImpl>>();
 	readonly #order = new Map<string, Map<string, number>>();
 	readonly #subscribers = new Map<string, Set<(table: RegistryTable<unknown>, codeVersion: number) => void>>();
@@ -581,6 +582,23 @@ export class HostImpl implements Host, HostCore {
 				"placement",
 				`${type.name} with this input lives on ${resolveHost(type.name, placement, normalized)}, not ${this.name}`,
 			);
+		}
+		const revocation = this.isSelf(principal)
+			? undefined
+			: this.#revocations.find((entry) => entry.matches(principal));
+		if (revocation !== undefined) {
+			const object = new ObjectImpl(this, {
+				address,
+				typeName: type.name,
+				input: normalized,
+				principal,
+				hostLifetime: hostLifetime(service),
+			});
+			object.status = "disposed";
+			object.revoke(revocation.reason);
+			const ref = new RefImpl(object, type, owner);
+			object.addRef(ref);
+			return ref;
 		}
 		let object = this.objects.get(address);
 		if (from !== undefined && object !== undefined && (object === from || reaches(object, from))) {
@@ -987,19 +1005,34 @@ export class HostImpl implements Host, HostCore {
 		const matching = [...this.objects.values(), ...this.#disposing].filter(
 			(object) => !this.isSelf(object.principal) && matches(object.principal),
 		);
-		// Links acting as a matching principal are re-stamped (if the acceptor can) or closed.
-		for (const connection of [...this.connections]) {
-			if (connection.role !== "downstream" || !matches(connection.principal)) continue;
-			// Relays under the old principal close at once, including those still resolving their route.
-			connection.revoke(connection.restamp?.(connection.principal));
-		}
-		// Patterns propagate to child hosts, which dispose their own matching objects (e.g. relayed guests).
-		if (typeof match !== "function") {
-			for (const connection of this.connections) {
-				if (connection.role === "downstream" && connection.peer.kind === "host") {
-					connection.send({ t: "invalidate", pattern: match });
+		const revocation = { matches, reason };
+		this.#revocations.push(revocation);
+		try {
+			// Revoke every authority before any holder's asynchronous cleanup can stall the rest.
+			for (const object of matching) object.revoke(reason);
+			for (const binding of [...this.bindings.values()]) {
+				if (binding.principal === undefined || this.isSelf(binding.principal) || !matches(binding.principal))
+					continue;
+				const hold = binding.hold;
+				binding.gone(reason);
+				hold?.channel.release(hold.id);
+			}
+			// Links acting as a matching principal are re-stamped (if the acceptor can) or closed.
+			for (const connection of [...this.connections]) {
+				if (connection.role !== "downstream" || !matches(connection.principal)) continue;
+				// Relays under the old principal close at once, including those still resolving their route.
+				connection.revoke(connection.restamp?.(connection.principal));
+			}
+			// Patterns propagate to child hosts, which dispose their own matching objects (e.g. relayed guests).
+			if (typeof match !== "function") {
+				for (const connection of this.connections) {
+					if (connection.role === "downstream" && connection.peer.kind === "host") {
+						connection.send({ t: "invalidate", pattern: match });
+					}
 				}
 			}
+		} finally {
+			this.#revocations.splice(this.#revocations.indexOf(revocation), 1);
 		}
 		// Revoking links may release their last holds and start disposal; join the objects captured before that.
 		await disposeHoldersFirst(matching, reason, "invalidatePrincipal: disposal failed");
@@ -1183,6 +1216,15 @@ export class HostImpl implements Host, HostCore {
 		const principal =
 			options?.principal === undefined || this.isSelf(options.principal) ? undefined : options.principal;
 		const key = this.#remoteKey(type, input, principal === undefined ? this.principal : principal);
+		const revocation =
+			principal === undefined ? undefined : this.#revocations.find((entry) => entry.matches(principal));
+		if (revocation !== undefined) {
+			const binding = new RemoteBinding(this, { key, contract: type, at, input, principal });
+			const ref = new RemoteRef(binding, owner, options?.state !== false);
+			binding.addView(ref);
+			binding.gone(revocation.reason);
+			return ref;
+		}
 		let binding = this.bindings.get(key);
 		const fresh = binding === undefined || binding.ended;
 		if (binding === undefined || binding.ended) {
@@ -1214,7 +1256,12 @@ export class HostImpl implements Host, HostCore {
 			if (route === undefined) binding.gone(new ChordError("unavailable", `no route to ${binding.at}`));
 			else
 				bindWhenSynced(
-					this.#resolve(route, binding.at, binding.principal === undefined ? this.principal : binding.principal),
+					this.#resolve(
+						route,
+						binding.at,
+						binding.principal === undefined ? this.principal : binding.principal,
+						() => !binding.ended,
+					),
 				);
 		}
 	}

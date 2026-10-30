@@ -1,7 +1,14 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
+import {
+	cropKittyImageLine,
+	deleteKittyImage,
+	getKittyImagePlacement,
+	getPngDimensions,
+	isImageLine,
+	registerKittyImageMetadata,
+} from "./terminal-image.ts";
 import { CURSOR_MARKER, type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
 import {
 	extractAnsiCode,
@@ -84,7 +91,6 @@ class BoundedTerminalWriter {
 interface KittyImageHeader {
 	ids: number[];
 	rows: number;
-	column: number;
 	columns?: number;
 }
 
@@ -107,7 +113,7 @@ function parseKittyImageHeader(line: string): KittyImageHeader | undefined {
 		else if (key === "r") rows = numberValue;
 		else if (key === "c") columns = numberValue;
 	}
-	return { ids, rows, column: visibleWidth(line.slice(0, sequenceStart)), columns };
+	return { ids, rows, columns };
 }
 
 function extractKittyImageIds(line: string): number[] {
@@ -512,8 +518,6 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const reset = this.applyLineResets(composed);
 		const imageCoverage = this.kittyViewportCoverage();
 		for (const image of imageCoverage) {
-			if (image.row < this.previousViewportTop || image.row + image.rows > this.previousViewportTop + height)
-				continue;
 			if (
 				!this.renderedOverlayLayouts.some(
 					(overlay) =>
@@ -524,6 +528,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				)
 			)
 				continue;
+			// Unknown custom formats must retain their placement: once deleted there is
+			// no safe viewport-only restore without source-pixel crop geometry.
+			if (!image.restore) continue;
 			// Lowercase i deletes placements only, retaining data for a=p on restore.
 			this.terminal.write(`\x1b_Ga=d,d=i,i=${image.id},q=2\x1b\\`);
 			this.hiddenKittyImages.add(image.id);
@@ -539,8 +546,22 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		}
 	}
 
-	private kittyViewportCoverage(): Array<{ id: number; row: number; rows: number; column: number; columns: number }> {
-		const images: Array<{ id: number; row: number; rows: number; column: number; columns: number }> = [];
+	private kittyViewportCoverage(): Array<{
+		id: number;
+		row: number;
+		rows: number;
+		column: number;
+		columns: number;
+		restore?: string;
+	}> {
+		const images: Array<{
+			id: number;
+			row: number;
+			rows: number;
+			column: number;
+			columns: number;
+			restore?: string;
+		}> = [];
 		if (!this.previousLayout) return images;
 		for (let index = 0; index < this.previousLines.length; index++) {
 			const header = parseKittyImageHeader(this.previousLines[index]);
@@ -549,12 +570,71 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			const row = this.previousLayout.offsets[index];
 			if (row + header.rows <= this.previousViewportTop || row >= this.previousViewportTop + this.terminal.rows)
 				continue;
+			const hiddenRows = Math.max(0, this.previousViewportTop - row);
+			const visibleRows = Math.min(
+				header.rows - hiddenRows,
+				this.previousViewportTop + this.terminal.rows - row - hiddenRows,
+			);
+			const partial = hiddenRows > 0 || visibleRows < header.rows;
+			const line = this.previousLines[index];
+			const cursor = { index: line.indexOf(KITTY_SEQUENCE_PREFIX), row: 0, col: 0 };
+			terminalLineRows(line.slice(0, cursor.index), this.terminal.columns, cursor);
+			let restore = partial
+				? getKittyImagePlacement(cropKittyImageLine(line, hiddenRows, visibleRows))?.sequence
+				: `\x1b_Ga=p,i=${id},c=${header.columns ?? this.terminal.columns},r=${header.rows},C=1,q=2\x1b\\`;
+			if (partial && !restore) {
+				const start = line.indexOf(KITTY_SEQUENCE_PREFIX);
+				const controlsEnd = line.indexOf(";", start);
+				const controls = line.slice(start + KITTY_SEQUENCE_PREFIX.length, controlsEnd).split(",");
+				const values: Record<string, string> = {};
+				for (const control of controls) {
+					const [key, value] = control.split("=", 2);
+					if (value !== undefined) values[key] = value;
+				}
+				const format = Number(values.f ?? 32);
+				// PNG dimensions fit in the first 24 decoded bytes, even for chunked uploads.
+				const dimensions =
+					format === 100 && (values.t === undefined || values.t === "d")
+						? getPngDimensions(line.slice(controlsEnd + 1, controlsEnd + 33))
+						: undefined;
+				const sourceY = Number(values.y ?? 0);
+				const sourceHeight = Number(
+					values.h ?? dimensions?.heightPx ?? (format === 24 || format === 32 ? values.v : 0),
+				);
+				if (Number.isFinite(sourceHeight) && sourceHeight > 0 && Number.isFinite(sourceY) && sourceY >= 0) {
+					const sourceWidth = Number(dimensions?.widthPx ?? values.s);
+					if (
+						values.x === undefined &&
+						values.y === undefined &&
+						values.w === undefined &&
+						values.h === undefined &&
+						Number.isFinite(sourceWidth) &&
+						sourceWidth > 0
+					) {
+						// Reuse the existing bounded transmission registry; subsequent overlays
+						// take the registered-image path without inspecting the payload header.
+						registerKittyImageMetadata({
+							imageId: id,
+							columns: header.columns ?? this.terminal.columns,
+							rows: header.rows,
+							widthPx: sourceWidth,
+							heightPx: sourceHeight,
+						});
+					}
+					const cropY = Math.floor((sourceHeight * hiddenRows) / header.rows);
+					const cropEnd = Math.ceil((sourceHeight * (hiddenRows + visibleRows)) / header.rows);
+					const placement = controls.filter((control) => /^(?:i|p|x|w|X|Y|c|U|z|P|Q|H|V)=/.test(control));
+					placement.push(`y=${sourceY + cropY}`, `h=${cropEnd - cropY}`, `r=${visibleRows}`, "C=1");
+					restore = `\x1b_Ga=p,q=2,${placement.join(",")}\x1b\\`;
+				}
+			}
 			images.push({
 				id,
 				row,
 				rows: header.rows,
-				column: header.column,
+				column: cursor.col,
 				columns: header.columns ?? this.terminal.columns,
+				restore,
 			});
 		}
 		return images;
@@ -580,6 +660,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				if (!parseKittyImageHeader(lines[i])?.ids.length) {
 					for (let row = Math.max(top, start); row < Math.min(top + height, end); row++)
 						result[row - top] = lines[i];
+				} else if (start >= top) {
+					result[start - top] = terminalLinePhysicalRows(lines[i], width, 0, 1)[0] ?? "";
 				}
 				continue;
 			}
@@ -637,13 +719,13 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		if (restoring) {
 			for (const image of images) {
 				if (!this.hiddenKittyImages.has(image.id)) continue;
-				const delta = image.row - this.hardwareCursorRow;
+				if (!image.restore) continue;
+				const restoreRow = Math.max(image.row, this.previousViewportTop);
+				const delta = restoreRow - this.hardwareCursorRow;
 				if (delta > 0) output.append(`\x1b[${delta}B`);
 				else if (delta < 0) output.append(`\x1b[${-delta}A`);
-				output.append(
-					`\x1b[${image.column + 1}G\x1b_Ga=p,i=${image.id},c=${image.columns},r=${image.rows},C=1,q=2\x1b\\`,
-				);
-				this.hardwareCursorRow = image.row;
+				output.append(`\x1b[${image.column + 1}G${image.restore}`);
+				this.hardwareCursorRow = restoreRow;
 			}
 			this.hiddenKittyImages.clear();
 		}
@@ -716,14 +798,13 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				: this.buildLayout(newLines, width, firstChanged, this.previousLayout);
 		const prevLayout = this.previousLayout ?? this.rowLayout(this.previousLines, width);
 
-		// Helper to clear scrollback and viewport and render all new lines
 		const fullRender = (clear: boolean): void => {
 			this.fullRedrawCount += 1;
 			const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
 			output.append("\x1b[?2026h"); // Begin synchronized output
 			if (clear) {
 				output.append(this.deleteKittyImages(this.previousKittyImageIds));
-				output.append("\x1b[2J\x1b[H\x1b[3J"); // Clear screen, home, then clear scrollback
+				output.append("\x1b[2J\x1b[H\x1b[3J");
 			}
 			for (let i = 0; i < newLines.length; i++) {
 				if (i > 0) output.append("\r\n");

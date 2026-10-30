@@ -60,6 +60,30 @@ function stubUserModels(response: Response): void {
 
 afterEach(() => vi.restoreAllMocks());
 
+it.each(["Bearer gateway-token", null])(
+	"honors resolved authorization %j and endpoint without disclosing the stored key",
+	async (authorization) => {
+		stubUserModels(Response.json({ data: [{ id: "allowed" }] }));
+		const context = refreshContext();
+		context.auth = {
+			apiKey: "stored-secret",
+			baseUrl: "https://gateway.test/v1",
+			headers: { Authorization: authorization, "X-Gateway": "tenant" },
+		};
+		context.baseUrl = "https://ignored.test/v1";
+		context.identity = { userAgent: "short", attribution: null };
+		await personalizeOpenRouterCatalog([chatModel("allowed")], context);
+		const [url, init] = vi.mocked(globalThis.fetch).mock.calls[0]!;
+		expect(String(url)).toBe("https://gateway.test/v1/models/user");
+		const headers = new Headers(init?.headers);
+		expect(headers.get("authorization")).toBe(authorization);
+		expect(headers.get("x-gateway")).toBe("tenant");
+		expect(headers.get("user-agent")).toBe("pi");
+		expect(headers.has("HTTP-Referer")).toBe(false);
+		expect(JSON.stringify(init?.headers)).not.toContain("stored-secret");
+	},
+);
+
 describe("personalizeOpenRouterCatalog", () => {
 	it("keeps only the key's chat models, with the key's limits and prices", async () => {
 		const data: OpenRouterModel[] = [

@@ -949,6 +949,8 @@ describe("durable code mode", () => {
 
 	it("delivers a result only after its journal commit", async () => {
 		const storage = new ControlledStorage();
+		const firstReached = Promise.withResolvers<void>();
+		const failure = new Error("lost");
 		const seen: string[] = [];
 		const chat = codemodeChat([
 			{
@@ -956,7 +958,8 @@ describe("durable code mode", () => {
 				execute: async () => {
 					seen.push("first");
 					// The next commit is this result's journal commit: it never lands.
-					storage.failNextCommit(new Error("lost"));
+					storage.failNextCommit(failure);
+					firstReached.resolve();
 					return 1;
 				},
 			},
@@ -972,8 +975,8 @@ describe("durable code mode", () => {
 		chat.setup.faux.setResponses([script(`await first(); await second();`), DONE]);
 		const { harness, root } = await openChat(storage, chat.setup);
 		await root.submit({ type: "input", content: "go" }, context);
-		await eventually(() => seen.includes("first"));
-		await new Promise((resolve) => setTimeout(resolve, 100));
+		await firstReached.promise;
+		expect(await harness.closed).toEqual({ reason: "failed", error: failure });
 		expect(seen).toEqual(["first"]);
 		await harness.close(context).catch(() => {});
 	});
@@ -1001,11 +1004,18 @@ describe("durable code mode", () => {
 
 	it("times a script out across a restart, without admitting new calls", async () => {
 		const chat = codemodeChat();
+		let now = Date.now();
+		chat.setup.now = () => now;
 		const { harness, result } = await restart(
 			chat,
-			`// @options: {"timeout_ms": 300}
+			`// @options: {"timeout_ms": 30000}
 			await tools.hold({}); await tools.echo({ text: "late" });`,
-			() => new Promise((resolve) => setTimeout(resolve, 400)),
+			async (opened, task) => {
+				const run = await opened.snapshot(CodemodeRunDoc, task, context);
+				if (!run?.start) throw new Error("Missing durable script start");
+				expect(run.start.deadline).toBe(run.start.startedAt + 30000);
+				now += 30001;
+			},
 		);
 		expect(result.isError).toBe(true);
 		expect(result.text).toContain("deadline passed");

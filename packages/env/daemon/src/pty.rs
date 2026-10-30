@@ -192,11 +192,18 @@ pub fn run(
             format!("Working directory does not exist: {}", request.cwd),
         ));
     }
+    // Keep terminal registration inside the process gate: shutdown must see every terminal it may need to kill.
+    let mut ownership = groups
+        .lock()
+        .map_err(|_| Failure::new("spawn_error", "process ownership lock poisoned"))?;
+    if ownership.stopping {
+        return Err(Failure::new("spawn_error", "the connection has ended"));
+    }
     let (master, mut child) =
         unix::spawn(&request).map_err(|error| Failure::new("spawn_error", error.to_string()))?;
     let master = Arc::new(master);
     let pid = child.id();
-    groups.lock().unwrap().insert(pid);
+    ownership.pids.insert(pid);
     let (input, inputs) = mpsc::channel::<Vec<u8>>();
     terminals.lock().unwrap().insert(
         id,
@@ -206,6 +213,7 @@ pub fn run(
             pid,
         }),
     );
+    drop(ownership);
     output.control(Frame::new(
         EVENT,
         id,
@@ -317,7 +325,7 @@ pub fn run(
     unix::kill_session(pid);
     // Ending the input channel ends the writer thread.
     terminals.lock().unwrap().remove(&id);
-    groups.lock().unwrap().remove(&pid);
+    groups.lock().unwrap().pids.remove(&pid);
     let _ = reader.join();
     if aborted {
         return Err(Failure::new("aborted", "aborted"));
@@ -485,6 +493,16 @@ mod unix {
         cloexec(master.as_raw_fd())?;
         cloexec(slave.as_raw_fd())?;
         let slave = File::from(slave);
+        let master = File::from(master);
+        // SAFETY: fcntl on the descriptor owned above; reads and writes poll instead of blocking.
+        unsafe {
+            let flags = check(libc::fcntl(master.as_raw_fd(), libc::F_GETFL))?;
+            check(libc::fcntl(
+                master.as_raw_fd(),
+                libc::F_SETFL,
+                flags | libc::O_NONBLOCK,
+            ))?;
+        }
         let mut command = command(request);
         command
             .current_dir(&request.cwd)
@@ -524,16 +542,6 @@ mod unix {
         let child = command.spawn()?;
         // Only the program holds the terminal now, so reads end once it and its descendants close it.
         drop(slave);
-        let master = File::from(master);
-        // SAFETY: fcntl on the descriptor owned above; reads and writes poll instead of blocking.
-        unsafe {
-            let flags = check(libc::fcntl(master.as_raw_fd(), libc::F_GETFL))?;
-            check(libc::fcntl(
-                master.as_raw_fd(),
-                libc::F_SETFL,
-                flags | libc::O_NONBLOCK,
-            ))?;
-        }
         Ok((master, child))
     }
 

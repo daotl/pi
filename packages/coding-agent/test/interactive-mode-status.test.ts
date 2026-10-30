@@ -238,9 +238,18 @@ describe("InteractiveMode.showExtensionCustom", () => {
 		initTheme("dark");
 	});
 
+	// Exercise the private custom-dialog entry point with its public generic result contract.
+	const customDialogPrototype = InteractiveMode.prototype as unknown as {
+		showExtensionCustom<T>(
+			factory: (tui: TUI, theme: unknown, keybindings: unknown, done: (result: T) => void) => Component,
+			options?: { overlay?: boolean; overlayOptions?: { nonCapturing?: boolean } },
+		): Promise<T | undefined>;
+	};
+
 	// Inline custom components go through the extension dialog stack.
 	const extensionDialogState = () => ({
 		extensionDialogs: [],
+		extensionCustomDialogs: new Set<() => void>(),
 		programStatus: { setBlocked: vi.fn() },
 		pushExtensionDialog: (InteractiveMode as any).prototype.pushExtensionDialog,
 		removeExtensionDialog: (InteractiveMode as any).prototype.removeExtensionDialog,
@@ -272,8 +281,10 @@ describe("InteractiveMode.showExtensionCustom", () => {
 		const showExtensionCustom = <T>(
 			factory: (tui: TUI, theme: unknown, keybindings: unknown, done: (result: T) => void) => Component,
 			options?: { overlay?: boolean },
-		): Promise<T> =>
-			(InteractiveMode as any).prototype.showExtensionCustom.call(fakeThis, factory, options) as Promise<T>;
+		): Promise<T | undefined> =>
+			Reflect.apply(customDialogPrototype.showExtensionCustom, fakeThis, [factory, options]) as Promise<
+				T | undefined
+			>;
 
 		editorContainer.addChild(editor);
 		ui.addChild(editorContainer);
@@ -345,8 +356,10 @@ describe("InteractiveMode.showExtensionCustom", () => {
 			const showExtensionCustom = <T>(
 				factory: (tui: TUI, theme: unknown, keybindings: unknown, done: (result: T) => void) => Component,
 				options?: { overlay?: boolean; overlayOptions?: { nonCapturing?: boolean } },
-			): Promise<T> =>
-				(InteractiveMode as any).prototype.showExtensionCustom.call(fakeThis, factory, options) as Promise<T>;
+			): Promise<T | undefined> =>
+				Reflect.apply(customDialogPrototype.showExtensionCustom, fakeThis, [factory, options]) as Promise<
+					T | undefined
+				>;
 
 			editorContainer.addChild(editor);
 			ui.addChild(editorContainer);

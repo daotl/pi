@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { DurableObjectSqliteDatabase } from "../../src/sqlite/cloudflare.ts";
@@ -13,6 +14,21 @@ describe("Durable Object SQLite driver", () => {
 			n: 7,
 		});
 	});
+
+	for (const subarray of [false, true]) {
+		it(`preserves pooled Buffer${subarray ? " subarray" : ""} bounds when binding blobs`, async () => {
+			const database = new DurableObjectSqliteDatabase(durableObjectStorage());
+			const pooled = Buffer.from([91, 1, 2, 3, 92]);
+			const value = subarray ? pooled.subarray(1, 4) : Buffer.from([1, 2, 3]);
+			await database.exec("CREATE TABLE blobs (data BLOB)");
+			await database.run("INSERT INTO blobs (data) VALUES (?)", value);
+			expect(await database.get("SELECT data, length(data) AS size FROM blobs")).toEqual({
+				data: new Uint8Array([1, 2, 3]),
+				size: 3,
+			});
+			await database.close();
+		});
+	}
 
 	it("reads only the cursor's first row for get", async () => {
 		const operations: string[] = [];

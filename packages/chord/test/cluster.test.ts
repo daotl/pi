@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { Type } from "typebox";
-import { describe, it, onTestFinished } from "vitest";
+import { describe, it, onTestFinished, vi } from "vitest";
 import {
 	type Ctx,
 	createHost,
@@ -14,6 +14,7 @@ import {
 	local,
 	memoryLinkPair,
 	method,
+	PROTOCOL_VERSION,
 	remote,
 	type Self,
 } from "../src/index.ts";
@@ -664,56 +665,67 @@ describe("cross-host reload", () => {
 		assert.ok(Date.now() - started < 2000);
 	});
 
-	it("a reconciliation running when a reload starts syncs the child only after it, to the committed code version", async () => {
-		const modules = new Map<string, Facet>([["greeter", greeterFacet("v1")]]);
-		const serverLoading = latch();
-		let blockServer = false;
-		const server = createHost({
-			self: { kind: "host" },
-			name: "server",
-			onError: () => {},
-			loader: async (names) => {
-				if (blockServer) await serverLoading.promise;
-				return names.map((name) => ({ name: String(name), setup: () => {} }));
-			},
+	for (const parentFirst of [false, true]) {
+		it(`a reconciliation overlapping a reload converges when the ${parentFirst ? "parent" : "child"} finishes first`, async () => {
+			const modules = new Map<string, Facet>([["greeter", greeterFacet("v1")]]);
+			const serverLoading = latch();
+			let blockServer = false;
+			const server = createHost({
+				self: { kind: "host" },
+				name: "server",
+				onError: () => {},
+				loader: async (names) => {
+					if (blockServer) await serverLoading.promise;
+					return names.map((name) => ({ name: String(name), setup: () => {} }));
+				},
+			});
+			onTestFinished(() => server.close());
+			server.install({ name: "server-plugin", setup: () => {} });
+			await server.reload(["server-plugin"], { remote: { "session:": ["greeter"] } });
+			// The worker connects behind: its reconciliation to code version 2 waits in the worker's module loading.
+			const workerLoading = latch();
+			let blockWorker = true;
+			const [down, up] = memoryLinkPair();
+			server.accept(down, { principal: { worker: "w" }, kind: "host", name: "session:S1" });
+			const worker = createHost({
+				self: { kind: "host" },
+				name: "session:S1",
+				upstream: { link: up, principal: { kind: "server" } },
+				loader: async (names) => {
+					if (blockWorker) await workerLoading.promise;
+					return names.map((name) => modules.get(String(name))!);
+				},
+				onError: () => {},
+			});
+			onTestFinished(() => worker.close());
+			worker.install(modules.get("greeter")!);
+			await tick();
+			// A reload starts before the reconciliation committed; the worker is not one of its participants.
+			blockServer = true;
+			modules.set("greeter", greeterFacet("v2"));
+			const reloading = server.reload(["server-plugin"], { remote: { "session:": ["greeter"] } });
+			if (parentFirst) {
+				serverLoading.open();
+				await reloading;
+				assert.equal(worker.codeVersion, 1);
+				blockWorker = false;
+				workerLoading.open();
+			} else {
+				blockWorker = false;
+				workerLoading.open();
+				for (let i = 0; i < 50 && worker.codeVersion !== 2; i++) await tick();
+				assert.equal(worker.codeVersion, 2);
+				serverLoading.open();
+			}
+			const report = await reloading;
+			assert.deepEqual(Object.keys(report.children ?? {}), []);
+			assert.equal(report.codeVersion, 3);
+			const greeter = server.hold(Greeter, { session: "S1" });
+			assert.equal(await greeter.greet("a"), "v2 a");
+			assert.equal(worker.codeVersion, server.codeVersion);
+			assert.equal(up.closed, false);
 		});
-		onTestFinished(() => server.close());
-		server.install({ name: "server-plugin", setup: () => {} });
-		await server.reload(["server-plugin"], { remote: { "session:": ["greeter"] } });
-		// The worker connects behind: its reconciliation to code version 2 waits in the worker's module loading.
-		const workerLoading = latch();
-		let blockWorker = true;
-		const [down, up] = memoryLinkPair();
-		server.accept(down, { principal: { worker: "w" }, kind: "host", name: "session:S1" });
-		const worker = createHost({
-			self: { kind: "host" },
-			name: "session:S1",
-			upstream: { link: up, principal: { kind: "server" } },
-			loader: async (names) => {
-				if (blockWorker) await workerLoading.promise;
-				return names.map((name) => modules.get(String(name))!);
-			},
-			onError: () => {},
-		});
-		onTestFinished(() => worker.close());
-		worker.install(modules.get("greeter")!);
-		await tick();
-		// A reload starts before the reconciliation committed; the worker is not one of its participants.
-		blockServer = true;
-		modules.set("greeter", greeterFacet("v2"));
-		const reloading = server.reload(["server-plugin"], { remote: { "session:": ["greeter"] } });
-		blockWorker = false;
-		workerLoading.open();
-		for (let i = 0; i < 50 && worker.codeVersion !== 2; i++) await tick();
-		assert.equal(worker.codeVersion, 2);
-		serverLoading.open();
-		const report = await reloading;
-		assert.deepEqual(Object.keys(report.children ?? {}), []);
-		assert.equal(report.codeVersion, 3);
-		const greeter = server.hold(Greeter, { session: "S1" });
-		assert.equal(await greeter.greet("a"), "v2 a");
-		assert.equal(worker.codeVersion, server.codeVersion);
-	});
+	}
 
 	it("a child behind whose hello waits for a running reload is fenced at once: its calls up are admitted (spec 9)", async () => {
 		const pingFacet: Facet = {
@@ -1051,6 +1063,163 @@ describe("cluster commit boundaries", () => {
 				assert.equal(worker.codeVersion, server.codeVersion);
 				assert.deepEqual(errors, []);
 			}
+		});
+	}
+});
+
+describe("child rollback completion", () => {
+	for (const phase of ["loading", "preparing", "prepared", "failed-prepare"] as const) {
+		it(`acknowledges abort only after ${phase} work releases the reload slot`, async () => {
+			const loading = latch();
+			const entered = latch();
+			const finishOpen = latch();
+			const closing = latch();
+			const finishClose = latch();
+			const frames: Frame[] = [];
+			const [parent, up] = memoryLinkPair();
+			parent.receive((frame) => frames.push(frame));
+			const Store = local(`t.abort-ack-${phase}`, {
+				version: 1,
+				input: Type.Object({}),
+				members: { read: method(undefined, Type.String()) },
+			});
+			const candidate: Facet = {
+				name: "store",
+				setup: ({ serve }) =>
+					serve(Store, (_input, _principal, self) => {
+						self.resource("candidate", {
+							version: 1,
+							open: async () => {
+								entered.open();
+								if (phase === "preparing") await finishOpen.promise;
+								if (phase === "failed-prepare") throw new Error("prepare failed");
+								return "candidate";
+							},
+							close: async () => {
+								closing.open();
+								await finishClose.promise;
+							},
+						});
+						return { read: () => "new" };
+					}),
+			};
+			const worker = createHost({
+				name: "worker",
+				self: "host",
+				upstream: { link: up, principal: "parent" },
+				loader: async () => {
+					if (phase === "loading") {
+						entered.open();
+						await loading.promise;
+					}
+					return [candidate];
+				},
+				onError: () => {},
+			});
+			onTestFinished(async () => {
+				loading.open();
+				finishOpen.open();
+				finishClose.open();
+				await worker.close();
+			});
+			parent.send({ t: "hello", protocol: PROTOCOL_VERSION, name: "parent", kind: "host", codeVersion: 1 });
+			await worker.install({ name: "store", setup: ({ serve }) => serve(Store, () => ({ read: () => "old" })) });
+			const ref = await worker.get(Store, {});
+			parent.send({ t: "prepare", reload: 100, codeVersion: 2, plugins: ["store"], options: {} });
+			await entered.promise;
+			if (phase === "prepared" || phase === "failed-prepare") {
+				for (let i = 0; i < 50 && !frames.some((frame) => frame.t === "vote" && frame.reload === 100); i++)
+					await tick();
+				assert.ok(
+					frames.some(
+						(frame) =>
+							frame.t === "vote" &&
+							frame.reload === 100 &&
+							(phase === "prepared" ? frame.error === undefined : frame.error !== undefined),
+					),
+				);
+			}
+			parent.send({ t: "abort", reload: 100 });
+			if (phase !== "failed-prepare") {
+				await tick();
+				assert.equal(
+					frames.some((frame) => frame.t === "aborted" && frame.reload === 100),
+					false,
+				);
+			}
+			loading.open();
+			finishOpen.open();
+			if (phase === "preparing" || phase === "prepared") {
+				await closing.promise;
+				assert.equal(
+					frames.some((frame) => frame.t === "aborted" && frame.reload === 100),
+					false,
+				);
+			}
+			finishClose.open();
+			for (let i = 0; i < 50 && !frames.some((frame) => frame.t === "aborted" && frame.reload === 100); i++)
+				await tick();
+			assert.ok(frames.some((frame) => frame.t === "aborted" && frame.reload === 100));
+			assert.equal(await ref.read(), "old");
+			parent.send({ t: "prepare", reload: 101, codeVersion: 3, plugins: ["store"], options: {} });
+			for (let i = 0; i < 50 && !frames.some((frame) => frame.t === "vote" && frame.reload === 101); i++)
+				await tick();
+			const next = frames.find((frame) => frame.t === "vote" && frame.reload === 101);
+			assert.ok(next?.t === "vote");
+			if (phase === "failed-prepare") assert.match(next.error?.message ?? "", /prepare failed/);
+			else assert.equal(next.error, undefined);
+			parent.send({ t: "abort", reload: 101 });
+		});
+	}
+
+	it("rejects rollback acknowledgements from a client", async () => {
+		const server = createHost({ name: "server", self: "host", onError: () => {} });
+		const [down, client] = memoryLinkPair();
+		server.accept(down, { principal: "guest" });
+		client.receive(() => {});
+		let reason = "";
+		client.onClose((value) => {
+			reason = value;
+		});
+		client.send({ t: "hello", protocol: PROTOCOL_VERSION, name: "client", kind: "client", codeVersion: 0 });
+		client.send({ t: "aborted", reload: 1 });
+		for (let i = 0; i < 50 && !client.closed; i++) await tick();
+		assert.equal(reason, "protocol error: aborted from a non-participant");
+		await server.close();
+	});
+
+	for (const failure of ["disconnect", "timeout"] as const) {
+		it(`ends reconciliation on rollback acknowledgement ${failure} without retaining waiters`, async () => {
+			if (failure === "timeout") vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			const errors: unknown[] = [];
+			const server = createHost({ name: "server", self: "host", onError: (error) => errors.push(error) });
+			onTestFinished(async () => {
+				vi.useRealTimers();
+				await server.close();
+			});
+			await server.reload([{ name: "noop", setup: () => {} }]);
+			const [down, child] = memoryLinkPair();
+			const frames: Frame[] = [];
+			child.receive((frame) => frames.push(frame));
+			server.accept(down, { kind: "host", name: "worker", principal: "worker" });
+			child.send({ t: "hello", protocol: PROTOCOL_VERSION, name: "worker", kind: "host", codeVersion: 1 });
+			for (let i = 0; i < 50 && !frames.some((frame) => frame.t === "prepare"); i++) await tick();
+			const first = frames.find((frame) => frame.t === "prepare");
+			assert.ok(first?.t === "prepare");
+			await server.reload([{ name: "noop", setup: () => {} }]);
+			child.send({ t: "vote", reload: first.reload });
+			for (let i = 0; i < 50 && !frames.some((frame) => frame.t === "abort"); i++) await tick();
+			assert.ok(frames.some((frame) => frame.t === "abort"));
+			const internal = server as unknown as { connections: Set<{ abortions: Map<number, unknown> }> };
+			const connection = [...internal.connections][0]!;
+			assert.equal(connection.abortions.size, 1);
+			if (failure === "disconnect") child.close("lost during rollback");
+			else await vi.advanceTimersByTimeAsync(30_000);
+			for (let i = 0; i < 50 && errors.length === 0; i++) await tick();
+			assert.equal(connection.abortions.size, 0);
+			assert.equal(child.closed, true);
+			assert.ok(errors.some((error) => isChordError(error, failure === "timeout" ? "aborted" : "unavailable")));
+			assert.equal(frames.filter((frame) => frame.t === "prepare").length, 1);
 		});
 	}
 });

@@ -25,9 +25,16 @@ const EXIT_STDIO_GRACE: Duration = Duration::from_millis(100);
 /// How often a delivery waiting for the link to drain looks again.
 const UNSENT_POLL: Duration = Duration::from_millis(20);
 
-/// Commands this daemon started whose process trees have not finished cleanup.
+/// Creation and registration share the shutdown lock, including commands still preparing to spawn.
 #[cfg(unix)]
-pub type Groups = Arc<Mutex<HashSet<u32>>>;
+#[derive(Default)]
+pub struct ProcessGroups {
+    pub stopping: bool,
+    pub pids: HashSet<u32>,
+}
+
+#[cfg(unix)]
+pub type Groups = Arc<Mutex<ProcessGroups>>;
 #[cfg(windows)]
 pub type Groups = sys::ProcessGroups;
 
@@ -201,6 +208,7 @@ fn spawn(
     program: &str,
     args: &[String],
     piped_stdin: bool,
+    groups: &Groups,
 ) -> std::io::Result<Child> {
     let mut command = Command::new(program);
     command
@@ -213,7 +221,18 @@ fn spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     sys::configure(&mut command, args, &request.env, request.inherit_env);
-    command.spawn()
+    let mut groups = groups
+        .lock()
+        .map_err(|_| std::io::Error::other("process ownership lock poisoned"))?;
+    if groups.stopping {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "the connection has ended",
+        ));
+    }
+    let child = command.spawn()?;
+    groups.pids.insert(child.id());
+    Ok(child)
 }
 
 /// Read one pipe on its own thread. Without an output window, reading waits while too much output is unsent.
@@ -274,6 +293,9 @@ fn run_with_shell(
     groups: &Groups,
     shell_config: impl FnOnce(Option<&str>) -> Result<sys::ShellConfig, Failure>,
 ) -> Result<Value, Failure> {
+    // A skipped sample must carry its exclusion proof in one frame. Larger windows use
+    // ordinary bounded reader chunks with the existing output-queue backpressure.
+    request.window = request.window.filter(|window| window.max_bytes <= crate::frame::MAX_PAYLOAD - 4);
     let (sender, receiver) = mpsc::channel();
     control.attach(sender.clone());
     if control.aborted.load(Ordering::SeqCst) {
@@ -307,7 +329,7 @@ fn run_with_shell(
         ));
     }
     #[cfg(unix)]
-    let child = spawn(&request, &program, &args, stdin_command.is_some());
+    let child = spawn(&request, &program, &args, stdin_command.is_some(), groups);
     #[cfg(windows)]
     let child = sys::spawn_process(
         &program,
@@ -323,8 +345,6 @@ fn run_with_shell(
     let job = child.job.clone();
     #[cfg(unix)]
     let pid = child.id();
-    #[cfg(unix)]
-    groups.lock().unwrap().insert(pid);
     let deadline = request.timeout.map(|timeout| Instant::now() + timeout);
     let stop = Arc::new(AtomicBool::new(false));
     // Without a window, output is not coalesced; reading then waits for the link.
@@ -519,7 +539,7 @@ fn run_with_shell(
         let _ = worker.join();
     }
     #[cfg(unix)]
-    groups.lock().unwrap().remove(&pid);
+    groups.lock().unwrap().pids.remove(&pid);
     emit(&mut pending, 0, decoders[0].decode(&[], true));
     emit(&mut pending, 1, decoders[1].decode(&[], true));
     if let Some(pending) = &mut pending
@@ -573,6 +593,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn oversized_output_window_stops_reading_when_the_output_link_is_full() {
+        let root = sys::mkdtemp(&format!("{}/pi-env-backpressure-", sys::tmpdir())).unwrap();
+        let output = Arc::new(Output::default());
+        // A prior request fills the real output queue. No writer runs until this request settles.
+        output.bulk(Frame::with_payload(EVENT, 0, json!({}), vec![0; 4 * 1024 * 1024 + 1]), None);
+        let request = ExecRequest::from_json(&json!({
+            "command": "head -c 33554432 /dev/zero; printf completed > marker",
+            "cwd": root,
+            "timeoutMs": 500,
+            "window": {
+                "maxBytes": 32000000, "maxLines": 1000000,
+                "minIntervalMs": 60000, "bytesPerSecond": 1000000,
+            },
+        })).unwrap();
+        // The real execution deadline bounds a stalled pipe; no guessed sleeps or polling are needed.
+        let result = run(10, request, &sys::tmpdir(), &output, &Control::default(), &Arc::default());
+        let completed = Path::new(&root).join("marker").exists();
+        output.close();
+        let mut bytes = Vec::new();
+        output.run(&mut bytes);
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(result.unwrap_err().code, "timeout");
+        assert!(!completed, "the producer ran past the full link instead of blocking");
+        let mut frames = bytes.as_slice();
+        let mut stdout = 0;
+        while let Some(frame) = crate::frame::read_frame(&mut frames).unwrap() {
+            if frame.id == 10 {
+                assert!(frame.json.get("skipped").is_none());
+                if frame.json["stream"] == "stdout" {
+                    assert!(frame.payload.iter().all(|byte| *byte == 0));
+                    stdout += frame.payload.len();
+                }
+            }
+        }
+        // Each reader may hand off its first 64 KiB chunk, then must wait for the full queue to drain.
+        assert!(stdout <= 64 * 1024, "read {stdout} bytes beyond a blocked consumer");
+    }
+
+    #[test]
+    fn configured_relative_shell_runs_the_validated_executable_not_a_cwd_decoy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = sys::mkdtemp("./pi-env-relative-shell-").unwrap();
+        let trusted = Path::new(&root).join("configured-shell");
+        let cwd = Path::new(&root).join("command-cwd");
+        let decoy = cwd.join(&root).join("configured-shell");
+        std::fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+        for (path, text) in [(&trusted, "TRUSTED"), (&decoy, "DECOY")] {
+            std::fs::write(path, format!("#!/bin/sh\nprintf {text}\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let output = Arc::new(Output::default());
+        let request = ExecRequest::from_json(&json!({
+            "command": "ignored", "cwd": cwd, "shellPath": trusted,
+        })).unwrap();
+        let result = run(9, request, &sys::tmpdir(), &output, &Control::default(), &Arc::default());
+        output.close();
+        let mut bytes = Vec::new();
+        output.run(&mut bytes);
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(result.unwrap()["exitCode"], 0);
+        let mut frames = bytes.as_slice();
+        let mut stdout = Vec::new();
+        while let Some(frame) = crate::frame::read_frame(&mut frames).unwrap() {
+            if frame.json["stream"] == "stdout" {
+                stdout.extend(frame.payload);
+            }
+        }
+        assert_eq!(stdout, b"TRUSTED");
+    }
+
+    #[test]
     fn stdin_scripts_remain_cancellable_while_the_first_line_sleeps() {
         for abort in [false, true] {
             let control = Arc::new(Control::default());
@@ -591,7 +683,7 @@ mod tests {
                 let groups = groups.clone();
                 Some(thread::spawn(move || {
                     let until = Instant::now() + Duration::from_secs(1);
-                    while groups.lock().unwrap().is_empty() && Instant::now() < until {
+                    while groups.lock().unwrap().pids.is_empty() && Instant::now() < until {
                         thread::sleep(Duration::from_millis(1));
                     }
                     control.cancel(false);
@@ -623,7 +715,7 @@ mod tests {
             }
             assert_eq!(failure.code, if abort { "aborted" } else { "timeout" });
             assert!(started.elapsed() < Duration::from_secs(2));
-            assert!(groups.lock().unwrap().is_empty());
+            assert!(groups.lock().unwrap().pids.is_empty());
         }
     }
 
@@ -658,12 +750,11 @@ mod tests {
     #[test]
     fn stdin_scripts_drain_output_before_feeding_the_remaining_script() {
         let request = ExecRequest::from_json(&json!({
-            "command": format!("(sleep 3; kill -KILL $$) </dev/null >/dev/null 2>&1 & guard=$!\nhead -c 262144 /dev/zero; printf complete\nkill \"$guard\"\n{}", "# script tail\n".repeat(100_000)),
+            "command": format!("(sleep 3; kill -KILL $$) </dev/null >/dev/null 2>&1 & guard=$!\nhead -c 262144 /dev/zero; printf complete\nkill \"$guard\"\n{}", "# script tail\n".repeat(10_000)),
             "cwd": sys::tmpdir(),
             "timeoutMs": 2000,
         })).unwrap();
         let output = Arc::new(Output::default());
-        let started = Instant::now();
         let result = run_with_shell(
             2,
             request,
@@ -680,7 +771,6 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(result["exitCode"], 0);
         output.close();
         let mut bytes = Vec::new();

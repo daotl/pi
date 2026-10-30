@@ -8,7 +8,14 @@ const fixture = fileURLToPath(new URL("./fixtures/exit-without-stop.ts", import.
 function runFixture(mode: "exit" | "stop"): string {
 	const result = spawnSync(process.execPath, [fixture, mode], {
 		encoding: "utf8",
-		env: { ...process.env, TMUX: undefined, STY: undefined, ZELLIJ: undefined, TERM: "xterm-256color" },
+		env: {
+			...process.env,
+			TMUX: undefined,
+			STY: undefined,
+			ZELLIJ: undefined,
+			TERM: "xterm-256color",
+			PI_PROGRAM_STATUS: "1",
+		},
 		stdio: ["pipe", "pipe", "pipe"],
 		timeout: 10_000,
 	});
@@ -29,11 +36,16 @@ describe("terminal restore on process exit", () => {
 			assert.equal(count(output, sequence), 1, JSON.stringify(sequence));
 		}
 		assert.ok(output.indexOf("\x1b[<u") < output.indexOf("\x1b[?1049l"), "Kitty pop must precede leaving alt screen");
+		const clear = "\x1b]7501;state=clear\x1b\\";
+		assert.equal(count(output, clear), 1);
+		assert.ok(output.indexOf("state=blocked") < output.indexOf(clear));
+		assert.ok(output.indexOf(clear) < output.indexOf("\x1b[?1049l"));
 		assert.ok(output.endsWith("\x1b[?1049l\x1b[?25h"));
 	});
 
 	it("does not restore twice after a normal stop()", () => {
 		const output = runFixture("stop");
+		assert.equal(count(output, "\x1b]7501;state=clear\x1b\\"), 1);
 		for (const sequence of ["\x1b[?1006l", "\x1b[?1004l", "\x1b[<u", "\x1b[?2004l", "\x1b[?1049l"]) {
 			assert.equal(count(output, sequence), 1, JSON.stringify(sequence));
 		}

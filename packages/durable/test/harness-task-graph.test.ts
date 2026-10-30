@@ -8,6 +8,7 @@ import {
 	defineTask,
 	type EntryId,
 	MemoryStorage,
+	type Storage,
 	type TaskGraph,
 	type TaskId,
 } from "@earendil-works/pi-durable";
@@ -81,6 +82,41 @@ function statuses(graph: TaskGraph): Record<string, string> {
 }
 
 describe("task graph view", () => {
+	it("hydrates owned conversations by pages rather than by live task count and shares the mount", async () => {
+		class CountingStorage extends MemoryStorage {
+			conversationScans = 0;
+			override scanConversations(...args: Parameters<Storage["scanConversations"]>) {
+				this.conversationScans++;
+				return super.scanConversations(...args);
+			}
+		}
+		const storage = new CountingStorage();
+		const { Child } = family(gatesNever());
+		const { harness } = await openTasks(storage, [Child]);
+		const root = await harness.root(context);
+		const ids: TaskId[] = [];
+		const owned: ConversationId[] = [];
+		await root.commit(async (tx) => {
+			for (let index = 0; index < 300; index++) {
+				ids.push(await tx.createTask(Child, { late: false }, { ownership: { kind: "conversation" } }));
+			}
+			for (let index = 0; index < 260; index++) {
+				owned.push((await tx.createConversation({ ownership: { kind: "task", taskId: ids[0]! } })).id);
+			}
+			await tx.createConversation({ ownership: { kind: "ownerless" } });
+		}, context);
+		storage.conversationScans = 0;
+		const first = await harness.watchTaskGraph(context);
+		expect(storage.conversationScans).toBe(2);
+		expect(first.value.tasks[String(ids[0])]!.conversations).toEqual(owned.sort((a, b) => a - b));
+		for (const id of ids.slice(1)) expect(first.value.tasks[String(id)]!.conversations).toEqual([]);
+		const second = await harness.watchTaskGraph(context);
+		expect(second.value).toBe(first.value);
+		expect(storage.conversationScans).toBe(2);
+		await first.stop();
+		await second.stop();
+		await harness.close(context);
+	});
 	it("follows every live task through its statuses, owner edges, and owned conversations", async () => {
 		const child = deferred();
 		const late = deferred();

@@ -356,17 +356,35 @@ pub fn resolve_program(
     Ok(found.to_string_lossy().into_owned())
 }
 
-/// Node's `isLegacyWslBashPath`: `^[a-z]:\\windows\\(system32|sysnative)\\bash\.exe$`, case-insensitive.
+/// Node's SystemRoot-aware `isLegacyWslBashPath`, with conventional paths only when SystemRoot is absent.
 fn is_legacy_wsl_bash(path: &str) -> bool {
-    let normalized = path.replace('/', "\\").to_lowercase();
+    let system_root = std::env::var("SystemRoot").ok();
+    let normalize = |path: &str| {
+        let path = path.replace('/', "\\").to_lowercase();
+        let mut parts = Vec::new();
+        for part in path.split('\\') {
+            match part {
+                "" | "." => {}
+                ".." if parts.len() > 1 => { parts.pop(); }
+                _ => parts.push(part),
+            }
+        }
+        parts.join("\\")
+    };
+    let normalized = normalize(path);
+    if let Some(root) = system_root.as_deref().filter(|root| !root.is_empty()) {
+        let bytes = root.as_bytes();
+        if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || !matches!(bytes[2], b'/' | b'\\') {
+            return false;
+        }
+        let root = normalize(root);
+        return ["system32", "sysnative"].iter().any(|directory| {
+            normalized == format!("{root}\\{directory}\\bash.exe")
+        });
+    }
     let mut characters = normalized.chars();
-    characters
-        .next()
-        .is_some_and(|drive| drive.is_ascii_lowercase())
-        && matches!(
-            characters.as_str(),
-            ":\\windows\\system32\\bash.exe" | ":\\windows\\sysnative\\bash.exe"
-        )
+    characters.next().is_some_and(|drive| drive.is_ascii_lowercase())
+        && matches!(characters.as_str(), ":\\windows\\system32\\bash.exe" | ":\\windows\\sysnative\\bash.exe")
 }
 
 fn bash_config(program: &str) -> Result<ShellConfig, Failure> {
@@ -960,6 +978,34 @@ pub fn path_identity(path: &str, metadata: &Metadata, follow: bool) -> (u64, u64
 #[cfg(test)]
 mod tests {
     use super::quote_argument;
+
+    #[test]
+    fn recognizes_wsl_launchers_under_the_configured_windows_directory() {
+        use super::is_legacy_wsl_bash;
+
+        // Isolate SystemRoot per process instead of mutating the test runner's shared environment.
+        if let Ok(path) = std::env::var("PI_ENV_WSL_TEST_PATH") {
+            assert_eq!(is_legacy_wsl_bash(&path), std::env::var("PI_ENV_WSL_TEST_EXPECT").unwrap() == "true");
+            return;
+        }
+        for (root, path, expected) in [
+            (Some(r"D:\WinNT"), r"D:\WinNT\System32\bash.exe", true),
+            (Some(r"D:\WinNT"), r"d:/winnt/Sysnative/bash.exe", true),
+            (Some(r"D:\WinNT"), r"D:\WinNT\other\..\System32\bash.exe", true),
+            (Some(r"D:\WinNT"), r"C:\Windows\System32\bash.exe", false),
+            (Some(r"Windows"), r"C:\Windows\System32\bash.exe", false),
+            (None, r"C:\Windows\System32\bash.exe", true),
+            (None, r"C:\Git\bin\bash.exe", false),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "sys::windows::tests::recognizes_wsl_launchers_under_the_configured_windows_directory"])
+                .env("PI_ENV_WSL_TEST_PATH", path)
+                .env("PI_ENV_WSL_TEST_EXPECT", expected.to_string());
+            if let Some(root) = root { command.env("SystemRoot", root); } else { command.env_remove("SystemRoot"); }
+            assert!(command.status().unwrap().success(), "launcher: {path}, SystemRoot: {root:?}");
+        }
+    }
+
 
     #[test]
     fn quotes_arguments_like_libuv() {

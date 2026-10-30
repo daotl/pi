@@ -511,7 +511,7 @@ async function runLoop(
 			lastCompletedTurn = {
 				message,
 				toolResults,
-				canContinue: hasMoreToolCalls,
+				canContinue: hasMoreToolCalls && !signal?.aborted,
 				context: currentContext,
 				newMessages,
 			};
@@ -520,7 +520,7 @@ async function runLoop(
 			await emit({ type: "turn_end", message, toolResults });
 			if (execution) execution.finishTurnStarted = false;
 
-			if (decision?.action === "end") {
+			if (signal?.aborted || decision?.action === "end") {
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}

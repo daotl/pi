@@ -129,7 +129,7 @@ import {
 } from "../../core/model-resolver.ts";
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
-import { RADIUS_MCP_URL, RADIUS_PROVIDER_ID } from "../../core/radius.ts";
+import { getRadiusMcpUrl, RADIUS_PROVIDER_ID } from "../../core/radius.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import {
@@ -946,7 +946,12 @@ export class InteractiveMode {
 	// Extension UI state
 	// Extension dialogs shown in the editor slot (select, confirm, input, editor, inline custom).
 	// The last entry is visible; see pushExtensionDialog().
-	private extensionDialogs: Array<{ component: ExtensionDialogComponent; blocked: BlockedStatus | undefined }> = [];
+	private extensionDialogs: Array<{
+		component: ExtensionDialogComponent;
+		blocked: BlockedStatus | undefined;
+		cancel: () => void;
+	}> = [];
+	private extensionCustomDialogs = new Set<() => void>();
 	private extensionTerminalInputSubscriptions = new Set<{
 		handler: (data: string) => { consume?: boolean; data?: string } | undefined;
 		unsubscribe: () => void;
@@ -2909,11 +2914,13 @@ export class InteractiveMode {
 	}
 
 	private resetExtensionUI(): void {
+		const customDialogs = [...this.extensionCustomDialogs];
+		this.extensionCustomDialogs.clear();
+		for (const cancel of customDialogs) cancel();
 		if (this.extensionDialogs.length > 0) {
-			for (const dialog of this.extensionDialogs) {
-				dialog.component.dispose?.();
-			}
+			const dialogs = this.extensionDialogs;
 			this.extensionDialogs = [];
+			for (const dialog of dialogs) dialog.cancel();
 			this.showTopExtensionDialog();
 		}
 		this.ui.hideOverlay();
@@ -3147,9 +3154,9 @@ export class InteractiveMode {
 	 * the previous one again. Every dialog stays answerable, so no dialog promise is left pending,
 	 * and dialogs opened from inside another dialog (for example a confirm from a custom component) work.
 	 */
-	private pushExtensionDialog(component: ExtensionDialogComponent, blocked?: BlockedStatus): void {
+	private pushExtensionDialog(component: ExtensionDialogComponent, cancel: () => void, blocked?: BlockedStatus): void {
 		this.disposeActiveSelector();
-		this.extensionDialogs.push({ component, blocked });
+		this.extensionDialogs.push({ component, blocked, cancel });
 		this.showTopExtensionDialog();
 	}
 
@@ -3181,12 +3188,15 @@ export class InteractiveMode {
 		blocked: BlockedStatus = { kind: "question", message: title },
 	): Promise<string | undefined> {
 		return new Promise((resolve) => {
-			if (opts?.signal?.aborted) {
+			if (this.isShuttingDown || opts?.signal?.aborted) {
 				resolve(undefined);
 				return;
 			}
 
+			let closed = false;
 			const finish = (option: string | undefined) => {
+				if (closed) return;
+				closed = true;
 				opts?.signal?.removeEventListener("abort", onAbort);
 				selector.dispose();
 				this.removeExtensionDialog(selector);
@@ -3202,7 +3212,7 @@ export class InteractiveMode {
 				() => finish(undefined),
 				{ tui: this.ui, timeout: opts?.timeout, onToggleToolsExpanded: () => this.toggleToolOutputExpansion() },
 			);
-			this.pushExtensionDialog(selector, blocked);
+			this.pushExtensionDialog(selector, onAbort, blocked);
 		});
 	}
 
@@ -3238,12 +3248,15 @@ export class InteractiveMode {
 		opts?: ExtensionUIDialogOptions,
 	): Promise<string | undefined> {
 		return new Promise((resolve) => {
-			if (opts?.signal?.aborted) {
+			if (this.isShuttingDown || opts?.signal?.aborted) {
 				resolve(undefined);
 				return;
 			}
 
+			let closed = false;
 			const finish = (value: string | undefined) => {
+				if (closed) return;
+				closed = true;
 				opts?.signal?.removeEventListener("abort", onAbort);
 				input.dispose();
 				this.removeExtensionDialog(input);
@@ -3259,7 +3272,7 @@ export class InteractiveMode {
 				() => finish(undefined),
 				{ tui: this.ui, timeout: opts?.timeout },
 			);
-			this.pushExtensionDialog(input, { kind: "question", message: title });
+			this.pushExtensionDialog(input, onAbort, { kind: "question", message: title });
 		});
 	}
 
@@ -3267,8 +3280,12 @@ export class InteractiveMode {
 	 * Show a multi-line editor for extensions (with Ctrl+G support).
 	 */
 	private showExtensionEditor(title: string, prefill?: string): Promise<string | undefined> {
+		if (this.isShuttingDown) return Promise.resolve(undefined);
 		return new Promise((resolve) => {
+			let closed = false;
 			const finish = (value: string | undefined) => {
+				if (closed) return;
+				closed = true;
 				this.removeExtensionDialog(editor);
 				resolve(value);
 			};
@@ -3282,7 +3299,7 @@ export class InteractiveMode {
 				undefined,
 				this.settingsManager.getExternalEditorCommand(),
 			);
-			this.pushExtensionDialog(editor, { kind: "question", message: title });
+			this.pushExtensionDialog(editor, () => finish(undefined), { kind: "question", message: title });
 		});
 	}
 
@@ -3393,7 +3410,8 @@ export class InteractiveMode {
 			overlayOptions?: OverlayOptions | (() => OverlayOptions);
 			onHandle?: (handle: OverlayHandle) => void;
 		},
-	): Promise<T> {
+	): Promise<T | undefined> {
+		if (this.isShuttingDown) return undefined;
 		const savedText = this.editor.getText();
 		const isOverlay = options?.overlay ?? false;
 
@@ -3408,24 +3426,48 @@ export class InteractiveMode {
 				this.ui.requestRender();
 			};
 
-			const close = (result: T) => {
-				if (closed) return;
+			const cleanup = (): boolean => {
+				if (closed) return false;
 				closed = true;
+				this.extensionCustomDialogs.delete(cancel);
 				// Remove this overlay, not the topmost one: another overlay may have opened above it.
 				if (isOverlay) overlayHandle?.hide();
 				else restoreEditor();
-				// Note: both branches above already call requestRender
-				resolve(result);
 				try {
 					component?.dispose?.();
 				} catch {
 					/* ignore dispose errors */
 				}
+				return true;
 			};
 
-			Promise.resolve(factory(this.ui, theme, this.keybindings, close))
+			const close = (result: T | undefined) => {
+				if (!cleanup()) return;
+				resolve(result);
+			};
+
+			const cancel = () => close(undefined);
+			this.extensionCustomDialogs.add(cancel);
+
+			let created: (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>;
+			try {
+				created = factory(this.ui, theme, this.keybindings, close);
+			} catch (error) {
+				if (!cleanup()) return;
+				reject(error);
+				return;
+			}
+			Promise.resolve(created)
 				.then((c) => {
-					if (closed) return;
+					if (closed || this.isShuttingDown) {
+						cancel();
+						try {
+							c.dispose?.();
+						} catch {
+							/* ignore dispose errors */
+						}
+						return;
+					}
 					component = c;
 					if (isOverlay) {
 						// Resolve overlay options - can be static or dynamic function
@@ -3445,12 +3487,11 @@ export class InteractiveMode {
 						// Expose handle to caller for visibility control
 						options?.onHandle?.(overlayHandle);
 					} else {
-						this.pushExtensionDialog(c);
+						this.pushExtensionDialog(c, cancel);
 					}
 				})
 				.catch((err) => {
-					if (closed) return;
-					if (!isOverlay) restoreEditor();
+					if (!cleanup()) return;
 					reject(err);
 				});
 		});
@@ -8737,6 +8778,8 @@ export class InteractiveMode {
 	 * when missing. Nothing is asked when a global server already uses this login.
 	 */
 	private offerRadiusMcpServer(providerId: string, providerName: string): void {
+		const mcpUrl = getRadiusMcpUrl(this.session.modelRuntime.getProvider(providerId));
+		if (mcpUrl === undefined) return;
 		const mcpPath = path.join(getAgentDir(), "mcp.json");
 		const normalizeUrl = (url: string) => url.replace(/\/+$/u, "");
 		const { servers } = loadMcpConfig({
@@ -8745,7 +8788,7 @@ export class InteractiveMode {
 			projectTrusted: false,
 		});
 		const existing = servers.find(
-			(server) => "url" in server.config && normalizeUrl(server.config.url) === normalizeUrl(RADIUS_MCP_URL),
+			(server) => "url" in server.config && normalizeUrl(server.config.url) === normalizeUrl(mcpUrl),
 		);
 		if (existing && "url" in existing.config && existing.config.auth?.provider === providerId) return;
 
@@ -8757,7 +8800,7 @@ export class InteractiveMode {
 		const config: McpHttpServerConfig =
 			existing && "url" in existing.config
 				? { ...existing.config, auth: { provider: providerId } }
-				: { url: RADIUS_MCP_URL, auth: { provider: providerId } };
+				: { url: mcpUrl, auth: { provider: providerId } };
 		// `auth` replaces the MCP OAuth sign-in.
 		delete config.oauth;
 

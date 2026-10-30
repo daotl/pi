@@ -1,9 +1,14 @@
+import type { Provider } from "@earendil-works/pi-ai";
 import { DEFAULT_RADIUS_GATEWAY, normalizeRadiusGatewayUrl } from "@earendil-works/pi-ai/providers/radius-config";
 
 export const RADIUS_PROVIDER_ID = "radius";
 export const ENV_RADIUS_GATEWAY = "PI_RADIUS_GATEWAY";
-/** MCP endpoint of the gateway the built-in Radius provider signs in to. */
-export const RADIUS_MCP_URL = `${normalizeRadiusGatewayUrl(DEFAULT_RADIUS_GATEWAY)}/mcp`;
+/** MCP endpoint of the live Radius provider, never inferred from its model catalog. */
+export function getRadiusMcpUrl(provider: Pick<Provider, "baseUrl"> | undefined): string | undefined {
+	if (!provider?.baseUrl) return undefined;
+	const gateway = normalizeRadiusGatewayUrl(provider.baseUrl).replace(/\/v1$/u, "");
+	return `${gateway}/mcp`;
+}
 
 /** Radius gateway origin, honoring the `PI_RADIUS_GATEWAY` override. */
 export function getRadiusGatewayUrl(): string {

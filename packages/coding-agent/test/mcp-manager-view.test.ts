@@ -33,8 +33,12 @@ describe("MCP manager status screen", () => {
 
 	test("ignores the cancel key for operations that cannot be cancelled", () => {
 		const view = new McpManagerView(tui, theme, new KeybindingsManager());
+		const onCancel = vi.fn();
+		view.status("Sign in to issues", "Authorizing…", onCancel);
 		view.status("Sign in to issues", "Connecting…");
 		expect(rendered(view)).not.toContain("cancel");
 		view.handleInput(ESCAPE);
+		expect(onCancel).not.toHaveBeenCalled();
+		expect(rendered(view)).toContain("Connecting…");
 	});
 });

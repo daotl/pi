@@ -5,6 +5,7 @@ import { applyImmutable, type Decoder, decoder } from "./delta/index.ts";
 import { ChordError, invalid } from "./errors.ts";
 import {
 	CtxImpl,
+	linkedSignal,
 	notifyStatus,
 	REF_BASE,
 	type RefCore,
@@ -114,6 +115,7 @@ export class RemoteBinding {
 	#callVariants: readonly CallVariant[] = [];
 	#projectionChanged = deferred();
 	#fencedCodeVersions: readonly number[] = [];
+	readonly #callAbort = new AbortController();
 
 	constructor(
 		host: RemoteHost,
@@ -321,6 +323,7 @@ export class RemoteBinding {
 		this.#live.reject(error);
 		this.#projectionChanged.reject(error);
 		this.#settleHydration(error);
+		this.#callAbort.abort(error);
 		for (const view of [...this.views]) view.end(error);
 		this.#listeners.clear();
 		this.host.forgetBinding(this);
@@ -412,13 +415,18 @@ export class RemoteBinding {
 			}
 			// Clean before the transport serializes: even an unknown bigint field must never cross the link.
 			const sent = method.args === undefined ? undefined : Value.Clean(method.args, Value.Clone(args));
-			return hold.channel.call(
-				hold.id,
-				name,
-				sent,
-				{ rootId: ctx.rootId, codeVersion: ctx.codeVersion },
-				ctx.signal,
-			);
+			const linked = linkedSignal([ctx.signal, this.#callAbort.signal]);
+			try {
+				return await hold.channel.call(
+					hold.id,
+					name,
+					sent,
+					{ rootId: ctx.rootId, codeVersion: ctx.codeVersion },
+					linked.signal,
+				);
+			} finally {
+				linked.release();
+			}
 		}
 	}
 

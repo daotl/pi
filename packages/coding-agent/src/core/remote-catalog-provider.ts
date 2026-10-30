@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
 	type AnyModel,
 	getModelType,
@@ -184,13 +185,32 @@ export function withRemoteCatalog(
 	};
 }
 
+function personalizationKey(context: RefreshModelsContext): string | undefined {
+	if (!context.auth) return undefined;
+	const headers = new Map<string, string | null>();
+	for (const [name, value] of Object.entries(context.auth.headers ?? {})) headers.set(name.toLowerCase(), value);
+	const key =
+		context.credential?.type === "oauth"
+			? context.credential.access
+			: (context.credential?.key ?? context.auth.apiKey);
+	return createHash("sha256")
+		.update(
+			JSON.stringify({
+				baseUrl: (context.auth.baseUrl ?? context.baseUrl ?? "").replace(/\/+$/, ""),
+				credential: [context.credential?.type ?? "api_key", key],
+				apiKey: context.auth.apiKey,
+				headers: [...headers].sort(([left], [right]) => left.localeCompare(right)),
+			}),
+		)
+		.digest("hex");
+}
+
 /**
  * Like `withRemoteCatalog`, but on each network refresh the catalog (built-in models plus a newer
  * pi.dev catalog) is passed through `personalize` and the result is saved. The saved entry holds
- * the personalized list, not the pi.dev catalog, and replaces the catalog, including offline.
- * The refresh interval and etag revalidation are skipped. An empty list (nothing saved yet, or an
- * empty catalog saved by an older pi after a failed or missing pi.dev catalog) falls back to the
- * built-in models.
+ * the personalized list, not the pi.dev catalog, and replaces the catalog only when its auth and
+ * endpoint fingerprint matches. Legacy or unverifiable entries fall back to built-in models.
+ * The refresh interval and etag revalidation are skipped.
  */
 export function withPersonalizedCatalog(
 	provider: Provider,
@@ -207,7 +227,11 @@ export function withPersonalizedCatalog(
 		getModels: () => getAllModels().filter((model) => isModelType(model, "chat")),
 		getAllModels,
 		refreshModels: async (context) => {
-			const restored = (context.stored?.models ?? []).filter((model) => model.provider === provider.id);
+			const identity = personalizationKey(context);
+			const matching = identity !== undefined && context.stored?.personalizationKey === identity;
+			const restored = matching
+				? (context.stored?.models ?? []).filter((model) => model.provider === provider.id)
+				: [];
 			if (
 				!(await context.publish({
 					update: () => {
@@ -234,7 +258,7 @@ export function withPersonalizedCatalog(
 			const personalized = await personalize(mergeModels(builtinModels(), remote), context);
 			if (context.signal.aborted) return;
 			await context.publish({
-				persist: { models: personalized, checkedAt: Date.now() },
+				persist: { models: personalized, checkedAt: Date.now(), personalizationKey: identity },
 				update: () => {
 					personalModels = personalized;
 				},

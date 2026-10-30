@@ -627,21 +627,26 @@ export function composeModelProvider(
 		options: StreamOptions | undefined,
 		simple: boolean,
 	): AssistantMessageEventStream =>
-		lazyStream(model, async () => {
-			if (extension?.streamSimple && model.api === extension.api) {
-				return extension.streamSimple(model, context, options as SimpleStreamOptions);
-			}
-			if (base && supportsBaseApi(model)) {
+		lazyStream(
+			model,
+			async () => {
+				if (extension?.streamSimple && model.api === extension.api) {
+					return extension.streamSimple(model, context, options as SimpleStreamOptions);
+				}
+				if (base && supportsBaseApi(model)) {
+					return simple
+						? base.streamSimple(model, context, options as SimpleStreamOptions)
+						: base.stream(model, context, options);
+				}
+				const api = getApiProvider(model.api);
+				if (!api) throw new Error(`No API provider registered for api: ${model.api}`);
 				return simple
-					? base.streamSimple(model, context, options as SimpleStreamOptions)
-					: base.stream(model, context, options);
-			}
-			const api = getApiProvider(model.api);
-			if (!api) throw new Error(`No API provider registered for api: ${model.api}`);
-			return simple
-				? api.streamSimple(model, context, options as SimpleStreamOptions)
-				: api.stream(model, context, options);
-		});
+					? api.streamSimple(model, context, options as SimpleStreamOptions)
+					: api.stream(model, context, options);
+			},
+			undefined,
+			options?.signal,
+		);
 
 	const provider: Provider = {
 		id: providerId,
@@ -649,6 +654,41 @@ export function composeModelProvider(
 		baseUrl: extension?.baseUrl ?? config?.baseUrl ?? base?.baseUrl,
 		headers: base?.headers,
 		auth: { ...(apiKey ? { apiKey } : {}), ...(oauth ? { oauth } : {}) },
+		resolveCachedModelAuth:
+			base?.resolveCachedModelAuth && !extension?.oauth
+				? async (credential, ctx) => {
+						const rawKey = configuredApiKey(config, extension);
+						const rawHeaders = configuredHeaders(config, extension);
+						if (
+							Object.values(rawHeaders ?? {}).some(isCommandConfigValue) ||
+							(!credential && rawKey !== undefined && isCommandConfigValue(rawKey))
+						)
+							return undefined;
+						let effectiveCredential = credential;
+						if (!credential && rawKey !== undefined) {
+							const env = await configContextEnv([rawKey], ctx);
+							effectiveCredential = {
+								type: "api_key",
+								key: resolveConfigValueOrThrow(rawKey, `API key for provider "${providerId}"`, env),
+							};
+						}
+						const auth = await base.resolveCachedModelAuth!(effectiveCredential, ctx);
+						if (!auth) return undefined;
+						const explicitEnv = effectiveCredential?.env;
+						const env = await configContextEnv(
+							Object.values(rawHeaders ?? {}),
+							ctx,
+							typeof explicitEnv === "object" && explicitEnv !== null
+								? (explicitEnv as Record<string, string>)
+								: undefined,
+						);
+						return withConfiguredAuth(
+							auth,
+							resolveHeadersOrThrow(rawHeaders, `provider "${providerId}"`, env),
+							extension?.authHeader ?? config?.authHeader ?? false,
+						);
+					}
+				: undefined,
 		getModels: () => getAllModels().filter((model) => isModelType(model, "chat")),
 		getAllModels,
 		refreshModels:

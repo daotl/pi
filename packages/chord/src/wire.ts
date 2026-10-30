@@ -10,7 +10,7 @@ import { CHORD_ERROR_CODES, ChordError } from "./errors.ts";
 // State is addressed by (hold id, member): a hold implies the state of its variant, sent as units (a shape followed by
 // a snapshot of each member the consumer lacks; see Connection).
 //   both: hello, ping, pong, bye, root_end, ack; parent → child: invalidate, prepare, commit, abort, retire;
-//   child → parent: vote
+//   child → parent: vote, aborted
 //
 // Each frame is declared once, as the schema every received frame is checked against (`isFrame`); the types are derived
 // from it. Payloads (hold inputs, call args, results, snapshots) stay `unknown`: they are validated where they are
@@ -19,10 +19,9 @@ import { CHORD_ERROR_CODES, ChordError } from "./errors.ts";
 /**
  * The link protocol version, announced in `hello`. Peers of different versions do not talk: the side that notices
  * closes the link with reason `protocol-version <its version>`, so the other side learns it too
- * (`LinkOptions.onProtocolMismatch`). Version 6 adds control-only method projections, independent of state units and
- * their flow-control window.
+ * (`LinkOptions.onProtocolMismatch`). Version 7 acknowledges completed child rollback before reconciliation retries.
  */
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
 const Id = Type.Integer({ minimum: 1 });
 const Name = Type.String({ minLength: 1 });
@@ -178,6 +177,8 @@ const FrameSchema = Type.Union([
 	/** The parent dropped `codeVersion`: roots of it may still come from there no longer. */
 	Type.Object({ t: Type.Literal("retire"), codeVersion: Type.Integer({ minimum: 1 }) }),
 	Type.Object({ t: Type.Literal("abort"), reload: Reload }),
+	/** Child rollback finished and its reload slot is free. */
+	Type.Object({ t: Type.Literal("aborted"), reload: Reload }),
 ]);
 export type Frame = Static<typeof FrameSchema>;
 

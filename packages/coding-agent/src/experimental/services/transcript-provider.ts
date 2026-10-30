@@ -49,12 +49,19 @@ export function createTranscriptServiceFacet(lane: AgentLane): Facet {
 				TranscriptRuntime,
 				(_input, _principal, self) => {
 					const watch = self.resource("lane-watch", {
-						version: 1,
+						version: 2,
 						open: async ({ signal }) => {
 							const opened = await lane.watch(withAbortSignal(signal, BACKGROUND_CONTEXT));
-							return { opened, listener: undefined as ((event: HarnessEvent) => void) | undefined };
+							return {
+								opened,
+								listener: undefined as ((event: HarnessEvent) => void) | undefined,
+								tail: Promise.resolve(),
+							};
 						},
-						close: (watch) => watch.opened.unsubscribe(),
+						close: async (watch) => {
+							watch.opened.unsubscribe();
+							await watch.tail;
+						},
 					});
 					let stream: TranscriptStream | undefined;
 					const state = self.state("transcript", TranscriptStateSchema, {
@@ -72,7 +79,6 @@ export function createTranscriptServiceFacet(lane: AgentLane): Facet {
 							};
 						},
 					});
-					let rebase: Promise<void> | undefined;
 					const replaySizes: number[] = [];
 					let replayBytes = 2;
 					const retainReplay = (
@@ -102,147 +108,154 @@ export function createTranscriptServiceFacet(lane: AgentLane): Facet {
 							},
 						}),
 						async (event, ctx) => {
-							let forwarded: TranscriptEvent | undefined;
-							if (
-								(event.type === "message_start" || event.type === "message_update") &&
-								event.frame !== undefined &&
-								stream !== undefined &&
-								stream.messageId === event.entryId &&
-								event.frameSequence !== undefined &&
-								event.frameSequence <= stream.sequence
-							)
-								return;
-							if (
-								event.type === "message_start" &&
-								event.message.role === "assistant" &&
-								event.message.stopReason === "pending"
-							) {
+							// Chord subscriptions return void: own the complete handler, including an awaited reset.
+							const resource = watch.value;
+							const previous = resource.tail;
+							const finished = Promise.withResolvers<void>();
+							resource.tail = finished.promise;
+							try {
+								await previous;
+								let forwarded: TranscriptEvent | undefined;
 								if (
-									event.runId === undefined ||
-									event.entryId === undefined ||
-									event.frame?.type !== "start" ||
-									event.frameSequence !== 1
+									(event.type === "message_start" || event.type === "message_update") &&
+									event.frame !== undefined &&
+									stream !== undefined &&
+									stream.messageId === event.entryId &&
+									event.frameSequence !== undefined &&
+									event.frameSequence <= stream.sequence
 								)
-									throw new Error("Harness assistant start is missing response identity or start frame");
-								stream = {
-									runId: event.runId,
-									messageId: event.entryId,
-									sequence: event.frameSequence,
-									reducer: new AssistantMessageFrameReducer(),
-								};
-								stream.reducer.apply(event.frame);
-								forwarded = {
-									type: "assistant_frame",
-									phase: "start",
-									lane: event.lane,
-									runId: event.runId,
-									messageId: event.entryId,
-									frame: copyJson(event.frame, {
-										omitUndefinedProperties: true,
-									}) as JsonRepresentation<AssistantMessageFrame>,
-									...(event.recovery ? { recovery: event.recovery } : {}),
-								};
-							} else if (event.type === "message_update") {
-								if (event.frame !== undefined) {
+									return;
+								if (
+									event.type === "message_start" &&
+									event.message.role === "assistant" &&
+									event.message.stopReason === "pending"
+								) {
 									if (
-										stream?.runId !== event.runId ||
-										stream.messageId !== event.entryId ||
-										event.frameSequence !== stream.sequence + 1
+										event.runId === undefined ||
+										event.entryId === undefined ||
+										event.frame?.type !== "start" ||
+										event.frameSequence !== 1
 									)
-										throw new Error("Harness assistant update does not match the watched response");
+										throw new Error("Harness assistant start is missing response identity or start frame");
+									stream = {
+										runId: event.runId,
+										messageId: event.entryId,
+										sequence: event.frameSequence,
+										reducer: new AssistantMessageFrameReducer(),
+									};
 									stream.reducer.apply(event.frame);
-									stream.sequence = event.frameSequence;
 									forwarded = {
 										type: "assistant_frame",
-										phase: "update",
+										phase: "start",
 										lane: event.lane,
 										runId: event.runId,
-										messageId: stream.messageId,
+										messageId: event.entryId,
 										frame: copyJson(event.frame, {
 											omitUndefinedProperties: true,
 										}) as JsonRepresentation<AssistantMessageFrame>,
 										...(event.recovery ? { recovery: event.recovery } : {}),
 									};
-								}
-							} else {
-								forwarded = toLaneWatchEvent(event);
-								if (event.type === "message_end" || event.type === "run_end" || event.type === "run_suspend")
-									stream = undefined;
-							}
-							if (forwarded === undefined && event.type !== "message_update") return;
-							const sequence = state.value.sequence + (forwarded === undefined ? 0 : 1);
-							const retention = forwarded === undefined ? undefined : retainReplay(forwarded, sequence);
-							const checkpoint = stream?.reducer.checkpoint();
-							const streamingMessage = stream?.reducer.message;
-							let needsRebase = false;
-							state.change(ctx, (draft) => {
-								if (event.type !== "message_start" && event.type !== "message_update") {
-									needsRebase =
-										reduceLaneSnapshot(draft.snapshot as unknown as LaneSnapshot, event) === "rebase";
-								} else if (forwarded?.type !== "assistant_frame" && event.type === "message_start") {
-									needsRebase =
-										reduceLaneSnapshot(draft.snapshot as unknown as LaneSnapshot, event) === "rebase";
-								}
-								const operation = draft.snapshot?.operation;
-								if (
-									operation &&
-									stream &&
-									operation.id === stream.runId &&
-									streamingMessage !== undefined &&
-									forwarded?.type === "assistant_frame"
-								) {
-									applyFrameMessage(
-										operation,
-										streamingMessage,
-										forwarded.frame,
-										stream.reducer.toolArgumentChanges,
-									);
-								}
-								if (stream && checkpoint) {
-									const current = draft.stream;
-									if (current?.messageId === stream.messageId) {
-										for (const block of checkpoint.blocks) {
-											const previous = current.checkpoint.blocks.find(
-												(entry) => entry.contentIndex === block.contentIndex,
-											);
-											if (previous === undefined) current.checkpoint.blocks.push(block);
-											else if (
-												previous.state.kind === "toolCall" &&
-												block.state.kind === "toolCall" &&
-												forwarded?.type === "assistant_frame" &&
-												forwarded.frame.type === "toolcall_delta" &&
-												previous.contentIndex === forwarded.frame.contentIndex
-											) {
-												appendText(previous.state, "json", forwarded.frame.delta);
-												previous.state.ended = block.state.ended;
-											} else Object.assign(previous.state, block.state);
-										}
-										for (let index = current.checkpoint.blocks.length - 1; index >= 0; index--) {
-											if (
-												!checkpoint.blocks.some(
-													(block) => block.contentIndex === current.checkpoint.blocks[index]!.contentIndex,
-												)
-											)
-												current.checkpoint.blocks.splice(index, 1);
-										}
-										current.sequence = stream.sequence;
-									} else
-										draft.stream = {
-											runId: stream.runId,
+								} else if (event.type === "message_update") {
+									if (event.frame !== undefined) {
+										if (
+											stream?.runId !== event.runId ||
+											stream.messageId !== event.entryId ||
+											event.frameSequence !== stream.sequence + 1
+										)
+											throw new Error("Harness assistant update does not match the watched response");
+										stream.reducer.apply(event.frame);
+										stream.sequence = event.frameSequence;
+										forwarded = {
+											type: "assistant_frame",
+											phase: "update",
+											lane: event.lane,
+											runId: event.runId,
 											messageId: stream.messageId,
-											sequence: stream.sequence,
-											checkpoint,
+											frame: copyJson(event.frame, {
+												omitUndefinedProperties: true,
+											}) as JsonRepresentation<AssistantMessageFrame>,
+											...(event.recovery ? { recovery: event.recovery } : {}),
 										};
-								} else draft.stream = null;
-								if (forwarded !== undefined && retention !== undefined) {
-									draft.sequence = sequence;
-									if (retention.retain) draft.events.push({ sequence, event: forwarded });
-									if (retention.evicted > 0)
-										draft.events.splice(0, Math.min(retention.evicted, draft.events.length));
+									}
+								} else {
+									forwarded = toLaneWatchEvent(event);
+									if (event.type === "message_end" || event.type === "run_end" || event.type === "run_suspend")
+										stream = undefined;
 								}
-							});
-							if (needsRebase && rebase === undefined) {
-								rebase = (async () => {
+								if (forwarded === undefined && event.type !== "message_update") return;
+								const sequence = state.value.sequence + (forwarded === undefined ? 0 : 1);
+								const retention = forwarded === undefined ? undefined : retainReplay(forwarded, sequence);
+								const checkpoint = stream?.reducer.checkpoint();
+								const streamingMessage = stream?.reducer.message;
+								let needsRebase = false;
+								state.change(ctx, (draft) => {
+									if (event.type !== "message_start" && event.type !== "message_update") {
+										needsRebase =
+											reduceLaneSnapshot(draft.snapshot as unknown as LaneSnapshot, event) === "rebase";
+									} else if (forwarded?.type !== "assistant_frame" && event.type === "message_start") {
+										needsRebase =
+											reduceLaneSnapshot(draft.snapshot as unknown as LaneSnapshot, event) === "rebase";
+									}
+									const operation = draft.snapshot?.operation;
+									if (
+										operation &&
+										stream &&
+										operation.id === stream.runId &&
+										streamingMessage !== undefined &&
+										forwarded?.type === "assistant_frame"
+									) {
+										applyFrameMessage(
+											operation,
+											streamingMessage,
+											forwarded.frame,
+											stream.reducer.toolArgumentChanges,
+										);
+									}
+									if (stream && checkpoint) {
+										const current = draft.stream;
+										if (current?.messageId === stream.messageId) {
+											for (const block of checkpoint.blocks) {
+												const previous = current.checkpoint.blocks.find(
+													(entry) => entry.contentIndex === block.contentIndex,
+												);
+												if (previous === undefined) current.checkpoint.blocks.push(block);
+												else if (
+													previous.state.kind === "toolCall" &&
+													block.state.kind === "toolCall" &&
+													forwarded?.type === "assistant_frame" &&
+													forwarded.frame.type === "toolcall_delta" &&
+													previous.contentIndex === forwarded.frame.contentIndex
+												) {
+													appendText(previous.state, "json", forwarded.frame.delta);
+													previous.state.ended = block.state.ended;
+												} else Object.assign(previous.state, block.state);
+											}
+											for (let index = current.checkpoint.blocks.length - 1; index >= 0; index--) {
+												if (
+													!checkpoint.blocks.some(
+														(block) =>
+															block.contentIndex === current.checkpoint.blocks[index]!.contentIndex,
+													)
+												)
+													current.checkpoint.blocks.splice(index, 1);
+											}
+											current.sequence = stream.sequence;
+										} else
+											draft.stream = {
+												runId: stream.runId,
+												messageId: stream.messageId,
+												sequence: stream.sequence,
+												checkpoint,
+											};
+									} else draft.stream = null;
+									if (forwarded !== undefined && retention !== undefined) {
+										draft.sequence = sequence;
+										if (retention.retain) draft.events.push({ sequence, event: forwarded });
+										if (retention.evicted > 0)
+											draft.events.splice(0, Math.min(retention.evicted, draft.events.length));
+									}
+								});
+								if (needsRebase) {
 									const snapshot = await watch.value.opened.resnapshot(
 										withAbortSignal(ctx.signal, BACKGROUND_CONTEXT),
 									);
@@ -274,12 +287,9 @@ export function createTranscriptServiceFacet(lane: AgentLane): Facet {
 										if (retention.evicted > 0)
 											draft.events.splice(0, Math.min(retention.evicted, draft.events.length));
 									});
-								})();
-								try {
-									await rebase;
-								} finally {
-									rebase = undefined;
 								}
+							} finally {
+								finished.resolve();
 							}
 						},
 					);

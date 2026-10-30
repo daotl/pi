@@ -312,11 +312,14 @@ describe("read of images, with the Photon image processor", () => {
 	});
 
 	it("scales an image down to the maximum size, and says how to map coordinates back", async () => {
-		const result = await read("wide.png", encode(4000, 1000, "png"), { images: processor });
+		const result = await read("wide.png", encode(40, 10, "png"), {
+			images: processor,
+			resize: { maxWidth: 20, maxHeight: 20 },
+		});
 		const block = onlyImage(result);
-		expect(decodedImage(block.data)).toMatchObject({ width: 2000, height: 500 });
+		expect(decodedImage(block.data)).toMatchObject({ width: 20, height: 5 });
 		expect(messages(result)).toEqual([
-			`Read image file [${block.mimeType}]. Resized from 4000x1000 to 2000x500. Multiply coordinates by 2.00 to map them to the original.`,
+			`Read image file [${block.mimeType}]. Resized from 40x10 to 20x5. Multiply coordinates by 2.00 to map them to the original.`,
 		]);
 	});
 

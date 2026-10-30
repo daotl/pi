@@ -14,9 +14,10 @@ const device = { userCode: "ABCD-EFGH", verificationUri: "https://example.com/de
 
 function createDialog() {
 	const onComplete = vi.fn();
-	const dialog = new LoginDialogComponent({ requestRender: vi.fn() } as unknown as TUI, "custom-provider", onComplete);
+	const requestRender = vi.fn();
+	const dialog = new LoginDialogComponent({ requestRender } as unknown as TUI, "custom-provider", onComplete);
 	dialog.focused = true;
-	return { dialog, onComplete };
+	return { dialog, onComplete, requestRender };
 }
 
 function render(dialog: LoginDialogComponent): string {
@@ -138,5 +139,45 @@ describe("device-code login", () => {
 		expect(render(dialog)).toContain("Waiting for authentication...");
 		expect(dialog.signal.aborted).toBe(false);
 		expect(onComplete).not.toHaveBeenCalled();
+	});
+
+	it.each(["cancel", "unfocus", "browser", "details", "replacement"] as const)(
+		"ignores late clipboard success and rejection after %s",
+		async (transition) => {
+			for (const failure of [false, true]) {
+				const pending = Promise.withResolvers<void>();
+				vi.mocked(copyToClipboard).mockReturnValueOnce(pending.promise);
+				const { dialog, requestRender } = createDialog();
+				dialog.showDeviceCode(device);
+				dialog.handleInput("\r");
+				expect(render(dialog)).toContain("Copying code...");
+				if (transition === "cancel") dialog.handleInput("\x1b");
+				else if (transition === "unfocus") dialog.focused = false;
+				else if (transition === "browser") dialog.showAuth("https://example.com/authorize");
+				else if (transition === "details") dialog.showDetails(["Choose a login method"]);
+				else dialog.showDeviceCode({ ...device, userCode: "NEW-CODE" });
+				const current = render(dialog);
+				requestRender.mockClear();
+				if (failure) pending.reject(new Error("Clipboard unavailable"));
+				else pending.resolve();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(render(dialog)).toBe(current);
+				expect(requestRender).not.toHaveBeenCalled();
+			}
+		},
+	);
+
+	it.each([false, true])("updates the current dialog after deferred clipboard failure=%s", async (failure) => {
+		const pending = Promise.withResolvers<void>();
+		vi.mocked(copyToClipboard).mockReturnValueOnce(pending.promise);
+		const { dialog, requestRender } = createDialog();
+		dialog.showDeviceCode(device);
+		dialog.handleInput("\r");
+		requestRender.mockClear();
+		if (failure) pending.reject(new Error("Clipboard unavailable"));
+		else pending.resolve();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(render(dialog)).toContain(failure ? "Copy code manually" : "Code copied to clipboard");
+		expect(requestRender).toHaveBeenCalledOnce();
 	});
 });

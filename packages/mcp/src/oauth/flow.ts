@@ -407,17 +407,19 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 	if (existing?.refresh_token) {
 		// Cancellation before dispatch must not consume a stored refresh token.
 		options.signal?.throwIfAborted();
+		const refreshSignal = options.refreshSignal === null ? undefined : (options.refreshSignal ?? options.signal);
 		try {
 			const tokens = await refreshAuthorization(discovered.authorizationServerUrl, {
 				...tokenOptions,
-				signal: options.refreshSignal === null ? undefined : (options.refreshSignal ?? options.signal),
+				signal: refreshSignal,
 				refreshToken: existing.refresh_token,
 			});
 			// A refresh without `scope` keeps the scope of the grant (RFC 6749 §6).
 			await provider.saveTokens(withScope(tokens, existing.scope));
 			return "AUTHORIZED";
 		} catch (error) {
-			if (options.signal?.aborted || error instanceof OAuthInsecureEndpointError) throw error;
+			if (options.signal?.aborted || refreshSignal?.aborted || error instanceof OAuthInsecureEndpointError)
+				throw error;
 			if (error instanceof OAuthError && error.code !== "server_error") throw error;
 		}
 	}
@@ -440,7 +442,7 @@ export async function authorizeMcp(provider: OAuthClientProvider, options: OAuth
 		return await runFlow(provider, options);
 	} catch (error) {
 		// A cancelled caller must not start a fresh flow after a failed refresh.
-		if (options.signal?.aborted) throw error;
+		if (options.signal?.aborted || options.refreshSignal?.aborted) throw error;
 		if (error instanceof OAuthError && ["invalid_client", "unauthorized_client"].includes(error.code)) {
 			await provider.invalidateCredentials?.("all");
 			return runFlow(provider, options);

@@ -34,6 +34,8 @@ import { WATCH_CAPACITY, type Watch } from "./view.ts";
 
 export type PublishedConversationView = ConversationView & {
 	commit: { events: ViewEvent[] };
+	/** A failed publication retains its last revision but is no longer a live view. Reacquire after repair. */
+	publication: { status: "live" } | { status: "failed"; error: string };
 };
 
 export interface PicoConversationService {
@@ -242,7 +244,7 @@ const ConversationSpecSchema = Type.Unsafe<Omit<ConversationSpec, "parent">>(
 );
 
 export const PicoConversationService = remote("pi.conversation", {
-	version: 1,
+	version: 2,
 	input: Type.Object({ conversationId: IdSchema }),
 	host: hostNamed("harness"),
 	variants: {
@@ -259,6 +261,10 @@ export const PicoConversationService = remote("pi.conversation", {
 						tasks: JsonObjectSchema,
 						plugins: JsonObjectSchema,
 						commit: Type.Object({ events: Type.Array(Type.Unknown()) }),
+						publication: Type.Union([
+							Type.Object({ status: Type.Literal("live") }),
+							Type.Object({ status: Type.Literal("failed"), error: Type.String() }),
+						]),
 					}),
 				),
 			},
@@ -322,7 +328,7 @@ export function createPicoHarnessFacet(harness: Harness) {
 			serve(PicoHarnessService, () => ({ harness }), { lifetime: "host" });
 			serve(PicoConversationService, ({ conversationId }, _principal, self) => {
 				const source = self.resource("conversation", {
-					version: 1,
+					version: 2,
 					async open({ signal }) {
 						const context = withAbortSignal(signal, BACKGROUND_CONTEXT);
 						const conversation = await harness.conversation(conversationId, context);
@@ -434,7 +440,11 @@ export async function attachChordView(
 	opts: ChordViewBridgeOptions = {},
 ): Promise<ChordViewBridge> {
 	const watch = await conversation.watch(ctx);
-	const view = createState({ ...structuredClone(watch.view), commit: { events: [] } });
+	const view = createState({
+		...structuredClone(watch.view),
+		commit: { events: [] },
+		publication: { status: "live" },
+	});
 	return bridgeWatch(watch, view, ctx, opts);
 }
 
@@ -455,6 +465,16 @@ function bridgeWatch(
 		closed = true;
 		queue.length = 0;
 		watch.stop();
+		const error = cause instanceof Error ? cause : new Error(String(cause));
+		try {
+			view.change(ctx, (draft) => {
+				draft.publication = { status: "failed", error: error.message };
+				draft.commit.events = [];
+			});
+		} catch (publicationError) {
+			// The failure callback still receives the publication failure when even the terminal update cannot publish.
+			cause = publicationError;
+		}
 		try {
 			opts.onFailure?.(cause instanceof Error ? cause : new Error(String(cause)));
 		} catch {}
@@ -483,6 +503,10 @@ function bridgeWatch(
 		if (scheduled) return;
 		scheduled = true;
 		queueMicrotask(drain);
+	});
+	void watch.ended.then((end) => {
+		if (end.reason === "failed") fail(end.error);
+		else if (!closed) fail(new Error("Pico view watch stopped"));
 	});
 	return {
 		view,

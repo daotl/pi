@@ -63,7 +63,7 @@ Regular mode leaves mouse input to the terminal because the terminal owns scroll
 
 ## Use custom screens and overlays
 
-`ctx.ui.custom()` temporarily gives one component control of the interactive area and resolves when that component calls the supplied completion callback.
+`ctx.ui.custom<T>()` temporarily gives one component control of the interactive area and returns `Promise<T | undefined>`. Calling the supplied `done(result: T)` callback completes it normally. Resetting extension UI (including reload, session replacement, and shutdown) cancels it with `undefined`, even if the component uses a different cancellation value. Handle `undefined` before reading the result. Components returned by an asynchronous factory after cancellation are disposed without being mounted.
 
 ### Build a minimal custom screen
 
@@ -144,6 +144,8 @@ Treat each custom component instance as belonging to one interaction. Create a n
 Finish the interaction with the completion callback supplied to the component factory. It resolves the `ctx.ui.custom()` promise and disposes the component. Do not call `OverlayHandle.hide()` on an overlay created by `ctx.ui.custom()`.
 
 See [`overlay-qa-tests.ts`](../examples/extensions/overlay-qa-tests.ts) for positioning, stacking, focus, responsive visibility, and animation behavior.
+
+In regular mode, overlays that cover a partially scrolled Kitty image restore only its visible crop, preserving scrollback. Built-in `Image` components provide the needed source dimensions. Custom Kitty transmissions can provide PNG data (`f=100`), raw RGB/RGBA dimensions (`s`/`v`), or an explicit source crop (`h`). If a custom format has no source-height metadata, its partial placement is retained rather than deleted, so an overlapping overlay cannot cover those image cells. No transcript replay is used to restore it.
 
 ## Apply themes correctly
 

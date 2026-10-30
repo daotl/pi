@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InMemoryCredentialStore } from "../src/auth/credential-store.ts";
 import { createModels, createProvider, getModelType } from "../src/models.ts";
 import {
@@ -50,7 +50,11 @@ const context: ClassifierContext = {
 	},
 };
 
-describe.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")("Models with classifier models", () => {
+// Only catalog metadata is enabled; provider requests below use synthetic implementations or mocked fetch.
+beforeEach(() => vi.stubEnv("PI_DISABLE_CLOUD_PROVIDERS", "0"));
+afterEach(() => vi.unstubAllEnvs());
+
+describe("Models with classifier models", () => {
 	it("keeps chat and classifier entries with the same provider and id separate", async () => {
 		const chat = chatModel("test", "shared");
 		const classifier = classifierModel("test", "shared");
@@ -251,8 +255,6 @@ describe.skipIf(process.env.PI_DISABLE_CLOUD_PROVIDERS === "1")("Models with cla
 			expect(model).toMatchObject({
 				api: "typesafe-system-one",
 				baseUrl: "https://openrouter.ai/api/v1",
-				// Explicit, so images keep OpenRouter's form when the baseUrl is overridden.
-				compat: { imageInput: "state-image-urls", sendImageOptInHeader: false },
 			});
 			expect(models.getModel("openrouter", model.id)).toBeUndefined();
 			expect(models.getModelOfType("classifier", "openrouter", model.id)).toEqual(model);

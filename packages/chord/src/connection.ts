@@ -417,6 +417,8 @@ export class Connection implements RemoteChannel {
 	readonly relayedCalls = new Map<number, RelayCall>();
 	/** Reload votes awaited from this (child) peer. */
 	readonly votes = new Map<number, Pending>();
+	/** Child rollback completions awaited before reconciliation retries. */
+	readonly abortions = new Map<number, Pending>();
 
 	constructor(
 		host: HostImpl,
@@ -838,6 +840,16 @@ export class Connection implements RemoteChannel {
 				} else if (frame.t === "retire") this.host.allowRetire(frame.codeVersion);
 				else this.host.onReloadFrame(this, frame);
 				return;
+			case "aborted": {
+				if (this.role !== "downstream" || this.peer.kind !== "host") {
+					this.#violation("aborted from a non-participant");
+					return;
+				}
+				const pending = this.abortions.get(frame.reload);
+				this.abortions.delete(frame.reload);
+				pending?.resolve(undefined);
+				return;
+			}
 			case "vote": {
 				if (this.role !== "downstream" || this.peer.kind !== "host") {
 					this.#violation("vote from a non-participant");
@@ -1320,6 +1332,8 @@ export class Connection implements RemoteChannel {
 		this.calls.clear();
 		for (const vote of this.votes.values()) vote.reject(error);
 		this.votes.clear();
+		for (const pending of this.abortions.values()) pending.reject(error);
+		this.abortions.clear();
 		for (const waiter of this.#syncWaiters) waiter.reject(error);
 		this.#syncWaiters.clear();
 		// As downstream of relays: their origins lose the hold.

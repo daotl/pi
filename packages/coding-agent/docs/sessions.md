@@ -73,6 +73,8 @@ Run `/compact` to compact manually. You can add instructions when the summary sh
 
 Compaction can fail if the provider is unavailable or cannot accept the summarization request. Correct the provider problem and run `/compact` again. Disabling automatic compaction does not disable the manual command.
 
+When GitHub Copilot overflow recovery generates its built-in summary, Pi bounds the serialized normalized summary context below 32 MiB. It keeps bounded conversation text and fitting recent images, omitting older images only when necessary; saved history is unchanged. If the remaining context still exceeds the bound, recovery fails before dispatch. This bound is not a guarantee about the provider's final wire payload, which can differ after adapter conversion or payload hooks. Ordinary requests, manual compaction and other providers do not enable this recovery-specific bound.
+
 Accepted steering and follow-up input does not grant another retry. When automatic retry is disabled or exhausted, queued input is sent as an ordinary request rather than recapturing the interrupted assistant prefix. An already approved prefix retry keeps its first request ahead of queued steering; that input is delivered afterward.
 
 Trailing system-policy patches do not hide an interrupted assistant from continuation. Successful continuation keeps those patches; if its echo is rejected, restoring the original partial also restores the ordered trailing patches. A system patch alone does not make a completed assistant answer runnable again.
@@ -124,6 +126,8 @@ Edits, surgical deletions and failed-prefill restoration can create context-only
 Use `/export` to write the current session as HTML or JSONL. Use `/share` to upload it and get a viewer link. By default, Pi uses a Radius artifact when Radius authentication is configured; otherwise, it uses a private GitHub gist. Set [`sessionShareDestination`](settings.md#sessions-and-context) to `gist` or `radius` to force one destination.
 
 Review exported or shared sessions first. They can contain prompts, model responses, tool arguments, command output, file contents, and extension messages.
+
+The HTML viewer vendors Marked 18.0.11 with a task-list tokenizer backport that associates each checkbox marker with its own paragraph, preserving literal markers in later paragraphs. To regenerate it from a checkout with dependencies installed, run `node scripts/generate-export-marked.mjs` at the repository root, then `node scripts/generate-export-marked.mjs --check`. The generator authenticates the installed Marked source map by exact version and SHA-256, applies the readable TypeScript backport, and bundles it with pinned esbuild 0.28.2 while preserving the upstream license and UMD exports. Do not edit the minified asset or move tokenizer internals into the viewer; upgrades require reviewing the source pin and backport together.
 
 ## Report a bug
 

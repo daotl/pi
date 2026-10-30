@@ -96,6 +96,86 @@ describe("RemoteExecutionEnv", () => {
 		expect(tail.length > 1000 || tail.split("\n").length - 1 > 20).toBe(true);
 	}, 60_000);
 
+	it("rejects pending requests and reconnects when stdin breaks while pings continue", async () => {
+		// A real child pipe cannot use parent fake timers. This guard bounds failure and is always cleared.
+		const script = [
+			'const { readSync, closeSync } = require("node:fs");',
+			"const token = process.argv.at(-1);",
+			'process.stdout.write("PI-ENV " + token + "\\n");',
+			"function send(kind, id, json) { const body = Buffer.from(JSON.stringify(json)); const head = Buffer.alloc(13); head.writeUInt32BE(9 + body.length); head[4] = kind; head.writeUInt32BE(id, 5); head.writeUInt32BE(body.length, 9); process.stdout.write(Buffer.concat([head, body])); }",
+			"let buffered = Buffer.alloc(0); const input = Buffer.alloc(65536); let closed = false;",
+			'while (!closed) { const count = readSync(0, input); if (count === 0) process.exit(1); buffered = Buffer.concat([buffered, input.subarray(0, count)]); while (buffered.length >= 4 && buffered.length >= 4 + buffered.readUInt32BE(0)) { const size = 4 + buffered.readUInt32BE(0); const id = buffered.readUInt32BE(5); const json = JSON.parse(buffered.subarray(13, 13 + buffered.readUInt32BE(9))); buffered = buffered.subarray(size); if (json.op === "hello") send(2, id, { protocol: 1, pid: process.pid }); else if (json.op === "lstat") { closeSync(0); closed = true; send(4, id, { kind: "writeClosed" }); break; } } }',
+			"setInterval(() => send(6, 0, {}), 40);",
+		].join("\n");
+		let starts = 0;
+		const connection = new Connection({
+			command: async () => (++starts === 1 ? [process.execPath, "-e", script, "--"] : [daemon]),
+		});
+		connections.push(connection);
+		let pid: number | undefined;
+		let guard: ReturnType<typeof setTimeout> | undefined;
+		let cleanupError: unknown;
+		const deadline = new Promise<never>((_resolve, reject) => {
+			guard = setTimeout(() => reject(new Error("broken stdin requests did not settle")), 2000);
+		});
+		try {
+			pid = (await Promise.race([connection.info(), deadline])).pid;
+			let writeClosed!: () => void;
+			const ready = new Promise<void>((resolve) => {
+				writeClosed = resolve;
+			});
+			const controller = new AbortController();
+			const pending = connection
+				.request(
+					"lstat",
+					{ path: "." },
+					{
+						signal: controller.signal,
+						onEvent: () => writeClosed(),
+					},
+				)
+				.catch((error: unknown) => error);
+			await Promise.race([ready, deadline]);
+			const next = connection.request("lstat", { path: "." }).catch((error: unknown) => error);
+			controller.abort();
+			for (const failure of await Promise.race([Promise.all([pending, next]), deadline])) {
+				expect(failure).toMatchObject({ fields: { lost: true }, message: "pi-env connection write failed" });
+			}
+			expect((await Promise.race([connection.info(), deadline])).protocol).toBe(1);
+			expect(starts).toBe(2);
+		} finally {
+			clearTimeout(guard);
+			connection.close();
+			if (pid !== undefined) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch (error) {
+					if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) cleanupError = error;
+				}
+			}
+		}
+		if (cleanupError) throw cleanupError;
+	});
+
+	it("keeps oversized output windows successful and delivers all bytes before the result", async () => {
+		const { env } = environment();
+		const total = 20_000_000;
+		let delivered = 0;
+		const result = await env.exec(
+			["sh", "-c", `head -c ${total} /dev/zero`],
+			{
+				window: { maxBytes: 32_000_000, maxLines: 1_000_000, minIntervalMs: 60_000, bytesPerSecond: 1_000_000 },
+				onOutput: (text, _context, info) => {
+					delivered += Buffer.byteLength(text);
+					expect(info.skipped).toBeUndefined();
+					expect(Buffer.byteLength(text)).toBeLessThanOrEqual(16 * 1024 * 1024 - 64 * 1024);
+				},
+			},
+			context,
+		);
+		expect(getOrThrow(result).exitCode).toBe(0);
+		expect(delivered).toBe(total);
+	}, 30_000);
 	it("aborts commands cancelled right after they are sent", async () => {
 		const { env } = environment();
 		const started = Date.now();

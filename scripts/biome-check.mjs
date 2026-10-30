@@ -69,7 +69,14 @@ let failures = 0;
 let checked = 0;
 try {
 	for (const path of files) {
-		const original = readFileSync(path, "utf8");
+		let original;
+		try {
+			original = readFileSync(path, "utf8");
+		} catch (error) {
+			// Indexed paths can disappear before their deletion is staged.
+			if (error.code === "ENOENT") continue;
+			throw error;
+		}
 		const fixed = write
 			? withFile(
 					path,

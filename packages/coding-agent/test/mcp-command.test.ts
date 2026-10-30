@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { runMcpCommand } from "../src/extensions/mcp/cli.ts";
 
 const FIXTURE = resolve(import.meta.dirname, "../../mcp/test/fixtures/stdio-server.mjs");
@@ -64,21 +64,49 @@ describe("pi mcp", () => {
 	});
 
 	it("cancels a stalled initialize at the whole-login deadline", async () => {
+		const methods: unknown[] = [];
+		const initialized = Promise.withResolvers<void>();
+		const deadline = new AbortController();
+		const originalTimeout = AbortSignal.timeout;
+		const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+			return milliseconds === 50 ? deadline.signal : originalTimeout(milliseconds);
+		});
 		const server = createServer((request, response) => {
-			if (request.method === "POST") request.resume();
-			else response.end();
+			if (request.method === "POST") {
+				let body = "";
+				request.setEncoding("utf8");
+				request.on("data", (chunk: string) => {
+					body += chunk;
+				});
+				request.on("end", () => {
+					const message: unknown = JSON.parse(body);
+					if (message !== null && typeof message === "object" && "method" in message) {
+						methods.push(message.method);
+						if (message.method === "initialize") initialized.resolve();
+					}
+				});
+			} else response.end();
 		});
 		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 		try {
 			const address = server.address();
 			if (address === null || typeof address === "string") throw new Error("Expected loopback address");
-			const started = performance.now();
-			const result = await run(["login", "stalled", "--timeout", "0.05"], {
+			let settled = false;
+			const pending = run(["login", "stalled", "--timeout", "0.05"], {
 				stalled: { url: `http://127.0.0.1:${address.port}/mcp`, timeout: 2 },
+			}).finally(() => {
+				settled = true;
 			});
+			await initialized.promise;
+			expect(timeout).toHaveBeenCalledWith(50);
+			expect(settled).toBe(false);
+			deadline.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+			const result = await pending;
 			expect(result.exitCode).toBe(1);
-			expect(performance.now() - started).toBeLessThan(1_000);
+			expect(methods).toContain("initialize");
+			expect(result.output).toContain("timed out before connection completed.");
 		} finally {
+			timeout.mockRestore();
 			server.closeAllConnections();
 			await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
 		}

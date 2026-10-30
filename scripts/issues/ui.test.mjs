@@ -158,3 +158,61 @@ for (const failure of ["http", "network"]) {
 		assert.deepEqual(ui.requests[4].body, { number: 10, priority: null });
 	});
 }
+
+for (const action of ["prio", "allnone", "retriage", "sync"]) {
+	for (const failure of ["http", "network"]) {
+		test(`${action} ${failure} failures survive successful authoritative refreshes`, async () => {
+			const ui = harness();
+			await ui.respond(ui.requests[0], snapshot([issue(10), issue(20)]));
+			if (action === "sync") ui.nodes.sync.retry();
+			else ui.click({ act: action, n: "10", p: "p0" });
+			ui.requests[1].resolve(failure === "http"
+				? { ok: false, status: 500, text: async () => "disk full <details>" }
+				: Promise.reject(new Error("network offline")));
+			await tick();
+			assert.equal(ui.requests[2].path, "/api/state");
+			const partial = issue(10); partial.decision = { priority: "none" };
+			await ui.respond(ui.requests[2], snapshot([partial, issue(20)]));
+			assert.match(ui.nodes.status.innerHTML, /Operation failed:/);
+			assert.match(ui.nodes.status.innerHTML, failure === "http" ? /500: disk full &lt;details&gt;/ : /network offline/);
+			assert.doesNotMatch(ui.nodes.main.innerHTML, /data-n="20" disabled/);
+			assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 10/);
+			ui.poll();
+			await ui.respond(ui.requests[3], snapshot([partial, issue(20)]));
+			assert.match(ui.nodes.status.innerHTML, /Operation failed:/);
+		});
+	}
+}
+
+test("mutation and refresh errors are independent and a successful retry clears only the mutation error", async () => {
+	const ui = harness();
+	await ui.respond(ui.requests[0], snapshot([issue(10)]));
+	ui.click({ act: "prio", n: "10", p: "p0" });
+	ui.requests[1].resolve({ ok: false, status: 500, text: async () => "disk full" });
+	await tick();
+	ui.requests[2].resolve({ ok: false, status: 503, text: async () => "refresh unavailable" });
+	await tick();
+	assert.match(ui.nodes.status.innerHTML, /Operation failed:.*disk full/);
+	assert.match(ui.nodes.status.innerHTML, /State refresh failed/);
+	ui.nodes.sync.retry();
+	await ui.respond(ui.requests[3], snapshot([issue(10)]));
+	assert.match(ui.nodes.status.innerHTML, /Operation failed:.*disk full/);
+	assert.doesNotMatch(ui.nodes.status.innerHTML, /State refresh failed/);
+	ui.click({ act: "prio", n: "10", p: "p0" });
+	await ui.respond(ui.requests[4]);
+	const decided = issue(10); decided.decision = { priority: "p0" };
+	await ui.respond(ui.requests[5], snapshot([decided]));
+	assert.doesNotMatch(ui.nodes.status.innerHTML, /Operation failed/);
+});
+
+test("an overlapping successful mutation cannot erase another operation's failure", async () => {
+	const ui = harness();
+	await ui.respond(ui.requests[0], snapshot([issue(10)]));
+	ui.click({ act: "prio", n: "10", p: "p0" });
+	ui.click({ act: "retriage", n: "10" });
+	ui.requests[1].resolve({ ok: false, status: 500, text: async () => "disk full" });
+	await tick();
+	await ui.respond(ui.requests[2]);
+	await ui.respond(ui.requests[3], snapshot([issue(10)]));
+	assert.match(ui.nodes.status.innerHTML, /Operation failed:.*disk full/);
+});

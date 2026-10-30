@@ -13,8 +13,8 @@ export type RemotePlatform = {
 	arch: "x64" | "arm64";
 	/** The remote home directory, in the remote system's own spelling. */
 	home: string;
-	/** Windows: the shell `sshd` runs commands with (`DefaultShell`). */
-	shell?: "cmd" | "powershell";
+	/** Windows: the shell `sshd` runs commands with (`DefaultShell`), including Git Bash/MSYS/Cygwin. */
+	shell?: "cmd" | "powershell" | "posix";
 	/** Problems worth telling the owner about, such as Termux without `termux-exec`. */
 	warnings: string[];
 };
@@ -339,12 +339,25 @@ export async function detectPlatform(target: SshTarget): Promise<RemotePlatform>
 		probe = parseProbe(target, await runSsh(target, WINDOWS_PROBE));
 	}
 	// Git Bash as Windows' default SSH shell: ask PowerShell for Windows' own architecture and home spelling.
-	if (/^(MINGW|MSYS|CYGWIN)/.test(probe.system)) probe = parseProbe(target, await runSsh(target, WINDOWS_PROBE));
+	const posixWindows = /^(MINGW|MSYS|CYGWIN)/.test(probe.system);
+	if (posixWindows) probe = parseProbe(target, await runSsh(target, WINDOWS_PROBE));
 	const arch = normalizeArch(probe.machine);
 	const { system, os, home } = probe;
 	if (system === "Windows") {
-		// cmd.exe expands %OS%; PowerShell prints it as is.
-		const shell = (await runSsh(target, "echo %OS%")).includes("Windows_NT") ? "cmd" : "powershell";
+		// Explicit `sh` identifies a child interpreter, not the SSH login shell.
+		// Probe native shells before treating a Windows uname result as outer POSIX.
+		let shell: "cmd" | "powershell" | "posix";
+		if ((await runSsh(target, "echo %OS%")).includes("Windows_NT")) shell = "cmd";
+		else if (!posixWindows) shell = "powershell";
+		else {
+			try {
+				const answer = await runSsh(target, '"PI-ENV-POWERSHELL-" + $PSVersionTable.PSVersion.Major');
+				shell = /^PI-ENV-POWERSHELL-\d+\r?$/m.test(answer) ? "powershell" : "posix";
+			} catch (error) {
+				if (error instanceof HostKeyUnknownError || error instanceof HostKeyChangedError) throw error;
+				shell = "posix";
+			}
+		}
 		return { platform: "windows", arch, home, shell, warnings: [] };
 	}
 	if (system === "Darwin") return { platform: "darwin", arch, home, warnings: [] };
@@ -474,6 +487,8 @@ export interface SshConnectOptions extends SshTarget {
 /** The remote command that starts the daemon at `file`, before the `serve` arguments. */
 function launchCommand(remote: RemotePlatform, file: string, loginShell: boolean): string {
 	if (remote.platform === "windows") {
+		// Git Bash/MSYS/Cygwin accept forward-slash Windows paths as POSIX-quoted executable names.
+		if (remote.shell === "posix") return quotePosix(file.replaceAll("\\", "/"));
 		// PowerShell runs a quoted path only with the call operator; cmd.exe keeps one pair of quotes around a program.
 		if (remote.shell === "powershell") return `& ${quotePowerShell(file)}`;
 		return file.includes(" ") ? `"${file}"` : file;

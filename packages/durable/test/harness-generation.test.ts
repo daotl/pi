@@ -1,5 +1,6 @@
 import {
 	type AssistantMessage,
+	createAssistantMessageEventStream,
 	fauxAssistantMessage,
 	type Message,
 	type Models,
@@ -115,6 +116,43 @@ describe("generation", () => {
 			outcome: { status: "completed", result: { entryId: settled.answer } },
 		});
 		await harness.close(context);
+	});
+
+	it("keeps provider start arguments while paused and after close/reopen converts the partial", async () => {
+		const setup = chatSetup();
+		const originalModels = setup.models;
+		const partial = fauxAssistantMessage(
+			[{ type: "toolCall", id: "initial-prefix", name: "write", arguments: { path: "src/a" } }],
+			{ stopReason: "pending" },
+		);
+		const models = withStream(originalModels, (_model, _request, options) => {
+			const stream = createAssistantMessageEventStream();
+			stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+			options?.signal?.addEventListener(
+				"abort",
+				() => {
+					stream.end({ ...partial, stopReason: "aborted" });
+				},
+				{ once: true },
+			);
+			return stream;
+		});
+		const storage = new ControlledStorage();
+		let opened = await openChat(storage, { ...setup, models });
+		opened.harness.resume();
+		const submission = await opened.root.submit({ type: "input", content: "write" }, context);
+		await waitFor(async () => (await live(opened.harness, opened.root))?.generation?.message !== undefined);
+		expect((await live(opened.harness, opened.root))?.generation?.message?.content).toEqual(partial.content);
+		await opened.harness.close(context);
+		setup.faux.setResponses([fauxAssistantMessage("recovered")]);
+		opened = await openChat(storage.reopen(), setup);
+		opened.harness.resume();
+		await (await opened.harness.submission(submission.id, context))!.wait(context);
+		const aborted = (await allEntries(opened.root)).find((entry) =>
+			entry.model?.some((message) => message.role === "assistant" && message.stopReason === "aborted"),
+		);
+		expect(aborted?.model?.[0]?.content).toEqual(partial.content);
+		await opened.harness.close(context);
 	});
 
 	it("stores partials as deltas and a complete base once nothing is in flight", async () => {

@@ -141,8 +141,14 @@ changed anything visible to this conversation. Envelopes arriving before
 `start()` are buffered (bounded; overflow closes the watch). Asynchronous
 consumers (the Chord bridge, application queues) own their own queue and
 backpressure policy (`plugins.md` §6.1). A listener throw closes that watch and
-reports through `onError`. `stop` is idempotent; nothing is delivered after
-`stop`.
+reports through `onReport`. A projection throw ends every watch of that view
+without rejecting the successful durable commit. Every raw watch exposes
+`ended: Promise<{ reason: "stopped" } | { reason: "failed"; error: Error }>`;
+it resolves exactly once and never rejects. Projection, listener, and pre-start
+overflow failures preserve the actual error in the `failed` outcome, including
+when failure occurs before `start()`. `stop` is idempotent, resolves `ended` with
+`stopped`, and prevents further delivery. Consumers must observe terminal state,
+not treat the last captured revision as live indefinitely.
 
 Base flush: after the kernel rebases the view tracker (reopen of a cold watch is a
 fresh snapshot instead), an envelope may carry `["r", view]` as its only op.

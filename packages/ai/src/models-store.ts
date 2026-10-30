@@ -12,6 +12,8 @@ export interface ModelsStoreEntry {
 	 * (quotes included) and echoed back as If-None-Match.
 	 */
 	etag?: string;
+	/** Non-secret SHA-256 identity of the auth and endpoint that produced a personalized catalog. */
+	personalizationKey?: string;
 }
 
 export interface ModelsStoreOperationOptions {

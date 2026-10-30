@@ -1,5 +1,12 @@
-import { type AuthType, type CredentialStore, InMemoryCredentialStore } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
+import {
+	type AuthType,
+	type CredentialStore,
+	createAssistantMessageEventStream,
+	createProvider,
+	InMemoryCredentialStore,
+	type Model,
+} from "@earendil-works/pi-ai";
+import { describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { enableBuiltinProviders } from "./test-network-env.ts";
@@ -34,6 +41,59 @@ function testModel(id: string) {
 }
 
 describe("ModelRuntime auth options", () => {
+	it.each(["stream", "streamSimple", "streamDeferred"] as const)(
+		"preserves cancellation while %s resolves provider authentication",
+		async (method) => {
+			const runtime = await ModelRuntime.create({
+				credentials: new InMemoryCredentialStore(),
+				modelsPath: null,
+				refreshOnCreate: false,
+			});
+			const model: Model<"auth-cancel"> = {
+				...testModel("pending-auth"),
+				provider: "auth-cancel",
+				api: "auth-cancel",
+				baseUrl: "https://example.test/v1",
+			};
+			let markStarted: (() => void) | undefined;
+			const started = new Promise<void>((resolve) => {
+				markStarted = resolve;
+			});
+			const respond = vi.fn(() => createAssistantMessageEventStream());
+			runtime.registerNativeProvider(
+				createProvider({
+					id: model.provider,
+					models: [model],
+					auth: {
+						apiKey: {
+							name: "Pending auth",
+							check: async () => ({ type: "api_key" }),
+							resolve: async () => {
+								markStarted?.();
+								return new Promise<never>(() => {});
+							},
+						},
+					},
+					api: { stream: respond, streamSimple: respond, fetchDeferred: respond },
+				}),
+			);
+			const controller = new AbortController();
+			const options = { signal: controller.signal };
+			const stream =
+				method === "streamDeferred"
+					? runtime.streamDeferred(
+							model,
+							{ api: model.api, provider: model.provider, modelId: model.id, id: "pending" },
+							options,
+						)
+					: runtime[method](model, { messages: [] }, options);
+			await started;
+			controller.abort(new Error("cancelled during auth"));
+			expect((await stream.result()).stopReason).toBe("aborted");
+			expect(respond).not.toHaveBeenCalled();
+		},
+	);
+
 	// Built-in auth metadata is bundled; no provider request is needed.
 	it("accepts a pi-ai CredentialStore", async () => {
 		enableBuiltinProviders();

@@ -33,7 +33,7 @@ import type {
 	TaskQuery,
 	TaskRecord,
 } from "../../types.ts";
-import { nextCursor, type ScanStart, scanStart } from "../scan.ts";
+import { nextCursor, type ScanStart, scanStart, validateScanLimit } from "../scan.ts";
 import { applySqliteMigrationsForSchema } from "./migrations.ts";
 import { createSqliteSchema, type SqliteSchema } from "./schema.ts";
 
@@ -230,7 +230,7 @@ export class SqliteStorage implements Storage {
 		_context: Context,
 	): Promise<Page<ConversationRecord, Cursor>> {
 		this.assertOpen();
-		const start = scanStart(query.order, cursor, "ascending");
+		const start = scanStart(query.order, cursor, "ascending", limit);
 		const scan = scanSql(start);
 		const clauses = [scan.clause];
 		const params: SqliteValue[] = [scan.param];
@@ -352,7 +352,7 @@ export class SqliteStorage implements Storage {
 		limit: number,
 		cursor: Cursor | undefined,
 	): Promise<Page<EntryRecord, Cursor>> {
-		const { order, after } = scanStart(query.order, cursor, "descending");
+		const { order, after } = scanStart(query.order, cursor, "descending", limit);
 		if (order === "ascending") return this.readEntriesAscending(query, limit, after);
 		let conversation = await this.readConversation(query.conversationId);
 		if (conversation === undefined) throw new StorageRequestError(`Unknown conversation: ${query.conversationId}`);
@@ -439,7 +439,7 @@ export class SqliteStorage implements Storage {
 		_context: Context,
 	): Promise<Page<StoredTask, Cursor>> {
 		this.assertOpen();
-		const start = scanStart(query.order, cursor, "ascending");
+		const start = scanStart(query.order, cursor, "ascending", limit);
 		const scan = scanSql(start);
 		const clauses = [scan.clause];
 		const params: SqliteValue[] = [scan.param];
@@ -488,7 +488,7 @@ export class SqliteStorage implements Storage {
 		_context: Context,
 	): Promise<Page<SubmissionRecord, Cursor>> {
 		this.assertOpen();
-		const start = scanStart(query.order, cursor, "ascending");
+		const start = scanStart(query.order, cursor, "ascending", limit);
 		const scan = scanSql(start);
 		const clauses = [scan.clause];
 		const params: SqliteValue[] = [scan.param];
@@ -561,6 +561,7 @@ export class SqliteStorage implements Storage {
 		_context: Context,
 	): Promise<Page<DocumentRecord, Cursor>> {
 		this.assertOpen();
+		validateScanLimit(limit);
 		const scope = scopeColumns(query.scope);
 		const clauses = ["scope_kind = ?", "owner_id = ?", "id > ?"];
 		const params: SqliteValue[] = [scope.scopeKind, scope.ownerId, cursorId(cursor) ?? -1];

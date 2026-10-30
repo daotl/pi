@@ -267,7 +267,9 @@ pub fn shell_config(shell_path: Option<&str>) -> Result<ShellConfig, Failure> {
     };
     if let Some(configured) = shell_path {
         if path_exists(configured) {
-            return Ok(shell(configured));
+            let program = std::path::absolute(configured)
+                .map_err(|error| Failure::new("shell_unavailable", error.to_string()))?;
+            return Ok(shell(&program.to_string_lossy()));
         }
         return Err(Failure::new(
             "shell_unavailable",

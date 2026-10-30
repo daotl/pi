@@ -106,7 +106,7 @@ export default function (pi: ExtensionAPI) {
 				return loader;
 			});
 
-			if (result === null) {
+			if (result === undefined || result === null) {
 				ctx.ui.notify("Cancelled", "info");
 				return;
 			}

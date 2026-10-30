@@ -302,6 +302,12 @@ describe("a failed Storage call", () => {
 		const { harness, root, reports } = await started(new MemoryStorage());
 		const entry = await root.commit((tx) => tx.appendEntry(root.id, { kind: "note" }), context);
 		const requests: (() => Promise<unknown>)[] = [
+			...[0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1].flatMap((limit) => [
+				() => root.commit((tx) => tx.scanConversations({}, limit), context),
+				() => root.commit((tx) => tx.scanEntries({ conversationId: root.id }, limit), context),
+				() => root.commit((tx) => tx.scanTasks({}, limit), context),
+				() => root.entries({}, limit, undefined, context),
+			]),
 			() => root.entries({}, 10, { after: "x" }, context),
 			async () => {
 				const page = await root.entries({ order: "ascending" }, 1, undefined, context);

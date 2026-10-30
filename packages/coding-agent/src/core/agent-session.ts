@@ -4934,6 +4934,7 @@ export class AgentSession {
 			this.agent,
 			(model) => this._requestHistoryPolicy(model),
 			(model) => this._usesAdapterOutputClamp(model),
+			reason === "overflow" && request.model.provider === "github-copilot" ? 32 * 1024 * 1024 : undefined,
 		);
 		return { ...result, usageModel: request.model };
 	}

@@ -140,6 +140,208 @@ describe("state init", () => {
 		assert.deepEqual(ref.notes.value, ["from source"]);
 	});
 
+	it("reload initializers can call newly added dependencies without publishing their code", async () => {
+		const host = createHost({ self: "host", onError: () => {} });
+		const Source = local("t.reload-init-source", {
+			version: 1,
+			input: Type.Object({}),
+			members: { read: method(undefined, Type.String()) },
+		});
+		const Leaf = local("t.reload-init-leaf", {
+			version: 1,
+			input: Type.Object({}),
+			members: { read: method(undefined, Type.String()) },
+		});
+		const Consumer = local("t.reload-init-consumer", {
+			version: 1,
+			input: Type.Object({}),
+			members: { read: method(undefined, Type.String()) },
+		});
+		const started = latch<void>();
+		const finish = latch<void>();
+		const source: Facet = {
+			name: "source",
+			setup: ({ serve }) => {
+				serve(Leaf, () => ({ read: () => "prepared source" }));
+				serve(Source, (_input, _principal, self) => {
+					const leaf = self.get(Leaf, {});
+					return { read: (ctx) => leaf.read(ctx) };
+				});
+			},
+		};
+		const consumer = (added: boolean): Facet => ({
+			name: "consumer",
+			setup: ({ serve }) =>
+				serve(Consumer, (_input, _principal, self) => {
+					if (!added) return { read: () => "old" };
+					const source = self.get(Source, {});
+					const value = self.state("value", Type.String(), {
+						init: async (ctx) => {
+							const value = await source.read(ctx);
+							started.open();
+							await finish.promise;
+							return value;
+						},
+					});
+					return { read: () => value.value };
+				}),
+		});
+		await host.install(consumer(false));
+		const ref = await host.get(Consumer, {});
+		const before = host.codeVersion;
+		const reloading = host.reload([source, consumer(true)]);
+		try {
+			await Promise.race([started.promise, reloading]);
+			assert.equal(host.codeVersion, before);
+			assert.equal(await ref.read(), "old");
+			const publicSource = await host.get(Source, {});
+			await assert.rejects(publicSource.read(), (error) => isChordError(error, "superseded"));
+			publicSource.release();
+			finish.open();
+			await reloading;
+			assert.equal(await ref.read(), "prepared source");
+		} finally {
+			finish.open();
+			await reloading.catch(() => {});
+			await host.close();
+		}
+	});
+
+	it("a failed reload unwinds nested initializer calls and removes its newly added dependency", async () => {
+		const host = createHost({ self: "host", onError: () => {} });
+		const Source = local("t.failed-init-source", {
+			version: 1,
+			input: Type.Object({}),
+			members: { read: method(undefined, Type.String()) },
+		});
+		const Consumer = local("t.failed-init-consumer", {
+			version: 1,
+			input: Type.Object({}),
+			members: { read: method(undefined, Type.String()) },
+		});
+		const closed: string[] = [];
+		const source: Facet = {
+			name: "source",
+			setup: ({ serve }) =>
+				serve(Source, (_input, _principal, self) => {
+					self.resource("native", {
+						version: 1,
+						open: () => "source",
+						close: (value) => {
+							closed.push(value);
+						},
+					});
+					return { read: () => "candidate" };
+				}),
+		};
+		const initial: Facet = { name: "consumer", setup: ({ serve }) => serve(Consumer, () => ({ read: () => "old" })) };
+		await host.install(initial);
+		const ref = await host.get(Consumer, {});
+		try {
+			await assert.rejects(
+				host.reload([
+					source,
+					{
+						name: "consumer",
+						setup: ({ serve }) =>
+							serve(Consumer, (_input, _principal, self) => {
+								const source = self.get(Source, {});
+								self.state("value", Type.String(), {
+									init: async (ctx) => {
+										assert.equal(await source.read(ctx), "candidate");
+										throw new Error("initializer refuses candidate");
+									},
+								});
+								return { read: () => "new" };
+							}),
+					},
+				]),
+				/initializer refuses candidate/,
+			);
+			assert.equal(await ref.read(), "old");
+			assert.deepEqual(closed, ["source"]);
+			assert.throws(() => host.hold(Source, {}), /not served/);
+		} finally {
+			await host.close();
+		}
+	});
+
+	it("settled initializers cancel and join unawaited nested calls before rollback closes dependencies", async () => {
+		const host = createHost({ self: "host", onError: () => {} });
+		const Source = local("t.init-owned-call", {
+			version: 1,
+			input: Type.Object({}),
+			members: { read: method(undefined, Type.String()) },
+		});
+		const Consumer = local("t.init-owned-consumer", {
+			version: 1,
+			input: Type.Object({}),
+			members: { read: method(undefined, Type.String()) },
+		});
+		const started = latch<void>();
+		const log: string[] = [];
+		let escaped: Ctx | undefined;
+		let nested: Promise<string> | undefined;
+		const source: Facet = {
+			name: "source",
+			setup: ({ serve }) =>
+				serve(Source, (_input, _principal, self) => {
+					const resource = self.resource("native", {
+						version: 1,
+						open: () => "open",
+						close: () => {
+							log.push("closed");
+						},
+					});
+					return {
+						read: async (ctx) => {
+							started.open();
+							await new Promise<void>((resolve) =>
+								ctx.signal.addEventListener("abort", () => resolve(), { once: true }),
+							);
+							log.push(`cancelled while ${resource.value}`);
+							return "cancelled";
+						},
+					};
+				}),
+		};
+		await host.install({ name: "consumer", setup: ({ serve }) => serve(Consumer, () => ({ read: () => "old" })) });
+		const ref = await host.get(Consumer, {});
+		try {
+			await assert.rejects(
+				host.reload([
+					source,
+					{
+						name: "consumer",
+						setup: ({ serve }) =>
+							serve(Consumer, (_input, _principal, self) => {
+								const dependency = self.get(Source, {});
+								self.state("value", Type.String(), {
+									init: async (ctx) => {
+										escaped = ctx;
+										nested = dependency.read(ctx);
+										await Promise.race([started.promise, nested]);
+										throw new Error("initializer failed after spawning call");
+									},
+								});
+								return { read: () => "new" };
+							}),
+					},
+				]),
+				/initializer failed after spawning call/,
+			);
+			assert.equal(await nested, "cancelled");
+			assert.deepEqual(log, ["cancelled while open", "closed"]);
+			assert.equal(await ref.read(), "old");
+			await assert.rejects(
+				escaped!.get(Consumer, {}),
+				(error) => isChordError(error, "aborted") && error.reason === "expired",
+			);
+		} finally {
+			await host.close();
+		}
+	});
+
 	describe("reload", () => {
 		const facet = (spec: {
 			readonly inits: string[];

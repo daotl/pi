@@ -1,24 +1,38 @@
-import { type Component, Container, Text } from "@earendil-works/pi-tui";
+import { type Component, Container, type OverlayHandle, Text } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
 type DialogContext = {
 	extensionDialogs: Component[];
+	extensionCustomDialogs: Set<() => void>;
+	isShuttingDown: boolean;
 	editorContainer: Container;
 	editor: Component & { getText(): string; setText(text: string): void };
 	focused: Component | undefined;
-	ui: { setFocus: (component: Component) => void; requestRender: () => void };
+	ui: {
+		setFocus: (component: Component) => void;
+		requestRender: () => void;
+		showOverlay: ReturnType<typeof vi.fn>;
+		hideOverlay: ReturnType<typeof vi.fn>;
+	};
 	programStatus: { setBlocked: ReturnType<typeof vi.fn> };
 	disposeActiveSelector: () => void;
 	toggleToolOutputExpansion: () => void;
 };
 
 type DialogMethods = {
+	resetExtensionUI(): void;
 	showExtensionConfirm(title: string, message: string, opts?: { signal?: AbortSignal }): Promise<boolean>;
 	showExtensionCustom<T>(
-		factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: T) => void) => Component,
-	): Promise<T>;
+		factory: (
+			tui: unknown,
+			theme: unknown,
+			keybindings: unknown,
+			done: (result: T) => void,
+		) => Component | Promise<Component>,
+		options?: { overlay?: boolean; onHandle?: (handle: OverlayHandle) => void },
+	): Promise<T | undefined>;
 };
 
 function createContext(): DialogContext & DialogMethods {
@@ -32,6 +46,8 @@ function createContext(): DialogContext & DialogMethods {
 	});
 	const context: DialogContext = {
 		extensionDialogs: [],
+		extensionCustomDialogs: new Set(),
+		isShuttingDown: false,
 		editorContainer: new Container(),
 		editor,
 		focused: undefined,
@@ -40,11 +56,27 @@ function createContext(): DialogContext & DialogMethods {
 				context.focused = component;
 			},
 			requestRender: vi.fn(),
+			showOverlay: vi.fn(() => ({ hide: vi.fn() })),
+			hideOverlay: vi.fn(),
 		},
 		programStatus: { setBlocked: vi.fn() },
 		disposeActiveSelector: vi.fn(),
 		toggleToolOutputExpansion: vi.fn(),
 	};
+	Object.assign(context, {
+		clearExtensionTerminalInputListeners: vi.fn(),
+		setExtensionFooter: vi.fn(),
+		setExtensionHeader: vi.fn(),
+		clearExtensionWidgets: vi.fn(),
+		footerDataProvider: { clearExtensionStatuses: vi.fn() },
+		footer: { invalidate: vi.fn() },
+		setCustomEditorComponent: vi.fn(),
+		setupAutocompleteProvider: vi.fn(),
+		defaultEditor: {},
+		updateTerminalTitle: vi.fn(),
+		setWorkingIndicator: vi.fn(),
+		setHiddenThinkingLabel: vi.fn(),
+	});
 	return new Proxy(context, {
 		get(target, key, receiver) {
 			if (key in target) return Reflect.get(target, key, receiver);
@@ -148,5 +180,158 @@ describe("InteractiveMode extension dialogs", () => {
 		done?.("kept");
 		await expect(custom).resolves.toBe("kept");
 		expect(context.focused).toBe(context.editor);
+	});
+
+	it("settles and disposes every custom dialog once when reset reenters done", async () => {
+		const context = createContext();
+		const disposals: string[] = [];
+		const settlements: string[] = [];
+		const open = (label: string) =>
+			context
+				.showExtensionCustom<string>((_ui, _theme, _keys, done) =>
+					Object.assign(new Text(label), {
+						dispose: () => {
+							disposals.push(label);
+							done(label);
+						},
+					}),
+				)
+				.then((result) => {
+					settlements.push(label);
+					return result;
+				});
+		const first = open("first");
+		const second = open("second");
+		await vi.waitFor(() => expect(visible(context)).toContain("second"));
+		context.resetExtensionUI();
+		expect(disposals).toEqual(["first", "second"]);
+		await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+		expect(settlements).toEqual(["first", "second"]);
+		expect(context.extensionDialogs).toEqual([]);
+		expect(context.focused).toBe(context.editor);
+	});
+
+	it("cancels non-nullable object and nullable string consumers before they use their result", async () => {
+		const context = createContext();
+		const consumeObject = vi.fn();
+		const consumeString = vi.fn();
+		const object = context
+			.showExtensionCustom<{ cancelled: boolean; answer: string }>(() => new Text("object"))
+			.then((result) => {
+				if (result === undefined || result.cancelled) return "cancelled";
+				consumeObject(result.answer);
+				return "answered";
+			});
+		const string = context
+			.showExtensionCustom<string | null>(() => new Text("string"))
+			.then((result) => {
+				if (result === undefined || result === null) return "cancelled";
+				consumeString(result);
+				return "answered";
+			});
+		await vi.waitFor(() => expect(visible(context)).toContain("string"));
+		context.resetExtensionUI();
+		await expect(Promise.all([object, string])).resolves.toEqual(["cancelled", "cancelled"]);
+		expect(consumeObject).not.toHaveBeenCalled();
+		expect(consumeString).not.toHaveBeenCalled();
+	});
+
+	it.each([false, true])(
+		"disposes a late custom factory without mounting after reset (overlay: %s)",
+		async (overlay) => {
+			const context = createContext();
+			let finishFactory: (component: Component) => void = () => {
+				throw new Error("factory not started");
+			};
+			const dispose = vi.fn();
+			const result = context.showExtensionCustom<string>(
+				() =>
+					new Promise<Component>((resolve) => {
+						finishFactory = resolve;
+					}),
+				{ overlay },
+			);
+			context.resetExtensionUI();
+			await expect(result).resolves.toBeUndefined();
+			finishFactory(Object.assign(new Text("late"), { dispose }));
+			await vi.waitFor(() => expect(dispose).toHaveBeenCalledTimes(1));
+			expect(context.extensionDialogs).toEqual([]);
+			expect(context.ui.showOverlay).not.toHaveBeenCalled();
+		},
+	);
+
+	it.each([false, true])("does not start a custom factory during shutdown (overlay: %s)", async (overlay) => {
+		const context = createContext();
+		context.isShuttingDown = true;
+		const factory = vi.fn(() => new Text("must not mount"));
+		await expect(context.showExtensionCustom<string>(factory, { overlay })).resolves.toBeUndefined();
+		expect(factory).not.toHaveBeenCalled();
+		expect(context.ui.showOverlay).not.toHaveBeenCalled();
+	});
+
+	it("settles and disposes a mounted overlay when extension UI resets", async () => {
+		const context = createContext();
+		const dispose = vi.fn();
+		const result = context.showExtensionCustom<{ answer: string }>(
+			() => Object.assign(new Text("overlay"), { dispose }),
+			{ overlay: true },
+		);
+		await vi.waitFor(() => expect(context.ui.showOverlay).toHaveBeenCalledTimes(1));
+		context.resetExtensionUI();
+		await expect(result).resolves.toBeUndefined();
+		expect(dispose).toHaveBeenCalledTimes(1);
+		expect(context.extensionCustomDialogs.size).toBe(0);
+	});
+
+	it.each([false, true])("cancels a factory that resolves after shutdown starts (overlay: %s)", async (overlay) => {
+		const context = createContext();
+		let finishFactory: (component: Component) => void = () => {
+			throw new Error("factory not started");
+		};
+		const dispose = vi.fn();
+		const result = context.showExtensionCustom<string>(
+			() =>
+				new Promise<Component>((resolve) => {
+					finishFactory = resolve;
+				}),
+			{ overlay },
+		);
+		context.isShuttingDown = true;
+		finishFactory(Object.assign(new Text("late shutdown"), { dispose }));
+		await expect(result).resolves.toBeUndefined();
+		expect(dispose).toHaveBeenCalledTimes(1);
+		expect(context.extensionDialogs).toEqual([]);
+		expect(context.ui.showOverlay).not.toHaveBeenCalled();
+	});
+
+	it("rejects and releases its mounted overlay when onHandle throws", async () => {
+		const context = createContext();
+		const hide = vi.fn();
+		context.ui.showOverlay.mockReturnValue({ hide });
+		const failure = new Error("onHandle failed");
+		let done: (result: string) => void = () => {
+			throw new Error("factory not started");
+		};
+		const dispose = vi.fn(() => done("dispose reentry"));
+		const result = context.showExtensionCustom<string>(
+			(_tui, _theme, _keys, finish) => {
+				done = finish;
+				return Object.assign(new Text("failed overlay"), { dispose });
+			},
+			{
+				overlay: true,
+				onHandle: () => {
+					throw failure;
+				},
+			},
+		);
+		await expect(result).rejects.toBe(failure);
+		expect(hide).toHaveBeenCalledTimes(1);
+		expect(dispose).toHaveBeenCalledTimes(1);
+		expect(context.extensionCustomDialogs.size).toBe(0);
+		done("late completion");
+		context.resetExtensionUI();
+		expect(hide).toHaveBeenCalledTimes(1);
+		expect(dispose).toHaveBeenCalledTimes(1);
 	});
 });

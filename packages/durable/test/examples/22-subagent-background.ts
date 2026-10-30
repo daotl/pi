@@ -148,7 +148,7 @@ const subagentTool = defineTool({
 	execute: async (args, api, callContext) => {
 		const { action, name, message, followUp } = args;
 		const reply = (text: string, conversationId?: ConversationId) => ({
-			content: [{ type: "text" as const, text }],
+			output: [{ type: "text" as const, text }],
 			// A UI can attach to the subagent's conversation through the call's details.
 			...(conversationId === undefined || name === undefined ? {} : { details: { name, conversationId } }),
 		});
@@ -243,6 +243,7 @@ if (process.env.OPENAI_API_KEY !== undefined) {
 			return call({ action: "send", name: "reader", message: "Now go through all chapters in detail." });
 		}
 		if (text.includes("Stop reader")) return call({ action: "stop", name: "reader" });
+		if (text.includes("Send to missing")) return call({ action: "send", name: "missing", message: "hello" });
 		if (text.includes("my subagents")) return call({ action: "status" });
 		if (text.includes("[subagent")) return answer("Noted.");
 		// The subagent: short answers, and a long chapter walk-through that is stopped halfway.
@@ -346,6 +347,10 @@ await say("Stop reader.");
 await settle();
 
 await say("What are my subagents doing?");
+await settle();
+
+// Invalid commands also return model-visible explanations, rather than empty successful results.
+await say("Send to missing.");
 await settle();
 
 // The process stops while the subagent works on a message; after the restart its answer still arrives.
