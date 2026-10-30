@@ -184,7 +184,13 @@ export function createTelemetryAdapterConformance(
 				const context = fixture.propagation.extract(carrier);
 				strictEqual(await context.startSpan({ name: `fallback-${index}` }, () => 42), 42);
 			}
-			for (const span of await fixture.getSpans()) strictEqual(span.parentContext, null);
+			const spans = await fixture.getSpans();
+			strictEqual(spans.length, carriers.length);
+			for (const index of carriers.keys()) {
+				const span = findSpan(spans, `fallback-${index}`);
+				strictEqual(span.parentContext, null);
+				strictEqual(span.parentId, null);
+			}
 		}),
 
 		createCase(factory, "propagation", "propagates across fresh adapters and multiple hops", async (fixture) => {

@@ -374,6 +374,7 @@ export class WebSocketLink extends BaseLink {
 		this.#socket = socket;
 		this.#compress = options.compress ?? false;
 		const acceptPacked = options.acceptPacked ?? true;
+		socket.addEventListener("error", () => this.ended("socket error"));
 		// Binary messages as ArrayBuffer (browsers and Node's WebSocket default to Blob).
 		if ("binaryType" in socket) (socket as { binaryType: string }).binaryType = "arraybuffer";
 		socket.addEventListener("open", () => {

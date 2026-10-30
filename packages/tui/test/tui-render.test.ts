@@ -968,6 +968,262 @@ describe("TUI differential rendering", () => {
 });
 
 describe("TUI overlays over native-reflow content", () => {
+	for (const protocol of ["kitty", "iterm2"] as const) {
+		it(`emits a built-in ${protocol} image overlay after text clears and restores its footprint`, async () => {
+			setCapabilities({ images: protocol, trueColor: true, hyperlinks: true });
+			const terminal = new LoggingVirtualTerminal(20, 6);
+			const tui = new TuiMainScreen(terminal);
+			tui.addChild(new Text("base row zero\nbase row one\nbase row two\nbase row three", 0, 0));
+			const image = new Image(
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a+WQAAAAASUVORK5CYII=",
+				"image/png",
+				{ fallbackColor: (text) => text },
+				{ maxWidthCells: 3, maxHeightCells: 2, imageId: 6100 },
+				{ widthPx: 30, heightPx: 60 },
+			);
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				const before = terminal.getViewport();
+				terminal.clearWrites();
+				const overlay = tui.showOverlay(image, { width: 5, row: 1, col: 4 });
+				await terminal.waitForRender();
+				const writes = terminal.getWrites();
+				const prefix = protocol === "kitty" ? "\x1b_G" : "\x1b]1337;File=";
+				const anchor = writes.indexOf(prefix);
+				assert.ok(anchor !== -1, "overlay must transmit its own image");
+				assert.ok(anchor > writes.lastIndexOf("\x1b[20X"), "text clears must precede graphics");
+				assert.ok(writes.slice(0, anchor).includes("\x1b[5G"), "image anchor retains overlay column");
+				assert.strictEqual(terminal.getViewport()[1].slice(0, 4), before[1].slice(0, 4));
+				terminal.clearWrites();
+				image.invalidate();
+				tui.requestRender();
+				await terminal.waitForRender();
+				if (protocol === "kitty") {
+					assert.ok(
+						terminal.getWrites().includes(deleteKittyImage(6100)),
+						"old overlay placement is removed on update",
+					);
+				}
+				assert.ok(terminal.getWrites().includes(prefix));
+				terminal.clearWrites();
+				overlay.hide();
+				await terminal.waitForRender();
+				assert.deepStrictEqual(terminal.getViewport(), before);
+				if (protocol === "kitty") assert.ok(terminal.getWrites().includes(deleteKittyImage(6100)));
+				assert.ok(!terminal.getWrites().includes("\x1b[3J"));
+			} finally {
+				tui.stop();
+				resetCapabilitiesCache();
+			}
+		});
+	}
+
+	for (const protocol of ["kitty", "iterm2"] as const) {
+		it(`preserves text left of a ${protocol} image across redraw focus changes and hide`, async () => {
+			setCapabilities({ images: protocol, trueColor: true, hyperlinks: true });
+			setCellDimensions({ widthPx: 10, heightPx: 20 });
+			const terminal = new LoggingVirtualTerminal(20, 4);
+			const tui = new TuiMainScreen(terminal);
+			tui.addChild(new Text("base row zero\nleft row one\nbase row two\nbase row three", 0, 0));
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (text) => text },
+				{ maxWidthCells: 3, maxHeightCells: 2, imageId: 6103 },
+				{ widthPx: 30, heightPx: 40 },
+			);
+			const prefix = protocol === "kitty" ? "\x1b_G" : "\x1b]1337;File=";
+			const assertTextAndImage = () => {
+				assert.strictEqual(terminal.getViewport()[0].slice(0, 4), "YESe");
+				assert.strictEqual(terminal.getViewport()[1].slice(0, 4), "left");
+				assert.ok(terminal.getWrites().includes(prefix), "disjoint text must not suppress graphics");
+				if (protocol === "iterm2") {
+					assert.ok(
+						terminal.getWrites().includes(`\x1b[5G\x1b7\x1b[1A${prefix}`),
+						"iTerm2 must retain its upward anchor movement without replaying text",
+					);
+				}
+				terminal.clearWrites();
+			};
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				const before = terminal.getViewport();
+				const dialog = tui.showOverlay(new Text("YES", 0, 0), { width: 3, row: 0, col: 0 });
+				await terminal.waitForRender();
+				terminal.clearWrites();
+				const imageOverlay = tui.showOverlay(image, { width: 5, row: 0, col: 4 });
+				await terminal.waitForRender();
+				assertTextAndImage();
+				image.invalidate();
+				tui.requestRender();
+				await terminal.waitForRender();
+				assertTextAndImage();
+				dialog.focus();
+				await terminal.waitForRender();
+				assertTextAndImage();
+				imageOverlay.focus();
+				await terminal.waitForRender();
+				assertTextAndImage();
+				imageOverlay.hide();
+				await terminal.waitForRender();
+				assert.strictEqual(
+					terminal.getViewport()[0].padEnd(terminal.columns),
+					`YES${before[0].slice(3)}`.padEnd(terminal.columns),
+				);
+				assert.strictEqual(terminal.getViewport()[1].padEnd(terminal.columns), before[1].padEnd(terminal.columns));
+				dialog.hide();
+				await terminal.waitForRender();
+				assert.deepStrictEqual(
+					terminal.getViewport().map((line) => line.padEnd(terminal.columns)),
+					before.map((line) => line.padEnd(terminal.columns)),
+				);
+			} finally {
+				tui.stop();
+				resetCapabilitiesCache();
+				setCellDimensions({ widthPx: 9, heightPx: 18 });
+			}
+		});
+	}
+
+	for (const limit of ["maxHeight", "viewport"] as const) {
+		it(`crops built-in Kitty overlay placements to ${limit}`, async () => {
+			setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+			setCellDimensions({ widthPx: 10, heightPx: 20 });
+			const terminal = new LoggingVirtualTerminal(20, limit === "viewport" ? 1 : 4);
+			const tui = new TuiMainScreen(terminal);
+			tui.addChild(new Text("base row", 0, 0));
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (text) => text },
+				{ maxWidthCells: 3, maxHeightCells: 2, imageId: 6101 },
+				{ widthPx: 30, heightPx: 40 },
+			);
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				terminal.clearWrites();
+				tui.showOverlay(image, { width: 5, row: 0, col: 4, ...(limit === "maxHeight" ? { maxHeight: 1 } : {}) });
+				await terminal.waitForRender();
+				const placements = [...terminal.getWrites().matchAll(/\x1b_G([^;]*);[^\x1b]*\x1b\\/g)]
+					.map((match) => Object.fromEntries(match[1].split(",").map((control) => control.split("="))))
+					.filter((controls) => controls.i === "6101" && (controls.a === "T" || controls.a === "p"));
+				assert.deepStrictEqual(
+					placements.map(({ c, r, y, h }) => ({ c, r, y, h })),
+					[{ c: "3", r: "1", y: "0", h: "20" }],
+				);
+				assert.ok(!terminal.getWrites().includes("\x1b[3J"));
+			} finally {
+				tui.stop();
+				resetCapabilitiesCache();
+				setCellDimensions({ widthPx: 9, heightPx: 18 });
+			}
+		});
+	}
+
+	for (const dialogRow of [0, 1]) {
+		it(`honors focus order when a text dialog intersects Kitty overlay row ${dialogRow}`, async () => {
+			setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+			setCellDimensions({ widthPx: 10, heightPx: 20 });
+			const terminal = new LoggingVirtualTerminal(20, 4);
+			const tui = new TuiMainScreen(terminal);
+			tui.addChild(new Text("base row zero\nbase row one\nbase row two\nbase row three", 0, 0));
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (text) => text },
+				{ maxWidthCells: 3, maxHeightCells: 2, imageId: 6102 },
+				{ widthPx: 30, heightPx: 40 },
+			);
+			const hasPlacement = () => /\x1b_Ga=(?:T|p),[^;]*\bi=6102(?:,|;)/.test(terminal.getWrites());
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				const imageOverlay = tui.showOverlay(image, { width: 5, row: 0, col: 4 });
+				await terminal.waitForRender();
+				terminal.clearWrites();
+				const dialog = tui.showOverlay(new Text("YES", 0, 0), { width: 3, row: dialogRow, col: 4 });
+				await terminal.waitForRender();
+				assert.ok(!hasPlacement(), "the lower image must not cover the newer dialog");
+				assert.strictEqual(terminal.getViewport()[dialogRow].slice(4, 7), "YES");
+				terminal.clearWrites();
+				imageOverlay.focus();
+				await terminal.waitForRender();
+				assert.ok(hasPlacement(), "focusing the image brings its footprint to the front");
+				terminal.clearWrites();
+				dialog.focus();
+				await terminal.waitForRender();
+				assert.ok(!hasPlacement());
+				assert.strictEqual(terminal.getViewport()[dialogRow].slice(4, 7), "YES");
+				terminal.clearWrites();
+				dialog.hide();
+				await terminal.waitForRender();
+				assert.ok(hasPlacement(), "closing the dialog restores the retained image component");
+				terminal.clearWrites();
+				tui.showOverlay(new Text("BY", 0, 0), { width: 2, row: dialogRow, col: 7 });
+				await terminal.waitForRender();
+				assert.ok(hasPlacement(), "a dialog beside the image's actual columns must not suppress it");
+				assert.strictEqual(terminal.getViewport()[dialogRow].slice(7, 9), "BY");
+				assert.ok(!terminal.getWrites().includes("\x1b[3J"));
+			} finally {
+				tui.stop();
+				resetCapabilitiesCache();
+				setCellDimensions({ widthPx: 9, heightPx: 18 });
+			}
+		});
+	}
+
+	it("preserves soft-wrap and hard-newline metadata through overlay open update and hide", async () => {
+		const terminal = new LoggingVirtualTerminal(10, 6);
+		const tui = new TuiMainScreen(terminal);
+		tui.addChild(new Text("abcdefghijABCDEFGHIJ\nhard line", 0, 0));
+		const flags = () => {
+			// VirtualTerminal owns this known emulator; its production Terminal surface omits buffer metadata.
+			const emulator = terminal as unknown as { xterm: XtermTerminalType };
+			const buffer = emulator.xterm.buffer.active;
+			return [0, 1, 2].map((row) => buffer.getLine(buffer.viewportY + row)?.isWrapped);
+		};
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(flags(), [false, true, false]);
+			const text = new Text("X", 0, 0);
+			const overlay = tui.showOverlay(text, { width: 1, row: 1, col: 0 });
+			await terminal.waitForRender();
+			assert.deepStrictEqual(flags(), [false, true, false]);
+			text.setText("Y");
+			tui.requestRender();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(flags(), [false, true, false]);
+			overlay.hide();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport().slice(0, 3), ["abcdefghij", "ABCDEFGHIJ", "hard line"]);
+			assert.deepStrictEqual(flags(), [false, true, false]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("restores untouched Indic constituents after a carriage-return overwrite", async () => {
+		const terminal = new VirtualTerminal(10, 4);
+		const tui = new TuiMainScreen(terminal);
+		tui.addChild(new Text("र्क\rZ", 0, 0));
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[0], "Zक");
+			const overlay = tui.showOverlay(new Text("X", 0, 0), { width: 1, row: 0, col: 0 });
+			await terminal.waitForRender();
+			overlay.hide();
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[0], "Zक");
+		} finally {
+			tui.stop();
+		}
+	});
+
 	for (const hiddenRows of [1, 2]) {
 		it(`paints over a scrolled Kitty continuation and restores its visible crop (${hiddenRows} hidden rows)`, async () => {
 			setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });

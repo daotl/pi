@@ -16,7 +16,7 @@ import type {
 } from "openai/resources/chat/completions.js";
 import type { Model, ProviderHeaders } from "./types.ts";
 import { providerHeadersToRecord } from "./utils/headers.ts";
-import { getPiUserAgent } from "./utils/pi-user-agent.ts";
+import { formatUserAgent } from "./utils/identity.ts";
 import { type RetryPolicy, retryDelayMs } from "./utils/retry.ts";
 import { sleep } from "./utils/sleep.ts";
 
@@ -119,7 +119,7 @@ export async function countTokens(model: Model<any>, options: CountTokensOptions
 	const headers = providerHeadersToRecord(
 		{
 			"Content-Type": "application/json",
-			"User-Agent": getPiUserAgent(),
+			"User-Agent": formatUserAgent(),
 			...(options.apiKey ? { Authorization: `Bearer ${options.apiKey}` } : {}),
 		},
 		model.headers,
@@ -193,7 +193,7 @@ export async function countChatTokens(model: Model<any>, options: CountChatToken
 	const headers = providerHeadersToRecord(
 		{
 			"Content-Type": "application/json",
-			"User-Agent": getPiUserAgent(),
+			"User-Agent": formatUserAgent(),
 			...(options.apiKey ? { Authorization: `Bearer ${options.apiKey}` } : {}),
 		},
 		model.headers,

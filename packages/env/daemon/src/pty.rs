@@ -5,7 +5,7 @@
 use crate::errors::Failure;
 use crate::exec::{Control, Groups};
 #[cfg(unix)]
-use crate::exec::Message;
+use crate::exec::{Message, RawOutput};
 #[cfg(unix)]
 use crate::frame::{EVENT, Frame};
 use crate::output::Output;
@@ -222,6 +222,7 @@ pub fn run(
 
     let stop = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicUsize::new(0));
+    let raw = Arc::new(RawOutput::default());
     let reader = {
         let master = master.clone();
         let sender = sender.clone();
@@ -230,7 +231,7 @@ pub fn run(
         let paused = paused.clone();
         thread::spawn(move || {
             unix::read(&master, &stop, |bytes| {
-                let delivered = sender.send(Message::Data(0, bytes.to_vec())).is_ok();
+                let delivered = raw.send(0, bytes, &sender, &stop, &paused);
                 // Like a full pipe: a program that writes faster than the link waits.
                 output.wait_for_room(&stop, &paused);
                 delivered
@@ -292,7 +293,7 @@ pub fn run(
         };
         let wait = if status.is_some() { wait.min(Duration::from_millis(20)) } else { wait };
         match receiver.recv_timeout(wait) {
-            Ok(Message::Data(_, bytes)) => {
+            Ok(Message::Data(_, bytes, _permit)) => {
                 output.bulk(
                     Frame::with_payload(EVENT, id, json!({ "kind": "output" }), bytes),
                     None,

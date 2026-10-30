@@ -2,7 +2,9 @@ import type { ResponseStreamEvent } from "openai/resources/responses/responses.j
 import { describe, expect, it, vi } from "vitest";
 import { processResponsesStream } from "../src/api/openai-responses-shared.ts";
 import type { AssistantMessage, AssistantMessageEvent, Model } from "../src/types.ts";
+import { AssistantMessageFrameEncoder, AssistantMessageFrameReducer } from "../src/utils/assistant-message-frame.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
+import { ToolCallArgumentsStream } from "../src/utils/streaming-json.ts";
 
 function createOutput(model: Model<"openai-responses">): AssistantMessage {
 	return {
@@ -102,6 +104,90 @@ describe("openai responses partialJson cleanup", () => {
 		}
 		expect(toolCallEnd.toolCall).toBe(persistedToolCall);
 		expect("partialJson" in toolCallEnd.toolCall).toBe(false);
+	});
+
+	it("publishes previews refreshed by unchanged argument replacements before interruption", async () => {
+		const model: Model<"openai-responses"> = {
+			id: "gpt-test",
+			name: "GPT test",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://example.test/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 64_000,
+		};
+		const output = createOutput(model);
+		const stream = new AssistantMessageEventStream();
+		const mirror = new ToolCallArgumentsStream();
+		const frameEncoder = new AssistantMessageFrameEncoder();
+		const frameReducer = new AssistantMessageFrameReducer();
+		const start = frameEncoder.encode({ type: "start", partial: output });
+		if (start) frameReducer.apply(start);
+		let replayed: Record<string, unknown> = {};
+		let sawLag = false;
+		// Observe each published partial synchronously: later upstream events mutate the same output object.
+		const push = stream.push.bind(stream);
+		stream.push = (event) => {
+			const encoded = frameEncoder.encode(event);
+			if (encoded) frameReducer.apply(encoded);
+			if (event.type === "toolcall_delta") {
+				replayed = mirror.append(event.delta);
+				const call = event.partial.content[event.contentIndex];
+				if (call?.type !== "toolCall") throw new Error("Missing streamed tool call");
+				expect(replayed).toEqual(call.arguments);
+				const replayedCall = frameReducer.message?.content[event.contentIndex];
+				if (replayedCall?.type !== "toolCall") throw new Error("Missing replayed tool call");
+				expect(replayedCall.arguments).toEqual(call.arguments);
+			}
+			push(event);
+		};
+		const fields = Object.fromEntries(Array.from({ length: 1024 }, (_, index) => [`field${index}`, ""]));
+		let text = `${JSON.stringify(fields).slice(0, -1)},"command":"`;
+		async function* events(): AsyncIterable<ResponseStreamEvent> {
+			yield {
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_test", call_id: "call_test", name: "write", arguments: "" },
+			} as ResponseStreamEvent;
+			yield {
+				type: "response.function_call_arguments.delta",
+				output_index: 0,
+				delta: text,
+			} as ResponseStreamEvent;
+			for (let length = 1; length <= 400; length++) {
+				text += "x";
+				yield {
+					type: "response.function_call_arguments.delta",
+					output_index: 0,
+					delta: "x",
+				} as ResponseStreamEvent;
+				const call = output.content[0];
+				if (call?.type !== "toolCall") throw new Error("Missing streamed tool call");
+				if ((call.arguments.command as string).length < length) {
+					sawLag = true;
+					break;
+				}
+			}
+			// A provider may repeat its complete text without supplying a missing suffix. An empty append still
+			// pays copy credit and can publish a fresher preview, even when the argument text is malformed.
+			for (let count = 0; count < 16; count++) {
+				yield {
+					type: "response.function_call_arguments.done",
+					output_index: 0,
+					arguments: text,
+				} as ResponseStreamEvent;
+			}
+			throw new Error("Connection interrupted");
+		}
+		await expect(processResponsesStream(events(), output, stream, model)).rejects.toThrow("Connection interrupted");
+		expect(sawLag).toBe(true);
+		const call = output.content[0];
+		if (call?.type !== "toolCall") throw new Error("Missing interrupted tool call");
+		expect(call.arguments).toEqual({ ...fields, command: text.slice(text.lastIndexOf('"') + 1) });
+		expect(replayed).toEqual(call.arguments);
 	});
 
 	// #10897

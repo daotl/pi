@@ -205,7 +205,10 @@ export class Cell<T> extends Source<T> {
 		try {
 			const draft = change.state as Draft<Box<T>>;
 			const result: unknown = fn(draft.v as Draft<T>);
-			if (result instanceof Promise) throw new TypeError("cell.change callbacks must be synchronous");
+			if (result instanceof Promise) {
+				void Promise.resolve(result).catch(() => undefined);
+				throw new TypeError("cell.change callbacks must be synchronous");
+			}
 			if (result !== undefined) {
 				if (result !== draft.v) assertValid("state", `state ${this.key}`, this.schema, result);
 				draft.v = result as Draft<T>;
@@ -367,7 +370,10 @@ export class Derived<T> extends Source<T> {
 
 	compute(read: (source: Readable<unknown>) => unknown): T {
 		const result: unknown = this.#fn(...(this.sources.map(read) as never[]));
-		if (result instanceof Promise) throw new TypeError(`derive ${this.key}: fn must be synchronous`);
+		if (result instanceof Promise) {
+			void Promise.resolve(result).catch(() => undefined);
+			throw new TypeError(`derive ${this.key}: fn must be synchronous`);
+		}
 		return result as T;
 	}
 

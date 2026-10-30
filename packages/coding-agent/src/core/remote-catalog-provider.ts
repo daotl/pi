@@ -218,9 +218,9 @@ export function withPersonalizedCatalog(
 	catalogBaseUrl: string = DEFAULT_CATALOG_BASE_URL,
 	localGeneratedAt?: number,
 ): Provider {
-	let personalModels: readonly AnyModel[] = [];
+	let personalModels: readonly AnyModel[] | undefined;
 	const builtinModels = (): readonly AnyModel[] => provider.getAllModels?.() ?? provider.getModels();
-	const getAllModels = (): readonly AnyModel[] => (personalModels.length > 0 ? personalModels : builtinModels());
+	const getAllModels = (): readonly AnyModel[] => personalModels ?? builtinModels();
 
 	return {
 		...provider,
@@ -231,7 +231,7 @@ export function withPersonalizedCatalog(
 			const matching = identity !== undefined && context.stored?.personalizationKey === identity;
 			const restored = matching
 				? (context.stored?.models ?? []).filter((model) => model.provider === provider.id)
-				: [];
+				: undefined;
 			if (
 				!(await context.publish({
 					update: () => {

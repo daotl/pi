@@ -309,6 +309,7 @@ describe("a failed Storage call", () => {
 				() => root.entries({}, limit, undefined, context),
 			]),
 			() => root.entries({}, 10, { after: "x" }, context),
+			...[null, 1, "cursor", true].map((cursor) => () => root.entries({}, 10, cursor as never, context)),
 			async () => {
 				const page = await root.entries({ order: "ascending" }, 1, undefined, context);
 				return root.entries({ order: "descending" }, 1, page.next ?? { after: 1, order: "ascending" }, context);
@@ -318,9 +319,12 @@ describe("a failed Storage call", () => {
 			() => harness.snapshotAsOf(LiveDoc as never, root.id, entry.id, context),
 		];
 		for (const request of requests) {
-			await expect(request()).rejects.toMatchObject({ name: "StorageRequestError" });
+			await expect(request()).rejects.toBeInstanceOf(StorageRequestError);
 		}
-		await expect(root.commit((tx) => tx.appendEntry(root.id, { kind: "note" }), context)).resolves.toBeDefined();
+		const later = await root.commit((tx) => tx.appendEntry(root.id, { kind: "note.after-invalid" }), context);
+		expect((await root.entries({ order: "ascending" }, 10, undefined, context)).items.map((item) => item.id)).toEqual(
+			[entry.id, later.id],
+		);
 		let ended = false;
 		void harness.closed.then(() => {
 			ended = true;

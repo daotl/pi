@@ -298,6 +298,33 @@ describe("parseCodemodeSource", () => {
 		expect(() => parseCodemodeSource(input)).toThrow("found one on line 2");
 	});
 
+	it("recognizes declaration bodies after automatic semicolon insertion", () => {
+		for (const initializer of ["1", "{}", "function() {}", "class {}", "(() => {})"]) {
+			for (const declaration of [
+				"function f() {}",
+				"async function f() {}",
+				"class A {}",
+				"class A extends Object {}",
+			]) {
+				for (const pattern of ["/`/", "/'/", '/"/']) {
+					const prefix = `const n = ${initializer}\n${declaration}\n${pattern}.test("x");`;
+					expect(() => parseCodemodeSource(`${prefix}\n// @options: {"timeout_ms": 1}\nwhile (true) {}`)).toThrow(
+						"found one on line 4",
+					);
+					const literal = `${prefix}\nconst source = \`example\n// @options: {}\n\`;`;
+					expect(parseCodemodeSource(literal)).toEqual({ code: literal, options: {} });
+				}
+			}
+		}
+		for (const input of [
+			"const n =\nfunction() {} / `example\n// @options: {}\n`;",
+			"const n =\nclass {} / `example\n// @options: {}\n`;",
+			"call(\nfunction() {} / `example\n// @options: {}\n`);",
+			"const n = { value:\nclass {} / `example\n// @options: {}\n` };",
+		])
+			expect(parseCodemodeSource(input)).toEqual({ code: input, options: {} });
+	});
+
 	// #10631: an options line after the first line used to be ignored, so its timeout never applied.
 	it("rejects an options line that is not the first line", () => {
 		const cases: [string, number][] = [

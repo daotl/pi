@@ -1,3 +1,5 @@
+import { fork } from "node:child_process";
+import { once } from "node:events";
 import {
 	chmodSync,
 	existsSync,
@@ -714,23 +716,60 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		expect(process.exitCode).toBeUndefined();
 	});
 
-	it("removes older managed releases after an update", async () => {
-		// https://github.com/earendil-works/pi/issues/10392
+	it("retains old releases for lazy first use by an open session across updates", async () => {
+		// Replaces #10392's age-only pruning contract: age does not prove a release unused.
 		const targetVersion = getNewerPatchVersion();
 		const { managedRoot } = prepareManagedInstall(targetVersion);
 		const releasesRoot = join(managedRoot, "releases");
-		mkdirSync(join(releasesRoot, "0.0.1", "node_modules"), { recursive: true });
-		mkdirSync(join(releasesRoot, "0.0.2-beta.1"), { recursive: true });
-		mkdirSync(join(releasesRoot, "not-a-release"), { recursive: true });
-		mockManagedUpdate(targetVersion);
-		vi.spyOn(console, "log").mockImplementation(() => {});
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		await expect(runPackageCommandDirectly(["update", "--self"])).resolves.toBeUndefined();
-
-		expect(readdirSync(releasesRoot).sort()).toEqual([VERSION, "not-a-release", targetVersion].sort());
-		expect(errorSpy).not.toHaveBeenCalled();
-		expect(process.exitCode).toBeUndefined();
+		const oldRelease = join(releasesRoot, "0.0.1");
+		mkdirSync(oldRelease, { recursive: true });
+		writeFileSync(join(oldRelease, "lazy.cjs"), 'module.exports = "loaded from old release";');
+		const entry = join(oldRelease, "session.cjs");
+		writeFileSync(
+			entry,
+			'process.on("message", () => { try { process.send({ loaded: require("./lazy.cjs") }); } catch (error) { process.send({ error: String(error) }); } }); process.send("ready");',
+		);
+		const session = fork(entry, [], {
+			execPath: originalExecPath,
+			execArgv: [],
+			stdio: ["ignore", "ignore", "ignore", "ipc"],
+		});
+		try {
+			expect((await once(session, "message"))[0]).toBe("ready");
+			mockManagedUpdate(targetVersion);
+			vi.spyOn(console, "log").mockImplementation(() => {});
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			await runPackageCommandDirectly(["update", "--self"]);
+			expect(readFileSync(join(managedRoot, "current-version"), "utf8")).toBe(`${targetVersion}\n`);
+			const parts = targetVersion.split(".");
+			const nextVersion = `${parts[0]}.${parts[1]}.${Number(parts[2]) + 1}`;
+			const nextBin = join(releasesRoot, nextVersion, "node_modules", ".bin");
+			mkdirSync(nextBin, { recursive: true });
+			const executable = join(nextBin, process.platform === "win32" ? "pi.cmd" : "pi");
+			writeFileSync(
+				executable,
+				process.platform === "win32"
+					? `@echo off\r\necho ${nextVersion}\r\n`
+					: `#!/bin/sh\nprintf '%s\\n' ${nextVersion}\n`,
+			);
+			chmodSync(executable, 0o755);
+			mkdirSync(join(releasesRoot, targetVersion, "node_modules", ...PACKAGE_NAME.split("/")), { recursive: true });
+			process.env.PI_PACKAGE_DIR = join(releasesRoot, targetVersion, "node_modules", ...PACKAGE_NAME.split("/"));
+			mockManagedUpdate(nextVersion);
+			await runPackageCommandDirectly(["update", "--self"]);
+			expect(readFileSync(join(managedRoot, "current-version"), "utf8")).toBe(`${nextVersion}\n`);
+			const loaded = once(session, "message");
+			session.send("load lazy feature");
+			expect((await loaded)[0]).toEqual({ loaded: "loaded from old release" });
+			expect(errorSpy).not.toHaveBeenCalled();
+			expect(process.exitCode).toBeUndefined();
+		} finally {
+			if (session.exitCode === null && session.signalCode === null) {
+				const exited = once(session, "exit");
+				session.kill();
+				await exited;
+			}
+		}
 	});
 
 	it("rejects a concurrent managed update", async () => {

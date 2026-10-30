@@ -668,6 +668,7 @@ describe("InteractiveMode tool-row ownership", () => {
 		]);
 		const context = {
 			settingsManager: { getShowTerminalProgress: () => false },
+			cancelScheduledPreflights: () => {},
 			disposeActiveSelector: () => {},
 			clearScheduledMessages: () => {},
 			clearHeartbeats: () => {},

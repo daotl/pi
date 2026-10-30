@@ -121,6 +121,7 @@ function misplacedOptionsLine(input: string): number | undefined {
 	let nextBrace: "block" | "function" | "class-member" | undefined;
 	const classBodies: { braces: number; parentheses: number; declaration: boolean }[] = [];
 	const objectBodies: { braces: number; parentheses: number; brackets: number; property: boolean }[] = [];
+	const statementScopes = [{ braces: 0, parentheses: 0, brackets: 0 }];
 	let control = false;
 	let member = false;
 	let label = false;
@@ -196,6 +197,24 @@ function misplacedOptionsLine(input: string): number | undefined {
 			objectBody.brackets === brackets
 				? objectBody
 				: undefined;
+		// ASI also separates a completed statement expression from a following
+		// declaration. Restrict this to statement-list depth: a newline in a call,
+		// object value, class header or field must not turn an expression into a declaration.
+		const statementScope = statementScopes.at(-1)!;
+		if (
+			lineBreak &&
+			!expressionStart &&
+			!member &&
+			!functionParameters &&
+			classBodies.at(-1)?.braces !== braces.length &&
+			statementScope.braces === braces.length &&
+			statementScope.parentheses === parentheses.length &&
+			statementScope.brackets === brackets &&
+			word !== undefined &&
+			!/^(?:in|instanceof)$/.test(word)
+		) {
+			statementStart = true;
+		}
 		// A newline ends an initialized field only when its expression has ended and the
 		// next token cannot continue it. Calls, indexing, tagged templates and division
 		// still continue across newlines; class/function headers are not complete values.
@@ -322,7 +341,9 @@ function misplacedOptionsLine(input: string): number | undefined {
 			}
 			expressionStart = true;
 			statementStart = context === "block" || context === "function" || context === "class-member";
+			if (statementStart) statementScopes.push({ braces: braces.length, parentheses: parentheses.length, brackets });
 		} else if (char === "}") {
+			if (statementScopes.at(-1)?.braces === braces.length) statementScopes.pop();
 			if (objectBodies.at(-1)?.braces === braces.length) objectBodies.pop();
 			const brace = braces.pop();
 			const context = typeof brace === "object" ? brace.kind : brace;

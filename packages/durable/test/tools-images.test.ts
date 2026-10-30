@@ -229,6 +229,14 @@ describe("read of images, without an image processor", () => {
 		expect(onlyImage(tiny)).toEqual({ type: "image", data: toBase64(gif()), mimeType: "image/gif" });
 	});
 
+	it("returns a short lossless WebP unchanged without an image processor", async () => {
+		// Valid 1x1 transparent VP8L: single-symbol prefix trees need no pixel bits.
+		const webp = Uint8Array.from(Buffer.from("5249464614000000574542505650384c080000002f00000010888808", "hex"));
+		const result = await read("tiny.webp", webp);
+		expect(result.output).toEqual([{ type: "image", data: toBase64(webp), mimeType: "image/webp" }]);
+		expect(messages(result)).toEqual(["Read image file [image/webp]."]);
+	});
+
 	it("refuses an image too large to send without reading it", async () => {
 		const { env, reads } = readEnv();
 		const result = await read("big.png", noisyPng(1100, 1100), { env });

@@ -1,4 +1,3 @@
-import { Value } from "typebox/value";
 import { HYDRATION, type Hydration } from "./cell.ts";
 import type { AnyContract } from "./contract.ts";
 import { applyImmutable, type Decoder, decoder } from "./delta/index.ts";
@@ -14,6 +13,7 @@ import {
 	refsByProxy,
 	type StatusListener,
 } from "./object.ts";
+import { projectJson } from "./schema.ts";
 import type { Ctx, Readable, RefStatus, Shape, StateEvent } from "./types.ts";
 import { type CallVariant, fromWireError, type RootRef, type WireError } from "./wire.ts";
 
@@ -182,9 +182,13 @@ export class RemoteBinding {
 		if (!wanted) {
 			this.hydrated = false;
 			this.members.clear();
-			if (this.#pending !== undefined) this.#pending.missing.clear();
+			if (this.#pending !== undefined) {
+				this.#pending.missing.clear();
+				this.#pending.values.clear();
+			}
 		}
 		if (this.hold !== undefined) this.hold.channel.wantState(this.hold.id, wanted);
+		if (!wanted && this.#pending !== undefined) this.#apply();
 		for (const view of this.views) view.update();
 	}
 
@@ -413,8 +417,8 @@ export class RemoteBinding {
 				context?.check(this.host);
 				args = noArgs ? undefined : given[0];
 			}
-			// Clean before the transport serializes: even an unknown bigint field must never cross the link.
-			const sent = method.args === undefined ? undefined : Value.Clean(method.args, Value.Clone(args));
+			// Project before enforcing strict JSON: unknown non-JSON fields must be removed before serialization.
+			const sent = method.args === undefined ? undefined : projectJson(method.args, args);
 			const linked = linkedSignal([ctx.signal, this.#callAbort.signal]);
 			try {
 				return await hold.channel.call(

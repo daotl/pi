@@ -1376,12 +1376,17 @@ async function relayCall(
 	aborted.catch(() => {});
 	try {
 		const down = await Promise.race([relay.ready(), aborted]);
+		if (signal.aborted) throw abortError();
 		if (relay.closed) throw new ChordError("gone", "relayed hold closed");
 		return await new Promise<unknown>((resolve, reject) => {
 			const call = new RelayCall(relay, frame.id, down.nextId(), { resolve, reject });
 			onCancel = () => call.cancel(abortError(), true);
 			signal.addEventListener("abort", onCancel, { once: true });
 			host.rootSent(root.rootId, down);
+			if (signal.aborted) {
+				call.cancel(abortError(), false);
+				return;
+			}
 			down.send({ t: "call", id: call.downId, hold: relay.downId, member: frame.member, args: frame.args, root });
 		});
 	} finally {

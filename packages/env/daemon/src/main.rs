@@ -241,7 +241,7 @@ impl Server {
             "write" => {
                 let path = field(json, "path")?;
                 let parents = json["parents"].as_bool().unwrap_or(true);
-                let file = fs::write(path, flag(json, "append"), parents, &payload)?;
+                let file = fs::write(path, flag(json, "append"), parents, &payload, control)?;
                 if !flag(json, "keep") {
                     return plain(Ok(json!({})));
                 }
@@ -252,9 +252,8 @@ impl Server {
                 if handle.failed.load(Ordering::SeqCst) {
                     return Err(Failure::new("EBADF", "an earlier write failed"));
                 }
-                (&handle.file).write_all(&payload).map_err(|error| {
+                fs::write_chunk(&handle.file, &handle.path, &payload, Some(control)).inspect_err(|_| {
                     handle.failed.store(true, Ordering::SeqCst);
-                    Failure::io(&error, "write", &handle.path)
                 })?;
                 plain(Ok(json!({})))
             }
@@ -706,6 +705,51 @@ mod tests {
     use super::*;
 
 
+    #[test]
+    fn queued_cancelled_chunks_leave_the_file_at_the_last_completed_write() {
+        let root = sys::mkdtemp(&format!("{}{}pi-env-write-cancel-", sys::tmpdir(), sys::PATH_SEPARATOR)).unwrap();
+        let path = std::path::Path::new(&root).join("file").to_string_lossy().into_owned();
+        let server = Arc::new(Server {
+            output: Arc::default(), tmpdir: root.clone(), handles: Mutex::default(),
+            next_handle: AtomicU64::new(1), controls: Mutex::default(), groups: Arc::default(), terminals: Arc::default(),
+            #[cfg(unix)]
+            special: Mutex::new(None),
+        });
+        let (opened, _) = server.dispatch(1, &json!({ "op": "write", "path": path, "keep": true }), b"first".to_vec(), &Control::default()).unwrap();
+        let handle_json = json!({ "op": "writeChunk", "handle": opened["handle"] });
+        let handle = server.file(&handle_json).unwrap();
+        let (jobs, queue) = mpsc::channel::<Job>();
+        let worker = thread::spawn(move || { queue.recv().unwrap()(); });
+        let (entered, ready) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        run_in_order(&jobs, handle.clone(), Box::new(move || {
+            entered.send(()).unwrap();
+            held.recv().unwrap();
+        }));
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        let control = Arc::new(Control::default());
+        let (completed, result) = mpsc::channel();
+        let queued_server = server.clone();
+        let queued_control = control.clone();
+        run_in_order(&jobs, handle.clone(), Box::new(move || {
+            completed.send(queued_server.dispatch(2, &handle_json, b"cancelled".to_vec(), &queued_control)).unwrap();
+        }));
+        control.cancel(false);
+        release.send(()).unwrap();
+        assert_eq!(result.recv_timeout(Duration::from_secs(3)).unwrap().unwrap_err().code, "aborted");
+        worker.join().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        // Already cancelled initial requests must not truncate an existing file or create missing parents.
+        let cancelled = json!({ "op": "write", "path": path });
+        assert_eq!(server.dispatch(3, &cancelled, b"replacement".to_vec(), &control).unwrap_err().code, "aborted");
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        let missing = std::path::Path::new(&root).join("missing/file");
+        assert_eq!(server.dispatch(4, &json!({ "op": "write", "path": missing }), vec![], &control).unwrap_err().code, "aborted");
+        assert!(!missing.parent().unwrap().exists());
+        drop(handle);
+        drop(server);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[cfg(unix)]
     #[test]
     fn shutdown_refuses_exec_and_terminal_requests_that_have_not_spawned() {

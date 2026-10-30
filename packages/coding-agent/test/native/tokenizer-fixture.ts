@@ -88,7 +88,10 @@ export async function createNativeTokenizerFixture(options: HarnessOptions = {})
 			const url = String(input);
 			const body = String(init?.body);
 			const authorization = new Headers(init?.headers).get("authorization");
-			if (url.endsWith("/tokenize") || url.endsWith("/chat/completions/input_tokens")) {
+			if (
+				url === "https://tokenizer.invalid/tokenize" ||
+				url === "https://tokenizer.invalid/v1/chat/completions/input_tokens"
+			) {
 				uploads.push({ url, body, authorization });
 				if (url.endsWith("/chat/completions/input_tokens")) {
 					const request = JSON.parse(body) as { messages: Array<Record<string, unknown>> };

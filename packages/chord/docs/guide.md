@@ -133,6 +133,8 @@ export const Index = local("pi.index", {
 
 `{ session: "S1", conversation: 1 }` always means the same object. Inputs are normalized (defaults applied, unknown fields removed), validated, and serialized canonically. Fields equal to their default are left out, so adding a new optional field with a default doesn't change existing addresses. Changing a default, or how inputs are normalized, needs a new type name.
 
+Normalization and remote argument projection work on private copies. Reserved JSON property names remain data, sibling aliases are projected independently, and getters are read into data properties without invoking caller setters. Unknown fields are cleaned before retained values are checked for strict JSON.
+
 ### Versions and compatibility
 
 Every bundle carries its own copy of each contract it was built against. When a consumer binds to a provider, the two copies are compared:
@@ -642,6 +644,8 @@ await host.reload([new URL("../plugins/chat/worker.ts", import.meta.url)]);  // 
 4. **Commit:** in one synchronous step, install the new code, swap registry tables, restart tasks, rebind listeners, and send `reset` and shape updates to subscribers.
 5. **Retire:** old code keeps running the roots it started. Once they end, it's dropped, along with whatever it alone declared. If they are still running when the next reload starts, that reload waits up to `retireDeadline`, then aborts them (their `ctx.signal`) before it closes what only the old code used.
 
+Candidate derivations use prospective provider state only for objects still live at preflight. Disposed candidates are unwound without aborting unrelated live upgrades. Closing a host cancels and joins its reload, including resource cleanup, and releases retirement timers and subscriptions immediately.
+
 ### Compatible changes: no waiting
 
 Bug fixes, new methods, new cells, new resources and registration changes all switch immediately. A root that started on the old code finishes on it, and new roots get the new code.
@@ -745,6 +749,7 @@ const sessions = self.get(Sessions, {});  // `hostNamed("server")`: worker → s
 
 - **The server relays** between its children: worker to worker, and browser to worker.
 - **Disconnects:** when a browser disconnects, exactly the references it had in workers are released.
+- **WebSocket transport errors:** malformed protocol frames and failed handshakes close only the affected link, including while authentication is pending. The adapter owns the socket's error listener for its full lifetime.
 - **Principals across links:**
   - a forwarded principal is accepted only from the parent link;
   - calls an object makes itself act as its host;
@@ -821,3 +826,8 @@ A reload changing the guard: Durable phases already running keep the old snapsho
 | Check arguments in methods | Treating the variant as all of authorization |
 | Pass `ctx` everywhere | Starting background work with the caller's `ctx` (use a task) |
 | Treat state values as immutable | Mutating what you read |
+
+### Bounded streamed output
+
+`OutputBuffer.push()` accepts strings or UTF-8 byte chunks. A trailing high surrogate in a string waits for the next chunk or `end()`, like an incomplete UTF-8 byte sequence. Completed unpaired surrogates become U+FFFD. Snapshots include only resolved characters; byte and dropped-line counts describe that decoded stream. An omission boundary flushes an incomplete character before applying its skipped counts.
+

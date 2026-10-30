@@ -108,6 +108,8 @@ export class Triage {
 	private queue: number[] = [];
 	private active = 0;
 	private runningAttempts = new Set<string>();
+	private runningTasks = new Map<number, Set<Promise<void>>>();
+	private retriages = new Map<number, Promise<void>>();
 	/** Conversation ID to issue number, for the tools. */
 	private conversations = new Map<number, number>();
 
@@ -173,17 +175,35 @@ export class Triage {
 		}
 	}
 
-	async retriage(number: number): Promise<void> {
-		await this.update(number, (issue) => {
-			this.conversations.delete(issue.conversationId);
-			issue.status = "queued";
-			issue.attempt += 1;
-			issue.conversationId = 0;
-			issue.error = "";
-			issue.result = null;
-			issue.triagedAt = "";
+	retriage(number: number): Promise<void> {
+		const previous = this.retriages.get(number) ?? Promise.resolve();
+		const operation = previous.catch(() => {}).then(async () => {
+			let conversationId = 0;
+			await this.update(number, (issue) => {
+				conversationId = issue.conversationId;
+				issue.status = "queued";
+				issue.attempt += 1;
+				issue.conversationId = 0;
+				issue.error = "";
+				issue.result = null;
+				issue.triagedAt = "";
+			});
+			// Keep tool routing until the superseded run has stopped. Its ownership
+			// check now rejects publication, but submit_triage can still terminate it.
+			if (conversationId) {
+				const conversation = await this.harness.conversation(conversationId as ConversationId, context);
+				await conversation?.abort(context);
+			}
+			await Promise.all(this.runningTasks.get(number) ?? []);
+			this.conversations.delete(conversationId);
+			this.enqueue(number);
+		}).finally(() => {
+			if (this.retriages.get(number) !== operation) return;
+			this.retriages.delete(number);
+			this.pump();
 		});
-		this.enqueue(number);
+		this.retriages.set(number, operation);
+		return operation;
 	}
 
 	/** `undefined` keeps a field, `null` clears it. A category equal to the agent's counts as no override. */
@@ -208,14 +228,21 @@ export class Triage {
 
 	private pump(): void {
 		while (this.active < this.options.concurrency && this.queue.length > 0) {
-			const number = this.queue.shift()!;
+			const index = this.queue.findIndex((number) => !this.retriages.has(number));
+			if (index < 0) break;
+			const number = this.queue.splice(index, 1)[0]!;
 			this.active++;
-			this.run(number)
+			const tasks = this.runningTasks.get(number) ?? new Set<Promise<void>>();
+			this.runningTasks.set(number, tasks);
+			const task = this.run(number)
 				.catch((error: unknown) => console.error(`#${number}:`, error))
 				.finally(() => {
+					tasks.delete(task);
+					if (tasks.size === 0) this.runningTasks.delete(number);
 					this.active--;
 					this.pump();
 				});
+			tasks.add(task);
 		}
 	}
 
@@ -226,6 +253,7 @@ export class Triage {
 	private async run(number: number): Promise<void> {
 		const existing = (await this.state()).issues[number];
 		const attempt = existing?.attempt ?? 0;
+		if (this.retriages.has(number)) return;
 		const key = `${number}:${attempt}`;
 		if (this.runningAttempts.has(key)) return;
 		this.runningAttempts.add(key);
@@ -250,7 +278,7 @@ export class Triage {
 				state.status = "running";
 				claimed = true;
 			});
-			if (!claimed) return;
+			if (!claimed || this.retriages.has(number)) return;
 			conversationId = conversation.id;
 			this.conversations.set(conversationId, number);
 			const submission = await conversation.submit(

@@ -1,5 +1,4 @@
 import type { Static, TSchema } from "typebox";
-import { Value } from "typebox/value";
 import {
 	Cell,
 	Derived,
@@ -30,7 +29,7 @@ import { asChordError, ChordError, invalid, runAll } from "./errors.ts";
 import { enqueue } from "./publish.ts";
 import type { Registration, Registry } from "./registry.ts";
 import type { RemoteHost } from "./remote.ts";
-import { assertValid, normalize } from "./schema.ts";
+import { assertValid, normalize, projectJson } from "./schema.ts";
 import type { Ctx, Exposed, GetOptions, Readable, RefStatus, Shape, StateEvent } from "./types.ts";
 
 const noop = (): void => {};
@@ -665,6 +664,20 @@ class MemberReadable implements Readable<unknown> {
 		return source.value;
 	}
 
+	/** Reload preflight reads the provider's private candidate without publishing or rebinding the reference. */
+	candidateSource(installed: (object: ObjectImpl) => Installed | undefined): Readable<unknown> {
+		const ref = this.#ref;
+		if (ref.status === "released" || ref.status === "gone") throw ref.terminalError();
+		const provider = installed(ref.object) ?? ref.object.currentInstalled();
+		if (provider === undefined) throw notReady(`${ref.address}.${this.#name}`);
+		const view = ref.viewOf(provider);
+		const source = ref.inVariant(view, this.#name) ? view[this.#name] : undefined;
+		if (!isSource(source) && !isReadableLike(source)) {
+			throw new ChordError("not_in_variant", `${ref.address}: ${this.#name} is not candidate state`);
+		}
+		return source as Readable<unknown>;
+	}
+
 	/** Not hydrated while the reference is not live, or while its source (a forwarded remote member) is not. */
 	get [HYDRATION](): Hydration | undefined {
 		const ref = this.#ref;
@@ -775,6 +788,14 @@ class MemberReadable implements Readable<unknown> {
 	}
 }
 
+/** Resolves a local reference member through a reload's candidate provider; other readables are unchanged. */
+export function candidateSource(
+	source: Readable<unknown>,
+	installed: (object: ObjectImpl) => Installed | undefined,
+): Readable<unknown> {
+	return source instanceof MemberReadable ? source.candidateSource(installed) : source;
+}
+
 /** One reference on an object. Exposed through a Proxy so members bind late to the current implementation. */
 export class RefImpl {
 	readonly object: ObjectImpl;
@@ -854,9 +875,12 @@ export class RefImpl {
 	release(): void {
 		if (this.status === "released" || this.status === "gone") return;
 		this.status = "released";
-		this.#stopReadables();
-		this.#statusChanged();
-		this.object.release(this);
+		try {
+			this.#stopReadables();
+		} finally {
+			this.object.release(this);
+			this.#statusChanged();
+		}
 	}
 
 	// ─── internal ───
@@ -1246,8 +1270,10 @@ export class ObjectImpl {
 		this.host.inFactory--;
 		const run = self.run(implementation);
 		try {
-			if (implementation instanceof Promise)
+			if (implementation instanceof Promise) {
+				void Promise.resolve(implementation).catch(() => undefined);
 				throw invalid("implementation", `${this.typeName}: factories must be synchronous`);
+			}
 			validateImplementation(service, run.implementation);
 		} catch (error) {
 			discard(run);
@@ -1746,8 +1772,8 @@ export class ObjectImpl {
 			// The additive rule assumes a consumer sends only what its own schema knows, and a provider sees only what its
 			// schema knows: strip with both before validating.
 			const own = ref.contract.scope === "remote" && wanted?.kind === "method" ? wanted.args : undefined;
-			const sent = own === undefined ? args : Value.Clean(own, Value.Clone(args));
-			input = validated?.args ? Value.Clean(validated.args, Value.Clone(sent)) : sent;
+			const sent = own === undefined ? args : projectJson(own, args);
+			input = validated?.args ? projectJson(validated.args, sent) : sent;
 			if (validated?.args) assertValid("args", `${this.address}.${name} args`, validated.args, input);
 		}
 		this.lease(ctx);
@@ -1878,13 +1904,23 @@ export class ObjectImpl {
 		if (this.#linger !== undefined) clearTimeout(this.#linger);
 		this.#linger = undefined;
 		const error = reason ?? new ChordError("gone", `${this.address} was disposed`);
+		const errors = [...this.#revocationErrors];
+		const endRefs = (): void => {
+			for (const ref of [...this.refs]) {
+				try {
+					ref.gone(error);
+				} catch (failure) {
+					errors.push(failure);
+				}
+			}
+		};
 		if (forced) {
-			for (const ref of this.refs) ref.gone(error);
+			endRefs();
 			this.callAbort.abort(error);
 		}
 		this.activationAbort.abort(error);
 		if (wasActivating) await this.ready.catch(noop);
-		for (const ref of this.refs) ref.gone(error);
+		endRefs();
 		const decls = this.allDecls();
 		this.stopTasks();
 		const subscriptions = [...this.#subscriptions.values()];
@@ -1892,17 +1928,29 @@ export class ObjectImpl {
 		await Promise.allSettled([...this.#invocations]);
 		await Promise.allSettled([...this.retirements]);
 		const registered = [...decls].some((set) => set.registrations.size > 0) && !this.deferredRuntime;
-		if (registered) this.host.registriesChanged();
+		if (registered) {
+			try {
+				this.host.registriesChanged();
+			} catch (failure) {
+				errors.push(failure);
+			}
+		}
 		const refs = new Set<RefCore>();
 		for (const set of decls) {
-			for (const derived of set.derives.values()) derived.detach();
+			for (const derived of set.derives.values()) {
+				try {
+					derived.detach();
+				} catch (failure) {
+					errors.push(failure);
+				}
+			}
 			for (const ref of set.refs.values()) refs.add(ref);
 		}
 		// Host teardown must still see this holder's references until its resources finish closing.
 		try {
 			await runAll(
 				[
-					...this.#revocationErrors.map((failure) => () => {
+					...errors.map((failure) => () => {
 						throw failure;
 					}),
 					...subscriptions.map((subscription) => () => subscription.unsubscribe()),

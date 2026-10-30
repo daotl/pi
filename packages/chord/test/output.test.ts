@@ -144,6 +144,49 @@ describe("OutputBuffer", () => {
 		expect(buffer.snapshot()).toEqual({ text: "b\n😀\n", droppedBytes: 2, droppedLines: 1 });
 	});
 
+	it("counts surrogate pairs across string chunks without closing the head window early", () => {
+		for (const limits of [head(10, 6), tail(10, 6), head(10, 4), tail(10, 4)]) {
+			const buffer = new OutputBuffer(limits);
+			let stream = "";
+			for (const chunk of ["\ud83d", "\ude00", "a", "b", "\ud83d", "x", "\ude00"]) {
+				stream += chunk;
+				buffer.push(chunk);
+				const expected = boundOutput(
+					(/[\ud800-\udbff]$/.test(stream) ? stream.slice(0, -1) : stream).toWellFormed(),
+					limits,
+				);
+				expect(buffer.snapshot()).toEqual({
+					text: expected.text,
+					droppedBytes: expected.droppedBytes,
+					droppedLines: expected.droppedLines,
+				});
+			}
+			buffer.end();
+			expect(buffer.snapshot().droppedBytes).toBe(boundOutput(stream.toWellFormed(), limits).droppedBytes);
+		}
+	});
+
+	it("flushes a pending high surrogate at stream end and before skipped output", () => {
+		for (const retain of ["head", "tail"] as const) {
+			const buffer = new OutputBuffer({ maxBytes: 4, maxLines: 10, retain });
+			buffer.push("abcdef");
+			buffer.push("\ud83d");
+			buffer.snapshot();
+			buffer.end();
+			const expected = boundOutput("abcdef\ufffd", { maxBytes: 4, maxLines: 10, retain });
+			expect(buffer.snapshot()).toEqual({
+				text: expected.text,
+				droppedBytes: expected.droppedBytes,
+				droppedLines: expected.droppedLines,
+			});
+		}
+		const buffer = new OutputBuffer(tail(10, 4));
+		buffer.push("\ud83d");
+		buffer.push("\ude00", { bytes: 5, newlines: 0, endsWithNewline: false });
+		buffer.end();
+		expect(buffer.snapshot()).toEqual({ text: "\ufffd", droppedBytes: 8, droppedLines: 0 });
+	});
+
 	it("sanitizes the retained text but counts the raw stream", () => {
 		const buffer = new OutputBuffer(tail(1));
 		buffer.push("a\u0007\n");

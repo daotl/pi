@@ -40,29 +40,52 @@ export function radiusProvider(options: RadiusProviderOptions = {}): Provider<"p
 			apiKey: envApiKeyAuth("Radius API key", ["RADIUS_API_KEY"]),
 			oauth: lazyOAuth({ name, load: () => loadRadiusOAuth({ name, gateway }) }),
 		},
+		resolveCachedModelAuth: async (credential, ctx) => ({
+			apiKey:
+				credential?.type === "oauth" ? credential.access : credential?.key || (await ctx.env("RADIUS_API_KEY")),
+		}),
 		getModels: () => dynamicModels ?? baselineModels,
 		refreshModels: async (context) => {
+			// Only side-effect-free, proven auth can identify a stored account catalog.
+			const identityText = context.auth?.apiKey
+				? JSON.stringify({
+						gateway,
+						baseUrl: (context.auth.baseUrl ?? context.baseUrl ?? "").replace(/\/+$/, ""),
+						credential: context.credential?.type ?? "api_key",
+						apiKey: context.auth.apiKey,
+						headers: Object.entries(context.auth.headers ?? {})
+							.map(([key, value]) => [key.toLowerCase(), value] as const)
+							.sort(([left], [right]) => left.localeCompare(right)),
+					})
+				: undefined;
+			const identity =
+				identityText === undefined
+					? undefined
+					: Array.from(
+							new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(identityText))),
+							(byte) => byte.toString(16).padStart(2, "0"),
+						).join("");
 			const stored = context.stored;
-			if (stored) {
-				const restored = stored.models.filter((model) => model.provider === id) as Model<"pi-messages">[];
-				if (
-					!(await context.publish({
-						update: () => {
-							dynamicModels = restored;
-						},
-					}))
-				) {
-					return;
-				}
+			const matching = identity !== undefined && stored?.personalizationKey === identity;
+			const restored = matching
+				? ((stored?.models ?? []).filter((model) => model.provider === id) as Model<"pi-messages">[])
+				: undefined;
+			if (
+				!(await context.publish({
+					update: () => {
+						dynamicModels = restored;
+					},
+				}))
+			) {
+				return;
 			}
-
 			// Import catalogs cached by the pre-ModelsStore Radius implementation.
-			if (!stored && context.credential?.type === "oauth") {
+			if (!stored && identity !== undefined && context.credential?.type === "oauth") {
 				const legacy = getRadiusModels(id, context.credential);
 				if (legacy.length > 0) {
 					if (
 						!(await context.publish({
-							persist: { models: legacy, checkedAt: Date.now() },
+							persist: { models: legacy, checkedAt: Date.now(), personalizationKey: identity },
 							update: () => {
 								dynamicModels = legacy;
 							},
@@ -74,12 +97,12 @@ export function radiusProvider(options: RadiusProviderOptions = {}): Provider<"p
 			}
 
 			if (!context.allowNetwork || context.signal.aborted) return;
-			const apiKey = context.credential?.type === "oauth" ? context.credential.access : context.credential?.key;
+			const apiKey = context.auth?.apiKey;
 			const config = await loadRadiusGatewayConfig(gateway, apiKey, context.signal);
 			if (context.signal.aborted) return;
 			const refreshed = getRadiusModelsFromConfig(id, config);
 			await context.publish({
-				persist: { models: refreshed, checkedAt: Date.now() },
+				persist: { models: refreshed, checkedAt: Date.now(), personalizationKey: identity },
 				update: () => {
 					dynamicModels = refreshed;
 				},

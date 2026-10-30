@@ -1,8 +1,9 @@
-import type { Cell } from "./cell.ts";
+import { type Cell, Derived } from "./cell.ts";
 import { type AnyContract, bind, coverage } from "./contract.ts";
-import { asChordError, ChordError, invalid, isChordError } from "./errors.ts";
+import { asChordError, ChordError, invalid } from "./errors.ts";
 import type { CodeVersionState, Facet, HostImpl, PluginRef, Serve } from "./host.ts";
 import {
+	candidateSource,
 	type Factory,
 	hostLifetime,
 	makeService,
@@ -74,35 +75,61 @@ interface Candidate {
  * cells and derivations) against every schema that will apply after the commit: the cell's new schema and the new
  * implementation's remote state-member schemas. Repeated immediately before publication, since live sources may change.
  */
-function dryRun(candidate: Candidate): void {
-	const { run, migrated, service, object } = candidate;
-	const exposed = memberSchemas(service, run.implementation);
-	for (const [cell, value] of migrated) {
-		for (const schema of exposed.get(cell) ?? [])
-			assertValid("state", `${object.address}: migrated state ${cell.key}`, schema, value);
+function dryRun(candidates: ReadonlyMap<ObjectImpl, Candidate>): void {
+	const live = new Map([...candidates].filter(([object]) => object.status === "live"));
+	const values = new Map<unknown, unknown>();
+	for (const candidate of live.values()) for (const [cell, value] of candidate.migrated) values.set(cell, value);
+	const computing = new Set<Readable<unknown>>();
+	const read = (source: Readable<unknown>): unknown => {
+		if (values.has(source)) return values.get(source);
+		if (computing.has(source)) throw invalid("cycle", "candidate state derivation cycle");
+		computing.add(source);
+		try {
+			const resolved = candidateSource(source, (object) => {
+				const candidate = live.get(object);
+				return candidate === undefined
+					? undefined
+					: {
+							codeVersion: object.host.pendingCodeVersion()!,
+							service: candidate.service,
+							implementation: candidate.run.implementation,
+							decls: candidate.run.decls,
+						};
+			});
+			const value =
+				resolved !== source ? read(resolved) : source instanceof Derived ? source.compute(read) : source.value;
+			values.set(source, value);
+			return value;
+		} finally {
+			computing.delete(source);
+		}
+	};
+	for (const { run, service, object } of live.values()) {
+		const exposed = memberSchemas(service, run.implementation);
+		for (const [source, schemas] of exposed) {
+			const value = read(source);
+			for (const schema of schemas) assertValid("state", `${object.address}: candidate state`, schema, value);
+		}
+		for (const derived of run.decls.derives.values()) read(derived);
 	}
-	const values = new Map<unknown, unknown>(migrated);
-	const derives = [...run.decls.derives].sort(([, a], [, b]) => a.seq - b.seq);
-	for (const [name, derived] of derives) {
-		const value = derived.compute((source) => (values.has(source) ? values.get(source) : candidateValue(source)));
-		for (const schema of exposed.get(derived) ?? [])
-			assertValid("state", `${object.address}: derivation ${name}`, schema, value);
-		values.set(derived, value);
-	}
-	candidate.derived = values;
+	for (const candidate of live.values()) candidate.derived = values;
 }
 
-/**
- * A source's value for a dry run. A reference to a provider this reload upgrades too reads nothing before the commit
- * (its new contract does not bind the old code): the dry run computes without it, the commit with the real value.
- */
-function candidateValue(source: Readable<unknown>): unknown {
-	try {
-		return source.value;
-	} catch (error) {
-		if (isChordError(error, "not_ready") || isChordError(error, "not_in_variant")) return undefined;
-		throw error;
-	}
+/** Local reference ownership is acyclic: providers install before consumers attach their derivations. */
+function orderedCandidates(candidates: ReadonlyMap<ObjectImpl, Candidate>): Candidate[] {
+	const ordered: Candidate[] = [];
+	const seen = new Set<ObjectImpl>();
+	const visit = (candidate: Candidate): void => {
+		if (seen.has(candidate.object)) return;
+		seen.add(candidate.object);
+		for (const ref of candidate.run.decls.refs.values()) {
+			const dependency = ref.object === undefined ? undefined : candidates.get(ref.object);
+			if (dependency !== undefined) visit(dependency);
+		}
+		ordered.push(candidate);
+	};
+	for (const candidate of candidates.values()) visit(candidate);
+	return ordered;
 }
 
 /** A reload error keeps the underlying code (`contract_mismatch`, `invalid`, ...) and says it aborted the reload. */
@@ -141,12 +168,17 @@ export async function beginReload(
 	options: ReloadOptions,
 	codeVersion?: number,
 ): Promise<Reload> {
+	host.checkOpen();
 	if (host.reloading) {
 		throw new ChordError("unavailable", "a reload is already running", { reason: "reload_running" });
 	}
 	host.reloading = true;
 	try {
-		return new Reload(host, await host.resolve(plugins), options, codeVersion);
+		const facets = await host.resolve(plugins);
+		host.checkOpen();
+		const reload = new Reload(host, facets, options, codeVersion);
+		host.reloadOperation = reload;
+		return reload;
 	} catch (error) {
 		host.reloadEnded();
 		throw reloadError(error);
@@ -160,20 +192,30 @@ export function endReload(host: HostImpl): void {
 /** Most milliseconds a forced retirement waits for aborted roots to settle before it closes what they used. */
 const ABORTED_ROOTS_GRACE = 1000;
 
-/** Resolves true once `ready()` holds (checked whenever retirement-relevant state changes), false after `ms`. */
-function until(host: HostImpl, ready: () => boolean, ms: number): Promise<boolean> {
+/** Resolves on readiness or timeout; cancellation releases both the deadline and retirement subscription. */
+function until(host: HostImpl, ready: () => boolean, ms: number, signal: AbortSignal): Promise<boolean> {
+	if (signal.aborted) return Promise.reject(new ChordError("aborted", "reload aborted", { cause: signal.reason }));
 	if (ready()) return Promise.resolve(true);
-	return new Promise<boolean>((resolve) => {
-		const timer = setTimeout(() => {
+	return new Promise<boolean>((resolve, reject) => {
+		const cleanup = (): void => {
+			clearTimeout(timer);
 			stop();
+			signal.removeEventListener("abort", onAbort);
+		};
+		const onAbort = (): void => {
+			cleanup();
+			reject(new ChordError("aborted", "reload aborted", { cause: signal.reason }));
+		};
+		const timer = setTimeout(() => {
+			cleanup();
 			resolve(false);
 		}, ms);
 		const stop = host.watchRetirement(() => {
 			if (!ready()) return;
-			clearTimeout(timer);
-			stop();
+			cleanup();
 			resolve(true);
 		});
+		signal.addEventListener("abort", onAbort, { once: true });
 	});
 }
 
@@ -208,6 +250,12 @@ export class Reload {
 		this.codeVersion = codeVersion;
 	}
 
+	/** Stops candidate work synchronously; its owner still joins prepare and rollback before freeing the slot. */
+	cancel(reason: unknown): void {
+		this.abort.abort(reason);
+		for (const run of this.facetRuns.values()) run.abort(reason);
+	}
+
 	/** Everything up to the commit. On failure the host is rolled back and the underlying error is thrown. */
 	async prepare(): Promise<void> {
 		this.#preparing = this.#prepare();
@@ -236,6 +284,7 @@ export class Reload {
 		this.tables = this.host.buildTables(this.entries());
 		await this.gate();
 		this.#alive();
+		dryRun(this.candidates);
 		this.#stage();
 	}
 
@@ -254,6 +303,8 @@ export class Reload {
 
 	/** After every await of prepare: a rollback meanwhile (abort from the coordinator) ends it. */
 	#alive(): void {
+		this.host.checkOpen();
+		if (this.abort.signal.aborted) throw new ChordError("aborted", "reload aborted while preparing");
 		if (this.rolledBack) throw new ChordError("aborted", "reload aborted while preparing", { reason: "aborted" });
 	}
 
@@ -284,9 +335,14 @@ export class Reload {
 		if (previous === undefined) return;
 		const deadline = this.options.retireDeadline ?? 5000;
 		const gone = (): boolean => host.previous !== previous;
-		if (!(await until(host, () => gone() || host.retirable(), deadline)) && !gone()) {
+		if (!(await until(host, () => gone() || host.retirable(), deadline, this.abort.signal)) && !gone()) {
 			previous.abort.abort(new ChordError("superseded", `code version ${previous.id} was retired`));
-			await until(host, () => gone() || previous.roots.size === 0, Math.min(deadline, ABORTED_ROOTS_GRACE));
+			await until(
+				host,
+				() => gone() || previous.roots.size === 0,
+				Math.min(deadline, ABORTED_ROOTS_GRACE),
+				this.abort.signal,
+			);
 		}
 		if (!gone()) host.retire();
 	}
@@ -296,9 +352,11 @@ export class Reload {
 		const replaced = new Set([...this.facets.map((facet) => facet.name), ...(this.options.remove ?? [])]);
 		const current = this.host.current.services;
 		this.services = new Map([...current].filter(([, service]) => !replaced.has(service.facet)));
+		this.#alive();
 		for (const facet of this.facets) {
 			const run = new AbortController();
 			this.facetRuns.set(facet.name, run);
+			this.#alive();
 			facet.setup(
 				this.host.facetApi(
 					((type: AnyContract, factory: Factory<AnyContract>, options: ServeOptions = {}) =>
@@ -306,6 +364,7 @@ export class Reload {
 					run.signal,
 				),
 			);
+			this.#alive();
 		}
 		for (const [name, service] of this.services) if (current.get(name) !== service) this.changed.add(name);
 		for (const name of current.keys()) if (!this.services.has(name)) this.removed.add(name);
@@ -444,7 +503,7 @@ export class Reload {
 		if (candidate.reasons.length === 0) {
 			await object.initCells(run, this.abort.signal, this.host.pending?.id);
 			this.#alive();
-			dryRun(candidate);
+			// Candidate references are evaluated together after every provider and gated migration is prepared.
 		}
 	}
 
@@ -549,7 +608,6 @@ export class Reload {
 			assertValid("state", `${object.address}: migrated state ${name}`, schema, value);
 			candidate.migrated.set(cell, value);
 		}
-		dryRun(candidate);
 	}
 
 	async rollback(): Promise<void> {
@@ -577,7 +635,12 @@ export class Reload {
 		}
 		// A post-commit failed child can clean up, but cannot restore old resources or restart old tasks.
 		if (this.host.failed !== undefined) {
-			await this.host.close().catch(report);
+			if (!this.host.shutdown.signal.aborted) void this.host.close().catch(report);
+			this.host.pending = undefined;
+			this.host.gating = undefined;
+			return;
+		}
+		if (this.host.shutdown.signal.aborted) {
 			this.host.pending = undefined;
 			this.host.gating = undefined;
 			return;
@@ -614,9 +677,8 @@ export class Reload {
 	 * after installation; an installation failure leaves the host terminally failed.
 	 */
 	commit(beforeStart?: () => void): ReloadReport {
-		for (const candidate of this.candidates.values()) {
-			if (candidate.object.status === "live") dryRun(candidate);
-		}
+		this.#alive();
+		dryRun(this.candidates);
 		try {
 			return holdPublications(() => {
 				const report = this.#publish();
@@ -645,7 +707,9 @@ export class Reload {
 		host.previous = previous;
 		host.current = next;
 		const prepared: string[] = [];
-		for (const object of [...host.objects.values()]) {
+		const ordered = orderedCandidates(this.candidates);
+		const ranks = new Map(ordered.map((candidate, index) => [candidate.object, index]));
+		for (const object of [...host.objects.values()].sort((a, b) => (ranks.get(a) ?? -1) - (ranks.get(b) ?? -1))) {
 			if (this.removed.has(object.typeName)) continue;
 			const candidate = this.candidates.get(object);
 			if (candidate === undefined) {

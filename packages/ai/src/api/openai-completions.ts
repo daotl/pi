@@ -654,8 +654,9 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 
 							let delta = "";
 							const input = state.input;
-							if (toolCall.function?.arguments && input.kind === "json") {
-								delta = toolCall.function.arguments;
+							if (input.kind === "json") {
+								// Every emitted delta advances copy credit, including metadata-only and raw-only updates.
+								delta = toolCall.function?.arguments ?? "";
 								block.arguments = input.arguments.append(delta);
 							} else if (toolCall.custom?.input && input.kind === "custom") {
 								delta =

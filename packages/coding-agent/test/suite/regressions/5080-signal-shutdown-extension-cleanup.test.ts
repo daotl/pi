@@ -8,6 +8,7 @@ import {
 	ProcessTerminal,
 	setPadLinesToWidth,
 	setWrapLinesToWidth,
+	Text,
 } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { Type } from "typebox";
@@ -37,6 +38,8 @@ import { createHarness } from "../harness.ts";
 
 type ShutdownThis = {
 	isShuttingDown: boolean;
+	cancelScheduledPreflights: () => void;
+	cancelExtensionDialogs: () => void;
 	session: { abort: () => Promise<void>; flushPendingPersistence: () => void };
 	unregisterSignalHandlers: () => void;
 	runtimeHost: { dispose: () => Promise<void> };
@@ -98,6 +101,8 @@ function restoreStdoutIsTTY(): void {
 function createContext(order: string[], sessionManager = createSessionManager()): ShutdownThis {
 	return {
 		isShuttingDown: false,
+		cancelScheduledPreflights: () => {},
+		cancelExtensionDialogs: () => {},
 		session: { abort: async () => {}, flushPendingPersistence: () => {} },
 		unregisterSignalHandlers: vi.fn(),
 		runtimeHost: {
@@ -299,6 +304,105 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 
 		expect(order).toEqual(["drainInput", "suspend", "dispose", "stop"]);
 	});
+
+	test.each(
+		[false, true].flatMap((fromSignal) => (["select", "custom"] as const).map((kind) => ({ fromSignal, kind }))),
+	)(
+		"settles active unsignalled $kind tools before shutdown abort (signal: $fromSignal)",
+		async ({ fromSignal, kind }) => {
+			const previous = {
+				pad: isPadLinesToWidth(),
+				wrap: isWrapLinesToWidth(),
+				background: isMessageBackground(),
+				separator: isMessageSeparator(),
+			};
+			const entered = Promise.withResolvers<void>();
+			const answers: unknown[] = [];
+			const harness = await createHarness({
+				settings: { quietStartup: true, compaction: { enabled: false }, retry: { enabled: false } },
+				extensionFactories: [
+					(pi) => {
+						pi.registerTool({
+							name: "ask_unsignalled",
+							label: "Ask",
+							description: "Wait for a dialog without an abort listener",
+							parameters: Type.Object({}),
+							async execute(_id, _params, _signal, _update, ctx) {
+								const answer =
+									kind === "select"
+										? ctx.ui.select("Allow tool?", ["Yes", "No"])
+										: ctx.ui.custom<string>(() => new Text("Waiting for user"));
+								entered.resolve();
+								answers.push(await answer);
+								return { content: [{ type: "text", text: "dialog cancelled" }], details: {} };
+							},
+						});
+					},
+				],
+			});
+			const runtime = new AgentSessionRuntime(
+				harness.session,
+				{
+					cwd: harness.sessionManager.getCwd(),
+					agentDir: harness.tempDir,
+					modelRuntime: harness.session.modelRuntime,
+					settingsManager: harness.settingsManager,
+					resourceLoader: harness.session.resourceLoader,
+					diagnostics: [],
+				},
+				async () => {
+					throw new Error("Unexpected replacement");
+				},
+			);
+			const terminal = new VirtualTerminal(120, 40);
+			const mode = new InteractiveMode(runtime, { terminal });
+			// Exercise private lifecycle entrypoints with a real session, runtime, extension and TUI.
+			const internal = mode as unknown as {
+				shutdown(options?: { fromSignal?: boolean }): Promise<void>;
+				resetExtensionUI(): void;
+			};
+			vi.spyOn(process, "exit").mockImplementation((() => {
+				throw new ProcessExitError();
+			}) as typeof process.exit);
+			let running: Promise<void> | undefined;
+			try {
+				await mode.init();
+				harness.setResponses([
+					fauxAssistantMessage(fauxToolCall("ask_unsignalled", {}), { stopReason: "toolUse" }),
+				]);
+				running = harness.session.prompt("ask first");
+				await entered.promise;
+				await terminal.waitForRender();
+				expect(terminal.getViewport().join("\n")).toContain(kind === "select" ? "Allow tool?" : "Waiting for user");
+				await callShutdown(internal as unknown as ShutdownThis, { fromSignal });
+				await running;
+				expect(answers).toEqual([undefined]);
+				expect(harness.eventsOfType("agent_end")).toHaveLength(1);
+				expect(harness.sessionManager.getEntries()).toEqual(
+					expect.arrayContaining([
+						expect.objectContaining({
+							type: "message",
+							message: expect.objectContaining({
+								role: "toolResult",
+								content: [{ type: "text", text: "dialog cancelled" }],
+							}),
+						}),
+					]),
+				);
+			} finally {
+				internal.resetExtensionUI();
+				await harness.session.abort();
+				await running?.catch(() => {});
+				mode.stop();
+				await runtime.dispose();
+				harness.cleanup();
+				setPadLinesToWidth(previous.pad);
+				setWrapLinesToWidth(previous.wrap);
+				setMessageBackground(previous.background);
+				setMessageSeparator(previous.separator);
+			}
+		},
+	);
 
 	test.each([false, true])(
 		"cancels reactivation dialogs before mounting during signal=%s shutdown",

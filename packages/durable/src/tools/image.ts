@@ -86,14 +86,13 @@ export function imageDimensions(
 		case "image/gif":
 			return bytes.length < 10 ? undefined : { width: readUint16LE(bytes, 6), height: readUint16LE(bytes, 8) };
 		case "image/webp":
-			if (bytes.length < 30) return undefined;
-			if (startsWithAscii(bytes, 12, "VP8 "))
+			if (bytes.length >= 30 && startsWithAscii(bytes, 12, "VP8 "))
 				return { width: readUint16LE(bytes, 26) & 0x3fff, height: readUint16LE(bytes, 28) & 0x3fff };
-			if (startsWithAscii(bytes, 12, "VP8L")) {
+			if (bytes.length >= 25 && startsWithAscii(bytes, 12, "VP8L")) {
 				const bits = readUint32LE(bytes, 21);
 				return { width: (bits & 0x3fff) + 1, height: ((bits >>> 14) & 0x3fff) + 1 };
 			}
-			if (startsWithAscii(bytes, 12, "VP8X")) {
+			if (bytes.length >= 30 && startsWithAscii(bytes, 12, "VP8X")) {
 				const uint24 = (offset: number): number => readUint16LE(bytes, offset) + ((bytes[offset + 2] ?? 0) << 16);
 				return { width: uint24(24) + 1, height: uint24(27) + 1 };
 			}

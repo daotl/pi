@@ -25,6 +25,55 @@ const EXIT_STDIO_GRACE: Duration = Duration::from_millis(100);
 /// How often a delivery waiting for the link to drain looks again.
 const UNSENT_POLL: Duration = Duration::from_millis(20);
 
+/// Raw pipe bytes waiting for decoding/spilling, independently of the downstream output window.
+const RAW_LIMIT: usize = 1024 * 1024;
+
+#[derive(Default)]
+pub struct RawOutput {
+    bytes: AtomicUsize,
+}
+
+/// The queued message owns its reservation until it is consumed or the receiver is dropped.
+pub struct RawPermit {
+    output: Arc<RawOutput>,
+    bytes: usize,
+}
+
+impl Drop for RawPermit {
+    fn drop(&mut self) {
+        self.output.bytes.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
+
+impl RawOutput {
+    pub fn send(
+        self: &Arc<Self>,
+        stream: usize,
+        bytes: &[u8],
+        sender: &Sender<Message>,
+        stop: &AtomicBool,
+        paused: &AtomicUsize,
+    ) -> bool {
+        paused.fetch_add(1, Ordering::SeqCst);
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                paused.fetch_sub(1, Ordering::SeqCst);
+                return false;
+            }
+            let queued = self.bytes.load(Ordering::SeqCst);
+            if queued + bytes.len() <= RAW_LIMIT {
+                if self.bytes.compare_exchange(queued, queued + bytes.len(), Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    break;
+                }
+            } else {
+                thread::sleep(UNSENT_POLL);
+            }
+        }
+        paused.fetch_sub(1, Ordering::SeqCst);
+        let permit = RawPermit { output: self.clone(), bytes: bytes.len() };
+        sender.send(Message::Data(stream, bytes.to_vec(), permit)).is_ok()
+    }
+}
 /// Creation and registration share the shutdown lock, including commands still preparing to spawn.
 #[cfg(unix)]
 #[derive(Default)]
@@ -39,7 +88,7 @@ pub type Groups = Arc<Mutex<ProcessGroups>>;
 pub type Groups = sys::ProcessGroups;
 
 pub enum Message {
-    Data(usize, Vec<u8>),
+    Data(usize, Vec<u8>, RawPermit),
     Eof(usize),
     Exit(ExitStatus),
     WaitFailed(String),
@@ -242,11 +291,12 @@ fn spawn_reader(
     sender: Sender<Message>,
     stop: Arc<AtomicBool>,
     output: Option<Arc<Output>>,
+    raw: Arc<RawOutput>,
     paused: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         sys::read_pipe(pipe, &stop, |bytes| {
-            let delivered = sender.send(Message::Data(stream, bytes.to_vec())).is_ok();
+            let delivered = raw.send(stream, bytes, &sender, &stop, &paused);
             if let Some(output) = &output {
                 output.wait_for_room(&stop, &paused);
             }
@@ -354,6 +404,7 @@ fn run_with_shell(
         None
     };
     let paused = Arc::new(AtomicUsize::new(0));
+    let raw = Arc::new(RawOutput::default());
     let readers = [
         spawn_reader(
             0,
@@ -361,6 +412,7 @@ fn run_with_shell(
             sender.clone(),
             stop.clone(),
             gate.clone(),
+            raw.clone(),
             paused.clone(),
         ),
         spawn_reader(
@@ -369,6 +421,7 @@ fn run_with_shell(
             sender.clone(),
             stop.clone(),
             gate,
+            raw,
             paused.clone(),
         ),
     ];
@@ -489,7 +542,7 @@ fn run_with_shell(
             });
         }
         match receiver.recv_timeout(wait) {
-            Ok(Message::Data(stream, bytes)) => {
+            Ok(Message::Data(stream, bytes, _permit)) => {
                 emit(&mut pending, stream, decoders[stream].decode(&bytes, false));
                 if let Some(spill) = &mut spill {
                     spill.push(&bytes, tmpdir);
@@ -519,6 +572,9 @@ fn run_with_shell(
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+    #[cfg(unix)]
+    // Preserve the saved leader status, but retain ownership until its remaining descendants are killed.
+    kill_group(pid);
     #[cfg(windows)]
     {
         // A normal leader exit does not transfer ownership of its descendants to the client.
@@ -591,6 +647,80 @@ fn run_with_shell(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_leader_exit_cleans_background_children_without_changing_its_status() {
+        let root = sys::mkdtemp(&format!("{}/pi-env-background-", sys::tmpdir())).unwrap();
+        let request = ExecRequest::from_json(&json!({
+            "command": "sleep 30 >/dev/null 2>&1 & echo $! > child; exit 23",
+            "cwd": root,
+        })).unwrap();
+        let groups: Groups = Arc::default();
+        let result = run(1, request, &root, &Arc::new(Output::default()), &Control::default(), &groups).unwrap();
+        let pid: i32 = std::fs::read_to_string(Path::new(&root).join("child")).unwrap().trim().parse().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let alive = loop {
+            // An orphan can remain as a zombie until the host reaper runs; zombies cannot execute or retain pipes.
+            let state = Command::new("/bin/ps").args(["-p", &pid.to_string(), "-o", "stat="]).output().unwrap();
+            let state = String::from_utf8_lossy(&state.stdout);
+            let alive = state.split_whitespace().any(|state| !state.starts_with('Z'));
+            if !alive || Instant::now() >= deadline { break alive; }
+            thread::sleep(Duration::from_millis(5));
+        };
+        // Also clean the fixture when run against the defective implementation.
+        unsafe { libc::kill(pid, libc::SIGKILL); }
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(result["exitCode"], 23);
+        assert!(groups.lock().unwrap().pids.is_empty());
+        assert!(!alive, "background child survived the completed command");
+    }
+
+    #[test]
+    fn full_raw_handoff_does_not_block_control_or_reader_shutdown() {
+        let raw = Arc::new(RawOutput::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicUsize::new(0));
+        let (sender, receiver) = mpsc::channel();
+        let chunk = vec![0; 64 * 1024];
+        for _ in 0..RAW_LIMIT / chunk.len() {
+            assert!(raw.send(0, &chunk, &sender, &stop, &paused));
+        }
+        let worker = {
+            let raw = raw.clone();
+            let stop = stop.clone();
+            let paused = paused.clone();
+            let sender = sender.clone();
+            thread::spawn(move || raw.send(0, &chunk, &sender, &stop, &paused))
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while paused.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let control = Control::default();
+        control.attach(sender.clone());
+        control.cancel(false);
+        assert!(sender.send(Message::Eof(0)).is_ok());
+        use std::os::unix::process::ExitStatusExt;
+        assert!(sender.send(Message::Exit(ExitStatus::from_raw(23 << 8))).is_ok());
+        // Shutdown joins readers before draining/dropping the receiver; a full raw queue must not retain them.
+        stop.store(true, Ordering::SeqCst);
+        while !worker.is_finished() {
+            assert!(Instant::now() < deadline, "raw reader remained blocked during shutdown");
+            thread::yield_now();
+        }
+        assert!(!worker.join().unwrap());
+        let mut received = 0;
+        for _ in 0..RAW_LIMIT / (64 * 1024) {
+            let Message::Data(_, bytes, _permit) = receiver.try_recv().unwrap() else { panic!("missing raw data"); };
+            received += bytes.len();
+        }
+        assert_eq!(received, RAW_LIMIT);
+        assert!(matches!(receiver.try_recv().unwrap(), Message::Cancel));
+        assert!(matches!(receiver.try_recv().unwrap(), Message::Eof(0)));
+        assert!(matches!(receiver.try_recv().unwrap(), Message::Exit(status) if status.code() == Some(23)));
+        assert_eq!(raw.bytes.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn oversized_output_window_stops_reading_when_the_output_link_is_full() {

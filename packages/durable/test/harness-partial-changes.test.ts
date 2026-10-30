@@ -3,10 +3,12 @@ import { type Op, track } from "@earendil-works/chord/delta";
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	normalizeContext,
 	type ToolCall,
 	ToolCallArgumentsStream,
 } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { stream as streamOpenAICompletions } from "../../ai/src/api/openai-completions.ts";
 import type { LiveState } from "../src/harness/live.ts";
 import { PartialChanges, type PartialMessage } from "../src/harness/partial-changes.ts";
 
@@ -92,6 +94,26 @@ function pieces(text: string, size: number): string[] {
 	return result;
 }
 
+/** A suffix-shaped operation can still hide Chord comparing the whole previous string during preparation. */
+function commitWithoutPrefixRead(stream: { commit(): void }, prefixLength: number): void {
+	const prefixReads: number[] = [];
+	const slice = String.prototype.slice;
+	const spy = vi.spyOn(String.prototype, "slice").mockImplementation(function (
+		this: string,
+		start?: number,
+		end?: number,
+	) {
+		if (this.length > prefixLength && start === 0 && end === prefixLength) prefixReads.push(this.length);
+		return slice.call(this, start, end);
+	});
+	try {
+		stream.commit();
+	} finally {
+		spy.mockRestore();
+	}
+	expect(prefixReads).toEqual([]);
+}
+
 const ARGUMENTS = {
 	path: "src/a.ts",
 	n: 1234,
@@ -139,6 +161,43 @@ describe("PartialChanges", () => {
 		}
 	});
 
+	it.each([
+		['{"count":12', "3}", { count: 12 }, { count: 123 }],
+		['{"flag":tr', "ue}", { flag: true }, { flag: true }],
+	] as const)("preserves the provider snapshot before a scalar ends: %s", (prefix, suffix, preview, final) => {
+		for (const existing of [false, true]) {
+			const stream = setup();
+			if (existing) {
+				stream.argument("{");
+				stream.commit();
+				stream.argument(prefix.slice(1));
+			} else stream.argument(prefix);
+			stream.commit();
+			expect(stream.committed().arguments).toEqual(preview);
+			// A failed write must not discard the authoritative preview, either.
+			stream.commit(true);
+			stream.commit();
+			expect(stream.committed().arguments).toEqual(preview);
+			stream.argument(suffix);
+			stream.commit();
+			expect(stream.committed().arguments).toEqual(final);
+		}
+	});
+
+	it("preserves open containers deeper than the parser's reported changes", () => {
+		const stream = setup();
+		stream.argument(`${'{"nested":'.repeat(34)}"partial`);
+		stream.commit();
+		let expected: unknown = "partial";
+		for (let depth = 0; depth < 34; depth++) expected = { nested: expected };
+		expect(stream.committed().arguments).toEqual(expected);
+		stream.argument(` text"${"}".repeat(34)}`);
+		stream.commit();
+		let final: unknown = "partial text";
+		for (let depth = 0; depth < 34; depth++) final = { nested: final };
+		expect(stream.committed().arguments).toEqual(final);
+	});
+
 	it("handles a number ending and a string starting in one piece, and escapes split across pieces", () => {
 		const stream = setup();
 		for (const piece of [
@@ -180,6 +239,205 @@ describe("PartialChanges", () => {
 			text: `Hello${" more".repeat(20)}`,
 			arguments: { path: "a.ts", content: `x${"yz".repeat(20)}` },
 		});
+	});
+
+	it.each(["completed", "pending", "failed"] as const)(
+		"resumes suffix-only argument commits after %s scalar reconciliation",
+		(scenario) => {
+			const stream = setup();
+			let command = "x".repeat(64 * 1024);
+			if (scenario === "completed") stream.argument(`{"timeout":30,"command":"${command}`);
+			else {
+				stream.argument('{"timeout":3');
+				stream.commit();
+				stream.argument(`0,"command":"${command}`);
+			}
+			stream.commit(scenario === "failed");
+			if (scenario === "failed") {
+				stream.argument(" retry");
+				command += " retry";
+				stream.commit();
+			}
+			expect(stream.committed().arguments).toEqual({ timeout: 30, command });
+			for (const suffix of [" first", " second", " third"]) {
+				stream.argument(suffix);
+				commitWithoutPrefixRead(stream, command.length);
+				command += suffix;
+				expect(stream.committed().arguments).toEqual({ timeout: 30, command });
+				expect(stream.ops.at(-1)).toEqual([
+					["a", ["generation", "message", "content", 1, "arguments", "command"], suffix],
+				]);
+			}
+		},
+	);
+
+	it("preserves budget-lagged provider previews and resumes exact appends after they catch up", () => {
+		const stream = setup();
+		const fields = Object.fromEntries(Array.from({ length: 1024 }, (_, index) => [`field${index}`, ""]));
+		stream.argument(`${JSON.stringify(fields).slice(0, -1)},"command":"`);
+		stream.commit();
+		let sawLag = false;
+		for (let length = 1; length <= 400; length++) {
+			stream.argument("x");
+			const preview = (stream.partial.content[1] as ToolCall).arguments;
+			if ((preview.command as string).length < length) sawLag = true;
+			stream.commit();
+			expect(stream.committed().arguments).toEqual(preview);
+		}
+		expect(sawLag).toBe(true);
+		// A large delta pays for a fresh preview; the following deltas can use exact suffix edits again.
+		const fresh = "y".repeat(64 * 1024);
+		stream.argument(fresh);
+		stream.commit();
+		let command = "x".repeat(400) + fresh;
+		expect(stream.committed().arguments).toEqual({ ...fields, command });
+		for (const suffix of [" first", " second", " third"]) {
+			stream.argument(suffix);
+			commitWithoutPrefixRead(stream, command.length);
+			command += suffix;
+			expect(stream.committed().arguments).toEqual({ ...fields, command });
+		}
+	});
+
+	it.each([false, true])(
+		"commits actual OpenAI raw-only progress and interruption (fresh preview: %s)",
+		async (fresh) => {
+			const fields = Object.fromEntries(Array.from({ length: 1024 }, (_, index) => [`field${index}`, ""]));
+			const prefix = `${JSON.stringify(fields).slice(0, -1)},"command":"`;
+			const updates = [
+				{ id: "call_1", function: { name: "write", arguments: "" } },
+				{ function: { arguments: prefix } },
+				...Array.from({ length: 400 }, () => ({ function: { arguments: "x" } })),
+				...Array.from({ length: 16 }, () => ({ __raw: "<raw>" })),
+				...Array.from({ length: 16 }, () => ({ function: { arguments: "y" } })),
+				...(fresh
+					? [{ function: { arguments: "z".repeat(64 * 1024) } }, { function: { arguments: " tail" } }]
+					: []),
+			];
+			const gates = Array.from({ length: updates.length + 1 }, () => Promise.withResolvers<void>());
+			const fetch: typeof globalThis.fetch = async () => {
+				let index = 0;
+				const encoder = new TextEncoder();
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						async pull(controller) {
+							await gates[index]!.promise;
+							if (index === updates.length) {
+								controller.error(new Error("Connection interrupted"));
+								return;
+							}
+							const chunk = {
+								id: "chatcmpl-preview",
+								choices: [{ index: 0, delta: { tool_calls: [{ index: 0, ...updates[index++] }] } }],
+							};
+							controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+						},
+					}),
+					{ status: 200, headers: { "content-type": "text/event-stream" } },
+				);
+			};
+			const response = streamOpenAICompletions(
+				{
+					id: "preview-test",
+					name: "Preview test",
+					api: "openai-completions",
+					provider: "openai",
+					baseUrl: "https://example.test/v1",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 200_000,
+					maxTokens: 64_000,
+				},
+				normalizeContext({ messages: [] }),
+				{ apiKey: "test", fetch, maxRetries: 0 },
+			);
+			const changes = new PartialChanges();
+			const tracker = track<Live>({ generation: { attempt: 1 } });
+			let index = 0;
+			let sawLag = false;
+			let sawEnd = false;
+			let lastOps: readonly Op[] = [];
+			let lastPreview: ToolCall["arguments"] | undefined;
+			const commit = (partial: AssistantMessage) => {
+				const message = copyJson(partial) as PartialMessage;
+				const taken = changes.take(message);
+				const change = tracker.beginChange();
+				changes.commit(change.state.generation, message, taken);
+				const prepared = change.prepare();
+				lastOps = [...prepared.ops];
+				tracker.adopt(prepared);
+				expect(tracker.value.generation.message).toEqual(partial);
+			};
+			gates[0]!.resolve();
+			try {
+				for await (const event of response) {
+					changes.observe(event);
+					if (event.type === "toolcall_end") sawEnd = true;
+					if (event.type !== "toolcall_delta") continue;
+					const call = event.partial.content[event.contentIndex];
+					if (call?.type !== "toolCall") throw new Error("Missing streamed tool call");
+					if (index > 1 && index <= 401 && (call.arguments.command as string).length < index - 1) sawLag = true;
+					lastPreview = structuredClone(call.arguments);
+					// Reconcile the exhausted preview first, then commit every raw-only event and resumed JSON delta.
+					if (index >= 401) commit(event.partial);
+					gates[++index]?.resolve();
+				}
+			} finally {
+				for (const gate of gates) gate.resolve();
+				await response.result();
+			}
+			expect(sawLag).toBe(true);
+			expect(sawEnd).toBe(false);
+			if (fresh) {
+				expect(lastOps).toEqual([["a", ["generation", "message", "content", 0, "arguments", "command"], " tail"]]);
+			}
+			const interrupted = await response.result();
+			expect(interrupted.stopReason).toBe("error");
+			expect(interrupted.errorMessage).toContain("Connection interrupted");
+			expect(interrupted.content[0]).toMatchObject({ arguments: lastPreview });
+			commit(interrupted);
+			expect(tracker.value.generation.message?.content[0]).toMatchObject({
+				...(fresh
+					? {
+							arguments: {
+								...fields,
+								command: `${"x".repeat(400)}${"y".repeat(16)}${"z".repeat(64 * 1024)} tail`,
+							},
+						}
+					: {}),
+				raw: "<raw>".repeat(16),
+			});
+		},
+	);
+
+	it.each([false, true])("keeps scalar reconciliation local to its taken commit (failed: %s)", (fail) => {
+		const stream = setup();
+		stream.argument('{"timeout":3');
+		stream.commit();
+		stream.argument("0");
+		const command = "x".repeat(64 * 1024);
+		stream.commit(fail, () => stream.argument(`,"command":"${command}`));
+		expect(stream.committed().arguments).toEqual({ timeout: fail ? 3 : 30 });
+		stream.commit();
+		expect(stream.committed().arguments).toEqual({ timeout: 30, command });
+		stream.argument(" tail");
+		commitWithoutPrefixRead(stream, command.length);
+		expect(stream.committed().arguments).toEqual({ timeout: 30, command: `${command} tail` });
+	});
+
+	it.each([false, true])("does not pull a later scalar preview into an earlier commit (failed: %s)", (fail) => {
+		const stream = setup();
+		stream.argument('{"command":"x');
+		stream.commit();
+		stream.argument('y"');
+		stream.commit(fail, () => stream.argument(',"timeout":3'));
+		expect(stream.committed().arguments).toEqual({ command: fail ? "x" : "xy" });
+		stream.commit();
+		expect(stream.committed().arguments).toEqual({ command: "xy", timeout: 3 });
+		stream.argument("0}");
+		stream.commit();
+		expect(stream.committed().arguments).toEqual({ command: "xy", timeout: 30 });
 	});
 
 	it("applies the changes of a failed commit in the next one", () => {

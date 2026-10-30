@@ -655,4 +655,28 @@ describe("personalized catalog provider", () => {
 		expect(provider.getModels()).toEqual([]);
 		expect(provider.getAllModels?.().map((entry) => entry.id)).toEqual(["image"]);
 	});
+
+	it("keeps an authoritative empty catalog online and for the same identity offline", async () => {
+		const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("missing", { status: 404 }));
+		const store = new InMemoryModelsStore();
+		const personalize = vi.fn<PersonalizeCatalog>(async () => []);
+		const provider = withPersonalizedCatalog(builtinProvider(), personalize);
+		const credential = { type: "api_key" as const, key: "account-a" };
+		await refreshProvider(provider, store, { credential });
+		expect(provider.getModels()).toEqual([]);
+		expect(provider.getAllModels?.()).toEqual([]);
+		expect((await store.read(provider.id))?.models).toEqual([]);
+		fetch.mockClear();
+		personalize.mockClear();
+		const restored = withPersonalizedCatalog(builtinProvider(), personalize);
+		await refreshProvider(restored, store, { credential, allowNetwork: false });
+		expect(restored.getAllModels?.()).toEqual([]);
+		await refreshProvider(restored, store, {
+			credential: { type: "api_key", key: "account-b" },
+			allowNetwork: false,
+		});
+		expect(restored.getModels().map((entry) => entry.id)).toEqual(["static"]);
+		expect(fetch).not.toHaveBeenCalled();
+		expect(personalize).not.toHaveBeenCalled();
+	});
 });

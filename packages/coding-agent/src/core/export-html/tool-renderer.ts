@@ -180,7 +180,7 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 
 				return {
 					...(callComponent ? { callHtml: ansiLinesToHtml(callComponent.render(width)) } : {}),
-					...(collapsed && collapsed !== expanded ? { collapsed } : {}),
+					...(collapsed !== expanded ? { collapsed } : {}),
 					expanded,
 				};
 			} catch {

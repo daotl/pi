@@ -14,6 +14,22 @@ class TestComponent implements Component {
 }
 
 describe("TUI wrapped-line differential rendering (wrapping disabled)", () => {
+	it("overwrites individual terminal glyphs without dropping untouched grapheme constituents", async () => {
+		for (const [source, expected] of [
+			["र्क\rZ", "Zक"],
+			["र्क\r\x1b[1CZ", "र्Z"],
+			["界\rZ", "Z "],
+			["áb\rZ", "Zb"],
+		] as const) {
+			const terminal = new VirtualTerminal(10, 4);
+			terminal.write(source);
+			await terminal.flush();
+			assert.strictEqual(terminal.getViewport()[0], expected.trimEnd());
+			assert.deepStrictEqual(terminalLinePhysicalRows(source, 10).map(stripTerminalSequences), [expected]);
+		}
+		assert.deepStrictEqual(terminalLinePhysicalRows("👩‍💻\rZ", 10).map(stripTerminalSequences), ["Z "]);
+	});
+
 	it("preserves text width while materializing forward cursor gaps for overlay restoration", () => {
 		const source = "a\x1b[2Cb";
 		assert.strictEqual(visibleWidth(source), 2);

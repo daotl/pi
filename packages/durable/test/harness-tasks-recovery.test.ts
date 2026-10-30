@@ -515,7 +515,17 @@ describe("blocked tasks", () => {
 		let opened = await openTasks(await openNodeSqliteStorage(path), []);
 		const id = await createIn(opened.harness, versioned(1, "v1"));
 		await opened.harness.close(context);
-		opened = await openTasks(await openNodeSqliteStorage(path), [versioned(2, "v2")]);
+		const wakes: { readonly active: boolean; readonly at?: number }[] = [];
+		opened = await openTasks(await openNodeSqliteStorage(path), [versioned(2, "v2")], {
+			onWake: (wake) => wakes.push(wake),
+		});
+		await flush();
+		expect((await opened.harness.inspect(context)).tasks).toMatchObject([
+			{ record: { id }, state: { kind: "blocked", reason: "migration_failed" } },
+		]);
+		expect(opened.harness.wake()).toEqual({ active: false });
+		expect(wakes.at(-1)).toEqual({ active: false });
+		expect(opened.reports).toEqual([]);
 		opened.harness.resume();
 		await eventually(() => opened.reports.length === 1);
 		expect(String(opened.reports[0])).toContain("has no migration from 1");

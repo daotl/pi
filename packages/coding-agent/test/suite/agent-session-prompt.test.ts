@@ -84,14 +84,16 @@ describe("AgentSession prompt characterization", () => {
 			});
 			harnesses.push(harness);
 			vi.spyOn(harness.settingsManager, "isProjectTrusted").mockReturnValue(false);
+			let observedDiscovery: string | null | undefined;
+			let observedTools: string[] | undefined;
 			harness.setResponses([
 				fauxAssistantMessage("first"),
 				fauxAssistantMessage("second"),
 				fauxAssistantMessage("summary"),
 				(context) => {
 					const system = getCurrentSystemMessage(context.messages);
-					expect(system?.sections?.discovery).toBe("ACCEPTED DISCOVERY");
-					expect(system?.toolsAdded?.map((tool) => tool.name)).toEqual(["echo"]);
+					observedDiscovery = system?.sections?.discovery;
+					observedTools = system?.toolsAdded?.map((tool) => tool.name);
 					return fauxAssistantMessage("continued");
 				},
 			]);
@@ -123,6 +125,11 @@ describe("AgentSession prompt characterization", () => {
 			harness.sessionManager.appendMessage({ role: "user", content: "pending", timestamp: Date.now() });
 			harness.session.refreshContext();
 			await harness.session.continue();
+			expect(observedDiscovery).toContain("ACCEPTED DISCOVERY");
+			expect(observedDiscovery).not.toContain("REJECTED DISCOVERY");
+			expect(observedTools).toEqual(["echo"]);
+			expect(getMessageText(harness.session.messages.at(-1)!)).toBe("continued");
+			expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
 		},
 	);
 

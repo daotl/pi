@@ -9,6 +9,7 @@ import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { ModelsJsonProvider } from "../src/core/model-config.ts";
 import { clearApiKeyCache, type ModelRegistry, type ProviderConfigInput } from "../src/core/model-registry.ts";
 import { createModelRegistry } from "./model-runtime-test-utils.ts";
+import { enableBuiltinProviders } from "./test-network-env.ts";
 
 describe("ModelRegistry", () => {
 	// Tests manipulating built-in (cloud) providers require their registration;
@@ -31,6 +32,7 @@ describe("ModelRegistry", () => {
 		}
 		clearApiKeyCache();
 		vi.restoreAllMocks();
+		vi.unstubAllEnvs();
 	});
 
 	/** Create minimal provider config  */
@@ -92,6 +94,65 @@ describe("ModelRegistry", () => {
 
 	const emptyContext = normalizeContext({
 		messages: [],
+	});
+
+	describe("sampling params overrides", () => {
+		test("deep-merges custom per-thinking-level sampling params with cloud providers disabled", async () => {
+			vi.stubEnv("PI_DISABLE_CLOUD_PROVIDERS", "1");
+			writeRawModelsJson({
+				"sampling-test": {
+					baseUrl: "https://sampling.invalid/v1",
+					api: "openai-completions",
+					models: [
+						{
+							id: "custom",
+							samplingParams: { temperature: 1, top_p: 0.95, top_k: 0 },
+							samplingParamsByThinkingLevel: {
+								low: { temperature: 0.6, top_p: 0.95 },
+								high: { temperature: 0.8 },
+							},
+						},
+					],
+					modelOverrides: {
+						custom: {
+							samplingParamsByThinkingLevel: { low: { temperature: 0.5, top_k: 20 }, max: { temperature: 1 } },
+						},
+					},
+				},
+			});
+			const registry = await createModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getError()).toBeUndefined();
+			const custom = registry.find("sampling-test", "custom");
+			expect(custom?.samplingParams).toEqual({ temperature: 1, top_p: 0.95, top_k: 0 });
+			expect(custom?.samplingParamsByThinkingLevel).toEqual({
+				low: { temperature: 0.5, top_p: 0.95, top_k: 20 },
+				high: { temperature: 0.8 },
+				max: { temperature: 1 },
+			});
+		});
+
+		test("keeps built-in sampling overrides available in offline CI", async () => {
+			enableBuiltinProviders();
+			writeRawModelsJson({
+				openrouter: {
+					modelOverrides: {
+						"anthropic/claude-sonnet-4.5": {
+							samplingParams: { top_p: 0.9 },
+							samplingParamsByThinkingLevel: { high: { temperature: 0.8 } },
+						},
+					},
+				},
+			});
+			const registry = await createModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getError()).toBeUndefined();
+			const sonnet = registry.find("openrouter", "anthropic/claude-sonnet-4.5");
+			expect(sonnet?.samplingParams).toEqual({ top_p: 0.9 });
+			expect(sonnet?.samplingParamsByThinkingLevel).toEqual({ high: { temperature: 0.8 } });
+			const opus = registry.find("openrouter", "anthropic/claude-opus-4.1");
+			expect(opus).toBeDefined();
+			expect(opus?.samplingParams).toBeUndefined();
+			expect(opus?.samplingParamsByThinkingLevel).toBeUndefined();
+		});
 	});
 
 	describe.skipIf(cloudDisabled)("baseUrl override (no custom models)", () => {
@@ -761,57 +822,6 @@ describe("ModelRegistry", () => {
 
 			expect(registry.getError()).toBeUndefined();
 			expect(compat?.allowedFallbackModels).toEqual([]);
-		});
-
-		test("custom models and model overrides carry sampling params", async () => {
-			writeRawModelsJson({
-				openrouter: {
-					baseUrl: "https://my-proxy.example.com/v1",
-					api: "openai-completions",
-					models: [
-						{
-							id: "custom/sampling-model",
-							samplingParams: { temperature: 1, top_p: 0.95, top_k: 0 },
-							samplingParamsByThinkingLevel: {
-								low: { temperature: 0.6, top_p: 0.95 },
-								high: { temperature: 0.8 },
-							},
-						},
-					],
-					modelOverrides: {
-						"custom/sampling-model": {
-							samplingParamsByThinkingLevel: {
-								low: { temperature: 0.5, top_k: 20 },
-								max: { temperature: 1 },
-							},
-						},
-						"anthropic/claude-sonnet-4.5": {
-							samplingParams: { top_p: 0.9 },
-							samplingParamsByThinkingLevel: { high: { temperature: 0.8 } },
-						},
-					},
-				},
-			});
-
-			const registry = await createModelRegistry(authStorage, modelsJsonPath);
-			const models = getModelsForProvider(registry, "openrouter");
-
-			const custom = models.find((m) => m.id === "custom/sampling-model");
-			expect(custom?.samplingParams).toEqual({ temperature: 1, top_p: 0.95, top_k: 0 });
-			expect(custom?.samplingParamsByThinkingLevel).toEqual({
-				low: { temperature: 0.5, top_p: 0.95, top_k: 20 },
-				high: { temperature: 0.8 },
-				max: { temperature: 1 },
-			});
-
-			const sonnet = models.find((m) => m.id === "anthropic/claude-sonnet-4.5");
-			expect(sonnet?.samplingParams).toEqual({ top_p: 0.9 });
-			expect(sonnet?.samplingParamsByThinkingLevel).toEqual({ high: { temperature: 0.8 } });
-
-			// Models without sampling config keep it unset.
-			const opus = models.find((m) => m.id === "anthropic/claude-opus-4.1");
-			expect(opus?.samplingParams).toBeUndefined();
-			expect(opus?.samplingParamsByThinkingLevel).toBeUndefined();
 		});
 
 		test("custom model and model override carry prompt cache lifetimes", async () => {

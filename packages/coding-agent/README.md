@@ -42,6 +42,8 @@ The installer pins all dependencies and updates Pi with `pi update`. Alternative
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 ```
 
+Managed updates retain older immutable releases because open sessions can load code and workers lazily. Updating does not prove an old release is unused. This uses additional disk space; remove an old release only after all Pi processes using that installation have stopped, and keep the version named by `current-version`.
+
 Pi requires Node.js 22.19 or newer. The macOS, Linux, and Windows installers can install it if needed. Pi does not require dependency lifecycle scripts for a normal npm installation.
 
 On macOS and Linux, Nix users can install the latest release with `nix profile add github:earendil-works/pi/stable`. See the [quickstart](docs/quickstart.md#1-install-pi) for updating and pinning releases.
@@ -204,6 +206,8 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/schedule <spec> [message]` | Schedule a one-shot message or continue; `list` lists, `-N` cancels last N, `cancel <id>` cancels one |
 | `/heartbeat <spec> [message]` | Schedule recurring wake-ups; `list` or no args lists, `-N` cancels last N, `cancel <id>` cancels one |
 | `/quit` | Quit pi |
+
+Quitting cancels unaccepted scheduled and heartbeat prompts before resolving extension dialogs. If shutdown fails before session invalidation and the same session resumes, canceled preflight ownership is released while queued schedules and already admitted runs retain their ownership.
 
 ### Keyboard Shortcuts
 

@@ -1,6 +1,7 @@
 import type { TSchema } from "typebox";
 import { Value } from "typebox/value";
 import { type ChordErrorReason, invalid } from "./errors.ts";
+import { copyJson } from "./json.ts";
 
 /** JSON Schema as data. TypeBox schemas are plain JSON Schema objects. */
 type Schema = { readonly [key: string]: unknown };
@@ -42,9 +43,44 @@ export function assertValid(reason: ChordErrorReason, what: string, schema: TSch
 	throw invalid(reason, `${what}: ${summary}`, errors);
 }
 
+/**
+ * Private projection input: copy containers without dropping reserved names or rejecting leaves that Clean may strip.
+ * Strict JSON ownership is established only after projection, never on the caller's unprojected business value.
+ */
+function cloneForProjection(value: unknown, copies = new WeakMap<object, unknown>()): unknown {
+	if (value === null || typeof value !== "object") return value;
+	const prototype = Object.getPrototypeOf(value);
+	if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) return value;
+	if (copies.has(value)) return copies.get(value);
+	const result = Array.isArray(value) ? new Array(value.length) : Object.create(prototype);
+	copies.set(value, result);
+	for (const key of Reflect.ownKeys(value)) {
+		if (Array.isArray(value) && key === "length") continue;
+		const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+		Object.defineProperty(result, key, {
+			value: cloneForProjection("value" in descriptor ? descriptor.value : Reflect.get(value, key), copies),
+			enumerable: descriptor.enumerable,
+			writable: true,
+			configurable: true,
+		});
+	}
+	// Only ancestors retain identity: sibling placements are independent values during mutating projection.
+	copies.delete(value);
+	return result;
+}
+
+/** Own and project remote JSON arguments, preserving omitted arguments and omitting undefined object properties. */
+export function projectJson(schema: TSchema, value: unknown): unknown {
+	const projected = Value.Clean(schema, cloneForProjection(value));
+	return projected === undefined ? undefined : copyJson(projected, { omitUndefinedProperties: true });
+}
+
 /** Applies defaults, strips unknown fields, validates. Returns a fresh value. */
 export function normalize(schema: TSchema, value: unknown, what: string): unknown {
-	const normalized = Value.Clean(schema, Value.Default(schema, Value.Clone(value === undefined ? {} : value)));
+	const normalized = copyJson(
+		Value.Clean(schema, Value.Default(schema, cloneForProjection(value === undefined ? {} : value))),
+		{ omitUndefinedProperties: true },
+	);
 	assertValid("input", what, schema, normalized);
 	return normalized;
 }
@@ -62,7 +98,7 @@ function stripDefaults(schema: Schema, value: unknown): unknown {
 	}
 	if (value === null || typeof value !== "object") return value;
 	const properties = asSchema(schema.properties);
-	const result: Record<string, unknown> = {};
+	const result: Record<string, unknown> = Object.create(null);
 	for (const [key, item] of Object.entries(value)) {
 		const property = asSchema(properties[key]);
 		if ("default" in property && deepEqual(property.default, item)) continue;

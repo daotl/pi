@@ -227,7 +227,7 @@ class RemoteBinaryReader implements BinaryReader {
 				{ startLine, ...(endLine === undefined ? {} : { endLine }) },
 				context.abortSignal ? { signal: context.abortSignal } : {},
 			);
-			return ok(json as unknown as LineScan);
+			return abortResult<LineScan>(context.abortSignal, this.#path) ?? ok(json as unknown as LineScan);
 		} catch (error) {
 			return err(toFileError(error, this.#path));
 		}
@@ -590,6 +590,7 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 	/**
 	 * Node's `writeFile` (abort checked before each 512 KiB write) or `appendFile` (no checks, one after): the first
 	 * request creates parents, opens, and writes the first chunk; later chunks go to the same open file.
+	 * Signal-bearing writes run sequentially so no later mutation starts before its cancellation checkpoint.
 	 */
 	async #write(path: string, content: string | Uint8Array, append: boolean, context: Context) {
 		const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : content;
@@ -600,7 +601,11 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 			async (resolved) => {
 				const first = bytes.subarray(0, WRITE_CHUNK);
 				const keep = bytes.length > WRITE_CHUNK;
-				const reply = await this.connection.request("write", { path: resolved, append, keep }, { payload: first });
+				const reply = await this.connection.request(
+					"write",
+					{ path: resolved, append, keep },
+					{ payload: first, ...(signal ? { signal } : {}) },
+				);
 				if (!keep) return;
 				const handle = new Handle(this, reply.json.handle as number, reply.session, resolved);
 				const inFlight: Promise<unknown>[] = [];
@@ -615,11 +620,11 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 						const written = handle.request(
 							"writeChunk",
 							{},
-							{ payload: bytes.subarray(offset, offset + WRITE_CHUNK) },
+							{ payload: bytes.subarray(offset, offset + WRITE_CHUNK), ...(signal ? { signal } : {}) },
 						);
 						written.catch(() => {});
 						inFlight.push(written);
-						if (inFlight.length >= WRITE_DEPTH) await inFlight.shift();
+						if (inFlight.length >= (signal ? 1 : WRITE_DEPTH)) await inFlight.shift();
 					}
 					// The first failure; later chunks are refused by the daemon, so the file has no gaps.
 					for (const written of inFlight) await written;

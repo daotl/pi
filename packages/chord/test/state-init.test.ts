@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { Type } from "typebox";
 import { describe, it } from "vitest";
+import type { HostImpl } from "../src/host.ts";
 import { type Ctx, createHost, type Facet, isChordError, local, method } from "../src/index.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -74,16 +75,13 @@ describe("state init", () => {
 		const has = host.root((ctx) => ref.has("a", ctx));
 		await until(() => log.includes("init"));
 		assert.equal(ref.status, "loading");
+		assert.deepEqual(seen, [], "loading initializers must not notify value subscribers");
 		loaded.open(["a", "b"]);
 		assert.equal(await has, true);
 		assert.equal(ref.count.value, 2);
 		await until(() => log.length === 4);
 		assert.deepEqual(log, ["open", "init", "listener a,b", "task a,b"]);
-		// Before live, a reference's member has no value (undefined); its first value is the loaded one.
-		assert.deepEqual(
-			seen.filter((value) => value !== undefined),
-			[["a", "b"]],
-		);
+		assert.deepEqual(seen, [["a", "b"]]);
 	});
 
 	it("an init cell cannot be read inside the factory", async () => {
@@ -425,10 +423,35 @@ describe("state init", () => {
 			await host.install(facet({ inits }));
 			const ref = host.hold(Notes, {});
 			await ref.ready;
-			const report = await host.reload([facet({ inits, countVersion: 2, extra: () => ["x"] })]);
-			assert.equal(report.gated.length, 1);
-			assert.deepEqual(inits, ["notes", "more"]);
-			assert.equal(ref.count.value, 2);
+			const release = latch<void>();
+			const leased = latch<void>();
+			const oldRoot = host.root(async (ctx) => {
+				await ref.has("loaded", ctx);
+				leased.open();
+				await release.promise;
+			});
+			await leased.promise;
+			const reloading = host.reload([facet({ inits, countVersion: 2, extra: () => ["x"] })]);
+			try {
+				// Observe admission after preparation has reached the gate, not merely after some elapsed time.
+				await until(() => {
+					const runtime = host as HostImpl;
+					const objects = runtime.objects;
+					return [...objects.values()].some((object) => object.gate !== undefined);
+				});
+				assert.deepEqual(inits, ["notes"]);
+				release.open();
+				await oldRoot;
+				const report = await reloading;
+				assert.equal(report.gated.length, 1);
+				assert.deepEqual(inits, ["notes", "more"]);
+				assert.equal(ref.count.value, 2);
+			} finally {
+				release.open();
+				await oldRoot;
+				await reloading.catch(() => {});
+				await host.close();
+			}
 		});
 	});
 });

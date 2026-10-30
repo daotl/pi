@@ -450,10 +450,12 @@ export interface ScheduledMessage {
 
 interface SettledDelivery {
 	phase: "preflight" | "run";
+	controller?: AbortController;
 }
 
 interface HeartbeatDelivery {
 	preserveCadence: boolean;
+	controller?: AbortController;
 }
 
 /** Recurring wake-up schedule: a fixed interval, or daily at a local time. */
@@ -914,6 +916,8 @@ export class InteractiveMode {
 	private deferredScheduledActions: ScheduledMessage[] = [];
 	private nextScheduleId = 1;
 	private settledDeliveryPending?: SettledDelivery;
+	private scheduledPreflights = new Set<AbortController>();
+	private scheduledDeliveryGeneration = 0;
 
 	// Recurring heartbeats (/heartbeat)
 	private heartbeats: HeartbeatEntry[] = [];
@@ -945,11 +949,12 @@ export class InteractiveMode {
 
 	// Extension UI state
 	// Extension dialogs shown in the editor slot (select, confirm, input, editor, inline custom).
-	// The last entry is visible; see pushExtensionDialog().
+	// Resolved entries form the visible stack; pending factories reserve their interaction order.
 	private extensionDialogs: Array<{
-		component: ExtensionDialogComponent;
+		component?: ExtensionDialogComponent;
 		blocked: BlockedStatus | undefined;
 		cancel: () => void;
+		onShow?: () => void;
 	}> = [];
 	private extensionCustomDialogs = new Set<() => void>();
 	private extensionTerminalInputSubscriptions = new Set<{
@@ -1003,6 +1008,7 @@ export class InteractiveMode {
 		this.options = { ...options, tuiMode };
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
+			this.cancelScheduledPreflights();
 			this.compactionQueueDeliveryPending?.submitting?.controller.abort();
 			this.compactionQueueDeliveryPending = undefined;
 			this.compactionQueuedMessages = [];
@@ -2913,7 +2919,7 @@ export class InteractiveMode {
 		this.renderWidgets();
 	}
 
-	private resetExtensionUI(): void {
+	private cancelExtensionDialogs(): void {
 		const customDialogs = [...this.extensionCustomDialogs];
 		this.extensionCustomDialogs.clear();
 		for (const cancel of customDialogs) cancel();
@@ -2923,6 +2929,10 @@ export class InteractiveMode {
 			for (const dialog of dialogs) dialog.cancel();
 			this.showTopExtensionDialog();
 		}
+	}
+
+	private resetExtensionUI(): void {
+		this.cancelExtensionDialogs();
 		this.ui.hideOverlay();
 		this.clearExtensionTerminalInputListeners();
 		this.setExtensionFooter(undefined);
@@ -3165,11 +3175,13 @@ export class InteractiveMode {
 		const index = this.extensionDialogs.findIndex((dialog) => dialog.component === component);
 		if (index === -1) return;
 		this.extensionDialogs.splice(index, 1);
-		if (index === this.extensionDialogs.length) this.showTopExtensionDialog();
+		if (!this.extensionDialogs.slice(index).some((dialog) => dialog.component !== undefined))
+			this.showTopExtensionDialog();
 	}
 
 	private showTopExtensionDialog(): void {
-		const top = this.extensionDialogs.at(-1);
+		const top = this.extensionDialogs.findLast((dialog) => dialog.component !== undefined);
+		top?.onShow?.();
 		const component = top?.component ?? this.editor;
 		this.editorContainer.clear();
 		this.editorContainer.addChild(component);
@@ -3412,18 +3424,30 @@ export class InteractiveMode {
 		},
 	): Promise<T | undefined> {
 		if (this.isShuttingDown) return undefined;
-		const savedText = this.editor.getText();
+		let savedText: string | undefined;
 		const isOverlay = options?.overlay ?? false;
 
 		return new Promise((resolve, reject) => {
 			let component: ExtensionDialogComponent | undefined;
 			let overlayHandle: OverlayHandle | undefined;
 			let closed = false;
+			const reservation: InteractiveMode["extensionDialogs"][number] = {
+				blocked: undefined,
+				cancel: () => cancel(),
+				onShow: () => {
+					savedText ??= this.editor.getText();
+				},
+			};
 
 			const restoreEditor = () => {
-				if (component) this.removeExtensionDialog(component);
-				this.editor.setText(savedText);
-				this.ui.requestRender();
+				const ownsEditor =
+					this.extensionDialogs.findLast((dialog) => dialog.component !== undefined) === reservation;
+				const index = this.extensionDialogs.indexOf(reservation);
+				if (index !== -1) this.extensionDialogs.splice(index, 1);
+				if (ownsEditor) {
+					if (savedText !== undefined) this.editor.setText(savedText);
+					this.showTopExtensionDialog();
+				}
 			};
 
 			const cleanup = (): boolean => {
@@ -3448,6 +3472,7 @@ export class InteractiveMode {
 
 			const cancel = () => close(undefined);
 			this.extensionCustomDialogs.add(cancel);
+			if (!isOverlay) this.extensionDialogs.push(reservation);
 
 			let created: (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>;
 			try {
@@ -3487,7 +3512,11 @@ export class InteractiveMode {
 						// Expose handle to caller for visibility control
 						options?.onHandle?.(overlayHandle);
 					} else {
-						this.pushExtensionDialog(c, cancel);
+						reservation.component = c;
+						if (this.extensionDialogs.findLast((dialog) => dialog.component !== undefined) === reservation) {
+							this.disposeActiveSelector();
+							this.showTopExtensionDialog();
+						}
 					}
 				})
 				.catch((err) => {
@@ -4971,6 +5000,8 @@ export class InteractiveMode {
 		const recovering = this.shutdownRecoveryEditor !== undefined;
 		this.shutdownRecoveryEditor = undefined;
 		this.isShuttingDown = true;
+		this.cancelScheduledPreflights();
+		this.cancelExtensionDialogs();
 		// Keep signal handlers registered until terminal cleanup has completed.
 		// `signal-exit` checks the listener list during the same SIGTERM/SIGHUP
 		// dispatch and re-sends the signal if only its own listeners remain.
@@ -6550,18 +6581,36 @@ export class InteractiveMode {
 		})();
 	}
 
+	private cancelScheduledPreflights(): void {
+		this.scheduledDeliveryGeneration++;
+		for (const controller of this.scheduledPreflights) {
+			if (
+				this.settledDeliveryPending?.phase === "preflight" &&
+				this.settledDeliveryPending.controller === controller
+			)
+				this.settledDeliveryPending = undefined;
+			if (this.heartbeatStartPending?.controller === controller) this.heartbeatStartPending = undefined;
+			controller.abort();
+		}
+		this.scheduledPreflights.clear();
+	}
+
 	private deliverScheduledMessage(
 		text: string,
 		onDispatch?: (waitingForRun: boolean) => void,
 		onOutcome?: (started: boolean) => void,
+		delivery?: SettledDelivery | HeartbeatDelivery,
 	): void {
+		if (this.isShuttingDown) return;
+		const session = this.session;
+		const generation = this.scheduledDeliveryGeneration;
 		let outcomeReported = false;
 		const reportOutcome = (started: boolean) => {
 			if (outcomeReported) return;
 			outcomeReported = true;
 			onOutcome?.(started);
 		};
-		if (this.session.isCompacting) {
+		if (session.isCompacting) {
 			// Flushed after compaction like user-typed queued messages.
 			this.compactionQueuedMessages.push({ text, mode: "followUp" });
 			this.updatePendingMessagesDisplay();
@@ -6569,52 +6618,45 @@ export class InteractiveMode {
 			onDispatch?.(true);
 			return;
 		}
-		if (this.session.isStreaming) {
-			// Queue after the current task instead of interrupting each turn.
+		const controller = new AbortController();
+		if (delivery) delivery.controller = controller;
+		this.scheduledPreflights.add(controller);
+		const isCurrent = () =>
+			this.session === session && this.scheduledDeliveryGeneration === generation && !controller.signal.aborted;
+		const fail = (error: unknown) => {
+			this.scheduledPreflights.delete(controller);
+			if (!isCurrent()) return;
 			reportOutcome(false);
-			onDispatch?.(true);
-			void this.session.prompt(text, { streamingBehavior: "followUp" }).catch((error: unknown) => {
-				this.showError(error instanceof Error ? error.message : String(error));
-			});
-			return;
-		}
-		void this.session
-			.prompt(text, {
+			this.showError(error instanceof Error ? error.message : String(error));
+			onDispatch?.(false);
+		};
+		const submit = (followUp: boolean): Promise<void> =>
+			session.prompt(text, {
+				...(followUp ? { streamingBehavior: "followUp" as const } : {}),
+				preflightSignal: controller.signal,
 				preflightResult: (disposition) => {
+					this.scheduledPreflights.delete(controller);
+					if (!isCurrent()) return;
 					reportOutcome(disposition === "started");
 					onDispatch?.(disposition !== "handled");
 				},
 				onDeferredError: () => {
+					this.scheduledPreflights.delete(controller);
+					if (!isCurrent()) return;
 					reportOutcome(false);
 					onDispatch?.(false);
 				},
-			})
-			.catch((error: unknown) => {
-				// Preserve ordinary messages if another run won asynchronous preflight.
-				if (error instanceof Error && error.message.includes("already processing")) {
-					void this.session
-						.prompt(text, {
-							streamingBehavior: "followUp",
-							preflightResult: (disposition) => {
-								reportOutcome(disposition === "started");
-								onDispatch?.(disposition !== "handled");
-							},
-							onDeferredError: () => {
-								reportOutcome(false);
-								onDispatch?.(false);
-							},
-						})
-						.catch((inner: unknown) => {
-							reportOutcome(false);
-							this.showError(inner instanceof Error ? inner.message : String(inner));
-							onDispatch?.(false);
-						});
-					return;
-				}
-				reportOutcome(false);
-				this.showError(error instanceof Error ? error.message : String(error));
-				onDispatch?.(false);
 			});
+		const followUp = session.isStreaming;
+		void submit(followUp).catch((error: unknown) => {
+			if (!isCurrent()) return;
+			// Preserve ordinary messages if another run won asynchronous preflight.
+			if (!followUp && error instanceof Error && error.message.includes("already processing")) {
+				void submit(true).catch(fail);
+				return;
+			}
+			fail(error);
+		});
 	}
 
 	/** Count a completed message toward message-count scheduled triggers. */
@@ -6677,7 +6719,7 @@ export class InteractiveMode {
 		if (deferred && (!due || deferred.id < due.id)) {
 			this.deferredScheduledActions.splice(deferredIndex, 1);
 			if (deferred.isContinue || deferred.isEdit) this.runScheduledAction(deferred, () => finish(false));
-			else this.deliverScheduledMessage(deferred.text, finish);
+			else this.deliverScheduledMessage(deferred.text, finish, undefined, delivery);
 			return;
 		}
 		if (this.pendingCompactionContinue) {
@@ -6688,7 +6730,7 @@ export class InteractiveMode {
 		if (due) {
 			this.scheduledMessages.splice(this.scheduledMessages.indexOf(due), 1);
 			if (due.isContinue || due.isEdit) this.runScheduledAction(due, () => finish(false));
-			else this.deliverScheduledMessage(due.text, finish);
+			else this.deliverScheduledMessage(due.text, finish, undefined, delivery);
 		}
 	}
 
@@ -7019,7 +7061,7 @@ export class InteractiveMode {
 			void this.handleContinueCommand();
 			onOutcome(session.isStreaming);
 		} else {
-			this.deliverScheduledMessage(entry.text, undefined, onOutcome);
+			this.deliverScheduledMessage(entry.text, undefined, onOutcome, delivery);
 		}
 	}
 
@@ -9667,6 +9709,7 @@ export class InteractiveMode {
 	}
 
 	stop(fullscreenExitOutput = this.settingsManager.getFullscreenExitOutput()): void {
+		this.cancelScheduledPreflights();
 		this.disposeActiveSelector();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);

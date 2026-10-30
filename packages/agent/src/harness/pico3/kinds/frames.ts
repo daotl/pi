@@ -5,6 +5,7 @@ import type {
 	ThinkingContent,
 	ToolCall,
 } from "@earendil-works/pi-ai";
+import { appendRawToolTokens } from "../membrane.ts";
 
 /**
  * Apply one encoded frame to the tracked output. Same switch as pi-ai's
@@ -53,12 +54,12 @@ export function applyFrame(o: { message?: AssistantMessage }, frame: AssistantMe
 		case "toolcall_checkpoint": {
 			const b = c[frame.contentIndex] as ToolCall;
 			b.arguments = safeParse(frame.json);
-			if (frame.rawDelta !== undefined) b.raw = (b.raw ?? "") + frame.rawDelta;
+			if (frame.rawDelta !== undefined) appendRawToolTokens(b, frame.rawDelta);
 			return;
 		}
 		case "toolcall_delta": {
 			const b = c[frame.contentIndex] as ToolCall;
-			if (frame.rawDelta !== undefined) b.raw = (b.raw ?? "") + frame.rawDelta;
+			if (frame.rawDelta !== undefined) appendRawToolTokens(b, frame.rawDelta);
 			return; // Arguments materialise at checkpoint/end, independently of raw tokens.
 		}
 		case "toolcall_end": {

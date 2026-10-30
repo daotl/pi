@@ -182,6 +182,19 @@ describe("OpenAI Decisions", () => {
 		expect(result.errorMessage).toContain("at most 128 images, got 129");
 	});
 
+	it("rejects images for a text-only model in direct adapter calls", async () => {
+		const fetch = vi.fn(async () => Response.json({ answers: wireAnswers }));
+		const result = await classify(
+			{ ...model, input: ["text"] },
+			{ ...context, images: [image] },
+			{ apiKey: "secret", fetch },
+		);
+		expect(result.stopReason).toBe("error");
+		expect(result.answers).toEqual({});
+		expect(result.errorMessage).toContain("image");
+		expect(fetch).not.toHaveBeenCalled();
+	});
+
 	it("fails the result when a question is refused and keeps the billed usage", async () => {
 		const result = await classify(model, context, {
 			apiKey: "secret",

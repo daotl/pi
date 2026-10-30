@@ -422,11 +422,11 @@ describe("durable code mode", () => {
 		const { harness, result } = await restart(
 			chat,
 			`const before = [Date.now(), Math.random()];
-			await tools.hold({});
 			await tools.echo({ text: String(before[0]) + "/" + String(before[1]) });
+			await tools.hold({});
 			return "ok";`,
 		);
-		expect(result.text).toBe("ok");
+		expect(result).toEqual({ text: "ok", isError: false });
 		// One echo: the same arguments, so the rerun admitted no second call.
 		expect([...chat.echo.values()]).toEqual([1]);
 		await harness.close(context);

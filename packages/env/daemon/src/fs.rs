@@ -1,12 +1,13 @@
 //! File operations with Node's semantics where the Rust standard library differs (docs/semantics.md).
 
 use crate::errors::Failure;
-use crate::sys;
+use crate::{exec::Control, sys};
 use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::sync::atomic::Ordering;
 
 pub type Outcome<T> = Result<T, Failure>;
 
@@ -105,7 +106,9 @@ pub fn mkdir(path: &str, recursive: bool) -> Outcome<Value> {
 
 /// `writeFile`/`appendFile`: create missing parents like Node's recursive `mkdir`, then write. Returns the open file
 /// for further chunks.
-pub fn write(path: &str, append: bool, parents: bool, content: &[u8]) -> Outcome<File> {
+pub fn write(path: &str, append: bool, parents: bool, content: &[u8], control: &Control) -> Outcome<File> {
+    let control = if append { None } else { Some(control) };
+    check_write(control)?;
     if let Some(parent) = Path::new(path)
         .parent()
         .filter(|_| parents)
@@ -114,15 +117,37 @@ pub fn write(path: &str, append: bool, parents: bool, content: &[u8]) -> Outcome
         mkdir_recursive(parent)
             .map_err(|error| Failure::io(&error, "mkdir", &parent.to_string_lossy()))?;
     }
+    check_write(control)?;
     let mode = if append {
         sys::OpenMode::Append
     } else {
         sys::OpenMode::Write
     };
-    let mut file = sys::open(path, mode).map_err(|error| Failure::io(&error, "open", path))?;
-    file.write_all(content)
-        .map_err(|error| Failure::io(&error, "write", path))?;
+    let file = sys::open(path, mode).map_err(|error| Failure::io(&error, "open", path))?;
+    write_chunk(&file, path, content, control)?;
     Ok(file)
+}
+
+fn check_write(control: Option<&Control>) -> Outcome<()> {
+    if control.is_some_and(|control| control.aborted.load(Ordering::SeqCst)) {
+        return Err(Failure::new("aborted", "aborted"));
+    }
+    Ok(())
+}
+
+/// Check again before each physical write, including retries after short or interrupted writes.
+pub fn write_chunk(mut file: &File, path: &str, mut content: &[u8], control: Option<&Control>) -> Outcome<()> {
+    check_write(control)?;
+    while !content.is_empty() {
+        check_write(control)?;
+        match file.write(content) {
+            Ok(0) => return Err(Failure::io(&io::Error::from(io::ErrorKind::WriteZero), "write", path)),
+            Ok(written) => content = &content[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(Failure::io(&error, "write", path)),
+        }
+    }
+    Ok(())
 }
 
 fn open_existing_for_write(path: &str) -> Outcome<File> {

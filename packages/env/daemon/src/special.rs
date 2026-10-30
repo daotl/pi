@@ -540,59 +540,160 @@ mod tests {
 
     #[test]
     fn misclassified_fifo_keeps_the_original_empty_writer_rendezvous() {
-        use std::os::unix::fs::OpenOptionsExt;
+        const CHILD: &str = "PI_ENV_FIFO_INTERRUPT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // SIGUSR2 belongs to the standalone daemon, never the test runner's global signal state.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "special::tests::misclassified_fifo_keeps_the_original_empty_writer_rendezvous", "--nocapture"])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "isolated FIFO interruption regression failed: {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("isolated FIFO interruption regression timed out");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        install_interrupt().unwrap();
         let root = sys::mkdtemp(&format!("{}/pi-env-open-race-", sys::tmpdir())).unwrap();
         let path = std::path::Path::new(&root).join("fifo");
         let raw = CString::new(path.as_os_str().as_bytes()).unwrap();
         // SAFETY: NUL-terminated path in a private test directory.
         assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+        let regular = std::path::Path::new(&root).join("regular");
+        std::fs::write(&regular, b"ordinary").unwrap();
         let (events, receiver) = mpsc::sync_channel(crate::MAX_HANDLES);
-        let mut quick = Openers::start(events, false);
-        // Force the exact metadata/open race state without probabilistic renames: a FIFO enters the quick pool
-        // with the same hint a just-replaced regular path would carry.
+        let mut quick = Openers::start(events.clone(), false);
+        let mut slow = Openers::start(events, true);
+        let controls: Vec<_> = (0..crate::WORKERS).map(|_| Arc::new(Control::default())).collect();
+        for (id, control) in controls.iter().enumerate() {
+            quick.submit(Request {
+                id: id as u32,
+                control: control.clone(),
+                operation: Operation::Open { path: path.to_string_lossy().into_owned(), slow: false },
+            });
+        }
+        wait_registered(&quick, crate::WORKERS);
+        // Every quick worker is occupied by a misclassified FIFO. Actual SIGUSR2 interruption must transfer
+        // each unopened request to the slow pool, freeing capacity without any writer rendezvous.
+        for _ in 0..crate::WORKERS {
+            let Event::Opened { opened, slow: is_slow } = interrupted_completion(&quick, &receiver, true) else {
+                panic!("expected a deferred open");
+            };
+            assert!(!is_slow);
+            assert!(opened.result.unwrap().is_none());
+            quick.active -= 1;
+            slow.submit(opened.request);
+        }
+        wait_registered(&slow, crate::WORKERS);
         quick.submit(Request {
-            id: 1,
+            id: 100,
             control: Arc::new(Control::default()),
-            operation: Operation::Open {
-                path: path.to_string_lossy().into_owned(),
-                slow: false,
-            },
+            operation: Operation::Open { path: regular.to_string_lossy().into_owned(), slow: false },
         });
-        // An empty writer's successful open/close proves the reader rendezvoused. Keep retrying ENXIO only while
-        // the helper has not entered its real blocking open; no wall-clock sleep or writer payload hides the race.
+        let Event::Opened { opened, slow: is_slow } = receiver.recv_timeout(Duration::from_secs(3)).unwrap() else {
+            panic!("ordinary open did not complete while slow FIFOs were blocked");
+        };
+        assert!(!is_slow);
+        assert_eq!(opened.request.id, 100);
+        let mut content = String::new();
+        opened.result.unwrap().unwrap().read_to_string(&mut content).unwrap();
+        assert_eq!(content, "ordinary");
+        quick.active -= 1;
+        for control in &controls { control.cancel(false); }
+        for _ in 0..crate::WORKERS {
+            let Event::Opened { opened, slow: is_slow } = interrupted_completion(&slow, &receiver, false) else {
+                panic!("expected cancellation of a deferred FIFO");
+            };
+            assert!(is_slow);
+            assert_eq!(sys::error_name(&opened.result.unwrap_err()), "aborted");
+            slow.active -= 1;
+        }
+
+        // Interrupt around a writer rendezvous. A nonblocking writer can succeed even when the reader syscall
+        // returns EINTR, so retain that one writer until quick completion or quick-to-slow transfer completes.
+        // Then close it and require EOF from the transferred reader without ever opening another writer.
+        use std::os::unix::fs::OpenOptionsExt;
+        for id in 200..216 {
+            quick.submit(Request {
+                id,
+                control: Arc::new(Control::default()),
+                operation: Operation::Open { path: path.to_string_lossy().into_owned(), slow: false },
+            });
+            wait_registered(&quick, 1);
+            let writer_path = path.clone();
+            let (release_writer, held_writer) = mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                loop {
+                    match std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&writer_path) {
+                        Ok(writer) => {
+                            held_writer.recv_timeout(Duration::from_secs(5)).unwrap();
+                            drop(writer);
+                            return;
+                        }
+                        Err(error) if error.raw_os_error() == Some(libc::ENXIO) && std::time::Instant::now() < deadline => std::thread::yield_now(),
+                        Err(error) => panic!("writer did not rendezvous: {error}"),
+                    }
+                }
+            });
+            let Event::Opened { mut opened, slow: is_slow } = interrupted_completion(&quick, &receiver, true) else {
+                panic!("expected the interrupted FIFO completion");
+            };
+            assert!(!is_slow);
+            quick.active -= 1;
+            if matches!(&opened.result, Ok(None)) {
+                slow.submit(opened.request);
+                let Event::Opened { opened: transferred, slow: is_slow } = receiver.recv_timeout(Duration::from_secs(3)).unwrap() else {
+                    panic!("expected the transferred FIFO completion");
+                };
+                assert!(is_slow);
+                slow.active -= 1;
+                opened = transferred;
+            }
+            release_writer.send(()).unwrap();
+            writer.join().unwrap();
+            assert_eq!(opened.request.id, id);
+            let mut file = opened.result.unwrap().expect("successful rendezvous must transfer its original descriptor");
+            // Nonblocking read turns a lost rendezvous into a deterministic failure, not a hung test.
+            unsafe {
+                let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
+                assert!(flags >= 0);
+                assert_eq!(libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK), 0);
+            }
+            assert_eq!(file.read(&mut [0]).unwrap(), 0);
+        }
+        drop(quick);
+        drop(slow);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn wait_registered(pool: &Openers, count: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while pool.registrations.iter().filter(|slot| slot.lock().unwrap().is_some()).count() != count {
+            assert!(std::time::Instant::now() < deadline, "FIFO helpers did not register");
+            std::thread::yield_now();
+        }
+    }
+
+    fn interrupted_completion(pool: &Openers, receiver: &mpsc::Receiver<Event>, defer: bool) -> Event {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&path)
-            {
-                Ok(writer) => {
-                    drop(writer);
-                    break;
-                }
-                Err(error)
-                    if error.raw_os_error() == Some(libc::ENXIO)
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::yield_now();
-                }
-                Err(error) => panic!("writer did not rendezvous: {error}"),
+            // Repeat to cover registration becoming visible just before the helper enters libc::open.
+            pool.interrupt(defer);
+            match receiver.recv_timeout(Duration::from_millis(5)) {
+                Ok(event) => return event,
+                Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => {}
+                Err(error) => panic!("interrupted helper did not complete: {error}"),
             }
         }
-        let Event::Opened { opened, slow } = receiver.recv_timeout(Duration::from_secs(3)).unwrap()
-        else {
-            panic!("expected the completed FIFO open");
-        };
-        assert!(!slow);
-        let mut file = opened
-            .result
-            .unwrap()
-            .expect("successful rendezvous must transfer its original descriptor");
-        let mut byte = [0];
-        assert_eq!(file.read(&mut byte).unwrap(), 0);
-        drop(file);
-        drop(quick);
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

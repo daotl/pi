@@ -10,6 +10,8 @@ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode
 
 type ShutdownThis = {
 	isShuttingDown: boolean;
+	cancelScheduledPreflights: () => void;
+	cancelExtensionDialogs: () => void;
 	unregisterSignalHandlers: () => void;
 	runtimeHost: { dispose: () => Promise<void> };
 	ui: { terminal: { drainInput: (ms: number) => Promise<void> } };
@@ -58,6 +60,8 @@ describe("InteractiveMode SIGTERM shutdown with signal-exit (#5724)", () => {
 		const dispose = deferred();
 		const context: ShutdownThis = {
 			isShuttingDown: false,
+			cancelScheduledPreflights: () => {},
+			cancelExtensionDialogs: () => {},
 			unregisterSignalHandlers: vi.fn(() => {
 				order.push("unregister");
 			}),

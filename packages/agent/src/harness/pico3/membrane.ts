@@ -1,3 +1,14 @@
+import { appendText, type Draft } from "@earendil-works/chord/delta";
+
+const rawAppenders = new WeakMap<object, (text: string) => void>();
+
+/** Preserve raw-token append intent across the transaction membrane. */
+export function appendRawToolTokens(target: { raw?: string }, text: string): void {
+	const append = rawAppenders.get(target);
+	if (append) append(text);
+	else target.raw = (target.raw ?? "") + text;
+}
+
 /**
  * A transaction-scoped revocable membrane over a Chord-tracked document.
  *
@@ -107,6 +118,12 @@ export class Membrane {
 		});
 		this.wrappers.set(target, proxy);
 		this.isWrapper.add(proxy);
+		rawAppenders.set(proxy, (text) => {
+			if (!m.alive) throw dead();
+			const raw = target as Draft<{ raw?: string }>;
+			if (raw.raw === undefined) raw.raw = "";
+			appendText(raw as Draft<{ raw: string }>, "raw", text);
+		});
 		return proxy as T;
 	}
 

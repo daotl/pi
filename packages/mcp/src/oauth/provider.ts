@@ -14,6 +14,8 @@ export interface McpOAuthState {
 	/** When the access token expires, in milliseconds since the epoch, from `expires_in` at the time it was saved. */
 	tokensExpireAt?: number;
 	codeVerifier?: string;
+	/** Requested scope of the pending authorization, saved atomically with its PKCE verifier. */
+	authorizationScope?: string;
 	oauthState?: string;
 	discovery?: OAuthDiscoveryState;
 }
@@ -116,8 +118,12 @@ export class McpOAuthProvider implements OAuthClientProvider {
 		await this.onRedirect(url);
 	}
 
-	async saveCodeVerifier(verifier: string): Promise<void> {
-		await this.update((value) => ({ ...value, codeVerifier: verifier }));
+	async saveCodeVerifier(verifier: string, scope?: string): Promise<void> {
+		await this.update((value) => ({ ...value, codeVerifier: verifier, authorizationScope: scope }));
+	}
+
+	async authorizationScope(): Promise<string | undefined> {
+		return (await this.load()).authorizationScope;
 	}
 
 	async codeVerifier(): Promise<string> {
@@ -134,7 +140,10 @@ export class McpOAuthProvider implements OAuthClientProvider {
 				delete next.tokens;
 				delete next.tokensExpireAt;
 			}
-			if (kind === "all" || kind === "verifier") delete next.codeVerifier;
+			if (kind === "all" || kind === "verifier") {
+				delete next.codeVerifier;
+				delete next.authorizationScope;
+			}
 			if (kind === "all" || kind === "discovery") delete next.discovery;
 			if (kind === "all") delete next.oauthState;
 			return next;

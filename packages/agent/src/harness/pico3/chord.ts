@@ -524,7 +524,20 @@ function bridgeWatch(
 
 function applyTracked(root: Draft<PublishedConversationView>, ops: readonly Op[]): void {
 	for (const op of ops) {
-		if (op[0] === "r") throw new Error("live Pico envelope unexpectedly replaced the view root");
+		if (op[0] === "r") {
+			// Tracker budget fallback replaces Pico's view, not the bridge's publication metadata.
+			const replacement = op[1];
+			if (replacement === null || typeof replacement !== "object" || Array.isArray(replacement))
+				throw new Error("Pico view root must be an object");
+			const record = root as unknown as Record<string, unknown>;
+			for (const key of Object.keys(record)) {
+				if (key !== "publication" && key !== "commit") delete record[key];
+			}
+			for (const [key, value] of Object.entries(replacement)) {
+				if (key !== "publication" && key !== "commit") record[key] = value;
+			}
+			continue;
+		}
 		const path = op[1];
 		if (op[0] === "p") {
 			const target = resolve(root, path);

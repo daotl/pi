@@ -42,6 +42,7 @@ export async function createSessionWorkerServices(options: {
 	const host = createHost({ name: "session", self: "worker" });
 	let reloadTail = Promise.resolve();
 	let disposed = false;
+	let disposal: Promise<void> | undefined;
 	const pluginLoader = options.facetLoader ?? (async () => ({ facets: [], async dispose() {} }));
 	let loadedPlugins = await pluginLoader();
 	const reloadPlugins = (): Promise<void> => {
@@ -131,15 +132,26 @@ export async function createSessionWorkerServices(options: {
 			return true;
 		},
 		removeAttachments,
-		async dispose() {
-			if (disposed) return;
+		dispose() {
+			if (disposal) return disposal;
 			disposed = true;
-			await removeAttachments(() => true);
-			await reloadTail;
-			const results = await Promise.allSettled([host.close(), loadedPlugins.dispose()]);
-			const errors = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
-			if (errors.length === 1) throw errors[0];
-			if (errors.length > 1) throw new AggregateError(errors, "Failed to dispose Session facets");
+			disposal = (async () => {
+				const errors: unknown[] = [];
+				try {
+					await removeAttachments(() => true);
+				} catch (error) {
+					errors.push(error);
+				}
+				await reloadTail;
+				const results = await Promise.allSettled([
+					Promise.resolve().then(() => host.close()),
+					Promise.resolve().then(() => loadedPlugins.dispose()),
+				]);
+				errors.push(...results.flatMap((result) => (result.status === "rejected" ? [result.reason] : [])));
+				if (errors.length === 1) throw errors[0];
+				if (errors.length > 1) throw new AggregateError(errors, "Failed to dispose Session facets");
+			})();
+			return disposal;
 		},
 	};
 }

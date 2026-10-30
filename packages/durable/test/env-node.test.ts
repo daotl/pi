@@ -682,6 +682,7 @@ describe("NodeExecutionEnv shell", () => {
 				execFile(
 					process.execPath,
 					[
+						"--conditions=source",
 						fileURLToPath(new URL("./fixtures/legacy-shell-transport.ts", import.meta.url)),
 						root,
 						shellPath,

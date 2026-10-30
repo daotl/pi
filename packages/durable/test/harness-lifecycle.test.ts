@@ -339,12 +339,25 @@ describe("Harness close", () => {
 		await harness.commit(async (tx) => {
 			(await tx.doc(Notes)).text = "x";
 		}, context);
-		// Count commit subscriptions of document observers.
+		// Document watches use internal commit observers, not host commit subscriptions.
+		const session = harness as unknown as SessionImpl;
+		const attached = session.documentCacheSizes.attached;
 		let subscriptions = 0;
-		const subscribe = harness.subscribeCommits.bind(harness);
-		harness.subscribeCommits = (listener) => {
+		let registrations = 0;
+		let publications = 0;
+		let cancelOnRegistration: AbortController | undefined;
+		const observe = session.observeCommits.bind(session);
+		session.observeCommits = (listener) => {
 			subscriptions++;
-			const unsubscribe = subscribe(listener);
+			registrations++;
+			const unsubscribe = observe((publication, ctx) => {
+				publications++;
+				listener(publication, ctx);
+			});
+			if (cancelOnRegistration !== undefined) {
+				const controller = cancelOnRegistration;
+				queueMicrotask(() => controller.abort(new Error("cancelled at registration")));
+			}
 			let active = true;
 			return () => {
 				if (active) subscriptions--;
@@ -352,6 +365,21 @@ describe("Harness close", () => {
 				unsubscribe();
 			};
 		};
+
+		// Positive control: the counter and pin must see a real observer and a later committed update.
+		const control = (await harness.watchDoc(Notes, context))!;
+		expect(subscriptions).toBe(1);
+		expect(session.documentCacheSizes.attached).toBe(attached + 1);
+		const delivered = deferred<string>();
+		control.start(async (value) => delivered.resolve(value?.text ?? "retired"));
+		await harness.commit(async (tx) => {
+			(await tx.doc(Notes)).text = "control";
+		}, context);
+		expect(await delivered.promise).toBe("control");
+		expect(publications).toBe(1);
+		await control.stop();
+		expect(subscriptions).toBe(0);
+		expect(session.documentCacheSizes.attached).toBe(attached);
 
 		// Cancel a document watch while its acquisition loads the document on the line.
 		await unloadDocuments(harness);
@@ -363,6 +391,23 @@ describe("Harness close", () => {
 		find.release();
 		await expect(docWatch).rejects.toThrow("cancelled");
 		expect(subscriptions).toBe(0);
+		expect(session.documentCacheSizes.attached).toBe(attached);
+
+		// Cancel after the observer registers, before watchDoc hands it back to its caller.
+		const beforeRegistration = registrations;
+		cancelOnRegistration = new AbortController();
+		await expect(harness.watchDoc(Notes, withSignal(cancelOnRegistration.signal))).rejects.toThrow(
+			"cancelled at registration",
+		);
+		cancelOnRegistration = undefined;
+		expect(registrations).toBe(beforeRegistration + 1);
+		expect(subscriptions).toBe(0);
+		expect(session.documentCacheSizes.attached).toBe(attached);
+		const beforeCommit = publications;
+		await harness.commit(async (tx) => {
+			(await tx.doc(Notes)).text = "after cancellation";
+		}, context);
+		expect(publications).toBe(beforeCommit);
 
 		// Cancel a view watch while it builds its mount on the line.
 		await unloadDocuments(harness);
@@ -373,6 +418,8 @@ describe("Harness close", () => {
 		controller.abort(new Error("cancelled"));
 		find.release();
 		await expect(viewWatch).rejects.toThrow("cancelled");
+		expect(subscriptions).toBe(0);
+		expect(session.documentCacheSizes.attached).toBe(attached);
 		// No observer kept the mount: the next observer builds a new one, and the one after that another.
 		const first = await root.watch(context);
 		const firstValue = first.value;

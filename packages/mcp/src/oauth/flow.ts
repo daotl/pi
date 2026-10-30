@@ -60,8 +60,11 @@ export interface OAuthClientProvider {
 	tokens(): OAuthTokens | undefined | Promise<OAuthTokens | undefined>;
 	saveTokens(tokens: OAuthTokens): void | Promise<void>;
 	redirectToAuthorization(url: URL): void | Promise<void>;
-	saveCodeVerifier(verifier: string): void | Promise<void>;
+	/** Atomically save the PKCE verifier and requested scope for the pending authorization. */
+	saveCodeVerifier(verifier: string, scope?: string): void | Promise<void>;
 	codeVerifier(): string | Promise<string>;
+	/** Scope saved with the pending verifier, retained across browser redirects and process restarts. */
+	authorizationScope(): string | undefined | Promise<string | undefined>;
 	addClientAuthentication?: AddClientAuthentication;
 	invalidateCredentials?(kind: "all" | "client" | "tokens" | "verifier" | "discovery"): void | Promise<void>;
 	saveDiscoveryState?(state: OAuthDiscoveryState): void | Promise<void>;
@@ -323,6 +326,7 @@ export function stepUpScope(granted: string | undefined, challenged: string | un
 }
 
 async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions): Promise<OAuthFlowResult> {
+	options.signal?.throwIfAborted();
 	const metadataUrl = options.authorizationServerMetadataUrl && secureEndpoint(options.authorizationServerMetadataUrl);
 	// With a configured metadata URL, discovery is not cached, so changing the URL applies at once.
 	const cached = metadataUrl ? undefined : await provider.discoveryState?.();
@@ -398,9 +402,9 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 			codeVerifier: await provider.codeVerifier(),
 			redirectUrl,
 		});
-		// A response without `scope` grants the requested scope (RFC 6749 §5.1). Recorded so a step-up can
-		// keep it. Callers pass the options of the authorization request, so `scope` is what was requested.
-		await provider.saveTokens(withScope(tokens, scope));
+		// A response without `scope` grants the pending authorization's requested scope (RFC 6749 §5.1),
+		// which may have been computed privately by adaptOAuthProvider for a step-up challenge.
+		await provider.saveTokens(withScope(tokens, (await provider.authorizationScope()) ?? scope));
 		return "AUTHORIZED";
 	}
 	const existing = options.skipRefresh ? undefined : await provider.tokens();
@@ -423,7 +427,9 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 			if (error instanceof OAuthError && error.code !== "server_error") throw error;
 		}
 	}
+	options.signal?.throwIfAborted();
 	const state = await provider.state?.();
+	options.signal?.throwIfAborted();
 	const authorization = await startAuthorization(discovered.authorizationServerUrl, {
 		metadata,
 		clientInformation: client,
@@ -432,7 +438,9 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 		state,
 		resource,
 	});
-	await provider.saveCodeVerifier(authorization.codeVerifier);
+	options.signal?.throwIfAborted();
+	await provider.saveCodeVerifier(authorization.codeVerifier, scope);
+	options.signal?.throwIfAborted();
 	await provider.redirectToAuthorization(authorization.authorizationUrl);
 	return "REDIRECT";
 }

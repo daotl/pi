@@ -75,6 +75,7 @@ describe("read-only Harness", () => {
 		expect((await viewer.getTask(run!.taskId, context))?.state.status).toBe("running");
 		const inspection = await viewer.inspect(context);
 		expect(inspection.scheduling).toBe("paused");
+		expect(inspection.tasks.find((task) => task.record.id === run!.taskId)?.state).toEqual({ kind: "running" });
 		expect(viewer.wake()).toEqual({ active: false });
 		await viewer.close(context);
 

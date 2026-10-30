@@ -12,8 +12,16 @@ import {
 	type TerminalColorScheme,
 	type TerminalColors,
 } from "./terminal-colors.ts";
-import { getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.ts";
 import {
+	cropKittyImageLine,
+	getCapabilities,
+	getKittyImageMetadata,
+	getKittyImagePlacementRows,
+	isImageLine,
+	setCellDimensions,
+} from "./terminal-image.ts";
+import {
+	extractAnsiCode,
 	extractSegments,
 	normalizeTerminalOutput,
 	sliceByColumn,
@@ -530,6 +538,7 @@ export abstract class TuiBase extends Container implements TUI {
 	private focusOrderCounter = 0;
 	private overlayStack: OverlayStackEntry[] = [];
 	protected renderedOverlayLayouts: RenderedOverlayLayout[] = [];
+	protected renderedOverlayImages: Array<{ row: number; rows: number; col: number; line: string }> = [];
 
 	get hasOverlayEntries(): boolean {
 		return this.overlayStack.length > 0;
@@ -1370,6 +1379,7 @@ export abstract class TuiBase extends Container implements TUI {
 
 	/** Composite all overlays into content lines (sorted by focusOrder, higher = on top). */
 	protected compositeOverlays(lines: string[], termWidth: number, termHeight: number): string[] {
+		this.renderedOverlayImages = [];
 		if (this.overlayStack.length === 0) {
 			this.renderedOverlayLayouts = [];
 			return lines;
@@ -1393,6 +1403,7 @@ export abstract class TuiBase extends Container implements TUI {
 
 			// Bound overlay layout without changing the transcript's native reflow policy.
 			let overlayLines = this.resolveFocusedCursor(withWrappedLines(() => component.render(width)));
+			if (this.mode === "regular" && overlayLines.some(isImageLine)) overlayLines = [...overlayLines];
 
 			// Apply maxHeight if specified
 			if (maxHeight !== undefined && overlayLines.length > maxHeight) {
@@ -1426,8 +1437,53 @@ export abstract class TuiBase extends Container implements TUI {
 
 		const viewportStart = Math.max(0, workingHeight - termHeight);
 
-		// Composite each overlay
-		for (const { overlayLines, row, col, w } of rendered) {
+		// Keep regular-screen graphics separate from text: a later overlay can own
+		// cells on an image's continuation rows even when its anchor is untouched.
+		for (const { entry, overlayLines, row, col, w } of rendered) {
+			if (this.mode === "regular") {
+				for (let i = 0; i < overlayLines.length; i++) {
+					const line = overlayLines[i];
+					if (!isImageLine(line)) continue;
+					const metadata = getKittyImageMetadata(line);
+					const imageRow = row + i;
+					const imageRows = getKittyImagePlacementRows(line) ?? 1;
+					const visibleRows = Math.min(imageRows, overlayLines.length - i, termHeight - imageRow);
+					const kittyStart = line.indexOf("\x1b_G");
+					const imageStart = kittyStart !== -1 ? kittyStart : line.indexOf("\x1b]1337;File=");
+					const imageCol = col + visibleWidth(line.slice(0, imageStart));
+					const imageColumns = metadata?.columns ?? w;
+					const covered =
+						kittyStart !== -1 &&
+						this.renderedOverlayLayouts.some(
+							(overlay) =>
+								overlay.entry.focusOrder > entry.focusOrder &&
+								overlay.col < imageCol + imageColumns &&
+								overlay.col + overlay.width > imageCol &&
+								overlay.row < imageRow + visibleRows &&
+								overlay.row + overlay.height > imageRow,
+						);
+					if (visibleRows > 0 && !covered) {
+						const clipped = metadata ? cropKittyImageLine(line, 0, visibleRows) : line;
+						this.renderedOverlayImages.push({
+							row: imageRow,
+							rows: visibleRows,
+							col: imageCol,
+							line: clipped,
+						});
+					}
+					let text = "";
+					for (let offset = 0; offset < line.length; ) {
+						const ansi = extractAnsiCode(line, offset);
+						if (ansi) {
+							if (ansi.code.endsWith("m") || ansi.code.startsWith("\x1b]8;")) text += ansi.code;
+							offset += ansi.length;
+						} else text += line[offset++];
+					}
+					// Do not mutate cached component lines: closing the covering overlay
+					// must restore the original, uncropped placement.
+					overlayLines[i] = text;
+				}
+			}
 			for (let i = 0; i < overlayLines.length; i++) {
 				const idx = viewportStart + row + i;
 				if (idx >= 0 && idx < result.length) {

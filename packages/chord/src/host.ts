@@ -35,7 +35,7 @@ import {
 } from "./object.ts";
 import { enqueue } from "./publish.ts";
 import type { Registry, RegistryTable, RegistryView } from "./registry.ts";
-import { type ReloadOptions, type ReloadReport, runReload } from "./reload.ts";
+import { type Reload, type ReloadOptions, type ReloadReport, runReload } from "./reload.ts";
 import { RemoteBinding, type RemoteChannel, RemoteRef } from "./remote.ts";
 import { canonicalIdentity, canonicalJson, deepEqual, normalize } from "./schema.ts";
 import type { Ctx, GetOptions } from "./types.ts";
@@ -300,6 +300,9 @@ export class HostImpl implements Host, HostCore {
 	/** Types behind a reload gate: new objects of these types are rejected `upgrade_conflict` until commit/abort. */
 	gating: ReadonlySet<string> | undefined;
 	reloading = false;
+	/** Terminal shutdown fences module loading and candidate facet runs before teardown snapshots objects. */
+	readonly shutdown = new AbortController();
+	reloadOperation: Reload | undefined;
 	readonly taskStopDeadline: number;
 	readonly readyTimeout: number;
 	readonly #principalKey: (principal: unknown) => string;
@@ -380,14 +383,19 @@ export class HostImpl implements Host, HostCore {
 	}
 
 	// ─── serving ───
+	checkOpen(): void {
+		if (this.#closing || this.#closed) throw this.#closedReason;
+	}
 
 	readonly serve: Serve = ((type, factory, options = {}) => {
+		this.checkOpen();
 		if (this.reloading) throw new Error("host.serve during a reload; serve from a facet passed to reload()");
 		this.serveInto(this.current.services, makeService(type, factory, options, ""));
 		if (options.lifetime === "host") this.startHostObject(this.current.services.get(type.name)!);
 	}) satisfies AnyServe as Serve;
 
 	install(facet: Facet, options: LoadOptions = {}): Promise<void> {
+		this.checkOpen();
 		if (this.reloading) throw new Error("host.install during a reload");
 		if (this.facets.has(facet.name)) throw new Error(`facet ${facet.name} is already installed; use reload()`);
 		const added: Service[] = [];
@@ -403,6 +411,7 @@ export class HostImpl implements Host, HostCore {
 					run.signal,
 				),
 			);
+			this.checkOpen();
 		} catch (error) {
 			run.abort(error);
 			throw error;
@@ -414,8 +423,10 @@ export class HostImpl implements Host, HostCore {
 	}
 
 	async load(plugins: readonly PluginRef[], options: LoadOptions = {}): Promise<void> {
+		this.checkOpen();
 		const facets = await this.resolve(plugins);
 		// No await between installs: a host object's factory may consume a type served by a later facet.
+		this.checkOpen();
 		await Promise.all(facets.map((facet) => this.install(facet, options)));
 	}
 
@@ -432,6 +443,7 @@ export class HostImpl implements Host, HostCore {
 
 	/** Turns plugin references into facets, importing modules through the loader. */
 	async resolve(plugins: readonly PluginRef[]): Promise<Facet[]> {
+		this.checkOpen();
 		const modules = plugins.filter((ref): ref is string | URL => !isFacet(ref));
 		if (modules.length > 0 && this.#loader === undefined) {
 			throw new Error(
@@ -439,6 +451,7 @@ export class HostImpl implements Host, HostCore {
 			);
 		}
 		const loaded = modules.length > 0 && this.#loader !== undefined ? await this.#loader(modules) : [];
+		this.checkOpen();
 		return plugins.map((ref) => (isFacet(ref) ? ref : loaded.shift()!));
 	}
 
@@ -461,6 +474,7 @@ export class HostImpl implements Host, HostCore {
 	}
 
 	serveInto(services: Map<string, Service>, service: Service): void {
+		this.checkOpen();
 		if (services.has(service.contract.name)) throw new Error(`${service.contract.name} is already served`);
 		const placement = service.contract.description.host;
 		if (placement !== undefined && !placedOn(placement, this.name)) {
@@ -1112,9 +1126,8 @@ export class HostImpl implements Host, HostCore {
 			return;
 		}
 		if (this.reloading) {
-			// Not a participant of the running reload (participants are fixed when it starts): in step now, it would miss
-			// the commit. Decided when the reload ends. A child already behind is fenced now, so the calls its roots make
-			// meanwhile are admitted in this host's code version (never relabeled) instead of being `superseded`.
+			// A child arriving during this reload is reconciled only after it ends. Behind roots keep their original
+			// code version and are admitted here at their first call rather than relabeled as synchronized.
 			connection.peerCodeVersion = codeVersion;
 			if (codeVersion < this.current.id) connection.fencedCodeVersions.add(codeVersion);
 			this.#deferredHellos.set(connection, codeVersion);
@@ -1136,10 +1149,13 @@ export class HostImpl implements Host, HostCore {
 	/** The host's reload slot was freed: children that said hello meanwhile are synced or reconciled now. */
 	reloadEnded(): void {
 		this.reloading = false;
-		for (const connection of this.connections) connection.codeVersionChanged();
+		this.reloadOperation = undefined;
 		const deferred = [...this.#deferredHellos];
 		this.#deferredHellos.clear();
-		for (const [connection, codeVersion] of deferred) if (connection.open) this.peerHello(connection, codeVersion);
+		if (!this.#closing) {
+			for (const connection of this.connections) connection.codeVersionChanged();
+			for (const [connection, codeVersion] of deferred) if (connection.open) this.peerHello(connection, codeVersion);
+		}
 		for (const resolve of this.#reloadWaiters.splice(0)) resolve();
 		this.maybeRetire();
 	}
@@ -1333,6 +1349,7 @@ export class HostImpl implements Host, HostCore {
 	}
 
 	reload(plugins: readonly PluginRef[], options: ReloadOptions = {}): Promise<ReloadReport> {
+		if (this.#closing || this.#closed) return Promise.reject(this.#closedReason);
 		// Client routes lead to independent providers, never participants in a presentation-local reload.
 		if (this.kind === "client") return runReload(this, plugins, options);
 		if (this.upstream !== undefined) {
@@ -1382,6 +1399,9 @@ export class HostImpl implements Host, HostCore {
 		this.#closing = true;
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		this.#closePromise = promise;
+		this.shutdown.abort(this.#closedReason);
+		this.reloadOperation?.cancel(this.#closedReason);
+		this.#childReloads.parentLost();
 		void this.#close().then(resolve, reject);
 		return promise;
 	}
@@ -1390,6 +1410,7 @@ export class HostImpl implements Host, HostCore {
 		this.hostObjects.clear();
 		for (const name of [...this.#facetRuns.keys()]) this.facetRunChanged(name, undefined);
 		const reason = new ChordError("gone", `host ${this.name} closed`);
+		if (this.reloading) await this.whenReloadEnded();
 		try {
 			await disposeHoldersFirst(
 				[...this.objects.values(), ...this.#disposing],

@@ -88,13 +88,20 @@ describe("AgentSession tool orchestration", () => {
 				else session.prepareSwipeRegeneration(group);
 				expect(session.getActiveToolNames()).toEqual(["read", "grep"]);
 				expect(session.getCallableToolNames()).toEqual(["read", "grep"]);
+				let declared: string[] | undefined;
 				harness.setResponses([
 					(context) => {
-						expect(getCurrentTools(context.messages).map((tool) => tool.name)).toEqual(["read", "grep"]);
+						declared = getCurrentTools(context.messages).map((tool) => tool.name);
 						return fauxAssistantMessage("correct loadout");
 					},
 				]);
 				await session.prompt("check tools");
+				expect(declared).toEqual(["read", "grep"]);
+				expect(session.messages.at(-1)).toMatchObject({
+					role: "assistant",
+					stopReason: "stop",
+					content: [{ type: "text", text: "correct loadout" }],
+				});
 				expect(session.getActiveToolNames()).toEqual(["read", "grep"]);
 			}
 		},

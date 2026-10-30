@@ -22,6 +22,7 @@ type DialogContext = {
 };
 
 type DialogMethods = {
+	shutdown(options?: { fromSignal?: boolean }): Promise<void>;
 	resetExtensionUI(): void;
 	showExtensionConfirm(title: string, message: string, opts?: { signal?: AbortSignal }): Promise<boolean>;
 	showExtensionCustom<T>(
@@ -76,6 +77,8 @@ function createContext(): DialogContext & DialogMethods {
 		updateTerminalTitle: vi.fn(),
 		setWorkingIndicator: vi.fn(),
 		setHiddenThinkingLabel: vi.fn(),
+		scheduledDeliveryGeneration: 0,
+		scheduledPreflights: new Set<AbortController>(),
 	});
 	return new Proxy(context, {
 		get(target, key, receiver) {
@@ -302,6 +305,147 @@ describe("InteractiveMode extension dialogs", () => {
 		expect(dispose).toHaveBeenCalledTimes(1);
 		expect(context.extensionDialogs).toEqual([]);
 		expect(context.ui.showOverlay).not.toHaveBeenCalled();
+	});
+
+	it.each([false, true])("cancels dialog-dependent work before shutdown waits (signal: %s)", async (fromSignal) => {
+		const context = createContext();
+		const confirm = context.showExtensionConfirm("Permission", "waiting tool hook");
+		const custom = context.showExtensionCustom<string>(() => new Text("waiting custom tool"));
+		await Promise.resolve();
+		const failure = new Error("persistence unavailable");
+		const settleRun = vi.fn(async () => {
+			await expect(confirm).resolves.toBe(false);
+			await expect(custom).resolves.toBeUndefined();
+			throw failure;
+		});
+		const clearWidgets = vi.fn();
+		Object.assign(context, {
+			session: { abort: settleRun },
+			runtimeHost: { dispose: settleRun },
+			showError: vi.fn(),
+			flushCompactionQueue: async () => {},
+			fireDueScheduledMessages: vi.fn(),
+			tickHeartbeats: vi.fn(),
+			clearExtensionWidgets: clearWidgets,
+		});
+		try {
+			await context.shutdown({ fromSignal });
+			expect(settleRun).toHaveBeenCalledTimes(1);
+			expect(clearWidgets).not.toHaveBeenCalled();
+			expect(context.focused).toBe(context.editor);
+		} finally {
+			context.resetExtensionUI();
+		}
+	});
+
+	it("keeps interaction order when two custom factories resolve in reverse order", async () => {
+		const context = createContext();
+		const firstFactory = Promise.withResolvers<Component>();
+		const secondFactory = Promise.withResolvers<Component>();
+		let firstDone: ((result: string) => void) | undefined;
+		let secondDone: ((result: string) => void) | undefined;
+		const first = context.showExtensionCustom<string>((_ui, _theme, _keys, done) => {
+			firstDone = done;
+			return firstFactory.promise;
+		});
+		const second = context.showExtensionCustom<string>((_ui, _theme, _keys, done) => {
+			secondDone = done;
+			return secondFactory.promise;
+		});
+		secondFactory.resolve(new Text("newer interaction"));
+		await Promise.resolve();
+		expect(visible(context)).toContain("newer interaction");
+		firstFactory.resolve(new Text("older interaction"));
+		await Promise.resolve();
+		expect(visible(context)).toContain("newer interaction");
+		secondDone?.("second");
+		await expect(second).resolves.toBe("second");
+		expect(visible(context)).toContain("older interaction");
+		firstDone?.("first");
+		await expect(first).resolves.toBe("first");
+	});
+
+	it.each(["reset", "reject"] as const)("preserves edits while an unmounted factory is %s", async (action) => {
+		const context = createContext();
+		context.editor.setText("original draft");
+		const factory = Promise.withResolvers<Component>();
+		const result = context.showExtensionCustom(() => factory.promise);
+		context.editor.setText("draft typed during loading");
+		if (action === "reset") {
+			context.resetExtensionUI();
+			await expect(result).resolves.toBeUndefined();
+			factory.resolve(new Text("late"));
+		} else {
+			const failure = new Error("factory failed");
+			factory.reject(failure);
+			await expect(result).rejects.toBe(failure);
+		}
+		expect(context.editor.getText()).toBe("draft typed during loading");
+	});
+
+	it("keeps a newer confirmation above an older factory and captures the draft at actual mount", async () => {
+		const context = createContext();
+		context.editor.setText("initial draft");
+		const factory = Promise.withResolvers<Component>();
+		let done: ((result: string) => void) | undefined;
+		const custom = context.showExtensionCustom<string>((_ui, _theme, _keys, finish) => {
+			done = finish;
+			return factory.promise;
+		});
+		context.editor.setText("new draft");
+		const confirm = context.showExtensionConfirm("Newer", "answer first");
+		factory.resolve(new Text("older custom"));
+		await Promise.resolve();
+		expect(visible(context)).toContain("Newer");
+		context.focused?.handleInput?.("\r");
+		await expect(confirm).resolves.toBe(true);
+		expect(visible(context)).toContain("older custom");
+		context.editor.setText("custom editor change");
+		done?.("finished");
+		await expect(custom).resolves.toBe("finished");
+		expect(context.editor.getText()).toBe("new draft");
+	});
+
+	it("reserves a custom slot before its factory opens a confirmation", async () => {
+		const context = createContext();
+		let confirm: Promise<boolean> | undefined;
+		let done: ((result: string) => void) | undefined;
+		const custom = context.showExtensionCustom<string>((_ui, _theme, _keys, finish) => {
+			done = finish;
+			confirm = context.showExtensionConfirm("Factory confirmation", "answer first");
+			return new Text("custom under confirmation");
+		});
+		await Promise.resolve();
+		expect(visible(context)).toContain("Factory confirmation");
+		context.focused?.handleInput?.("\x1b");
+		await expect(confirm).resolves.toBe(false);
+		expect(visible(context)).toContain("custom under confirmation");
+		done?.("finished");
+		await expect(custom).resolves.toBe("finished");
+	});
+
+	it("does not restore a hidden custom draft over its newer editor owner", async () => {
+		const context = createContext();
+		context.editor.setText("draft");
+		let closeOlder: ((result: string) => void) | undefined;
+		let closeNewer: ((result: string) => void) | undefined;
+		const older = context.showExtensionCustom<string>((_ui, _theme, _keys, done) => {
+			closeOlder = done;
+			return new Text("older");
+		});
+		await Promise.resolve();
+		const newer = context.showExtensionCustom<string>((_ui, _theme, _keys, done) => {
+			closeNewer = done;
+			return new Text("newer");
+		});
+		await Promise.resolve();
+		context.editor.setText("newer owns this edit");
+		closeOlder?.("closed hidden");
+		await expect(older).resolves.toBe("closed hidden");
+		expect(context.editor.getText()).toBe("newer owns this edit");
+		expect(visible(context)).toContain("newer");
+		closeNewer?.("closed visible");
+		await expect(newer).resolves.toBe("closed visible");
 	});
 
 	it("rejects and releases its mounted overlay when onHandle throws", async () => {

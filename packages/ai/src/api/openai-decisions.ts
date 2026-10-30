@@ -7,6 +7,7 @@ import type {
 	ClassifierResult,
 } from "../types.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
+import { assertClassifierInputSupported } from "../utils/model-operations.ts";
 import { isRecord, parseClassifierUsage, postClassifierRequest, requiredNumber } from "./classifier-shared.ts";
 
 /**
@@ -165,6 +166,7 @@ export const classify: ClassifierFunction<ClassifierOptions> = async (model, con
 
 	try {
 		if (model.api !== "openai-decisions") throw new Error(`Unsupported classifier API: ${model.api}`);
+		assertClassifierInputSupported(model, context);
 		const body = await postClassifierRequest(
 			LABEL,
 			new URL("decisions", `${model.baseUrl.replace(/\/+$/u, "")}/`),

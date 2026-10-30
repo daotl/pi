@@ -18,12 +18,24 @@ type Arguments = JsonRepresentation<ToolCall>["arguments"];
 export type PartialCommit = {
 	/** The plan `assignJson()` writes the message with: text appends, and the arguments it leaves to `changes`. */
 	readonly plan: AssignPlan;
-	/** Each tracked tool call by content index: its argument changes since the last commit, in order, and its snapshot. */
-	readonly toolCalls: ReadonlyMap<number, { readonly changes: readonly JsonChange[]; readonly snapshot: Arguments }>;
+	/** Each tracked tool call: changes since the last commit, their exactness, and the authoritative snapshot. */
+	readonly toolCalls: ReadonlyMap<number, ToolCallCommit>;
+};
+
+type ToolCallCommit = {
+	readonly changes: readonly JsonChange[];
+	readonly snapshot: Arguments;
+	/** Whether applying just these changes reproduces the provider snapshot. */
+	readonly exact: boolean;
 };
 
 /** What a tracked tool call changed since the last commit, and whether any commit took its changes yet. */
-type ToolCallState = { readonly parser: StreamingJsonParser; changes: JsonChange[]; committed: boolean };
+type ToolCallState = {
+	readonly parser: StreamingJsonParser;
+	changes: JsonChange[];
+	exact: boolean;
+	committed: boolean;
+};
 
 /**
  * Collects, from a response's events, what changed in its partial message since the last commit, so the commit appends
@@ -36,6 +48,8 @@ type ToolCallState = { readonly parser: StreamingJsonParser; changes: JsonChange
  * - Tool-call arguments starting empty: a `StreamingJsonParser` per call, fed with each `toolcall_delta`, reports what
  *   each piece changed. The commit applies those changes and leaves arguments out of the message assignment.
  *   Calls starting with nonempty arguments retain provider snapshots: subsequent deltas omit their initial prefix.
+ *   Pending scalars, depth-limited previews and copy-credit lag retain provider snapshots when parser edits are not
+ *   exact. Those commits reconcile their snapshots; later exact deltas resume append tracking from that snapshot.
  *   `toolcall_end` ends the tracking; the call's last commit assigns its final arguments.
  */
 export class PartialChanges {
@@ -63,6 +77,7 @@ export class PartialChanges {
 				this.#toolCalls.set(event.contentIndex, {
 					parser: new StreamingJsonParser(),
 					changes: [],
+					exact: true,
 					committed: false,
 				});
 				return;
@@ -78,6 +93,10 @@ export class PartialChanges {
 					}
 					call.changes.push(change);
 				}
+				// Match the provider's one snapshot per append, keeping both parsers' copy credit in step. This also
+				// detects stale previews: parse edits alone can be exact while the provider snapshot still lags.
+				call.parser.snapshot();
+				call.exact &&= call.parser.changesMatchSnapshot;
 				return;
 			}
 			case "text_end":
@@ -100,15 +119,17 @@ export class PartialChanges {
 			blocks.set(index, { kind: "fields", fields: new Map([[field, { kind: "append", text }]]) });
 		}
 		this.#text = new Map();
-		const toolCalls = new Map<number, { readonly changes: readonly JsonChange[]; readonly snapshot: Arguments }>();
+		const toolCalls = new Map<number, ToolCallCommit>();
 		for (const [index, call] of this.#toolCalls) {
 			const block = message.content[index];
 			// A tracked call is the tool call its `toolcall_start` named; the narrowing only tells TypeScript.
 			if (block?.type !== "toolCall") continue;
-			toolCalls.set(index, { changes: call.changes, snapshot: block.arguments });
+			toolCalls.set(index, { changes: call.changes, snapshot: block.arguments, exact: call.exact });
 			block.arguments = {};
 			blocks.set(index, { kind: "fields", fields: new Map([["arguments", { kind: "keep" }]]) });
 			call.changes = [];
+			// The captured commit owns any reconciliation; later deltas start from its authoritative snapshot.
+			call.exact = true;
 		}
 		return {
 			plan: { kind: "fields", fields: new Map([["content", { kind: "fields", fields: blocks }]]) },
@@ -129,11 +150,12 @@ export class PartialChanges {
 		commit: PartialCommit,
 	): void {
 		const committedBlocks = generation.message?.content.length ?? 0;
-		const apply: [number, readonly JsonChange[]][] = [];
-		for (const [index, { changes, snapshot }] of commit.toolCalls) {
+		const apply: [number, ToolCallCommit][] = [];
+		for (const [index, pending] of commit.toolCalls) {
+			const { snapshot } = pending;
 			const call = this.#toolCalls.get(index);
 			if (call === undefined) {
-				apply.push([index, [{ kind: "set", path: [], value: snapshot }]]);
+				apply.push([index, { ...pending, exact: false }]);
 				continue;
 			}
 			const block = message.content[index];
@@ -144,22 +166,26 @@ export class PartialChanges {
 				continue;
 			}
 			call.committed = true;
-			apply.push([index, changes]);
+			apply.push([index, pending]);
 		}
 		assignJson(generation, "message", message, commit.plan);
 		const content = generation.message?.content ?? [];
-		for (const [index, changes] of apply) {
+		for (const [index, pending] of apply) {
 			const block = content[index];
 			if (block?.type !== "toolCall") continue;
-			for (const change of changes) applyChange(block, change);
+			if (!pending.exact) assignJson(block, "arguments", pending.snapshot);
+			else for (const change of pending.changes) applyChange(block, change);
 		}
 	}
 
 	/** Put back what a failed commit took, so the next commit applies it first. */
 	restore(commit: PartialCommit): void {
-		for (const [index, { changes }] of commit.toolCalls) {
+		for (const [index, { changes, exact }] of commit.toolCalls) {
 			const call = this.#toolCalls.get(index);
-			if (call !== undefined) call.changes = [...changes, ...call.changes];
+			if (call !== undefined) {
+				call.changes = [...changes, ...call.changes];
+				call.exact &&= exact;
+			}
 		}
 	}
 }

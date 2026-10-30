@@ -22,6 +22,7 @@ import { RemoteExecutionEnv } from "../src/remote-env.ts";
 import {
 	acceptHostKey,
 	connectSsh,
+	deployDaemon,
 	detectPlatform,
 	forgetHostKey,
 	HostKeyChangedError,
@@ -49,9 +50,58 @@ const sshd =
 		? undefined
 		: (which("sshd") ?? (existsSync("/usr/sbin/sshd") ? "/usr/sbin/sshd" : undefined));
 const fish = process.platform === "win32" ? undefined : which("fish");
+const gnuSha256 =
+	process.platform === "win32"
+		? undefined
+		: [which("sha256sum"), which("gsha256sum")].find((program) => {
+				if (!program) return false;
+				try {
+					return execFileSync(program, ["--version"], { encoding: "utf8" }).includes("GNU coreutils");
+				} catch {
+					return false;
+				}
+			});
 
 // #34: execute SSH's joined remote command in the actual shell, without requiring a running sshd.
 describe.skipIf(process.platform === "win32")("SSH remote shell compatibility", () => {
+	it.skipIf(gnuSha256 === undefined)("verifies a backslash home with GNU sha256sum on upload and reuse", async () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-env-gnu-hash-"));
+		const home = join(root, "home \\with spaces");
+		const bin = join(root, "bin");
+		const ssh = join(root, "ssh");
+		mkdirSync(bin);
+		// Force the real GNU implementation even if the host normally prefers shasum or another utility.
+		writeFileSync(join(bin, "sha256sum"), `#!/bin/sh\nexec '${gnuSha256!.replaceAll("'", "'\\''")}' "$@"\n`, {
+			mode: 0o700,
+		});
+		writeFileSync(
+			ssh,
+			[
+				`#!${process.execPath}`,
+				'const { spawnSync } = require("node:child_process");',
+				'const command = process.argv.slice(process.argv.indexOf("--") + 2).join(" ");',
+				`const result = spawnSync("sh", ["-c", command], { stdio: "inherit", env: { ...process.env, PATH: ${JSON.stringify(bin)} + ":" + process.env.PATH } });`,
+				"if (result.error) throw result.error; process.exit(result.status ?? 1);",
+			].join("\n"),
+			{ mode: 0o700 },
+		);
+		const target: SshTarget = {
+			host: "gnu-hash",
+			hostKeyAlias: "gnu-hash",
+			knownHostsFile: join(root, "known_hosts"),
+			ssh,
+		};
+		const remote = { platform: "linux" as const, arch: "arm64" as const, home, warnings: [] };
+		try {
+			const deployed = await deployDaemon(target, remote, daemon);
+			expect(readFileSync(deployed)).toEqual(readFileSync(daemon));
+			const before = statSync(deployed).mtimeMs;
+			expect(await deployDaemon(target, remote, daemon)).toBe(deployed);
+			expect(statSync(deployed).mtimeMs).toBe(before);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 	for (const shell of ["sh", "fish"] as const) {
 		it.skipIf(shell === "fish" && fish === undefined)(
 			`detects, deploys and forwards daemon arguments through ${shell}`,

@@ -694,6 +694,8 @@ for await (const event of s) {
 - Arrays may be incomplete
 - Nested objects may be partially populated
 - At minimum, `arguments` will be an empty object `{}`, never `undefined`
+- OpenAI-compatible streams can emit empty JSON deltas for raw-only or metadata updates. These still advance the argument preview parser, so a copy-budget-limited preview may become fresher without receiving more JSON text. Responses also publishes the empty suffix of an unchanged argument replacement.
+- Compact assistant-message frames preserve those empty updates after JSON-stream alignment. Replay advances the argument parser without replacing an unaligned initial prefill before its checkpoint.
 - The Google provider does not support function call streaming. Instead, you will receive a single `toolcall_delta` event with the full arguments.
 
 ### Validating Tool Arguments

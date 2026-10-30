@@ -272,7 +272,7 @@ export class AssistantMessageFrameEncoder {
 						...(rawDelta === undefined ? {} : { rawDelta }),
 					};
 				}
-				if (delta.length === 0 && rawDelta === undefined) return undefined;
+				if (delta.length === 0 && rawDelta === undefined && !state.caughtUp) return undefined;
 				return {
 					type: "toolcall_delta",
 					contentIndex: event.contentIndex,
@@ -531,7 +531,8 @@ export class AssistantMessageFrameReducer {
 				if (block.type !== "toolCall" || state.kind !== "toolCall") {
 					throw new Error("Unreachable tool-call frame state");
 				}
-				if (frame.delta.length > 0) {
+				// Empty deltas advance preview copy credit after alignment, but must not erase an initial prefill.
+				if (frame.delta.length > 0 || state.json.length > 0 || Object.keys(block.arguments).length === 0) {
 					const argumentsStream = this.toolArguments.get(frame.contentIndex);
 					if (!argumentsStream) throw new Error("Unreachable tool-call argument stream");
 					block.arguments = argumentsStream.append(frame.delta);

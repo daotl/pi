@@ -251,6 +251,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private previousViewportTop = 0;
 	private overlaidRows: number[] = [];
 	private hiddenKittyImages = new Set<number>();
+	private overlayKittyImages = new Set<number>();
 	private baseCursor: { row: number; col: number; wrappedRow: number } | null = null;
 
 	captureRenderState(): TuiMainScreenRenderState {
@@ -288,6 +289,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.previousLayout = null;
 		this.overlaidRows = [];
 		this.hiddenKittyImages.clear();
+		this.overlayKittyImages.clear();
 		this.baseCursor = null;
 	}
 
@@ -473,6 +475,10 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		if (this.stopped) return;
 		const width = this.terminal.columns;
 		const height = this.terminal.rows;
+		if (this.overlayKittyImages.size > 0) {
+			this.terminal.write(this.deleteKittyImages(this.overlayKittyImages));
+			this.overlayKittyImages.clear();
+		}
 		// Restore old overlay cells before transcript writes can scroll them into history.
 		if (
 			this.overlaidRows.length > 0 &&
@@ -515,6 +521,11 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		for (let row = 0; row < height; row++) {
 			if (composed[row] !== viewport[row]) this.overlaidRows.push(row);
 		}
+		for (const image of this.renderedOverlayImages) {
+			for (let row = image.row; row < image.row + image.rows; row++) {
+				if (!this.overlaidRows.includes(row)) this.overlaidRows.push(row);
+			}
+		}
 		const reset = this.applyLineResets(composed);
 		const imageCoverage = this.kittyViewportCoverage();
 		for (const image of imageCoverage) {
@@ -535,7 +546,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			this.terminal.write(`\x1b_Ga=d,d=i,i=${image.id},q=2\x1b\\`);
 			this.hiddenKittyImages.add(image.id);
 		}
-		this.paintViewportRows(reset, this.overlaidRows, false, imageCoverage);
+		this.paintViewportRows(reset, this.overlaidRows, false, imageCoverage, this.renderedOverlayImages);
 		if (overlayCursor) {
 			this.positionHardwareCursor(overlayCursor, {
 				offsets: Array.from({ length: height }, (_, row) => this.previousViewportTop + row),
@@ -677,6 +688,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		rows: number[],
 		restoring = false,
 		images = this.kittyViewportCoverage(),
+		overlayImages: Array<{ row: number; col: number; line: string }> = [],
 	): void {
 		if (rows.length === 0) return;
 		const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
@@ -702,18 +714,52 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			const rowDelta = targetRow - this.hardwareCursorRow;
 			if (rowDelta > 0) output.append(`\x1b[${rowDelta}B`);
 			else if (rowDelta < 0) output.append(`\x1b[${-rowDelta}A`);
+			const text = lines[row];
 			const coverage = images.find((image) => targetRow >= image.row && targetRow < image.row + image.rows);
 			if (coverage) {
 				// Never erase a graphics cell merely to paint text beside its placement.
 				const hidden = this.hiddenKittyImages.has(coverage.id);
 				const leftCount = hidden ? 0 : Math.min(coverage.column, this.terminal.columns);
-				if (leftCount > 0)
-					output.append(`\x1b[1G\x1b[${leftCount}X${sliceByColumn(lines[row], 0, leftCount, true)}`);
+				if (leftCount > 0) output.append(`\x1b[1G\x1b[${leftCount}X${sliceByColumn(text, 0, leftCount, true)}`);
 				const startCol = hidden ? 0 : coverage.column + coverage.columns;
 				const count = this.terminal.columns - startCol;
 				if (count > 0)
-					output.append(`\x1b[${startCol + 1}G\x1b[${count}X${sliceByColumn(lines[row], startCol, count, true)}`);
-			} else output.append(`\r\x1b[2K${lines[row]}`);
+					output.append(`\x1b[${startCol + 1}G\x1b[${count}X${sliceByColumn(text, startCol, count, true)}`);
+			} else {
+				// ECH preserves native continuation flags; EL 2 turns soft wraps into hard breaks.
+				output.append(`\r\x1b[${this.terminal.columns}X${text}`);
+			}
+			this.hardwareCursorRow = targetRow;
+		}
+		// Overlay graphics have not been emitted by renderTranscript. Place them only
+		// after clearing every covered text row, otherwise later clears erase the image.
+		for (const { row, col, line } of overlayImages) {
+			const targetRow = this.previousViewportTop + row;
+			const delta = targetRow - this.hardwareCursorRow;
+			if (delta > 0) output.append(`\x1b[${delta}B`);
+			else if (delta < 0) output.append(`\x1b[${-delta}A`);
+			const kittyStart = line.indexOf(KITTY_SEQUENCE_PREFIX);
+			const imageStart = kittyStart !== -1 ? kittyStart : line.indexOf("\x1b]1337;File=");
+			let imageEnd = imageStart;
+			while (imageEnd < line.length) {
+				const ansi = extractAnsiCode(line, imageEnd);
+				if (!ansi || (!ansi.code.startsWith(KITTY_SEQUENCE_PREFIX) && !ansi.code.startsWith("\x1b]1337;File=")))
+					break;
+				imageEnd += ansi.length;
+			}
+			// Keep protocol anchor movement (iTerm2 moves up from its final reserved
+			// row), but never repaint printable prefixes over the composed text layer.
+			output.append(`\x1b[${col + 1}G\x1b7`);
+			for (let offset = 0; offset < imageStart; ) {
+				const ansi = extractAnsiCode(line, offset);
+				if (ansi) {
+					if (/^\x1b\[\d*A$/.test(ansi.code)) output.append(ansi.code);
+					offset += ansi.length;
+				} else offset++;
+			}
+			output.append(line.slice(imageStart, imageEnd));
+			output.append("\x1b8");
+			for (const id of extractKittyImageIds(line)) this.overlayKittyImages.add(id);
 			this.hardwareCursorRow = targetRow;
 		}
 		if (restoring) {

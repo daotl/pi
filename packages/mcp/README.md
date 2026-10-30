@@ -109,6 +109,8 @@ await connected;
 
 Inject `McpOAuthStateStore` into `McpOAuthProvider` for durable credentials. The package does not open a browser or choose where credentials are stored.
 
+Custom `OAuthClientProvider` implementations must atomically persist both arguments of `saveCodeVerifier(verifier, scope)` and return the pending scope from `authorizationScope()`. Clear both values when invalidating `"verifier"` or `"all"` credentials. This preserves challenge-only step-up scopes across redirects and restarts; code exchanges whose token response omits `scope` retain the authorization request's scope, while explicitly returned token scopes remain authoritative.
+
 The OAuth implementation is adapted from the MIT-licensed Model Context Protocol TypeScript SDK v1.29.0. Its license is included under `LICENSES/`.
 
 An MCP transport owns framing and I/O. It delivers individual JSON-RPC messages to `McpClient`; the client owns request correlation, initialization, timeouts, cancellation, server requests, and protocol-level helpers.

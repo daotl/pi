@@ -207,11 +207,16 @@ function advanceTerminalCell(position: TerminalCellPosition, width: number): voi
  * Based on code from the string-width library, but includes a possible-emoji
  * check to avoid running the RGI_Emoji regex unnecessarily.
  */
-function graphemeWidth(segment: string, position?: TerminalCellPosition): number {
+function graphemeWidth(
+	segment: string,
+	position?: TerminalCellPosition,
+	glyph?: (offset: number, width: number) => void,
+): number {
 	if (segment.length === 1) {
 		const code = segment.charCodeAt(0);
 		if (code >= 0x20 && code <= 0x7e) {
 			if (position) advanceTerminalCell(position, 1);
+			glyph?.(0, 1);
 			return 1;
 		}
 		if (code === 0x09) return 3;
@@ -220,12 +225,13 @@ function graphemeWidth(segment: string, position?: TerminalCellPosition): number
 	// Some marks occupy cells even without a base character.
 	if (terminalSpacingMarkRegex.test(segment)) {
 		const width = [...segment].length;
-		if (position) {
-			const startIndex = position.textIndex ?? 0;
+		if (position || glyph) {
+			const startIndex = position?.textIndex ?? 0;
 			let offset = 0;
 			for (const char of segment) {
-				if (position.rowBreak) position.textIndex = startIndex + offset;
-				advanceTerminalCell(position, 1);
+				if (position?.rowBreak) position.textIndex = startIndex + offset;
+				if (position) advanceTerminalCell(position, 1);
+				glyph?.(offset, 1);
 				offset += char.length;
 			}
 		}
@@ -240,6 +246,7 @@ function graphemeWidth(segment: string, position?: TerminalCellPosition): number
 	// Emoji check with pre-filter
 	if (couldBeEmoji(segment) && rgiEmojiRegex.test(segment)) {
 		if (position) advanceTerminalCell(position, 2);
+		glyph?.(0, 2);
 		return 2;
 	}
 
@@ -255,11 +262,13 @@ function graphemeWidth(segment: string, position?: TerminalCellPosition): number
 	// Keep width conservative (2) to avoid terminal auto-wrap drift artifacts.
 	if (cp >= 0x1f1e6 && cp <= 0x1f1ff) {
 		if (position) advanceTerminalCell(position, 2);
+		glyph?.(0, 2);
 		return 2;
 	}
 
 	let width = eastAsianWidth(cp);
 	if (position) advanceTerminalCell(position, width);
+	glyph?.(0, width);
 
 	// Intl.Segmenter can group multiple terminal-spacing code points into one
 	// grapheme. Count trailing visible code points that terminals may allocate
@@ -274,6 +283,7 @@ function graphemeWidth(segment: string, position?: TerminalCellPosition): number
 		if (terminalSpacingMarkRegex.test(char)) {
 			width += 1;
 			if (position) advanceTerminalCell(position, 1);
+			glyph?.(offset, 1);
 			followsMark = false;
 		} else if (markCharRegex.test(char)) {
 			followsMark = true;
@@ -284,9 +294,11 @@ function graphemeWidth(segment: string, position?: TerminalCellPosition): number
 				const cellWidth = eastAsianWidth(c);
 				width += cellWidth;
 				if (position) advanceTerminalCell(position, cellWidth);
+				glyph?.(offset, cellWidth);
 			} else if (c === 0x0e33 || c === 0x0eb3) {
 				width += 1;
 				if (position) advanceTerminalCell(position, 1);
+				glyph?.(offset, 1);
 			}
 			followsMark = false;
 		}
@@ -616,22 +628,32 @@ function materializeCursorRow(text: string, columns: number, tracker: AnsiCodeTr
 				column = 0;
 				continue;
 			}
-			const width = graphemeWidth(segment);
-			if (width === 0) {
+			const placements: Array<{ offset: number; width: number }> = [];
+			graphemeWidth(segment, undefined, (offset, width) => placements.push({ offset, width }));
+			if (placements.length === 0) {
 				const previous = cells[column - 1];
 				if (previous) previous.text += segment;
 				continue;
 			}
-			// Overwriting either half of a wide grapheme removes its whole placement.
-			for (let col = column; col < column + width; col++) {
-				const old = cells[col];
-				if (old) {
-					for (let covered = old.start; covered < old.start + old.width; covered++) cells[covered] = undefined;
+			for (let placement = 0; placement < placements.length; placement++) {
+				const { offset, width } = placements[placement];
+				// Overwriting either half of a wide glyph removes only that placement,
+				// not independently advancing constituents in the same Intl grapheme.
+				for (let col = column; col < column + width; col++) {
+					const old = cells[col];
+					if (old) {
+						for (let covered = old.start; covered < old.start + old.width; covered++) cells[covered] = undefined;
+					}
 				}
+				const cell = {
+					text: segment.slice(offset, placements[placement + 1]?.offset),
+					style,
+					start: column,
+					width,
+				};
+				for (let col = column; col < column + width; col++) cells[col] = cell;
+				column += width;
 			}
-			const cell = { text: segment, style, start: column, width };
-			for (let col = column; col < column + width; col++) cells[col] = cell;
-			column += width;
 		}
 		i = end;
 	}

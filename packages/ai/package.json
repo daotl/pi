@@ -32,6 +32,7 @@
 			"import": "./dist/api/*.js"
 		},
 		"./utils/*": {
+			"source": "./src/utils/*.ts",
 			"types": "./dist/utils/*.d.ts",
 			"import": "./dist/utils/*.js"
 		},

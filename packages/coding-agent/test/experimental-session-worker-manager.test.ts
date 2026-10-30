@@ -1,5 +1,5 @@
 import { ChildProcess } from "node:child_process";
-import { createHost, defineFacet, type Frame, hostNamed, method, remote } from "@earendil-works/chord";
+import { createHost, defineFacet, type Frame, hostNamed, local, method, remote } from "@earendil-works/chord";
 import {
 	type AgentLane,
 	BACKGROUND_CONTEXT,
@@ -596,6 +596,98 @@ describe("Session worker native channels", () => {
 			await releasedClient.close();
 			await retainedClient.close();
 			await services.dispose();
+		}
+	});
+
+	test("joins complete worker disposal and aggregates attachment, host and loader failures", async () => {
+		const attachmentError = new Error("attachment close failed");
+		const hostError = new Error("host resource close failed");
+		const loaderError = new Error("loader dispose failed");
+		const closing = Promise.withResolvers<void>();
+		const finishClose = Promise.withResolvers<void>();
+		const closed: string[] = [];
+		const Runtime = local("test.worker-dispose-runtime", { version: 1, input: Type.Object({}) });
+		const Contract = remote("test.worker-dispose-attachment", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("session"),
+			variants: { active: { methods: { alive: method(undefined, Type.Boolean()) } } },
+		});
+		const scope = { serverConnectionId: "generation", attachmentId: "failing" };
+		const [link, tunnel] = createRoutedLinkPair();
+		const services = await createSessionWorkerServices({
+			lane: createServiceLane(),
+			modelRuntime: undefined,
+			facetLoader: async () => ({
+				facets: [
+					{
+						name: "failing-disposal",
+						...defineFacet(({ serve }) => {
+							serve(
+								Runtime,
+								(_input, _principal, self) => {
+									self.resource("host-resource", {
+										version: 1,
+										open: () => ({}),
+										close: () => {
+											closed.push("host");
+											throw hostError;
+										},
+									});
+									return {};
+								},
+								{ lifetime: "host" },
+							);
+							serve(Contract, (_input, _principal, self) => {
+								self.resource("attachment-resource", {
+									version: 1,
+									open: () => ({}),
+									close: async () => {
+										closing.resolve();
+										await finishClose.promise;
+										closed.push("attachment");
+										throw attachmentError;
+									},
+								});
+								return { variant: "active", alive: () => true };
+							});
+						}),
+					},
+				],
+				async dispose() {
+					closed.push("loader");
+					throw loaderError;
+				},
+			}),
+			async publish(_scope, frame) {
+				tunnel.send(frame);
+			},
+		});
+		const client = createHost({ name: "disposal-client", kind: "client", self: null });
+		try {
+			services.attach(scope);
+			tunnel.receive((frame) => services.receive(scope, frame));
+			client.connect(link, { principal: null });
+			const ref = await client.get(Contract, {});
+			await client.root((ctx) => ref.alive(ctx));
+			const disposal = services.dispose();
+			const failure = disposal.catch((error: unknown) => error);
+			await closing.promise;
+			expect(services.dispose()).toBe(disposal);
+			expect(closed).toEqual([]);
+			finishClose.resolve();
+			const error = await failure;
+			const flatten = (value: unknown): unknown[] =>
+				value instanceof AggregateError ? value.errors.flatMap(flatten) : [value];
+			expect(flatten(error)).toEqual(expect.arrayContaining([attachmentError, hostError, loaderError]));
+			expect(closed.sort()).toEqual(["attachment", "host", "loader"]);
+			expect(services.dispose()).toBe(disposal);
+			await expect(services.dispose()).rejects.toBe(error);
+			ref.release();
+		} finally {
+			finishClose.resolve();
+			await client.close();
+			await services.dispose().catch(() => {});
 		}
 	});
 

@@ -1,4 +1,5 @@
 import type { ResponseStreamEvent } from "openai/resources/responses/responses.js";
+import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
 import { stream as streamMistral } from "../src/api/mistral-conversations.ts";
@@ -9,6 +10,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "../src/provide
 import type { AssistantMessage, AssistantMessageEvent, Model, TranscriptContext } from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
+import { validateToolArguments } from "../src/utils/validation.ts";
 import { allocatedBytes, collectGarbage } from "./memory-helpers.ts";
 
 // #9265: every provider re-parsed the accumulated tool-call arguments on each delta and kept the raw text on the
@@ -31,14 +33,16 @@ function deltasOf(text: string, size: number): string[] {
 }
 
 /** A fetch whose response streams `events` as server-sent events, produced lazily. */
-function sseFetch(events: () => Iterable<string>): typeof fetch {
+function sseFetch(events: () => Iterable<string>, beforeEvent?: (index: number) => Promise<void>): typeof fetch {
 	return async () => {
 		const iterator = events()[Symbol.iterator]();
 		const encoder = new TextEncoder();
+		let index = 0;
 		const body = new ReadableStream<Uint8Array>({
-			pull(controller) {
+			async pull(controller) {
 				let chunk = "";
-				for (let count = 0; count < 16; count++) {
+				for (let count = 0; count < (beforeEvent ? 1 : 16); count++) {
+					if (beforeEvent) await beforeEvent(index++);
 					const next = iterator.next();
 					if (next.done) {
 						if (chunk) controller.enqueue(encoder.encode(chunk));
@@ -190,13 +194,18 @@ function* responsesEvents(deltas: readonly string[], text: string): Generator<Re
 type Path = {
 	readonly name: string;
 	/** Stream one `write` call whose argument text arrives as `deltas`. */
-	readonly stream: (deltas: readonly string[], args: object, text: string) => AssistantMessageEventStream;
+	readonly stream: (
+		deltas: readonly string[],
+		args: object,
+		text: string,
+		beforeEvent?: (index: number) => Promise<void>,
+	) => AssistantMessageEventStream;
 };
 
 const PATHS: readonly Path[] = [
 	{
 		name: "anthropic-messages",
-		stream: (deltas) =>
+		stream: (deltas, _args, _text, beforeEvent) =>
 			streamAnthropic(
 				{
 					...baseModel,
@@ -207,12 +216,12 @@ const PATHS: readonly Path[] = [
 					baseUrl: "https://api.anthropic.com",
 				},
 				context,
-				{ apiKey: "sk-ant-test", fetch: sseFetch(() => anthropicEvents(deltas)) },
+				{ apiKey: "sk-ant-test", fetch: sseFetch(() => anthropicEvents(deltas), beforeEvent) },
 			),
 	},
 	{
 		name: "openai-completions",
-		stream: (deltas) =>
+		stream: (deltas, _args, _text, beforeEvent) =>
 			streamOpenAICompletions(
 				{
 					...baseModel,
@@ -223,12 +232,12 @@ const PATHS: readonly Path[] = [
 					baseUrl: "https://api.openai.com/v1",
 				},
 				context,
-				{ apiKey: "sk-test", fetch: sseFetch(() => chatEvents(deltas, false)) },
+				{ apiKey: "sk-test", fetch: sseFetch(() => chatEvents(deltas, false), beforeEvent) },
 			),
 	},
 	{
 		name: "openai-responses",
-		stream: (deltas, _args, text) => {
+		stream: (deltas, _args, text, beforeEvent) => {
 			const output: AssistantMessage = {
 				role: "assistant",
 				content: [],
@@ -259,7 +268,11 @@ const PATHS: readonly Path[] = [
 				events.push({ type: "start", partial: output });
 				await processResponsesStream(
 					(async function* () {
-						yield* responsesEvents(deltas, text);
+						let index = 0;
+						for (const event of responsesEvents(deltas, text)) {
+							await beforeEvent?.(index++);
+							yield event;
+						}
 					})(),
 					output,
 					events,
@@ -273,7 +286,7 @@ const PATHS: readonly Path[] = [
 	},
 	{
 		name: "mistral-conversations",
-		stream: (deltas) =>
+		stream: (deltas, _args, _text, beforeEvent) =>
 			streamMistral(
 				{
 					...baseModel,
@@ -284,12 +297,12 @@ const PATHS: readonly Path[] = [
 					baseUrl: "https://api.mistral.ai",
 				},
 				context,
-				{ apiKey: "test", fetch: sseFetch(() => chatEvents(deltas, true)) },
+				{ apiKey: "test", fetch: sseFetch(() => chatEvents(deltas, true), beforeEvent) },
 			),
 	},
 	{
 		name: "pi-messages",
-		stream: (deltas, args) =>
+		stream: (deltas, args, _text, beforeEvent) =>
 			streamPiMessages(
 				{
 					...baseModel,
@@ -300,7 +313,7 @@ const PATHS: readonly Path[] = [
 					baseUrl: "https://example.test/v1",
 				},
 				context,
-				{ apiKey: "test", fetch: sseFetch(() => piMessagesEvents(deltas, args)) },
+				{ apiKey: "test", fetch: sseFetch(() => piMessagesEvents(deltas, args), beforeEvent) },
 			),
 	},
 	{
@@ -359,6 +372,55 @@ describe.each(PATHS)("$name tool-call argument streaming", (path) => {
 		expect(message.content).toEqual([{ type: "toolCall", id: expect.any(String), name: "write", arguments: args }]);
 	});
 
+	it.skipIf(path.name === "faux")("shows non-empty strict prefixes while the upstream is paused", async () => {
+		const { args, text } = writeCall(5_000);
+		const first = Promise.withResolvers<void>();
+		const second = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const releaseSecond = Promise.withResolvers<void>();
+		const beforeEvent = async (index: number) => {
+			if (index === 20) {
+				first.resolve();
+				await releaseFirst.promise;
+			}
+			if (index === 60) {
+				second.resolve();
+				await releaseSecond.promise;
+			}
+		};
+		let latest: AssistantMessage | undefined;
+		let ended = false;
+		const stream = path.stream(deltasOf(text, 24), args, text, beforeEvent);
+		const consuming = consume(stream, (event) => {
+			if (event.type !== "done" && event.type !== "error") latest = event.partial;
+			if (event.type === "toolcall_end") ended = true;
+		});
+		const preview = () => {
+			const call = latest?.content[0];
+			const value = call?.type === "toolCall" ? call.arguments.content : undefined;
+			if (typeof value !== "string") throw new Error("Missing intermediate write preview");
+			expect(value.startsWith(args.content.slice(0, 32))).toBe(true);
+			expect(args.content.startsWith(value)).toBe(true);
+			expect(value.length).toBeLessThan(args.content.length);
+			expect(ended).toBe(false);
+			return value.length;
+		};
+		try {
+			await first.promise;
+			const shown = preview();
+			releaseFirst.resolve();
+			await second.promise;
+			expect(preview()).toBeGreaterThan(shown);
+		} finally {
+			releaseFirst.resolve();
+			releaseSecond.resolve();
+			await consuming;
+		}
+		expect((await stream.result()).content).toEqual([
+			{ type: "toolCall", id: expect.any(String), name: "write", arguments: args },
+		]);
+	});
+
 	it("allocates linearly in the argument text", async () => {
 		const run = (size: number) => {
 			const { args, text } = writeCall(size);
@@ -386,6 +448,25 @@ describe.each(PATHS)("$name tool-call argument streaming", (path) => {
 		await collectGarbage();
 		expect(references.filter((reference) => reference.deref() !== undefined)).toHaveLength(0);
 	});
+});
+
+it("rejects malformed Mistral terminal arguments rather than executing a parsed prefix", async () => {
+	const text = '{"path":"a","mode":.5}';
+	const path = PATHS.find((entry) => entry.name === "mistral-conversations")!;
+	let terminal: unknown;
+	const message = await consume(path.stream(deltasOf(text, 8), {}, text), (event) => {
+		if (event.type === "toolcall_end") terminal = event.toolCall;
+	});
+	const call = message.content[0];
+	expect(terminal).toMatchObject({ arguments: {}, argumentsError: expect.stringContaining(text) });
+	expect(call).toMatchObject({ arguments: {}, argumentsError: expect.stringContaining(text) });
+	if (call?.type !== "toolCall") throw new Error("Missing tool call");
+	const tool = {
+		name: "write",
+		description: "Write",
+		parameters: Type.Object({ path: Type.Optional(Type.String()) }),
+	};
+	expect(() => validateToolArguments(tool, call)).toThrow("Invalid arguments");
 });
 
 describe("tool-call stream state on errors", () => {

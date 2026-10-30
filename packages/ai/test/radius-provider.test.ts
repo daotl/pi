@@ -74,21 +74,89 @@ describe("Radius provider catalogs", () => {
 		expect(models.getModels("radius").map((model) => model.id)).toEqual(["balanced", "organization-only"]);
 	});
 
-	it("replaces the static public catalog with a cached catalog without network access", async () => {
+	it.each([false, true])("restores only matching account and gateway catalogs offline (empty: %s)", async (empty) => {
 		const store = new InMemoryModelsStore();
-		await store.write("radius", {
-			models: getRadiusModelsFromConfig("radius", radiusConfig()),
-			checkedAt: Date.now(),
-		});
-		const models = createModels({ modelsStore: store });
+		const credentials = new InMemoryCredentialStore();
+		await credentials.modify("radius", async () => ({ type: "api_key", key: "account-a" }));
+		const config = empty ? { ...radiusConfig(), models: [] } : radiusConfig();
+		const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json(config));
+		const models = createModels({ credentials, modelsStore: store });
 		models.setProvider(radiusProvider());
-
+		expect((await models.refresh({ providers: ["radius"] })).errors).toEqual(new Map());
+		const saved = await store.read("radius");
+		expect(saved?.personalizationKey).toMatch(/^[a-f0-9]{64}$/);
+		expect(JSON.stringify(saved)).not.toContain("account-a");
+		fetch.mockClear();
+		models.setProvider(radiusProvider());
 		await models.refresh({ providers: ["radius"], allowNetwork: false });
-
-		expect(models.getModel("radius", "balanced")?.name).toBe("Fresh Balanced");
-		expect(models.getModel("radius", "organization-only")).toBeDefined();
-		expect(models.getModels("radius").map((model) => model.id)).toEqual(["balanced", "organization-only"]);
+		expect(models.getModels("radius")).toEqual(getRadiusModelsFromConfig("radius", config));
+		await credentials.modify("radius", async () => ({ type: "api_key", key: "account-b" }));
+		await models.refresh({ providers: ["radius"], allowNetwork: false });
+		expect(models.getModels("radius")).toEqual(radiusProvider().getModels());
+		await credentials.modify("radius", async () => ({ type: "api_key", key: "account-a" }));
+		const otherGateway = radiusProvider({ gateway: "https://other-radius.example" });
+		models.setProvider(otherGateway);
+		await models.refresh({ providers: ["radius"], allowNetwork: false });
+		expect(models.getModels("radius")).toEqual([]);
+		await store.write("radius", { models: getRadiusModelsFromConfig("radius", config), checkedAt: 1 });
+		models.setProvider(radiusProvider());
+		await models.refresh({ providers: ["radius"], allowNetwork: false });
+		expect(models.getModels("radius")).toEqual(radiusProvider().getModels());
+		expect(fetch).not.toHaveBeenCalled();
 	});
+
+	it.each(["environment", "oauth", "unverifiable"] as const)(
+		"derives %s cache identity without invoking request auth",
+		async (kind) => {
+			const credentials = new InMemoryCredentialStore();
+			if (kind === "oauth") {
+				await credentials.modify("radius", async () => ({
+					type: "oauth",
+					access: "access-a",
+					refresh: "refresh-a",
+					expires: Date.now() + 3600000,
+				}));
+			}
+			const store = new InMemoryModelsStore();
+			const provider = radiusProvider();
+			const resolve = vi.fn(async () => ({ auth: { apiKey: "environment-a" } }));
+			const refresh = vi.fn(async () => {
+				throw new Error("Must not refresh OAuth offline");
+			});
+			const models = createModels({
+				credentials,
+				modelsStore: store,
+				authContext: { env: async () => "environment-a", fileExists: async () => false },
+			});
+			const configured = {
+				...provider,
+				auth: {
+					apiKey: { name: "Test", resolve },
+					oauth: provider.auth.oauth ? { ...provider.auth.oauth, refresh } : undefined,
+				},
+			};
+			models.setProvider(configured);
+			const fetch = vi
+				.spyOn(globalThis, "fetch")
+				.mockResolvedValue(Response.json({ ...radiusConfig(), models: [] }));
+			await models.refresh({ providers: ["radius"] });
+			if (kind === "oauth")
+				await credentials.modify("radius", async (current) =>
+					current?.type === "oauth" ? { ...current, expires: 0 } : current,
+				);
+			models.setProvider({
+				...configured,
+				resolveCachedModelAuth: kind === "unverifiable" ? undefined : configured.resolveCachedModelAuth,
+			});
+			resolve.mockClear();
+			fetch.mockClear();
+			await models.refresh({ providers: ["radius"], allowNetwork: false });
+			expect(models.getModels("radius")).toEqual(kind === "unverifiable" ? radiusProvider().getModels() : []);
+			expect(resolve).not.toHaveBeenCalled();
+			expect(refresh).not.toHaveBeenCalled();
+			expect(fetch).not.toHaveBeenCalled();
+		},
+	);
 
 	it("exposes no models when the organization disabled all of them", async () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(

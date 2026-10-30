@@ -539,9 +539,12 @@ export class TaskScheduler {
 						this.#report(error, REGISTRY);
 					}
 				}
-				if (snapshot !== undefined && "reason" in this.#fit(record, snapshot.task(record.kind))) {
-					this.#wakeBlocked.add(id);
-					continue;
+				if (snapshot !== undefined) {
+					const fit = this.#fit(record, snapshot.task(record.kind));
+					if ("reason" in fit || (fit.migrates && fit.task.definition.migrate === undefined)) {
+						this.#wakeBlocked.add(id);
+						continue;
+					}
 				}
 			}
 			this.#wakeReady.add(id);
@@ -1869,6 +1872,7 @@ export class TaskScheduler {
 
 	#inspectTask(record: AnyTaskRecord, snapshot: RegistrySnapshot): TaskInspection["state"] {
 		if (this.#invocations.has(record.id)) return { kind: "running" };
+		if (this.#readOnly && record.state.status === "running") return { kind: "running" };
 		if (record.state.status === "completing") return { kind: "completing" };
 		const on = this.#waitingOn(record);
 		if (on.length > 0) return { kind: "waiting", on };

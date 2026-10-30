@@ -556,6 +556,7 @@ export class AgentSession {
 				compactionId: string;
 				contextEditId: string | undefined;
 				leafId: string | null;
+				contextRevision: number;
 				model: Model<string>;
 				transform: Agent["transformContext"];
 				converter: Agent["convertToLlm"];
@@ -5159,6 +5160,7 @@ export class AgentSession {
 		const sessionContext = this.sessionManager.buildSessionContext();
 		const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
 		const leafId = this.sessionManager.getLeafId();
+		const contextRevision = this.sessionManager.getContextRevision();
 		const contextEditId = this._latestContextEditId;
 		const summaryBlockMaxTokens = this.settingsManager.getSummaryBlockMaxTokens();
 		const transform = this.agent.transformContext;
@@ -5221,6 +5223,7 @@ export class AgentSession {
 			!this._canUploadTokenizationText(countedModel) ||
 			signal?.aborted ||
 			summaryBlockMaxTokens !== this.settingsManager.getSummaryBlockMaxTokens() ||
+			contextRevision !== this.sessionManager.getContextRevision() ||
 			transform !== this.agent.transformContext ||
 			converter !== this.agent.convertToLlm ||
 			blockImages !== this.settingsManager.getBlockImages() ||
@@ -5235,6 +5238,7 @@ export class AgentSession {
 						model: countedModel,
 						transform,
 						converter,
+						contextRevision,
 						blockImages,
 						settingsPrefix,
 						incomingPrefix,
@@ -7214,6 +7218,7 @@ export class AgentSession {
 				counted?.compactionId === structure.compactionId &&
 				counted.contextEditId === structure.contextEditId &&
 				counted.leafId === this.sessionManager.getLeafId() &&
+				counted.contextRevision === revision &&
 				counted.model === model &&
 				counted.transform === this.agent.transformContext &&
 				counted.converter === this.agent.convertToLlm &&

@@ -77,7 +77,7 @@ describe("native routed Chord links", () => {
 		await client.dispose();
 	});
 
-	test("reconnects with fresh links and discards the former connection's queued frames", async () => {
+	test.each(["pre-link", "pre-receiver"] as const)("discards former %s frames on reconnect", async (stage) => {
 		const first = new MemoryByteServer();
 		const second = new MemoryByteServer();
 		let connection = 0;
@@ -86,11 +86,17 @@ describe("native routed Chord links", () => {
 			transportFactory: (handlers) => (connection++ === 0 ? first : second).connect(handlers),
 		});
 		await client.connect();
-		const old = createClientChordLink(client, () => target);
+		const old = stage === "pre-receiver" ? createClientChordLink(client, () => target) : undefined;
+		first.send({ type: "chord", target, frame: { t: "ping", n: 1 } });
 		first.disconnect();
-		expect(old.closed).toBe(true);
+		if (old) expect(old.closed).toBe(true);
 		await client.reconnect();
 		const fresh = createClientChordLink(client, () => target);
+		const received: Frame[] = [];
+		fresh.receive((frame) => received.push(frame));
+		expect(received).toEqual([]);
+		second.send({ type: "chord", target, frame: { t: "ping", n: 3 } });
+		expect(received).toEqual([{ t: "ping", n: 3 }]);
 		fresh.send({ t: "ping", n: 2 });
 		expect(second.messages.at(-1)).toEqual({ type: "chord", target, frame: { t: "ping", n: 2 } });
 		await client.dispose();

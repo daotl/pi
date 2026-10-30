@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import type { IncomingMessage } from "node:http";
+import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
 import { deflateRawSync } from "node:zlib";
 import { Type } from "typebox";
@@ -31,6 +33,15 @@ const Board = remote("t.board", {
 });
 
 describe("WebSocket links", () => {
+	it("survives malformed pre-authentication frames and failed outbound handshakes", () => {
+		const output = execFileSync(
+			process.execPath,
+			["--conditions=source", fileURLToPath(new URL("./fixtures/websocket-errors.ts", import.meta.url))],
+			{ encoding: "utf8", timeout: 10000 },
+		);
+		assert.equal(output.trim(), "preauth-survived; next-client-called; failed-outbound-closed");
+	});
+
 	for (const relayed of [false, true]) {
 		it(`null-authenticated WebSocket guests cannot read or call owner privileges ${relayed ? "through a relay" : "locally"}`, async () => {
 			const Access = remote("t.websocket-null", {

@@ -141,6 +141,7 @@ export class OutputBuffer {
 	#totalBytes = 0;
 	#totalNewlines = 0;
 	#endsWithNewline = true;
+	#pendingHighSurrogate = "";
 
 	constructor(limits: OutputLimits) {
 		this.#limits = limits;
@@ -164,7 +165,7 @@ export class OutputBuffer {
 		if (first && typeof chunk !== "string" && text.startsWith("\ufeff")) text = text.slice(1);
 		if (skipped === undefined) return this.#accept(pending + text);
 		if (this.#limits.retain !== "tail") throw new Error("Skipped output requires tail retention");
-		this.#accept(pending);
+		this.#accept(pending, true);
 		this.#skip(skipped);
 		this.#accept(text);
 		return true;
@@ -183,11 +184,19 @@ export class OutputBuffer {
 
 	/** Flush an incomplete trailing character as a replacement character; call when the stream ends. */
 	end(): void {
-		this.#accept(this.#decoder.decode());
+		this.#accept(this.#decoder.decode(), true);
 	}
 
-	#accept(text: string): boolean {
-		if (text.length === 0) return false;
+	#accept(text: string, final = false): boolean {
+		text = this.#pendingHighSurrogate + text;
+		this.#pendingHighSurrogate = "";
+		const last = text.charCodeAt(text.length - 1);
+		if (!final && last >= 0xd800 && last <= 0xdbff) {
+			this.#pendingHighSurrogate = text.slice(-1);
+			text = text.slice(0, -1);
+		}
+		text = text.toWellFormed();
+		if (text.length === 0) return this.#pendingHighSurrogate !== "";
 		const bytes = utf8ByteLength(text);
 		const newlines = countNewlines(text);
 		this.#totalBytes += bytes;
@@ -216,7 +225,7 @@ export class OutputBuffer {
 		return true;
 	}
 
-	/** Retained, sanitized output and what the limits dropped from the whole stream. */
+	/** Retained, sanitized output; incomplete trailing characters wait for the next chunk or end(). */
 	snapshot(): BoundedOutput {
 		const stored =
 			this.#chunks.length === 1 ? this.#chunks[0]!.text : this.#chunks.map((chunk) => chunk.text).join("");

@@ -509,3 +509,131 @@ test("remote conversation validation rejects malformed messages and edits withou
 	await client.root((call) => ref.write({ kind: "valid-unions", model: messages }, call));
 	assert.deepEqual((await root.context(ctx)).messages, [...original.messages, assistant, ...messages]);
 });
+
+test("a wide namespace commit keeps held Chord views live through the tracker root fallback", async () => {
+	const harness = await Harness.open(new MemoryStorage(), { models: fake({ respond: () => ({ text: "ok" }) }) }, ctx);
+	onTestFinished(() => harness.close(ctx));
+	const fields = Object.fromEntries(Array.from({ length: 4200 }, (_, index) => [`field${index}`, 0]));
+	const namespace = harness.namespace<Record<string, number>>(
+		"test.wide-chord-view",
+		{ sticky: fields },
+		{ view: (slice) => ({ ...slice }) },
+	);
+	const conversation = await harness.createConversation({}, ctx);
+	const host = createHost({ name: "harness", self: null });
+	onTestFinished(() => host.close());
+	await host.install(createPicoHarnessFacet(harness));
+	const ref = await host.get(PicoConversationService, { conversationId: conversation.id });
+	const raw = await conversation.watch(ctx);
+	onTestFinished(() => raw.stop());
+	const envelopes: Envelope[] = [];
+	raw.start((envelope) => envelopes.push(envelope));
+	const deliveries: PublishedConversationView[] = [];
+	onTestFinished(ref.view.subscribe((value) => deliveries.push(structuredClone(value))));
+	deliveries.length = 0;
+	await conversation.commit((tx) => {
+		const slice = tx.plugins(namespace);
+		for (let index = 0; index < 4200; index++) slice[`field${index}`] = 1;
+	}, ctx);
+	await sleep(0);
+	assert.ok(envelopes.some((envelope) => envelope.ops.some((op) => op[0] === "r")));
+	assert.deepEqual(ref.view.value.publication, { status: "live" });
+	assert.equal(deliveries.length, envelopes.length);
+	const fresh = await conversation.watch(ctx);
+	fresh.stop();
+	const { commit, publication: _publication, ...published } = ref.view.value;
+	assert.deepEqual(published, fresh.view);
+	assert.deepEqual(commit.events, envelopes.at(-1)!.events);
+	await conversation.commit((tx) => {
+		tx.plugins(namespace).field0 = 2;
+	}, ctx);
+	await sleep(0);
+	assert.deepEqual(ref.view.value.publication, { status: "live" });
+	const next = await conversation.watch(ctx);
+	next.stop();
+	const { commit: _nextCommit, publication: _nextPublication, ...nextPublished } = ref.view.value;
+	assert.deepEqual(nextPublished, next.view);
+});
+
+test("linked Pico writes preserve reserved JSON data names without aliasing or prototype pollution", async () => {
+	const harness = await Harness.open(new MemoryStorage(), { models: fake({ respond: () => ({ text: "ok" }) }) }, ctx);
+	const conversation = await harness.createConversation({}, ctx);
+	const provider = createHost({ name: "harness", self: null });
+	const client = createHost({ name: "presentation", kind: "client", self: null });
+	onTestFinished(async () => {
+		await client.close();
+		await provider.close();
+		await harness.close(ctx);
+	});
+	await provider.install(createPicoHarnessFacet(harness));
+	const [up, down] = memoryLinkPair();
+	provider.accept(down, { principal: null });
+	client.connect(up, { principal: null });
+	const ref = await client.get(PicoConversationService, { conversationId: conversation.id });
+	const data = JSON.parse(
+		'{"constructor":"recorded","prototype":"value","__proto__":{"polluted":true},"nested":{"constructor":"nested"}}',
+	);
+	await ref.write({ kind: "review.reserved-json", data });
+	const entries = await harness.entries({ conversationId: conversation.id, limit: 100 }, ctx);
+	const notes = entries.filter((entry) => entry.kind === "review.reserved-json");
+	assert.equal(notes.length, 1);
+	const stored = notes[0];
+	assert.deepEqual(stored.data, data);
+	assert.notEqual(stored.data, data);
+	assert.notEqual(stored.data!.nested, data.nested);
+	assert.equal(Object.hasOwn(stored.data!, "__proto__"), true);
+	assert.equal(Object.getPrototypeOf(stored.data), Object.prototype);
+	assert.equal(Object.hasOwn(Object.prototype, "polluted"), false);
+});
+
+test("a bridge root replacement applies trailing ops and that envelope's events in one publication", async () => {
+	const env = await open({});
+	onTestFinished(() => env.close());
+	const raw = await env.root.watch(ctx);
+	let publish: (envelope: Envelope) => void = () => {};
+	const bridge = await attachChordView(
+		{
+			watch: async () => ({
+				get view() {
+					return raw.view;
+				},
+				get revision() {
+					return raw.revision;
+				},
+				get closed() {
+					return raw.closed;
+				},
+				ended: raw.ended,
+				start: (listener) => {
+					publish = listener;
+				},
+				stop: () => raw.stop(),
+			}),
+		},
+		replicatedState,
+		ctx,
+	);
+	onTestFinished(() => bridge.close());
+	const deliveries: PublishedConversationView[] = [];
+	onTestFinished(
+		bridge.view.subscribe((value, _context, delivery) => {
+			if (delivery.kind === "update") deliveries.push(structuredClone(value));
+		}),
+	);
+	const replacement = structuredClone(raw.view);
+	replacement.plugins = { replaced: true };
+	const events: Envelope["events"] = [{ type: "turn.started", inputs: [] }];
+	publish({
+		revision: 1,
+		ops: [
+			["r", replacement as never],
+			["s", ["plugins", "afterRoot"], "applied"],
+		],
+		events,
+	});
+	await sleep(0);
+	assert.equal(deliveries.length, 1);
+	assert.deepEqual(bridge.view.value.plugins, { replaced: true, afterRoot: "applied" });
+	assert.deepEqual(bridge.view.value.publication, { status: "live" });
+	assert.deepEqual(bridge.view.value.commit.events, events);
+});

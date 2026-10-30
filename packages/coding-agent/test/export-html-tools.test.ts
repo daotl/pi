@@ -39,6 +39,75 @@ function renderExportedCall(html: string, ownerId: string, leafId = ownerId): st
 }
 
 describe("export HTML historical tool content", () => {
+	it("keeps successful read output collapsed and supports local and global expansion", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-export-read-"));
+		try {
+			initTheme("dark", false);
+			const manager = SessionManager.create(cwd, cwd);
+			const call: ToolCall = { type: "toolCall", id: "read-1", name: "read", arguments: { path: "read.txt" } };
+			manager.appendMessage({ role: "user", content: "read the file", timestamp: 1 });
+			const ownerId = manager.appendMessage({ ...fauxAssistantMessage(""), content: [call] });
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: call.id,
+				toolName: call.name,
+				content: [{ type: "text", text: "first recorded line\nlast recorded line" }],
+				isError: false,
+				timestamp: 2,
+			});
+			const html = readFileSync(
+				await exportSessionToHtml(manager, undefined, {
+					outputPath: join(cwd, "out.html"),
+					toolRenderer: createToolHtmlRenderer({ getToolRenderers: () => readRenderers, theme, cwd }),
+				}),
+				"utf8",
+			);
+			const rendered = renderExportedCall(html, ownerId, manager.getLeafId()!);
+			expect(rendered).toContain('class="tool-output expandable ansi-rendered"');
+			const preview = rendered.match(/<div class="output-preview">([\s\S]*?)<\/div>/)?.[1];
+			expect(preview).toContain("Click to expand output");
+			expect(preview).not.toContain("first recorded line");
+			expect(rendered).toMatch(/output-full[\s\S]*first recorded line[\s\S]*last recorded line/);
+			const classes = new Set<string>();
+			const output = {
+				classList: {
+					toggle: (name: string, force?: boolean) => {
+						if (force ?? !classes.has(name)) classes.add(name);
+						else classes.delete(name);
+					},
+				},
+			};
+			const click = rendered.match(/onclick="([^"]+)"/)?.[1];
+			if (!click) throw new Error("Missing output click handler");
+			const clickHandler = runInContext(
+				`(function(){${click}})`,
+				createContext({ window: { getSelection: () => "" } }),
+			);
+			clickHandler.call(output);
+			expect(classes.has("expanded")).toBe(true);
+			clickHandler.call(output);
+			expect(classes.has("expanded")).toBe(false);
+			const viewer = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].at(-1)?.[1];
+			const toggle = viewer?.match(/function setToolOutputsExpanded\(expanded\) \{([\s\S]*?)\n {6}\}/)?.[0];
+			if (!toggle) throw new Error("Missing global tool toggle");
+			const setExpanded = runInContext(
+				`(function(){let toolOutputsExpanded;${toggle};return setToolOutputsExpanded;})()`,
+				createContext({
+					document: {
+						querySelector: () => null,
+						querySelectorAll: (selector: string) => (selector === ".tool-output.expandable" ? [output] : []),
+					},
+				}),
+			);
+			setExpanded(true);
+			expect(classes.has("expanded")).toBe(true);
+			setExpanded(false);
+			expect(classes.has("expanded")).toBe(false);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it.each(["missing", "changed"] as const)(
 		"isolates the recorded successful edit diff from error and pending siblings after the target is %s",
 		async (targetState) => {

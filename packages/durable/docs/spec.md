@@ -2126,8 +2126,8 @@ apply:
 An abort invocation runs its abort handler once. After it settles, a step
 applies rules 1, 2, and 4; a handler that returns without a terminal outcome
 faults the task. When Storage rejects a step's fault or handover write, the
-invocation still ends; the task stays `running` and the next reservation runs it
-again.
+invocation ends and the Session fails. The durable `running` record is recovered
+and reserved only after reopening the Session.
 
 On open, running-task reconciliation changes surviving `running` tasks back to
 `pending`, preserving their checkpoint and abort mark; `waiting` tasks stay
@@ -4373,6 +4373,10 @@ The run's inputs live in `pi.live.run`, not in the task input.
   snapshots through `toolcall_end` rather than reconstructing them from deltas
   that omit the initial prefix. Close/recovery preserves the same received
   argument snapshot in the interrupted assistant entry.
+  Pending scalars, depth-limited previews, and copy-budget lag likewise retain
+  the provider's received snapshot. After a reconciliation commit, exact
+  argument deltas resume suffix appends; a failed commit restores both its
+  pending changes and its need for snapshot reconciliation.
   Before streaming, the `beforeRequest` chain may
   replace the messages for this request only. Recovery resends the same
   committed messages with the same pinned model, thinking level, and stream

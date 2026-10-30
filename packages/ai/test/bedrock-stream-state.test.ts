@@ -1,10 +1,13 @@
+import { Type } from "typebox";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { allocatedBytes } from "./memory-helpers.ts";
 
 // #9265: Bedrock kept `index`, `partialJson` and the encrypted reasoning bytes on the content blocks while streaming,
 // and re-parsed the accumulated tool-call arguments on every delta.
 
-const bedrockMock = vi.hoisted(() => ({ streamEvents: undefined as (() => Iterable<unknown>) | undefined }));
+const bedrockMock = vi.hoisted(() => ({
+	streamEvents: undefined as (() => Iterable<unknown> | AsyncIterable<unknown>) | undefined,
+}));
 
 vi.mock("@aws-sdk/client-bedrock-runtime", () => {
 	class BedrockRuntimeServiceException extends Error {}
@@ -51,6 +54,7 @@ vi.mock("@aws-sdk/client-bedrock-runtime", () => {
 import { stream as streamBedrock } from "../src/api/bedrock-converse-stream.ts";
 import type { AssistantMessage, Model } from "../src/types.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
+import { validateToolArguments } from "../src/utils/validation.ts";
 
 const model: Model<"bedrock-converse-stream"> = {
 	id: "global.anthropic.claude-test",
@@ -119,21 +123,58 @@ describe("Bedrock stream state", () => {
 		bedrockMock.streamEvents = undefined;
 	});
 
-	it("keeps stream state off partial blocks and finishes the tool call with its exact arguments", async () => {
+	it("keeps stream state off partial blocks and shows growing arguments before finishing", async () => {
 		const { args, text } = writeCall(5_000);
-		bedrockMock.streamEvents = () => events(text);
-		let shown = -1;
+		const first = Promise.withResolvers<void>();
+		const second = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const releaseSecond = Promise.withResolvers<void>();
+		bedrockMock.streamEvents = async function* () {
+			let index = 0;
+			for (const event of events(text)) {
+				if (index === 20) {
+					first.resolve();
+					await releaseFirst.promise;
+				}
+				if (index === 60) {
+					second.resolve();
+					await releaseSecond.promise;
+				}
+				index++;
+				yield event;
+			}
+		};
+		let latest: AssistantMessage | undefined;
+		let ended = false;
 		const stream = streamBedrock(model, context);
-		for await (const event of stream) {
-			if (event.type === "done" || event.type === "error") continue;
-			expectNoStreamState(event.partial);
-			if (event.type !== "toolcall_delta") continue;
-			const call = event.partial.content[event.contentIndex];
-			const partial = call?.type === "toolCall" ? call.arguments.content : undefined;
-			if (typeof partial !== "string") continue;
-			expect(args.content.startsWith(partial)).toBe(true);
-			expect(partial.length).toBeGreaterThanOrEqual(shown);
-			shown = partial.length;
+		const consuming = (async () => {
+			for await (const event of stream) {
+				if (event.type === "done" || event.type === "error") continue;
+				latest = event.partial;
+				expectNoStreamState(event.partial);
+				if (event.type === "toolcall_end") ended = true;
+			}
+		})();
+		const preview = () => {
+			const call = latest?.content.find((block) => block.type === "toolCall");
+			const value = call?.type === "toolCall" ? call.arguments.content : undefined;
+			if (typeof value !== "string") throw new Error("Missing intermediate write preview");
+			expect(value.startsWith(args.content.slice(0, 32))).toBe(true);
+			expect(args.content.startsWith(value)).toBe(true);
+			expect(value.length).toBeLessThan(args.content.length);
+			expect(ended).toBe(false);
+			return value.length;
+		};
+		try {
+			await first.promise;
+			const shown = preview();
+			releaseFirst.resolve();
+			await second.promise;
+			expect(preview()).toBeGreaterThan(shown);
+		} finally {
+			releaseFirst.resolve();
+			releaseSecond.resolve();
+			await consuming;
 		}
 		const message = await stream.result();
 		expect(message.stopReason, message.errorMessage).toBe("toolUse");
@@ -142,6 +183,24 @@ describe("Bedrock stream state", () => {
 			{ type: "thinking", thinking: "[Reasoning redacted]", thinkingSignature: "AQID", redacted: true },
 			{ type: "toolCall", id: "tool_1", name: "write", arguments: args },
 		]);
+	});
+
+	it("rejects malformed completed arguments rather than executing a parsed prefix", async () => {
+		const text = '{"path":"a","mode":.5}';
+		bedrockMock.streamEvents = () => events(text);
+		const stream = streamBedrock(model, context);
+		let terminal: unknown;
+		for await (const event of stream) if (event.type === "toolcall_end") terminal = event.toolCall;
+		const call = (await stream.result()).content.find((block) => block.type === "toolCall");
+		expect(terminal).toMatchObject({ arguments: {}, argumentsError: expect.stringContaining(text) });
+		expect(call).toMatchObject({ arguments: {}, argumentsError: expect.stringContaining(text) });
+		if (call?.type !== "toolCall") throw new Error("Missing tool call");
+		const tool = {
+			name: "write",
+			description: "Write",
+			parameters: Type.Object({ path: Type.Optional(Type.String()) }),
+		};
+		expect(() => validateToolArguments(tool, call)).toThrow("Invalid arguments");
 	});
 
 	it("allocates linearly in the argument text", async () => {

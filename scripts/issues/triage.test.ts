@@ -25,7 +25,8 @@ test("retriage clears superseded output atomically and preserves decisions throu
 	const context = Object.assign(Object.create(Triage.prototype), {
 		options: { concurrency: 0, scriptDir: fileURLToPath(new URL(".", import.meta.url)), corpus: { get: () => ({}) } as unknown as Corpus, model: { provider: "local", modelId: "local" } },
 		categories: [], queue: [], active: 0, runningAttempts: new Set<string>(), conversations: new Map<number, number>([[10, 1]]),
-		harness: { commit, snapshot: async () => state, createConversation: async () => ({
+		runningTasks: new Map(), retriages: new Map(),
+		harness: { commit, snapshot: async () => state, conversation: async () => undefined, createConversation: async () => ({
 			id: nextId++, submit: async () => ({ wait: () => { started.resolve(); return settled.promise; } }),
 		}) },
 		formatIssue: () => "issue",
@@ -67,4 +68,70 @@ test("retriage clears superseded output atomically and preserves decisions throu
 	settled.resolve({ status: "answered" });
 	await successfulRun;
 	assert.equal(issue.status, "done");
+});
+
+test("retriage aborts and joins the paid run before admitting its replacement at concurrency one", async () => {
+	const issue: IssueState = { status: "queued", attempt: 0, conversationId: 0, error: "", result: null, triagedAt: "", decision: { priority: "p1", category: "maintainer", at: "saved" } };
+	const state = { inboxSince: "", issues: { 1: issue } };
+	const tx = { doc: async () => state } as unknown as Tx;
+	const commit = async <T>(change: (transaction: Tx) => T | Promise<T>): Promise<T> => change(tx);
+	const firstStarted = Promise.withResolvers<void>();
+	const secondStarted = Promise.withResolvers<void>();
+	const abortStarted = Promise.withResolvers<void>();
+	const finishAbort = Promise.withResolvers<void>();
+	const firstSettled = Promise.withResolvers<{ status: "answered" }>();
+	const secondSettled = Promise.withResolvers<{ status: "answered" }>();
+	let submitted = 0;
+	let inFlight = 0;
+	let peak = 0;
+	let triage!: Triage;
+	const conversations = [1, 2].map((id) => ({
+		id,
+		submit: async () => {
+			submitted++;
+			peak = Math.max(peak, ++inFlight);
+			(id === 1 ? firstStarted : secondStarted).resolve();
+			return { wait: async () => { await (id === 1 ? firstSettled : secondSettled).promise; inFlight--; return { status: "answered" }; } };
+		},
+		abort: async () => {
+			assert.equal(id, 1);
+			abortStarted.resolve();
+			await finishAbort.promise;
+			firstSettled.resolve({ status: "answered" });
+		},
+	}));
+	let created = 0;
+	triage = Object.assign(Object.create(Triage.prototype), {
+		options: { concurrency: 1, scriptDir: fileURLToPath(new URL(".", import.meta.url)), corpus: { get: () => ({}) } as unknown as Corpus, model: { provider: "local", modelId: "local" } },
+		categories: [], queue: [], active: 0, runningAttempts: new Set(), runningTasks: new Map(), retriages: new Map(), conversations: new Map(),
+		harness: { commit, snapshot: async () => state, createConversation: async () => conversations[created++], conversation: async (id: number) => conversations.find((candidate) => candidate.id === id) },
+		formatIssue: () => "issue",
+	}) as Triage;
+	const prototype = Triage.prototype as unknown as { enqueue(this: Triage, number: number): void; extension(this: Triage): Extension };
+	prototype.enqueue.call(triage, 1);
+	await firstStarted.promise;
+	const replacement = triage.retriage(1);
+	await abortStarted.promise;
+	assert.equal(submitted, 1);
+	assert.equal(inFlight, 1);
+	const submit = prototype.extension.call(triage).tools?.find((tool) => tool.name === "submit_triage");
+	assert.ok(submit?.execute);
+	const stale = await submit.execute(recommendation, { conversationId: 1 as ConversationId, commit } as unknown as ToolExecutionApi, BACKGROUND_CONTEXT);
+	assert.deepEqual(stale?.control, { terminate: true });
+	assert.equal(issue.result, null);
+	finishAbort.resolve();
+	await replacement;
+	await secondStarted.promise;
+	assert.equal(peak, 1);
+	assert.equal(submitted, 2);
+	assert.equal(issue.attempt, 1);
+	assert.equal(issue.conversationId, 2);
+	assert.deepEqual(issue.decision, { priority: "p1", category: "maintainer", at: "saved" });
+	const fresh = await submit.execute({ ...recommendation, summary: "new advice" }, { conversationId: 2 as ConversationId, commit } as unknown as ToolExecutionApi, BACKGROUND_CONTEXT);
+	assert.deepEqual(fresh?.control, { terminate: true });
+	assert.equal((issue.result as TriageResult | null)?.summary, "new advice");
+	secondSettled.resolve({ status: "answered" });
+	const tasks = Reflect.get(triage, "runningTasks") as Map<number, Set<Promise<void>>>;
+	await Promise.all(tasks.get(1) ?? []);
+	assert.equal(triage.queueSize().running, 0);
 });

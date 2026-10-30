@@ -734,7 +734,8 @@ export async function processResponsesStream<TApi extends Api>(
 			if (slot?.input.kind !== "json") continue;
 			const replaced = slot.input.arguments.replace(event.arguments);
 			slot.block.arguments = replaced.arguments;
-			if (replaced.delta) pushToolCallDelta(slot, replaced.delta);
+			// An unchanged replacement still advances preview copy credit; publish its empty delta too.
+			if (replaced.delta !== undefined) pushToolCallDelta(slot, replaced.delta);
 		} else if (event.type === "response.custom_tool_call_input.delta") {
 			const slot = getSlot(event.output_index, "toolCall");
 			if (slot?.input.kind !== "custom") continue;

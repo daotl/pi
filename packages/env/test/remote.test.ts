@@ -46,6 +46,54 @@ async function expectNativeChange(changes: WatchChange[], path: string, action: 
 }
 
 describe("RemoteExecutionEnv", () => {
+	it("rejects a completed scan whose reply arrives after local cancellation", async () => {
+		const { env, connection } = environment();
+		getOrThrow(await env.writeFile("scan.txt", "first\nsecond\n", context));
+		const reader = getOrThrow(await env.openBinaryReader("scan.txt", undefined, context));
+		const controller = new AbortController();
+		const request = connection.request.bind(connection);
+		const gate = vi.spyOn(connection, "request").mockImplementation(async (op, json, options) => {
+			const reply = await request(op, json, options);
+			if (op === "scanLines") controller.abort();
+			return reply;
+		});
+		try {
+			expect(await reader.scanLines({ startLine: 0 }, withAbortSignal(controller.signal, context))).toMatchObject({
+				ok: false,
+				error: { code: "aborted" },
+			});
+		} finally {
+			gate.mockRestore();
+			await reader.close(context);
+		}
+	});
+
+	it.each([false, true])(
+		"stops cancellable writes at a held chunk boundary but finishes appends (%s)",
+		async (append) => {
+			const { env, connection } = environment();
+			const controller = new AbortController();
+			const path = "cancelled-write.bin";
+			getOrThrow(await env.writeFile(path, "prefix", context));
+			const bytes = Buffer.alloc(512 * 1024 + 1, 0x61);
+			const request = connection.request.bind(connection);
+			const gate = vi.spyOn(connection, "request").mockImplementation(async (op, json, options) => {
+				const reply = await request(op, json, options);
+				// Hold the completed initial write's reply until abort. Later chunks have not started yet.
+				if (op === "write" && json.path === join(env.cwd, path)) controller.abort();
+				return reply;
+			});
+			try {
+				const write = append ? env.appendFile.bind(env) : env.writeFile.bind(env);
+				const result = await write(path, bytes, withAbortSignal(controller.signal, context));
+				expect(result).toMatchObject({ ok: false, error: { code: "aborted" } });
+			} finally {
+				gate.mockRestore();
+			}
+			const actual = Buffer.from(getOrThrow(await env.readBinaryFile(path, context)));
+			expect(actual).toEqual(append ? Buffer.concat([Buffer.from("prefix"), bytes]) : bytes.subarray(0, 512 * 1024));
+		},
+	);
 	it("resolves drive-less Windows roots using the daemon cwd, not the client or environment drive", async () => {
 		const connection = new Connection({ command: [] });
 		vi.spyOn(connection, "info").mockResolvedValue({

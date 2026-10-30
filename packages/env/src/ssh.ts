@@ -400,7 +400,7 @@ function daemonPath(remote: RemotePlatform, sha256: string): string {
 		: `${remote.home}/.pi/mobile/tools/${name}`;
 }
 
-const POSIX_HASH = `hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1; elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$1" | sed 's/.*= //'; else echo none; fi; }`;
+const POSIX_HASH = `hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum < "$1" | cut -d' ' -f1; elif command -v shasum >/dev/null 2>&1; then shasum -a 256 < "$1" | cut -d' ' -f1; elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 < "$1" | sed 's/.*= //'; else echo none; fi; }`;
 
 /** Whether the remote file has this content: `present`, `missing`, or (POSIX without a hash tool) `nohash`. */
 async function checkDaemon(target: SshTarget, remote: RemotePlatform, file: string, sha256: string): Promise<string> {

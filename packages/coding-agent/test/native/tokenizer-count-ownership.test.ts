@@ -32,11 +32,16 @@ function footer(current: NativeTokenizerFixture) {
 }
 
 it.each(
-	(["custom", "bash", "model", "context-edit", "checkpoint"] as const).flatMap((mutation) =>
+	(["custom", "bash", "model", "context-edit", "checkpoint", "delete", "restore"] as const).flatMap((mutation) =>
 		(["during", "after"] as const).map((timing) => ({ mutation, timing })),
 	),
 )("does not reuse a count after $mutation changes $timing chat counting", async ({ mutation, timing }) => {
 	const current = await fixture();
+	const retained = current.manager
+		.getBranch()
+		.findLast((entry) => entry.type === "message" && entry.message.role === "user");
+	if (!retained) throw new Error("Missing retained user");
+	if (mutation === "restore") current.manager.softDeleteUnits([{ entryId: retained.id }]);
 	const started = Promise.withResolvers<void>();
 	const released = Promise.withResolvers<void>();
 	current.setTokenizer(async (url) => {
@@ -86,6 +91,12 @@ it.each(
 				.findLast((entry) => entry.type === "message" && entry.message.role === "user");
 			if (!retained) throw new Error("Missing retained user");
 			current.manager.appendContextEdit(retained.id, { content: "changed counted context" });
+			current.session.refreshContext();
+		} else if (mutation === "delete" || mutation === "restore") {
+			const leaf = current.manager.getLeafId();
+			if (mutation === "delete") current.manager.softDeleteUnits([{ entryId: retained.id }]);
+			else current.manager.restoreDeletedEntryIds([retained.id]);
+			expect(current.manager.getLeafId()).toBe(leaf);
 			current.session.refreshContext();
 		} else {
 			current.manager.appendCompaction("new checkpoint", current.manager.getLeafId()!, 100);

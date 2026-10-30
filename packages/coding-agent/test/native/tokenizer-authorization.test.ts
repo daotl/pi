@@ -39,6 +39,26 @@ it("retains native summary and full chat-template counting", async () => {
 	expect(fixture.summaries).toHaveLength(1);
 });
 
+it.each([
+	"https://foreign.invalid/tokenize",
+	"https://foreign.invalid/v1/chat/completions/input_tokens",
+	"https://tokenizer.invalid/v1/tokenize",
+	"https://tokenizer.invalid/chat/completions/input_tokens",
+])("rejects an unexpected tokenizer destination %s before recording uploads", async (url) => {
+	const fixture = await nativeFixture();
+	const tokenizer = vi.fn(async () => Response.json({ tokens: [1], input_tokens: 1 }));
+	fixture.setTokenizer(tokenizer);
+	await expect(
+		fetch(url, {
+			method: "POST",
+			headers: { Authorization: "Bearer offline-tokenizer-key" },
+			body: JSON.stringify({ content: privateMarker, messages: [] }),
+		}),
+	).rejects.toThrow(`Unexpected origin: ${url}`);
+	expect(fixture.uploads).toEqual([]);
+	expect(tokenizer).not.toHaveBeenCalled();
+});
+
 it.each([100, 25000])(
 	"preserves physical tokenizer counts, files, and output headroom beside a virtual sibling with %i-character results",
 	async (characters) => {

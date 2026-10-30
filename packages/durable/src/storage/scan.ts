@@ -30,6 +30,7 @@ export function scanStart(
 		throw new StorageRequestError(`Invalid scan order: ${String(requested)}`);
 	}
 	if (cursor === undefined) return { order: requested ?? fallback, after: undefined };
+	if (cursor === null || typeof cursor !== "object") throw new StorageRequestError("Invalid storage cursor");
 	const { after, order: stored } = cursor;
 	if (typeof after !== "number" || !Number.isSafeInteger(after))
 		throw new StorageRequestError("Invalid storage cursor");

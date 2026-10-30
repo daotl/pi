@@ -1058,9 +1058,9 @@
           } else {
             html += `<div class="tool-header"><span class="tool-name">${escapeHtml(name)}</span></div>`;
           }
-          if (rendered.resultHtmlCollapsed && rendered.resultHtmlExpanded && rendered.resultHtmlCollapsed !== rendered.resultHtmlExpanded) {
+          if (rendered.resultHtmlCollapsed !== undefined && rendered.resultHtmlExpanded !== undefined && rendered.resultHtmlCollapsed !== rendered.resultHtmlExpanded) {
             html += `<div class="tool-output expandable ansi-rendered" onclick="if(window.getSelection().toString())return;this.classList.toggle('expanded')">
-              <div class="output-preview">${rendered.resultHtmlCollapsed}</div>
+              <div class="output-preview">${rendered.resultHtmlCollapsed || '<span class="tool-expand-hint">Click to expand output</span>'}</div>
               <div class="output-full">${rendered.resultHtmlExpanded}</div>
             </div>`;
           } else if (rendered.resultHtmlExpanded || rendered.resultHtmlCollapsed) {

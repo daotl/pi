@@ -5,8 +5,10 @@ import type { AssistantMessageEvent, Model, Tool } from "../src/types.ts";
 import {
 	type AssistantMessageFrame,
 	AssistantMessageFrameEncoder,
+	AssistantMessageFrameReducer,
 	reduceAssistantMessageFrames,
 } from "../src/utils/assistant-message-frame.ts";
+import { ToolCallArgumentsStream } from "../src/utils/streaming-json.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 const mockState = vi.hoisted(() => ({
@@ -23,6 +25,7 @@ const mockState = vi.hoisted(() => ({
 		  }>
 		| undefined,
 	interrupt: false,
+	beforeChunk: undefined as ((index: number) => Promise<void>) | undefined,
 }));
 
 vi.mock("openai", () => {
@@ -43,10 +46,14 @@ vi.mock("openai", () => {
 									},
 								},
 							];
-							for (const chunk of chunks) {
+							for (const [index, chunk] of chunks.entries()) {
+								await mockState.beforeChunk?.(index);
 								yield chunk;
 							}
-							if (mockState.interrupt) throw new Error("Connection interrupted");
+							if (mockState.interrupt) {
+								await mockState.beforeChunk?.(chunks.length);
+								throw new Error("Connection interrupted");
+							}
 						},
 					};
 					const promise = Promise.resolve(stream) as Promise<typeof stream> & {
@@ -103,6 +110,7 @@ describe("openai-completions __raw tool-call capture", () => {
 	beforeEach(() => {
 		mockState.chunks = undefined;
 		mockState.interrupt = false;
+		mockState.beforeChunk = undefined;
 	});
 
 	it("concatenates __raw deltas onto ToolCall.raw", async () => {
@@ -327,6 +335,75 @@ describe("openai-completions __raw tool-call capture", () => {
 			{ type: "toolCall", id: "call_2", name: "read", arguments: {}, raw: "<second>second-tail" },
 		]);
 	});
+
+	it.each(["raw-only", "empty arguments", "metadata-only"])(
+		"keeps wide argument previews aligned across %s progress, JSON resumption and interruption",
+		async (progress) => {
+			const fields = Object.fromEntries(Array.from({ length: 1024 }, (_, index) => [`field${index}`, ""]));
+			const prefix = `${JSON.stringify(fields).slice(0, -1)},"command":"`;
+			const updates: Record<string, unknown>[] = [
+				{ id: "call_1", function: { name: "write", arguments: prefix } },
+				...Array.from({ length: 400 }, () => ({ function: { arguments: "x" } })),
+				...Array.from({ length: 16 }, () =>
+					progress === "raw-only"
+						? { __raw: "<raw>" }
+						: progress === "empty arguments"
+							? { function: { arguments: "" } }
+							: { id: "call_1", function: { name: "write" } },
+				),
+				...Array.from({ length: 16 }, () => ({ function: { arguments: "y" } })),
+				{ function: { arguments: "z".repeat(64 * 1024) } },
+				{ function: { arguments: " tail" } },
+			];
+			const gates = Array.from({ length: updates.length + 1 }, () => Promise.withResolvers<void>());
+			mockState.chunks = updates.map((update) => ({
+				choices: [{ delta: { tool_calls: [{ index: 0, ...update }] }, finish_reason: null }],
+			}));
+			mockState.beforeChunk = (index) => gates[index]!.promise;
+			mockState.interrupt = true;
+			const mirror = new ToolCallArgumentsStream();
+			const frameEncoder = new AssistantMessageFrameEncoder();
+			const frameReducer = new AssistantMessageFrameReducer();
+			const response = streamSimple(model, normalizeContext({ messages: [] }), { apiKey: "test" });
+			let index = 0;
+			let textLength = 0;
+			let sawLag = false;
+			let sawEnd = false;
+			gates[0]!.resolve();
+			try {
+				for await (const event of response) {
+					const encoded = frameEncoder.encode(event);
+					if (encoded) frameReducer.apply(encoded);
+					if (event.type === "toolcall_end") sawEnd = true;
+					if (event.type !== "toolcall_delta") continue;
+					const block = event.partial.content[event.contentIndex];
+					if (block?.type !== "toolCall") throw new Error("Missing streamed tool call");
+					const preview = mirror.append(event.delta);
+					if (index > 0 && index <= 400) {
+						textLength++;
+						if ((block.arguments.command as string).length < textLength) sawLag = true;
+					}
+					expect(block.arguments, `event ${index}: ${progress}`).toEqual(preview);
+					const replayedCall = frameReducer.message?.content[event.contentIndex];
+					if (replayedCall?.type !== "toolCall") throw new Error("Missing replayed tool call");
+					expect(replayedCall.arguments, `replayed event ${index}: ${progress}`).toEqual(block.arguments);
+					gates[++index]?.resolve();
+				}
+			} finally {
+				for (const gate of gates) gate.resolve();
+				await response.result();
+			}
+			expect(sawLag).toBe(true);
+			expect(sawEnd).toBe(false);
+			const result = await response.result();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("Connection interrupted");
+			expect(result.content[0]).toMatchObject({
+				arguments: { ...fields, command: `${"x".repeat(400)}${"y".repeat(16)}${"z".repeat(64 * 1024)} tail` },
+				...(progress === "raw-only" ? { raw: "<raw>".repeat(16) } : {}),
+			});
+		},
+	);
 
 	it.each([undefined, ""])("does not invent raw progress for __raw=%s", async (raw) => {
 		mockState.chunks = [

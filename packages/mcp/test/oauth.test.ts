@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { McpClient, StreamableHttpTransport } from "../src/index.ts";
 import {
 	adaptOAuthProvider,
@@ -27,6 +27,7 @@ class TestOAuthProvider implements OAuthClientProvider {
 	client: OAuthClientInformationMixed | undefined;
 	tokenSet: OAuthTokens | undefined;
 	verifier: string | undefined;
+	requestedScope: string | undefined;
 	discovery: OAuthDiscoveryState | undefined;
 	authorizationUrl: URL | undefined;
 
@@ -65,8 +66,13 @@ class TestOAuthProvider implements OAuthClientProvider {
 		this.authorizationUrl = url;
 	}
 
-	saveCodeVerifier(verifier: string): void {
+	saveCodeVerifier(verifier: string, scope?: string): void {
 		this.verifier = verifier;
+		this.requestedScope = scope;
+	}
+
+	authorizationScope(): string | undefined {
+		return this.requestedScope;
 	}
 
 	codeVerifier(): string {
@@ -77,7 +83,10 @@ class TestOAuthProvider implements OAuthClientProvider {
 	invalidateCredentials(kind: "all" | "client" | "tokens" | "verifier" | "discovery"): void {
 		if (kind === "all" || kind === "client") this.client = undefined;
 		if (kind === "all" || kind === "tokens") this.tokenSet = undefined;
-		if (kind === "all" || kind === "verifier") this.verifier = undefined;
+		if (kind === "all" || kind === "verifier") {
+			this.verifier = undefined;
+			this.requestedScope = undefined;
+		}
 		if (kind === "all" || kind === "discovery") this.discovery = undefined;
 	}
 
@@ -366,7 +375,14 @@ describe("MCP OAuth", () => {
 				);
 				return;
 			}
-			response.statusCode = url.pathname === "/token" ? 500 : 404;
+			if (url.pathname === "/token") {
+				const params = new URLSearchParams(await readBody(request));
+				expect(params.get("grant_type")).toBe("authorization_code");
+				response.setHeader("content-type", "application/json");
+				response.end(JSON.stringify({ access_token: "a2", token_type: "Bearer" }));
+				return;
+			}
+			response.statusCode = 404;
 			response.end();
 		});
 		const auth = adaptOAuthProvider(provider);
@@ -385,6 +401,22 @@ describe("MCP OAuth", () => {
 		expect(provider.authorizationUrl?.searchParams.get("scope")).toBe("repo read:org admin");
 		// The working grant is kept until the user authorizes the new scope.
 		expect(provider.tokenSet?.access_token).toBe("a1");
+		expect(await authorizeMcp(provider, { serverUrl: `${origin}/mcp`, authorizationCode: "code" })).toBe(
+			"AUTHORIZED",
+		);
+		expect(provider.tokenSet?.scope).toBe("repo read:org admin");
+		await expect(
+			auth.onUnauthorized?.({
+				response: new Response(null, {
+					status: 403,
+					headers: { "www-authenticate": 'Bearer error="insufficient_scope", scope="write"' },
+				}),
+				serverUrl: new URL(`${origin}/mcp`),
+				fetch,
+				token: "a2",
+			}),
+		).rejects.toBeInstanceOf(McpOAuthAuthorizationRequiredError);
+		expect(provider.authorizationUrl?.searchParams.get("scope")).toBe("repo read:org admin write");
 	});
 
 	it("binds persisted credentials to the exact MCP server URL", async () => {
@@ -408,6 +440,54 @@ describe("MCP OAuth", () => {
 		});
 		expect(await second.tokens()).toBeUndefined();
 	});
+
+	it.each([undefined, "server:granted"])(
+		"persists pending scope across provider reconstruction (response scope: %s)",
+		async (responseScope) => {
+			const store = new MemoryOAuthStateStore();
+			const options = {
+				serverUrl: "https://mcp.example/mcp",
+				redirectUrl: "http://127.0.0.1/callback",
+				clientId: "client",
+				clientMetadata: { client_name: "test", scope: "default" },
+				store,
+				onRedirect: () => {},
+			};
+			const provider = new McpOAuthProvider(options);
+			await provider.saveDiscoveryState({
+				authorizationServerUrl: "https://auth.example",
+				authorizationServerMetadata: {
+					issuer: "https://auth.example",
+					authorization_endpoint: "https://auth.example/authorize",
+					token_endpoint: "https://auth.example/token",
+					response_types_supported: ["code"],
+				},
+			});
+			await authorizeMcp(provider, { serverUrl: options.serverUrl, scope: "repo admin", skipRefresh: true });
+			const restored = new McpOAuthProvider(options);
+			expect(await restored.authorizationScope()).toBe("repo admin");
+			expect(
+				await authorizeMcp(restored, {
+					serverUrl: options.serverUrl,
+					authorizationCode: "code",
+					fetch: async () =>
+						Response.json({
+							access_token: "token",
+							token_type: "Bearer",
+							...(responseScope ? { scope: responseScope } : {}),
+						}),
+				}),
+			).toBe("AUTHORIZED");
+			expect((await restored.tokens())?.scope).toBe(responseScope ?? "repo admin");
+			await restored.invalidateCredentials("verifier");
+			expect(await restored.authorizationScope()).toBeUndefined();
+			await expect(restored.codeVerifier()).rejects.toThrow("No OAuth PKCE code verifier");
+			await restored.saveCodeVerifier("new-verifier", "new-scope");
+			await restored.invalidateCredentials("all");
+			expect(await restored.authorizationScope()).toBeUndefined();
+			await expect(restored.codeVerifier()).rejects.toThrow("No OAuth PKCE code verifier");
+		},
+	);
 
 	// #10493
 	it("registers with an application_type derived from the redirect URIs unless one is set", async () => {
@@ -666,6 +746,166 @@ describe("MCP OAuth", () => {
 		).rejects.toMatchObject({ name: "AbortError" });
 		expect(requests).toEqual([]);
 		expect(provider.tokenSet?.refresh_token).toBe("r1");
+		expect(provider.authorizationUrl).toBeUndefined();
+	});
+
+	it.each([false, true])("does not redirect a pre-cancelled cached flow (skipRefresh: %s)", async (skipRefresh) => {
+		const provider = new TestOAuthProvider("http://127.0.0.1/callback");
+		provider.client = { client_id: "client" };
+		provider.discovery = {
+			authorizationServerUrl: "https://auth.example",
+			authorizationServerMetadata: {
+				issuer: "https://auth.example",
+				authorization_endpoint: "https://auth.example/authorize",
+				token_endpoint: "https://auth.example/token",
+				response_types_supported: ["code"],
+			},
+		};
+		if (skipRefresh) provider.tokenSet = { access_token: "a1", refresh_token: "r1", token_type: "Bearer" };
+		const controller = new AbortController();
+		controller.abort();
+		await expect(
+			authorizeMcp(provider, { serverUrl: "https://mcp.example/mcp", signal: controller.signal, skipRefresh }),
+		).rejects.toMatchObject({ name: "AbortError" });
+		expect(provider.verifier).toBeUndefined();
+		expect(provider.authorizationUrl).toBeUndefined();
+	});
+
+	it.each(["client", "state", "verifier"] as const)(
+		"checks cancellation after asynchronous %s work",
+		async (boundary) => {
+			const provider = new TestOAuthProvider("http://127.0.0.1/callback");
+			provider.client = { client_id: "client" };
+			provider.discovery = {
+				authorizationServerUrl: "https://auth.example",
+				authorizationServerMetadata: {
+					issuer: "https://auth.example",
+					authorization_endpoint: "https://auth.example/authorize",
+					token_endpoint: "https://auth.example/token",
+					response_types_supported: ["code"],
+				},
+			};
+			const controller = new AbortController();
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const wait = async () => {
+				entered.resolve();
+				await release.promise;
+			};
+			const wrapped: OAuthClientProvider = {
+				redirectUrl: provider.redirectUrl,
+				clientMetadata: provider.clientMetadata,
+				discoveryState: () => provider.discoveryState(),
+				clientInformation: async () => {
+					if (boundary === "client") await wait();
+					return provider.clientInformation();
+				},
+				tokens: () => provider.tokens(),
+				saveTokens: (tokens) => provider.saveTokens(tokens),
+				state: async () => {
+					if (boundary === "state") await wait();
+					return provider.state();
+				},
+				saveCodeVerifier: async (verifier, scope) => {
+					provider.saveCodeVerifier(verifier, scope);
+					if (boundary === "verifier") await wait();
+				},
+				codeVerifier: () => provider.codeVerifier(),
+				authorizationScope: () => provider.authorizationScope(),
+				redirectToAuthorization: (url) => provider.redirectToAuthorization(url),
+			};
+			const running = authorizeMcp(wrapped, { serverUrl: "https://mcp.example/mcp", signal: controller.signal });
+			const outcome = running.catch((error: unknown) => error);
+			try {
+				await entered.promise;
+				controller.abort();
+			} finally {
+				release.resolve();
+			}
+			expect(await outcome).toMatchObject({ name: "AbortError" });
+			expect(provider.authorizationUrl).toBeUndefined();
+			if (boundary !== "verifier") expect(provider.verifier).toBeUndefined();
+		},
+	);
+
+	it("does not persist PKCE state or redirect when cancelled during digest", async () => {
+		const provider = new TestOAuthProvider("http://127.0.0.1/callback");
+		provider.client = { client_id: "client" };
+		provider.discovery = {
+			authorizationServerUrl: "https://auth.example",
+			authorizationServerMetadata: {
+				issuer: "https://auth.example",
+				authorization_endpoint: "https://auth.example/authorize",
+				token_endpoint: "https://auth.example/token",
+				response_types_supported: ["code"],
+			},
+		};
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const digest = crypto.subtle.digest.bind(crypto.subtle);
+		const spy = vi.spyOn(crypto.subtle, "digest").mockImplementation(async (algorithm, data) => {
+			entered.resolve();
+			await release.promise;
+			return digest(algorithm, data);
+		});
+		const controller = new AbortController();
+		const outcome = authorizeMcp(provider, { serverUrl: "https://mcp.example/mcp", signal: controller.signal }).catch(
+			(error: unknown) => error,
+		);
+		try {
+			await entered.promise;
+			controller.abort();
+			release.resolve();
+			expect(await outcome).toMatchObject({ name: "AbortError" });
+			expect(provider.verifier).toBeUndefined();
+			expect(provider.authorizationUrl).toBeUndefined();
+		} finally {
+			release.resolve();
+			await outcome;
+			spy.mockRestore();
+		}
+	});
+
+	it("saves a successful detached refresh even after caller cancellation", async () => {
+		const provider = new TestOAuthProvider("http://127.0.0.1/callback");
+		provider.client = { client_id: "client" };
+		provider.tokenSet = { access_token: "a1", refresh_token: "r1", token_type: "Bearer", scope: "repo" };
+		provider.discovery = {
+			authorizationServerUrl: "https://auth.example",
+			authorizationServerMetadata: {
+				issuer: "https://auth.example",
+				authorization_endpoint: "https://auth.example/authorize",
+				token_endpoint: "https://auth.example/token",
+				response_types_supported: ["code"],
+			},
+		};
+		const controller = new AbortController();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const running = authorizeMcp(provider, {
+			serverUrl: "https://mcp.example/mcp",
+			signal: controller.signal,
+			refreshSignal: null,
+			fetch: async (_url, init) => {
+				expect(init?.signal).toBeUndefined();
+				entered.resolve();
+				await release.promise;
+				return Response.json({ access_token: "a2", refresh_token: "r2", token_type: "Bearer" });
+			},
+		});
+		try {
+			await entered.promise;
+			controller.abort();
+		} finally {
+			release.resolve();
+		}
+		expect(await running).toBe("AUTHORIZED");
+		expect(provider.tokenSet).toEqual({
+			access_token: "a2",
+			refresh_token: "r2",
+			token_type: "Bearer",
+			scope: "repo",
+		});
 		expect(provider.authorizationUrl).toBeUndefined();
 	});
 

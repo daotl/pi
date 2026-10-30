@@ -972,6 +972,280 @@ it("stops an outgoing queue batch after its command replaces the runtime", async
 	}
 });
 
+it("cancels scheduled confirmation preflight before shutdown drains terminal input", async () => {
+	const entered = Promise.withResolvers<void>();
+	const resumed = Promise.withResolvers<void>();
+	const draining = Promise.withResolvers<void>();
+	const releaseDrain = Promise.withResolvers<void>();
+	const text = "never admit this shutdown prompt";
+	let confirmation: boolean | undefined;
+	const ui = await createSchedulingMode({
+		extensionFactories: [
+			(pi) => {
+				pi.on("before_agent_start", async (event, context) => {
+					if (event.messageType !== "user" || event.prompt !== text) return;
+					// Deliberately omit a signal: shutdown itself resolves this dialog.
+					const answer = context.ui.confirm("Scheduled permission", "Continue?");
+					entered.resolve();
+					confirmation = await answer;
+					resumed.resolve();
+				});
+			},
+		],
+	});
+	let providerRequests = 0;
+	ui.harness.setResponses([
+		() => {
+			providerRequests++;
+			return fauxAssistantMessage("must not run during shutdown");
+		},
+	]);
+	const exitError = new Error("test process exit");
+	const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+		throw exitError;
+	});
+	const drain = vi.spyOn(ui.terminal, "drainInput").mockImplementation(async () => {
+		draining.resolve();
+		await releaseDrain.promise;
+	});
+	// Exercise the real private shutdown path without exiting the test process.
+	const shutdownMode = ui.mode as unknown as { shutdown(): Promise<void> };
+	let shutdown: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		await ui.internal.handleScheduleCommand(`\n${text}`);
+		await entered.promise;
+		expect(ui.harness.session.isIdle).toBe(true);
+		shutdown = shutdownMode.shutdown();
+		await draining.promise;
+		await resumed.promise;
+		await setImmediate();
+		await setImmediate();
+		expect(confirmation).toBe(false);
+		expect(providerRequests).toBe(0);
+		expect(ui.harness.session.messages.map(getMessageText)).not.toContain(text);
+		expect(
+			ui.harness.sessionManager
+				.getEntries()
+				.some((entry) => entry.type === "message" && getMessageText(entry.message) === text),
+		).toBe(false);
+		releaseDrain.resolve();
+		await expect(shutdown).rejects.toBe(exitError);
+	} finally {
+		releaseDrain.resolve();
+		await shutdown?.catch(() => {});
+		drain.mockRestore();
+		exit.mockRestore();
+		await ui.cleanup();
+	}
+});
+
+it.each(
+	(["scheduled", "heartbeat"] as const).flatMap((kind) =>
+		(["persistence", "interactive disposal", "signal disposal"] as const).map((failure) => ({ kind, failure })),
+	),
+)(
+	"resumes scheduled work and heartbeats after $failure rejects a canceled $kind confirmation",
+	async ({ kind, failure }) => {
+		let entered = false;
+		let resumed = false;
+		let retainedEntered = false;
+		const releaseRetained = Promise.withResolvers<void>();
+		const canceledText = "cancel this permission preflight";
+		const retainedText = "retained schedule after shutdown failure";
+		const heartbeatText = "heartbeat after shutdown failure";
+		let confirmation: boolean | undefined;
+		const ui = await createSchedulingMode({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async (event, context) => {
+						if (event.messageType !== "user") return;
+						if (event.prompt === canceledText) {
+							const answer = context.ui.confirm("Scheduled permission", "Continue?");
+							entered = true;
+							confirmation = await answer;
+							resumed = true;
+						} else if (event.prompt === retainedText) {
+							retainedEntered = true;
+							await releaseRetained.promise;
+						}
+					});
+				},
+			],
+		});
+		const requests: string[] = [];
+		const respond = (context: TranscriptContext) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			return fauxAssistantMessage("recovered response");
+		};
+		ui.harness.setResponses([respond, respond]);
+		const shutdownError = new Error("recoverable shutdown failure");
+		const failureSpy =
+			failure === "persistence"
+				? vi.spyOn(ui.harness.session, "flushPendingPersistence").mockImplementationOnce(() => {
+						throw shutdownError;
+					})
+				: vi.spyOn(ui.runtime, "dispose").mockRejectedValueOnce(shutdownError);
+		const shutdownMode = ui.mode as unknown as {
+			shutdown(options?: { fromSignal?: boolean }): Promise<void>;
+			cancelScheduledPreflights(): void;
+			cancelExtensionDialogs(): void;
+			isShuttingDown: boolean;
+		};
+		try {
+			await ui.mode.init();
+			const session = ui.runtime.session;
+			if (kind === "scheduled") await ui.internal.handleScheduleCommand(`\n${canceledText}`);
+			else {
+				await ui.internal.handleHeartbeatCommand(`12:01\n${canceledText}`);
+				ui.internal.fireHeartbeat(ui.internal.heartbeats[0].id);
+			}
+			await vi.waitFor(() => expect(entered).toBe(true));
+			expect(session.isIdle).toBe(true);
+			await ui.internal.handleScheduleCommand(`\n${retainedText}`);
+			await ui.internal.handleHeartbeatCommand(`1h\n${heartbeatText}`);
+			await shutdownMode.shutdown(failure === "signal disposal" ? { fromSignal: true } : undefined);
+			await vi.waitFor(() => expect(resumed).toBe(true));
+			expect(confirmation).toBe(false);
+			expect(shutdownMode.isShuttingDown).toBe(false);
+			expect(ui.runtime.session).toBe(session);
+			await vi.waitFor(() => expect(ui.internal.scheduledMessages).toEqual([]));
+			await vi.waitFor(() => expect(retainedEntered).toBe(true));
+			expect(requests).toEqual([]);
+			expect(session.messages.map(getMessageText)).not.toContain(canceledText);
+			releaseRetained.resolve();
+			await vi.waitFor(() => expect(requests).toEqual([retainedText]));
+			await session.waitForIdle();
+			const beat = ui.internal.heartbeats.find((entry) => entry.text === heartbeatText);
+			if (!beat) throw new Error("Recovery lost the pending heartbeat");
+			beat.nextFireAt = Date.now() - 1;
+			ui.internal.tickHeartbeats();
+			await vi.waitFor(() => expect(requests).toEqual([retainedText, heartbeatText]));
+			await session.waitForIdle();
+			expect(session.messages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
+				"original context",
+				retainedText,
+				heartbeatText,
+			]);
+		} finally {
+			shutdownMode.isShuttingDown = true;
+			shutdownMode.cancelScheduledPreflights();
+			shutdownMode.cancelExtensionDialogs();
+			releaseRetained.resolve();
+			failureSpy.mockRestore();
+			await ui.cleanup();
+		}
+	},
+);
+
+it.each(
+	(["replace", "stop"] as const).flatMap((transition) =>
+		(["scheduled", "heartbeat", "streaming", "retry"] as const).map((kind) => ({ transition, kind })),
+	),
+)("cancels $kind preflight before $transition retires its session", async ({ transition, kind }) => {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const initialEntered = Promise.withResolvers<void>();
+	const initialRelease = Promise.withResolvers<void>();
+	const foreignRelease = Promise.withResolvers<void>();
+	const text = "discard scheduled outgoing input";
+	const ui = await createSchedulingMode({
+		extensionFactories: [
+			(pi) => {
+				pi.on("before_agent_start", async (event) => {
+					if (event.messageType === "user" && event.prompt === text && kind === "retry") {
+						initialEntered.resolve();
+						await initialRelease.promise;
+					} else if (event.messageType === "user" && event.prompt === text && kind !== "streaming") {
+						entered.resolve();
+						await release.promise;
+					}
+				});
+				pi.on("input", async (event) => {
+					if (event.text === text && event.streamingBehavior === "followUp") {
+						entered.resolve();
+						await release.promise;
+					}
+				});
+			},
+		],
+	});
+	const outgoing = ui.harness.session;
+	const requests: string[] = [];
+	ui.harness.setResponses([
+		async (context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			if (requests.at(-1) === "foreign run") await foreignRelease.promise;
+			return fauxAssistantMessage("response");
+		},
+		(context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			return fauxAssistantMessage("unexpected outgoing response");
+		},
+	]);
+	let running: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		if (kind === "streaming") {
+			running = outgoing.prompt("foreign run");
+			await vi.waitFor(() => expect(requests).toEqual(["foreign run"]));
+		}
+		if (kind === "heartbeat") {
+			await ui.internal.handleHeartbeatCommand(`12:01\n${text}`);
+			ui.internal.fireHeartbeat(ui.internal.heartbeats[0].id);
+		} else if (kind === "streaming") {
+			await ui.internal.handleScheduleCommand(`1h\n${text}`);
+			const scheduled = ui.internal.scheduledMessages[0];
+			if (scheduled.when.type === "time") scheduled.when.at = Date.now();
+			ui.internal.fireScheduledMessage(ui.internal.scheduledMessages[0].id);
+		} else await ui.internal.handleScheduleCommand(`\n${text}`);
+		if (kind === "retry") {
+			await initialEntered.promise;
+			running = outgoing.prompt("foreign run");
+			await vi.waitFor(() => expect(requests).toEqual(["foreign run"]));
+			initialRelease.resolve();
+		}
+		await entered.promise;
+		foreignRelease.resolve();
+		await running;
+		if (transition === "replace") await ui.runtime.newSession();
+		else ui.mode.stop();
+		release.resolve();
+		await setImmediate();
+		await setImmediate();
+		await outgoing.waitForIdle();
+		expect(requests).toEqual(kind === "streaming" || kind === "retry" ? ["foreign run"] : []);
+		expect(outgoing.messages.map(getMessageText)).not.toContain(text);
+		expect(
+			outgoing.sessionManager
+				.getEntries()
+				.some((entry) => entry.type === "message" && getMessageText(entry.message) === text),
+		).toBe(false);
+		expect(ui.runtime.session.messages.map(getMessageText)).not.toContain(text);
+	} finally {
+		initialRelease.resolve();
+		release.resolve();
+		foreignRelease.resolve();
+		await running?.catch(() => {});
+		await ui.cleanup();
+	}
+});
+
 it.each(["replace", "stop"] as const)(
 	"cancels reserved ordinary preflight before %s invalidates its owner",
 	async (transition) => {
