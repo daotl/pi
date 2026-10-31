@@ -157,6 +157,10 @@ for platform in "${PLATFORMS[@]}"; do
     native_path="native/${native_platform%-*}/prebuilds"
     mkdir -p "$OUTPUT_DIR/$platform/$native_path"
     cp -R "../tui/$native_path/$native_platform" "$OUTPUT_DIR/$platform/$native_path/"
+    if [[ "$platform" == windows-* ]]; then
+        mkdir -p "$OUTPUT_DIR/$platform/native/chord/prebuilds"
+        cp -R "../chord/native/prebuilds/$native_platform" "$OUTPUT_DIR/$platform/native/chord/prebuilds/"
+    fi
 done
 
 # Create archives

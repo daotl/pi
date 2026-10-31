@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { type ChildProcess, fork } from "node:child_process";
+import { type ChildProcess, fork, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,6 +16,7 @@ import {
 	type Instance,
 	processLock,
 } from "../src/manager.ts";
+import { createWindowsJob } from "../src/windows-job.ts";
 import { Echo } from "./fixtures/echo.ts";
 
 const entry = fileURLToPath(new URL("./fixtures/worker.ts", import.meta.url));
@@ -149,6 +150,167 @@ describe("processLock", () => {
 });
 
 describe("host manager forced tree cleanup", () => {
+	it.skipIf(process.platform !== "win32")(
+		"invalid inherited CRT layout and parent loss before launch cannot run application code",
+		() => {
+			const marker = scratch("invalid-native-start");
+			const job = createWindowsJob();
+			onTestFinished(() => {
+				job.close();
+				rmSync(marker, { force: true });
+			});
+			const script = `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`;
+			// No IPC slot: libuv provides only three CRT descriptors, not the required fork layout.
+			const invalid = spawnSync(job.launcher, [process.execPath, "-e", script], {
+				env: { ...process.env, CHORD2_WINDOWS_JOB: job.name },
+				stdio: "ignore",
+			});
+			assert.equal(invalid.status, 125);
+			assert.throws(() => readFileSync(marker), { code: "ENOENT" });
+			job.close();
+			// Closing the sole owner models kernel handle close on parent loss before launcher OpenJobObject.
+			const lost = spawnSync(job.launcher, [process.execPath, "-e", script], {
+				env: { ...process.env, CHORD2_WINDOWS_JOB: job.name },
+				stdio: "ignore",
+			});
+			assert.equal(lost.status, 125);
+			assert.throws(() => readFileSync(marker), { code: "ENOENT" });
+		},
+	);
+
+	it.skipIf(process.platform !== "win32")(
+		"snapshot deserialization and its descendants are already in the Job before user callbacks run",
+		async () => {
+			const blob = scratch("job-snapshot.blob");
+			const file = scratch("job-snapshot-child");
+			const snapshot = fileURLToPath(new URL("./fixtures/job-snapshot.cjs", import.meta.url));
+			const built = spawnSync(process.execPath, [`--snapshot-blob=${blob}`, "--build-snapshot", snapshot], {
+				encoding: "utf8",
+			});
+			assert.equal(built.status, 0, built.stderr);
+			const manager = createHostManager({
+				driver: forkDriver({ entry, execArgv: [`--snapshot-blob=${blob}`], env: { PRELOAD_CHILD_FILE: file } }),
+			});
+			onTestFinished(async () => {
+				await manager.stop();
+				rmSync(blob, { force: true });
+				rmSync(file, { force: true });
+			});
+			const instance = await manager.start();
+			const descendant = Number(readFileSync(file, "utf8"));
+			assert.ok(alive(descendant));
+			await manager.stop();
+			await instance.exited;
+			assert.equal(alive(descendant), false);
+		},
+	);
+
+	for (const terminal of ["normal", "crash-after-ready", "fatal-after-ready"] as const) {
+		it.skipIf(process.platform !== "win32")(
+			`${terminal} joins the actual Windows Job tree, including detached preload descendants`,
+			async () => {
+				const file = scratch(`job-preload-${terminal}`);
+				const preload = fileURLToPath(new URL("./fixtures/job-preload.cjs", import.meta.url));
+				const manager = createHostManager({
+					driver: forkDriver({
+						entry,
+						execArgv: ["--require", preload],
+						env: { PRELOAD_CHILD_FILE: file },
+						init: { greeting: "hi" },
+					}),
+				});
+				onTestFinished(async () => {
+					await manager.stop();
+					rmSync(file, { force: true });
+				});
+				const instance = await manager.start();
+				const descendant = Number(readFileSync(file, "utf8"));
+				assert.ok(alive(descendant));
+				if (terminal === "normal") await manager.stop();
+				else instance.send({ type: "init", value: terminal });
+				await instance.exited;
+				assert.equal(alive(instance.pid), false);
+				assert.equal(alive(descendant), false, "exited cannot resolve before Job ActiveProcesses reaches zero");
+			},
+		);
+	}
+
+	for (const preloadKind of ["environment", "import"] as const) {
+		it.skipIf(process.platform !== "win32")(
+			`owns ${preloadKind} preload descendants before application startup and preserves output taps`,
+			async () => {
+				const file = scratch(`job-${preloadKind}`);
+				const preload = fileURLToPath(new URL("./fixtures/job-preload.cjs", import.meta.url));
+				const output = Promise.withResolvers<void>();
+				let text = "";
+				const manager = createHostManager({
+					driver: forkDriver({
+						entry,
+						env: {
+							PRELOAD_CHILD_FILE: file,
+							...(preloadKind === "environment" ? { NODE_OPTIONS: `--require=${JSON.stringify(preload)}` } : {}),
+						},
+						execArgv:
+							preloadKind === "import"
+								? ["--import", new URL("./fixtures/job-import.mjs", import.meta.url).href]
+								: [],
+						init: { greeting: "hi" },
+						onOutput: (_stream, chunk) => {
+							text += Buffer.from(chunk).toString("utf8");
+							if (text.includes("chord-job-preload\n")) output.resolve();
+						},
+					}),
+				});
+				onTestFinished(async () => {
+					await manager.stop();
+					rmSync(file, { force: true });
+				});
+				const instance = await manager.start();
+				await output.promise;
+				const descendant = Number(readFileSync(file, "utf8"));
+				assert.ok(alive(descendant));
+				await manager.stop();
+				await instance.exited;
+				assert.equal(alive(descendant), false);
+			},
+		);
+	}
+
+	it.skipIf(process.platform !== "win32")(
+		"parent process loss closes its noninheritable Job and kills workers and detached descendants",
+		async () => {
+			const file = scratch("job-owner-loss");
+			const owner = fork(fileURLToPath(new URL("./fixtures/job-owner.ts", import.meta.url)), [file], {
+				execArgv: [],
+				stdio: ["ignore", "ignore", "inherit", "ipc"],
+			});
+			onTestFinished(async () => {
+				await terminate(owner);
+				rmSync(file, { force: true });
+			});
+			const started = Promise.withResolvers<number>();
+			owner.once("error", started.reject);
+			owner.once("exit", () => started.reject(new Error("Job owner exited before readiness")));
+			owner.once("message", (message) => {
+				if (message !== null && typeof message === "object" && "pid" in message && typeof message.pid === "number")
+					started.resolve(message.pid);
+				else started.reject(new Error("Job owner sent an invalid worker PID"));
+			});
+			const worker = await started.promise;
+			const descendant = Number(readFileSync(file, "utf8"));
+			assert.ok(alive(worker) && alive(descendant));
+			await terminate(owner);
+			// Real kernel death is asynchronous and has no Node event in this separate observer process.
+			for (let i = 0; i < 100 && (alive(worker) || alive(descendant)); i++) {
+				const tick = Promise.withResolvers<void>();
+				setTimeout(tick.resolve, 20);
+				await tick.promise;
+			}
+			assert.equal(alive(worker), false);
+			assert.equal(alive(descendant), false);
+		},
+	);
+
 	it.skipIf(process.platform !== "win32")(
 		"a fatal start kills the child and its descendants before rejecting",
 		async () => {
@@ -483,13 +645,57 @@ describe("manager terminal lifetime", () => {
 });
 
 describe("manager failure boundaries", () => {
-	it("a failed OS spawn settles exit and rejects start without an unhandled error", async () => {
+	for (const phase of ["starting", "stopping"] as const) {
+		it(`propagates tree cleanup failure during ${phase} without leaving a reusable instance`, async () => {
+			const cleanupError = new Error("native tree cleanup failed");
+			const exit = Promise.withResolvers<{ code: number; signal: null }>();
+			const adopted = Promise.withResolvers<void>();
+			let controls: ((message: ControlMessage) => void) | undefined;
+			const manager = createHostManager({
+				driver: {
+					spawn: () => {
+						adopted.resolve();
+						return {
+							pid: 1,
+							link: ipcLink({ connected: false, send: () => false, on: () => {}, off: () => {} }),
+							exited: exit.promise,
+							send: () => {
+								exit.reject(cleanupError);
+							},
+							killTree: () => {},
+							onControl: (listener) => {
+								controls = listener;
+							},
+						};
+					},
+				},
+			});
+			const started = manager.start();
+			await adopted.promise;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			if (phase === "starting") {
+				const rejected = assert.rejects(started, (error) => error === cleanupError);
+				exit.reject(cleanupError);
+				await rejected;
+			} else {
+				controls!({ type: "ready" });
+				await started;
+				await assert.rejects(manager.stop(), (error) => error === cleanupError);
+			}
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			assert.equal(manager.status, "stopped");
+			assert.equal(manager.instance, undefined);
+		});
+	}
+
+	it("a failed application launch rejects startup and leaves no managed instance", async () => {
 		const previous = Object.getOwnPropertyDescriptor(process, "execPath")!;
 		Object.defineProperty(process, "execPath", { ...previous, value: join(scratch("missing-node"), "node") });
 		try {
 			const manager = createHostManager({ driver: forkDriver({ entry }) });
-			await assert.rejects(manager.start(), /child exited before ready/);
+			await assert.rejects(manager.start());
 			assert.equal(manager.status, "stopped");
+			assert.equal(manager.instance, undefined);
 			await manager.stop();
 		} finally {
 			Object.defineProperty(process, "execPath", previous);

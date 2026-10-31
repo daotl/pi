@@ -1077,7 +1077,10 @@ describe("child rollback completion", () => {
 			const finishClose = latch();
 			const frames: Frame[] = [];
 			const [parent, up] = memoryLinkPair();
-			parent.receive((frame) => frames.push(frame));
+			parent.receive((frame) => {
+				frames.push(frame);
+				if (frame.t === "prepared") parent.send({ t: "advance", reload: frame.reload, phase: frame.phase });
+			});
 			const Store = local(`t.abort-ack-${phase}`, {
 				version: 1,
 				input: Type.Object({}),
@@ -1125,7 +1128,15 @@ describe("child rollback completion", () => {
 			parent.send({ t: "hello", protocol: PROTOCOL_VERSION, name: "parent", kind: "host", codeVersion: 1 });
 			await worker.install({ name: "store", setup: ({ serve }) => serve(Store, () => ({ read: () => "old" })) });
 			const ref = await worker.get(Store, {});
-			parent.send({ t: "prepare", reload: 100, codeVersion: 2, plugins: ["store"], options: {} });
+			parent.send({
+				t: "prepare",
+				reload: 100,
+				transaction: "test:100",
+				participants: ["parent", "worker"],
+				codeVersion: 2,
+				plugins: ["store"],
+				options: {},
+			});
 			await entered.promise;
 			if (phase === "prepared" || phase === "failed-prepare") {
 				for (let i = 0; i < 50 && !frames.some((frame) => frame.t === "vote" && frame.reload === 100); i++)
@@ -1161,7 +1172,15 @@ describe("child rollback completion", () => {
 				await tick();
 			assert.ok(frames.some((frame) => frame.t === "aborted" && frame.reload === 100));
 			assert.equal(await ref.read(), "old");
-			parent.send({ t: "prepare", reload: 101, codeVersion: 3, plugins: ["store"], options: {} });
+			parent.send({
+				t: "prepare",
+				reload: 101,
+				transaction: "test:101",
+				participants: ["parent", "worker"],
+				codeVersion: 3,
+				plugins: ["store"],
+				options: {},
+			});
 			for (let i = 0; i < 50 && !frames.some((frame) => frame.t === "vote" && frame.reload === 101); i++)
 				await tick();
 			const next = frames.find((frame) => frame.t === "vote" && frame.reload === 101);
@@ -1208,6 +1227,8 @@ describe("child rollback completion", () => {
 			assert.ok(first?.t === "prepare");
 			await server.reload([{ name: "noop", setup: () => {} }]);
 			child.send({ t: "vote", reload: first.reload });
+			child.send({ t: "prepared", reload: first.reload, phase: "declared" });
+			child.send({ t: "prepared", reload: first.reload, phase: "materialized" });
 			for (let i = 0; i < 50 && !frames.some((frame) => frame.t === "abort"); i++) await tick();
 			assert.ok(frames.some((frame) => frame.t === "abort"));
 			const internal = server as unknown as { connections: Set<{ abortions: Map<number, unknown> }> };

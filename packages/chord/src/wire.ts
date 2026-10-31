@@ -19,9 +19,9 @@ import { CHORD_ERROR_CODES, ChordError } from "./errors.ts";
 /**
  * The link protocol version, announced in `hello`. Peers of different versions do not talk: the side that notices
  * closes the link with reason `protocol-version <its version>`, so the other side learns it too
- * (`LinkOptions.onProtocolMismatch`). Version 7 acknowledges completed child rollback before reconciliation retries.
+ * (`LinkOptions.onProtocolMismatch`). Version 8 isolates transaction-owned candidate holds and prepare barriers.
  */
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
 
 const Id = Type.Integer({ minimum: 1 });
 const Name = Type.String({ minLength: 1 });
@@ -97,8 +97,15 @@ const FrameSchema = Type.Union([
 		state: Type.Optional(Type.Literal(false)),
 		/** The consumer already has values (a re-hold after a link loss): its unit is not urgent. */
 		again: Type.Optional(Type.Literal(true)),
+		/** Private candidate namespace, accepted only from this transaction's trusted host participants. */
+		transaction: Type.Optional(Name),
+		/** Participant stamped by the coordinator when relaying a candidate hold. */
+		participant: Type.Optional(Name),
 	}),
 	Type.Object({ t: Type.Literal("release"), id: Id }),
+	/** Every live view on this ordinary hold belongs to a run replaced by this transaction. */
+	Type.Object({ t: Type.Literal("replace_hold"), id: Id, transaction: Name, replacing: Type.Boolean() }),
+	Type.Object({ t: Type.Literal("replaced_hold"), id: Id, transaction: Name }),
 	Type.Object({
 		t: Type.Literal("shape"),
 		id: Id,
@@ -163,6 +170,8 @@ const FrameSchema = Type.Union([
 	Type.Object({
 		t: Type.Literal("prepare"),
 		reload: Reload,
+		transaction: Name,
+		participants: List(Name),
 		codeVersion: Type.Integer({ minimum: 1 }),
 		plugins: List(Type.String()),
 		options: WireReloadOptionsSchema,
@@ -172,6 +181,17 @@ const FrameSchema = Type.Union([
 		reload: Reload,
 		error: Type.Optional(WireErrorSchema),
 		report: Type.Optional(WireReloadReportSchema),
+	}),
+	/** Prepare barriers precede compatibility validation and private state hydration. */
+	Type.Object({
+		t: Type.Literal("prepared"),
+		reload: Reload,
+		phase: Type.Union([Type.Literal("declared"), Type.Literal("materialized")]),
+	}),
+	Type.Object({
+		t: Type.Literal("advance"),
+		reload: Reload,
+		phase: Type.Union([Type.Literal("declared"), Type.Literal("materialized")]),
 	}),
 	Type.Object({ t: Type.Literal("commit"), reload: Reload }),
 	/** The parent dropped `codeVersion`: roots of it may still come from there no longer. */

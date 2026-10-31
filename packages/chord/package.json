@@ -56,6 +56,7 @@
 	"sideEffects": false,
 	"files": [
 		"dist",
+		"native",
 		"docs",
 		"README.md",
 		"CHANGELOG.md",
@@ -64,8 +65,9 @@
 	"scripts": {
 		"clean": "shx rm -rf dist",
 		"build": "tsc -p tsconfig.build.json",
+		"build:native:win32": "node native/build.mjs",
 		"test": "vitest --run",
-		"prepublishOnly": "npm run clean && npm run build"
+		"prepublishOnly": "node native/check-prebuilds.mjs && npm run clean && npm run build"
 	},
 	"keywords": [
 		"application",

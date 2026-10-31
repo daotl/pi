@@ -6,6 +6,7 @@ import {
 	candidateSource,
 	type Factory,
 	hostLifetime,
+	type Installed,
 	makeService,
 	memberSchemas,
 	type ObjectImpl,
@@ -19,8 +20,16 @@ import {
 } from "./object.ts";
 import { holdPublications } from "./publish.ts";
 import type { RegistryTable } from "./registry.ts";
+import { RemoteRef } from "./remote.ts";
 import { assertValid, deepEqual } from "./schema.ts";
 import type { Readable } from "./types.ts";
+
+/** Coordinator-issued identity; no application option grants access to pending implementations. */
+export interface ReloadTransaction {
+	readonly id: string;
+	readonly participants: readonly string[];
+	barrier(phase: "declared" | "materialized"): Promise<void>;
+}
 
 export interface ReloadOptions {
 	/** Facet names to remove. */
@@ -167,6 +176,7 @@ export async function beginReload(
 	plugins: readonly PluginRef[],
 	options: ReloadOptions,
 	codeVersion?: number,
+	transaction?: ReloadTransaction,
 ): Promise<Reload> {
 	host.checkOpen();
 	if (host.reloading) {
@@ -176,7 +186,7 @@ export async function beginReload(
 	try {
 		const facets = await host.resolve(plugins);
 		host.checkOpen();
-		const reload = new Reload(host, facets, options, codeVersion);
+		const reload = new Reload(host, facets, options, codeVersion, transaction);
 		host.reloadOperation = reload;
 		return reload;
 	} catch (error) {
@@ -226,6 +236,15 @@ export class Reload {
 	readonly options: ReloadOptions;
 	/** Code version id to commit (issued by the coordinating server); a local reload allocates one. */
 	readonly codeVersion: number | undefined;
+	readonly transaction: ReloadTransaction | undefined;
+	readonly replacing = new Set<RemoteRef>();
+	readonly stateReady = new Set<ObjectImpl>();
+	materialized = false;
+	readonly completing = new Set<Promise<void>>();
+	readonly #stateWaiters = new Map<
+		ObjectImpl,
+		{ promise: Promise<void>; resolve: () => void; reject: (error: unknown) => void }
+	>();
 	readonly candidates = new Map<ObjectImpl, Candidate>();
 	readonly abort = new AbortController();
 	readonly closed: [ObjectImpl, ResourceImpl][] = [];
@@ -243,11 +262,18 @@ export class Reload {
 	#activations: Promise<void> | undefined;
 	#rollback: Promise<void> | undefined;
 
-	constructor(host: HostImpl, facets: readonly Facet[], options: ReloadOptions, codeVersion?: number) {
+	constructor(
+		host: HostImpl,
+		facets: readonly Facet[],
+		options: ReloadOptions,
+		codeVersion?: number,
+		transaction?: ReloadTransaction,
+	) {
 		this.host = host;
 		this.facets = facets;
 		this.options = options;
 		this.codeVersion = codeVersion;
+		this.transaction = transaction;
 	}
 
 	/** Stops candidate work synchronously; its owner still joins prepare and rollback before freeing the slot. */
@@ -272,20 +298,119 @@ export class Reload {
 		this.#alive();
 		this.load();
 		this.checkProviders();
+		// Announce immediately; independent resource work must not wait for another host's module loader.
+		this.declareReplacements();
 		await this.prepareAll();
 		this.#alive();
-		// From here new objects of changed types are rejected (upgrade_conflict, retryable) until commit or abort,
-		// so the candidate set is final once the activations already in flight have been prepared.
 		this.host.gating = this.changed;
 		this.#activations = this.prepareAll();
 		await this.withDeadline(this.#activations, "activations in flight did not finish");
 		this.#alive();
-		this.checkRefs();
-		this.tables = this.host.buildTables(this.entries());
-		await this.gate();
+		this.declareReplacements();
+		const declared = (async () => {
+			const receipts = Promise.all(
+				[...new Set([...this.replacing].map((ref) => ref.binding))].flatMap((binding) => [
+					...binding.replacementReceipts,
+				]),
+			);
+			receipts.catch(() => {});
+			await raceSignal(receipts, this.abort.signal);
+			if (this.transaction !== undefined) {
+				const barrier = this.transaction.barrier("declared");
+				barrier.catch(() => {});
+				await raceSignal(barrier, this.abort.signal);
+			}
+		})();
+		declared.catch(() => {});
+		this.materialized = true;
+		for (const connection of this.host.connections) connection.refreshCandidates();
+		const materializedReceipt = this.transaction?.barrier("materialized") ?? Promise.resolve();
+		materializedReceipt.catch(() => {});
+		const materialized = raceSignal(materializedReceipt, this.abort.signal);
+		materialized.catch(() => {});
+		if (this.transaction === undefined) this.checkRefs();
+		const completing = new Map<ObjectImpl, Promise<void>>();
+		const finish = (candidate: Candidate, ancestors = new Set<ObjectImpl>()): Promise<void> => {
+			if (ancestors.has(candidate.object)) return Promise.reject(invalid("cycle", "candidate reference cycle"));
+			const existing = completing.get(candidate.object);
+			if (existing !== undefined) return existing;
+			const next = new Set([...ancestors, candidate.object]);
+			const work = (async () => {
+				for (const ref of candidate.run.decls.refs.values()) {
+					const dependency = ref.object === undefined ? undefined : this.candidates.get(ref.object);
+					if (dependency !== undefined) await finish(dependency, next);
+				}
+				await candidate.object.open(
+					candidate.run.created.resources.filter((resource) => !candidate.atGate.includes(resource)),
+					candidate.run.created.refs,
+					this.abort.signal,
+				);
+				this.#alive();
+				const hydration = candidate.object.waitHydrated(candidate.run);
+				hydration.catch(() => {});
+				await raceSignal(hydration, this.abort.signal);
+				if (candidate.reasons.length > 0) await this.gate([candidate]);
+				else if (this.transaction !== undefined)
+					await candidate.object.initCells(candidate.run, this.abort.signal, this.host.pending?.id);
+				this.#alive();
+				const ready = new Map(
+					[...this.candidates].filter(([object]) => this.stateReady.has(object) || object === candidate.object),
+				);
+				dryRun(ready);
+				this.stateReady.add(candidate.object);
+				this.#stateWaiters.get(candidate.object)?.resolve();
+			})();
+			completing.set(candidate.object, work);
+			this.completing.add(work);
+			return work;
+		};
+		await Promise.all([...this.candidates.values()].map((candidate) => finish(candidate)));
 		this.#alive();
+		await declared;
+		await materialized;
+		this.checkRefs();
 		dryRun(this.candidates);
+		this.tables = this.host.buildTables(this.entries());
 		this.#stage();
+	}
+
+	declareReplacements(): void {
+		if (this.transaction === undefined) return;
+		for (const object of this.host.objects.values()) {
+			if (!this.changed.has(object.typeName) && !this.removed.has(object.typeName)) continue;
+			for (const ref of object.decls.refs.values()) {
+				if (!(ref instanceof RemoteRef)) continue;
+				this.replacing.add(ref);
+				ref.binding.replacing(ref, this.transaction.id);
+			}
+		}
+	}
+
+	/** Candidate metadata is available before state; waiting for state never blocks another host's factory pass. */
+	candidateInstalled(object: ObjectImpl): Installed | undefined {
+		const candidate = this.candidates.get(object);
+		return candidate === undefined
+			? (object.implementations.get(this.host.pending?.id ?? this.host.current.id) ?? object.currentInstalled())
+			: {
+					codeVersion: this.host.pending?.id ?? this.host.current.id,
+					service: candidate.service,
+					implementation: candidate.run.implementation,
+					decls: candidate.run.decls,
+				};
+	}
+
+	async candidateState(object: ObjectImpl): Promise<ReadonlyMap<unknown, unknown>> {
+		if (this.candidates.has(object) && !this.stateReady.has(object)) {
+			let waiter = this.#stateWaiters.get(object);
+			if (waiter === undefined) {
+				waiter = Promise.withResolvers<void>();
+				waiter.promise.catch(() => {});
+				this.#stateWaiters.set(object, waiter);
+			}
+			await raceSignal(waiter.promise, this.abort.signal);
+		}
+		this.#alive();
+		return this.candidates.get(object)?.derived ?? new Map();
 	}
 
 	/** What a successful prepare will commit (a child sends it with its vote). */
@@ -314,11 +439,11 @@ export class Reload {
 	 */
 	#stage(): void {
 		for (const candidate of this.candidates.values()) {
-			if (candidate.object.status === "live")
+			if (candidate.object.status === "live" && candidate.staged === undefined)
 				candidate.staged = candidate.object.stageListeners(candidate.run.decls);
 		}
 		for (const object of this.host.objects.values()) {
-			if (object.status === "live" && object.deferredRuntime)
+			if (object.status === "live" && object.deferredRuntime && !this.deferred.has(object))
 				this.deferred.set(object, object.stageListeners(object.decls));
 		}
 	}
@@ -490,20 +615,20 @@ export class Reload {
 				candidate.replaced.push(old);
 		}
 		if (deferred.size > 0) candidate.reasons.push("exclusive resource replaced");
-		await object.open(
-			run.created.resources.filter((resource) => !deferred.has(resource)),
-			run.created.refs,
-			this.abort.signal,
-		);
-		this.#alive();
-		await raceSignal(object.waitHydrated(run), this.abort.signal);
-		this.#alive();
-		// Cells this reload adds read their first value once the new resources are open (gated objects: at the gate);
-		// the derivations over them are checked after.
-		if (candidate.reasons.length === 0) {
-			await object.initCells(run, this.abort.signal, this.host.pending?.id);
+		// Resources and hydration finish independently once this host has materialized its candidate graph.
+		if (this.transaction === undefined) {
+			await object.open(
+				run.created.resources.filter((resource) => !deferred.has(resource)),
+				run.created.refs,
+				this.abort.signal,
+			);
 			this.#alive();
-			// Candidate references are evaluated together after every provider and gated migration is prepared.
+			await raceSignal(object.waitHydrated(run), this.abort.signal);
+			this.#alive();
+			if (candidate.reasons.length === 0) {
+				await object.initCells(run, this.abort.signal, this.host.pending?.id);
+				this.#alive();
+			}
 		}
 	}
 
@@ -517,13 +642,15 @@ export class Reload {
 			for (const ref of object.decls.refs.values())
 				if (![...run.decls.refs.values()].includes(ref)) dropped.add(ref);
 		}
+		for (const object of this.host.objects.values())
+			if (this.removed.has(object.typeName)) for (const ref of object.decls.refs.values()) dropped.add(ref);
 		for (const object of this.host.objects.values()) {
 			const service = this.services.get(object.typeName);
 			if (service === undefined || !this.changed.has(object.typeName)) continue;
 			for (const ref of object.refs) {
 				// The host's bootstrap reference follows this provider at commit; it is not an old-code consumer.
 				if (ref === this.host.hostObjects.get(object.typeName)) continue;
-				if (!dropped.has(ref) && ref.owner !== "client")
+				if (!dropped.has(ref) && ref.owner !== "client" && !this.host.replacedRemoteRef(ref, this.transaction?.id))
 					bind(service.contract, service.options.accepts, ref.contract);
 			}
 		}
@@ -540,12 +667,13 @@ export class Reload {
 	 * Admission cut, wait for grandfathered roots (deadline), replace exclusive resources, migrate into private
 	 * copies. Old tasks of gated objects are stopped at the cut; listener events are queued until commit or abort.
 	 */
-	async gate(): Promise<void> {
-		this.gated = [...this.candidates.values()].filter(
+	async gate(candidates = [...this.candidates.values()]): Promise<void> {
+		const gated = candidates.filter(
 			(candidate) => candidate.reasons.length > 0 && candidate.object.status === "live",
 		);
+		this.gated.push(...gated);
 		const deadline = this.options.gateDeadline ?? 5000;
-		const drained = this.gated.map(({ object }) => {
+		const drained = gated.map(({ object }) => {
 			const grandfathered = new Set(object.leases.keys());
 			const roots = new Promise<void>((resolve) => {
 				object.gate = { grandfathered, queue: [], drained: resolve };
@@ -565,7 +693,7 @@ export class Reload {
 			this.abort.signal,
 		).finally(() => clearTimeout(timer));
 		if (timedOut) {
-			const blocking = this.gated.flatMap(({ object }) => [...(object.gate?.grandfathered ?? [])]);
+			const blocking = gated.flatMap(({ object }) => [...(object.gate?.grandfathered ?? [])]);
 			throw new ChordError(
 				"aborted",
 				`gate deadline (${deadline} ms) missed; blocking roots: ${blocking.join(", ")}`,
@@ -576,7 +704,7 @@ export class Reload {
 			);
 		}
 		this.#alive();
-		for (const candidate of this.gated) {
+		for (const candidate of gated) {
 			const { object } = candidate;
 			const replaced = new Set(candidate.replaced);
 			for (const old of object.openOrder.filter((resource) => replaced.has(resource)).reverse()) {
@@ -590,7 +718,7 @@ export class Reload {
 			await object.initCells(candidate.run, this.abort.signal, this.host.pending?.id);
 			this.#alive();
 		}
-		for (const candidate of this.gated) this.migrate(candidate);
+		for (const candidate of gated) this.migrate(candidate);
 	}
 
 	migrate(candidate: Candidate): void {
@@ -617,6 +745,8 @@ export class Reload {
 		const rollback = this.#restore();
 		this.#rollback = rollback;
 		this.abort.abort(new ChordError("aborted", "reload aborted"));
+		for (const waiter of this.#stateWaiters.values())
+			waiter.reject(new ChordError("aborted", "candidate state aborted"));
 		for (const run of this.facetRuns.values()) run.abort(new ChordError("aborted", "reload aborted"));
 		return rollback;
 	}
@@ -626,6 +756,9 @@ export class Reload {
 		// exclusive closes must settle before unwind, restoration, and opening the gates can race with them.
 		await this.#preparing?.catch(() => {});
 		await this.#activations?.catch(() => {});
+		await Promise.allSettled([...this.completing]);
+		for (const ref of this.replacing) ref.binding.replacing(ref, undefined);
+		if (this.transaction !== undefined) this.host.finishCandidateBindings(this.transaction.id, false);
 		const report = (error: unknown): void => this.host.report(error);
 		for (const candidate of this.candidates.values()) candidate.staged?.discard();
 		for (const staged of this.deferred.values()) staged.discard();
@@ -665,7 +798,8 @@ export class Reload {
 		// Objects of types this reload would have added lose their code.
 		const reason = new ChordError("gone", "reload aborted; type not served");
 		for (const object of [...this.host.objects.values()]) {
-			if (!this.host.current.services.has(object.typeName)) await object.dispose(true, reason).catch(report);
+			if (!this.host.current.services.has(object.typeName) || object.deferredRuntime)
+				await object.dispose(true, reason).catch(report);
 		}
 		this.host.pending = undefined;
 		this.host.gating = undefined;
@@ -678,7 +812,10 @@ export class Reload {
 	 */
 	commit(beforeStart?: () => void): ReloadReport {
 		this.#alive();
+		this.checkRefs();
 		dryRun(this.candidates);
+		this.tables = this.host.buildTables(this.entries());
+		this.#stage();
 		try {
 			return holdPublications(() => {
 				const report = this.#publish();
@@ -686,6 +823,11 @@ export class Reload {
 				// starts (tasks, host object activations, then the held listener/registry/state notifications) can reach a child
 				// first.
 				beforeStart?.();
+				if (this.transaction !== undefined) this.host.finishCandidateBindings(this.transaction.id, true);
+				for (const object of this.host.objects.values()) {
+					object.candidateOnly = false;
+					for (const ref of object.refs) ref.candidate = false;
+				}
 				for (const start of this.#starts.splice(0)) start();
 				return report;
 			});
@@ -820,6 +962,7 @@ export class Reload {
 			pinned.release();
 		}
 		for (const ref of [...object.refs]) {
+			if (this.host.replacedRemoteRef(ref, this.transaction?.id)) continue;
 			// Browser references whose contract no longer binds are told to reload their code (they never block a reload).
 			if (ref.owner === "client") {
 				try {

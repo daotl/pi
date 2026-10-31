@@ -371,6 +371,8 @@ export interface HostCore {
 	retainedCodeVersions(): Iterable<readonly [number, ReadonlyMap<string, Service>]>;
 	pendingCodeVersion(): number | undefined;
 	service(typeName: string): Service | undefined;
+	candidateTransaction(): string | undefined;
+	candidateInstalled(object: ObjectImpl): Installed | undefined;
 	acquire(
 		type: AnyContract,
 		input: unknown,
@@ -801,6 +803,10 @@ export class RefImpl {
 	readonly object: ObjectImpl;
 	readonly contract: AnyContract;
 	readonly owner: RefOwner;
+	/** Private factory view, switched to the installed provider at commit. */
+	candidate: boolean;
+	/** A replaced remote run keeps its committed view until retirement releases it. */
+	retained: Installed | undefined;
 	readonly address: string;
 	readonly proxy: object;
 	readonly ready: Promise<void>;
@@ -815,10 +821,11 @@ export class RefImpl {
 	readonly views = new WeakMap<Record<string, unknown>, Record<string, unknown>>();
 	readonly callers = new Map<string, (...given: unknown[]) => Promise<unknown>>();
 
-	constructor(object: ObjectImpl, contract: AnyContract, owner: RefOwner) {
+	constructor(object: ObjectImpl, contract: AnyContract, owner: RefOwner, candidate = false) {
 		this.object = object;
 		this.contract = contract;
 		this.owner = owner;
+		this.candidate = candidate;
 		this.address = object.address;
 		this.status = object.status === "live" ? "live" : "loading";
 		this.ready = object.ready.then(() => {
@@ -846,7 +853,7 @@ export class RefImpl {
 	}
 
 	get shape(): Shape | undefined {
-		const installed = this.status === "live" ? this.object.currentInstalled() : undefined;
+		const installed = this.status === "live" ? this.currentInstalled() : undefined;
 		const view = installed === undefined ? undefined : this.#safeView(installed);
 		if (installed === undefined || view === undefined) return undefined;
 		return {
@@ -940,9 +947,14 @@ export class RefImpl {
 		return view;
 	}
 
+	currentInstalled(): Installed | undefined {
+		if (this.candidate) return this.retained ?? this.object.host.candidateInstalled(this.object);
+		return this.retained ?? this.object.currentInstalled();
+	}
+
 	currentView(): Record<string, unknown> | undefined {
 		if (this.status !== "live") return undefined;
-		const installed = this.object.currentInstalled();
+		const installed = this.currentInstalled();
 		return installed === undefined ? undefined : this.#safeView(installed);
 	}
 
@@ -1134,6 +1146,8 @@ export class ObjectImpl {
 	gate: Gate | undefined;
 	/** Served only by a running reload's pending code version: listeners, tasks and registrations start at its commit. */
 	deferredRuntime = false;
+	/** Created only for a reload's candidate dependency; ordinary acquisitions wait for commit. */
+	candidateOnly = false;
 	readonly #subscriptions = new Map<string, Subscription>();
 	readonly #invocations = new Set<Promise<unknown>>();
 	#tasks = new Map<string, RunningTask>();
@@ -1159,8 +1173,8 @@ export class ObjectImpl {
 		this.hostLifetime = identity.hostLifetime;
 	}
 
-	start(after: Promise<void> | undefined): void {
-		this.ready = this.#activate(after).then(
+	start(after: Promise<void> | undefined, service?: Service): void {
+		this.ready = this.#activate(after, service).then(
 			() => {
 				for (const ref of this.refs) ref.live();
 				this.#maybeIdle();
@@ -1182,16 +1196,16 @@ export class ObjectImpl {
 	 * implementations, runtime). Every failure, including one during finalization or a release while listeners start,
 	 * unwinds everything this activation did.
 	 */
-	async #activate(after: Promise<void> | undefined): Promise<void> {
+	async #activate(after: Promise<void> | undefined, requestedService?: Service): Promise<void> {
 		await after?.catch(noop);
 		const signal = this.activationAbort.signal;
 		const abandoned = (): ChordError => new ChordError("aborted", `${this.address} abandoned`);
 		if (signal.aborted) throw abandoned();
-		const service = this.host.service(this.typeName);
+		const service = requestedService ?? this.host.service(this.typeName);
 		if (service === undefined)
 			throw new ChordError("unavailable", `${this.typeName} is not served`, { reason: "unknown_type" });
 		this.service = service;
-		const run = this.run(service, undefined);
+		const run = this.run(service, undefined, requestedService !== undefined);
 		try {
 			await this.open(run.created.resources, run.created.refs, signal);
 			if (signal.aborted) throw abandoned();
@@ -1251,8 +1265,8 @@ export class ObjectImpl {
 	 * Runs the factory synchronously. With `previous`, runs in recording mode for a reload prepare. The run's
 	 * declarations stay in `pending` (visible to the cycle check) until the caller installs or discards them.
 	 */
-	run(service: Service, previous: Decls | undefined): Run {
-		const self = new SelfImpl(this, previous, hostLifetime(service));
+	run(service: Service, previous: Decls | undefined, candidate = false): Run {
+		const self = new SelfImpl(this, previous, hostLifetime(service), candidate);
 		const discard = (run: Run): void => {
 			this.pending.delete(run.decls);
 			void this.unwind(run).catch((cleanup: unknown) => this.host.report(cleanup));
@@ -2025,13 +2039,15 @@ class SelfImpl implements Self {
 	readonly #object: ObjectImpl;
 	readonly #previous: Decls | undefined;
 	readonly #hostLifetime: boolean;
+	readonly #candidate: boolean;
 	readonly #decls = new Decls();
 	readonly #created: Run["created"] = { refs: [], resources: [], derives: [], inits: [] };
 
-	constructor(object: ObjectImpl, previous: Decls | undefined, hostLifetime: boolean) {
+	constructor(object: ObjectImpl, previous: Decls | undefined, hostLifetime: boolean, candidate: boolean) {
 		this.#object = object;
 		this.#previous = previous;
 		this.#hostLifetime = hostLifetime;
+		this.#candidate = candidate;
 	}
 
 	run(implementation: unknown): Run {
@@ -2082,7 +2098,7 @@ class SelfImpl implements Self {
 		const host = this.#object.host;
 		// A prepare rerun (recording mode) binds new references against the reload's pending contracts: a breaking provider
 		// change and its updated consumer reload together.
-		const candidate = this.#previous !== undefined;
+		const candidate = this.#candidate || this.#previous !== undefined;
 		const address = host.addressOf(
 			type,
 			input,
@@ -2106,6 +2122,7 @@ class SelfImpl implements Self {
 		const existing = this.#previous?.refs.get(address);
 		if (
 			existing !== undefined &&
+			!(candidate && host.candidateTransaction() !== undefined && existing.object === undefined) &&
 			existing.contract.fingerprint === type.fingerprint &&
 			(!("wantsState" in existing) || existing.wantsState === wantsState) &&
 			existing.status !== "gone" &&

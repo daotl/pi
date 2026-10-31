@@ -1,5 +1,5 @@
 // Host manager (Node only): runs a child host process and keeps at most one instance of it alive.
-import { type ChildProcess, fork, spawn } from "node:child_process";
+import { type ChildProcess, fork } from "node:child_process";
 import { createHash } from "node:crypto";
 import { unlinkSync } from "node:fs";
 import { lstat, mkdir, rm } from "node:fs/promises";
@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { ChordError } from "./errors.ts";
 import { type IpcChannel, type IpcLink, ipcLink } from "./link.ts";
+import { createWindowsJob } from "./windows-job.ts";
 
 /** Control messages share the IPC channel with chord frames: `{ chord2control: message }`. */
 export type ControlMessage =
@@ -196,16 +197,33 @@ export function forkDriver(options: ForkDriverOptions): Driver {
 		spawn() {
 			// A lock this process inherited (e.g. as a child host itself) is not the child's: it gets only its own.
 			const env: NodeJS.ProcessEnv = { ...process.env };
-			delete env[LOCK_ENV];
+			for (const key of Object.keys(env)) {
+				if (key === LOCK_ENV || (process.platform === "win32" && key.toUpperCase() === LOCK_ENV)) delete env[key];
+			}
 			Object.assign(env, options.env);
+			if (process.platform === "win32") {
+				for (const key of Object.keys(env)) if (key.toUpperCase() === "CHORD2_WINDOWS_JOB") delete env[key];
+			}
 			if (options.lock !== undefined) env[LOCK_ENV] = options.lock;
-			// Detached: the child leads a process group, so the whole tree can be killed.
-			const child: ChildProcess = fork(options.entry, [...(options.args ?? [])], {
-				env,
-				execArgv: [...(options.execArgv ?? [])],
-				detached: true,
-				stdio: ["ignore", options.onOutput ? "pipe" : "inherit", options.onOutput ? "pipe" : "inherit", "ipc"],
-			});
+			const windowsJob = process.platform === "win32" ? createWindowsJob() : undefined;
+			if (windowsJob !== undefined) env.CHORD2_WINDOWS_JOB = windowsJob.name;
+			let child: ChildProcess;
+			try {
+				// The Windows adapter hands Node its original inherited fork IPC descriptor.
+				// JOB_LIST assigns the actual Node process at creation, including snapshot callbacks.
+				child = fork(options.entry, [...(options.args ?? [])], {
+					env,
+					execPath: windowsJob?.launcher,
+					execArgv: [...(windowsJob === undefined ? [] : [process.execPath]), ...(options.execArgv ?? [])],
+					detached: true,
+					stdio: ["ignore", options.onOutput ? "pipe" : "inherit", options.onOutput ? "pipe" : "inherit", "ipc"],
+				});
+			} catch (error) {
+				windowsJob?.close();
+				throw error;
+			}
+			// A synchronous native launch failure may leave an async fork error queued.
+			child.on("error", ignoreSendError);
 			if (options.onOutput) {
 				for (const stream of ["stdout", "stderr"] as const) {
 					child[stream]?.on("data", (chunk: Buffer) => {
@@ -214,7 +232,18 @@ export function forkDriver(options: ForkDriverOptions): Driver {
 					});
 				}
 			}
-			const pid = child.pid ?? -1;
+			let pid = child.pid ?? -1;
+			if (windowsJob !== undefined && pid > 0) {
+				try {
+					pid = windowsJob.launched(pid);
+				} catch (error) {
+					// launched() joins the native launcher and assigned Job before throwing.
+					// Do not publish a launcher PID as though it were an application PID.
+					windowsJob.close();
+					if (child.connected) child.disconnect();
+					throw error;
+				}
+			}
 			const killGroup = (): void => {
 				if (pid <= 0 || process.platform === "win32") return;
 				try {
@@ -223,49 +252,30 @@ export function forkDriver(options: ForkDriverOptions): Driver {
 					// No group left.
 				}
 			};
-			let treeTermination: Promise<void> | undefined;
 			const killTree = (): void => {
-				if (pid <= 0 || treeTermination !== undefined) return;
-				if (process.platform !== "win32") {
+				if (pid <= 0) return;
+				if (windowsJob !== undefined) windowsJob.terminate();
+				else {
 					try {
 						process.kill(-pid, "SIGKILL");
 					} catch {
 						child.kill("SIGKILL");
 					}
-					return;
-				}
-				// taskkill must discover the descendants before their parent exits. Join it before reporting exit.
-				const terminated = Promise.withResolvers<void>();
-				treeTermination = terminated.promise;
-				const fallback = (): void => {
-					child.kill("SIGKILL");
-					terminated.resolve();
-				};
-				try {
-					const killer = spawn(
-						join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe"),
-						["/F", "/T", "/PID", String(pid)],
-						{ stdio: "ignore", windowsHide: true },
-					);
-					killer.once("error", fallback);
-					killer.once("close", (code) => {
-						if (code !== 0) fallback();
-						else terminated.resolve();
-					});
-				} catch {
-					fallback();
 				}
 			};
 			const terminal = Promise.withResolvers<Exit>();
 			const exited = terminal.promise;
 			child.once("error", () => {
 				// Only a failed spawn has no exit event; send/kill errors on a live child must still join its exit.
-				if (pid <= 0) terminal.resolve({ code: null, signal: null });
+				if (pid <= 0) {
+					windowsJob?.close();
+					terminal.resolve({ code: null, signal: null });
+				}
 			});
 			child.once("exit", (code, signal) => {
 				killGroup();
-				if (treeTermination === undefined) terminal.resolve({ code, signal });
-				else void treeTermination.then(() => terminal.resolve({ code, signal }));
+				if (windowsJob === undefined) terminal.resolve({ code, signal });
+				else void windowsJob.finish().then(() => terminal.resolve({ code, signal }), terminal.reject);
 			});
 			const listeners = new Set<(message: ControlMessage) => void>();
 			child.on("message", (message) => {
@@ -337,6 +347,14 @@ export function createHostManager(options: HostManagerOptions): HostManager {
 		idleFor: idleSince === undefined ? 0 : Date.now() - idleSince,
 	});
 
+	const forget = (current: Instance): void => {
+		if (instance !== current) return;
+		instance = undefined;
+		status = "stopped";
+		booting = false;
+		clearInterval(timer);
+	};
+
 	const doStop = async (): Promise<void> => {
 		const current = instance;
 		if (current === undefined) {
@@ -346,20 +364,21 @@ export function createHostManager(options: HostManagerOptions): HostManager {
 		}
 		status = "stopping";
 		clearInterval(timer);
-		current.send({ type: "shutdown" });
 		let graceTimer: ReturnType<typeof setTimeout> | undefined;
-		const graceful = await Promise.race([
-			current.exited.then(() => true),
-			new Promise<boolean>((resolve) => {
-				graceTimer = setTimeout(() => resolve(false), options.grace ?? 5000);
-			}),
-		]);
-		clearTimeout(graceTimer);
-		if (!graceful) current.killTree();
-		await current.exited;
-		if (instance === current) instance = undefined;
-		booting = false;
-		status = "stopped";
+		try {
+			current.send({ type: "shutdown" });
+			const graceful = await Promise.race([
+				current.exited.then(() => true),
+				new Promise<boolean>((resolve) => {
+					graceTimer = setTimeout(() => resolve(false), options.grace ?? 5000);
+				}),
+			]);
+			if (!graceful) current.killTree();
+			await current.exited;
+		} finally {
+			clearTimeout(graceTimer);
+			forget(current);
+		}
 	};
 
 	const doStart = async (): Promise<Instance> => {
@@ -393,17 +412,15 @@ export function createHostManager(options: HostManagerOptions): HostManager {
 			void serialized(async () => {
 				if (instance !== current) return;
 				await current.exited;
-			});
+			}).catch(() => {}); // Exit observers own invalidation; callers awaiting exit retain its rejection.
 		};
-		current.exited.then((exit) => {
-			if (instance === current) {
-				instance = undefined;
-				status = "stopped";
-				booting = false;
-				clearInterval(timer);
-			}
-			options.onExit?.(exit);
-		});
+		void current.exited.then(
+			(exit) => {
+				forget(current);
+				options.onExit?.(exit);
+			},
+			() => forget(current),
+		);
 		await new Promise<void>((resolve, reject) => {
 			rejectReady = reject;
 			const timeout = setTimeout(
@@ -414,10 +431,12 @@ export function createHostManager(options: HostManagerOptions): HostManager {
 				clearTimeout(timeout);
 				fn();
 			};
-			current.exited.then((exit) =>
-				settle(() =>
-					reject(new ChordError("unavailable", `child exited before ready (${exit.code ?? exit.signal})`)),
-				),
+			void current.exited.then(
+				(exit) =>
+					settle(() =>
+						reject(new ChordError("unavailable", `child exited before ready (${exit.code ?? exit.signal})`)),
+					),
+				(error: unknown) => settle(() => reject(error)),
 			);
 			current.onControl((message) => {
 				if (instance !== current) return;

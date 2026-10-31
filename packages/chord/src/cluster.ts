@@ -1,7 +1,15 @@
 import type { Connection } from "./connection.ts";
 import { ChordError } from "./errors.ts";
 import type { HostImpl, PluginRef } from "./host.ts";
-import { beginReload, endReload, type Reload, type ReloadOptions, type ReloadReport, reloadError } from "./reload.ts";
+import {
+	beginReload,
+	endReload,
+	type Reload,
+	type ReloadOptions,
+	type ReloadReport,
+	type ReloadTransaction,
+	reloadError,
+} from "./reload.ts";
 import { type Frame, toWireError } from "./wire.ts";
 
 // Cross-host reload, coordinated by the server (the host without a parent):
@@ -34,7 +42,30 @@ function awaitVote(connection: Connection, id: number, deadline: number): Promis
 			reject(new ChordError("aborted", `votes missing after ${deadline} ms`, { reason: "vote_deadline" }));
 		}, deadline);
 	});
-	return vote.finally(() => clearTimeout(timer));
+	const settled = vote.finally(() => clearTimeout(timer));
+	settled.catch(() => {});
+	return settled;
+}
+
+/** Phase receipts are registered before prepare is sent; disconnect rejects them like votes. */
+function awaitPhase(
+	connection: Connection,
+	id: number,
+	phase: "declared" | "materialized",
+	deadline: number,
+): Promise<void> {
+	const key = `${id}:${phase}`;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const ready = new Promise<void>((resolve, reject) => {
+		connection.preparations.set(key, { resolve: () => resolve(), reject });
+		timer = setTimeout(() => {
+			connection.preparations.delete(key);
+			reject(new ChordError("aborted", `${phase} missing after ${deadline} ms`, { reason: "vote_deadline" }));
+		}, deadline);
+	});
+	const settled = ready.finally(() => clearTimeout(timer));
+	settled.catch(() => {});
+	return settled;
 }
 
 export async function runClusterReload(
@@ -50,20 +81,40 @@ export async function runClusterReload(
 			connection.role === "downstream" && connection.peer.kind === "host" && connection.open && connection.synced,
 	);
 	const codeVersion = host.peekNextCodeVersion();
-	const reload = await beginReload(host, plugins, options, codeVersion);
+	const id = ++reloadSeq;
+	const participants = synced.filter((connection) => connection.open);
+	const deadline = options.voteDeadline ?? (options.gateDeadline ?? 5000) + (options.retireDeadline ?? 5000) + 5000;
+	const phases = new Map<string, Promise<unknown>>();
+	const transaction: ReloadTransaction = {
+		id: `${host.name}:${codeVersion}:${id}`,
+		participants: [host.name, ...participants.map((connection) => connection.name!)],
+		async barrier(phase) {
+			await phases.get(phase);
+			for (const connection of participants) connection.send({ t: "advance", reload: id, phase });
+		},
+	};
+	const reload = await beginReload(host, plugins, options, codeVersion, transaction);
+	for (const connection of participants) connection.transaction = transaction.id;
 	try {
 		// Retire first: its `retire` frames reach every child before `prepare` (FIFO), so a child never retires a code
 		// version this host still runs roots of.
 		await reload.waitForRetirement();
-		const participants = synced.filter((connection) => connection.open);
-		const id = ++reloadSeq;
-		const deadline = options.voteDeadline ?? (options.gateDeadline ?? 5000) + (options.retireDeadline ?? 5000) + 5000;
+		if (participants.some((connection) => !connection.open))
+			throw new ChordError("unavailable", "reload participant disconnected during retirement");
+		for (const phase of ["declared", "materialized"] as const) {
+			const ready = Promise.all(participants.map((connection) => awaitPhase(connection, id, phase, deadline)));
+			ready.catch(() => {});
+			phases.set(phase, ready);
+		}
+		// Participant identity is fixed for the transaction; a lost link fails its receipts.
 		const votes = participants.map((connection) => {
 			const name = connection.name ?? "child";
 			const vote = awaitVote(connection, id, deadline);
 			connection.send({
 				t: "prepare",
 				reload: id,
+				transaction: transaction.id,
+				participants: transaction.participants,
 				codeVersion,
 				plugins: modulesFor(options.remote, name),
 				options: {
@@ -88,6 +139,10 @@ export async function runClusterReload(
 			for (const connection of participants) {
 				// Settle outstanding votes too: their timers and rejection handlers must not outlive this operation.
 				connection.votes.get(id)?.reject(error);
+				for (const phase of ["declared", "materialized"]) {
+					connection.preparations.get(`${id}:${phase}`)?.reject(error);
+					connection.preparations.delete(`${id}:${phase}`);
+				}
 				connection.votes.delete(id);
 				connection.send({ t: "abort", reload: id });
 			}
@@ -116,8 +171,22 @@ export async function runClusterReload(
 			if (child !== undefined) children[name] = child;
 		}
 		return { ...report, children };
+	} catch (error) {
+		if (host.failed === undefined && !reload.rolledBack) {
+			await reload.rollback();
+			for (const connection of participants) connection.send({ t: "abort", reload: id });
+		}
+		throw error;
 	} finally {
 		endReload(host);
+		for (const connection of participants) {
+			for (const phase of ["declared", "materialized"]) {
+				connection.preparations.get(`${id}:${phase}`)?.reject(new ChordError("aborted", "reload ended"));
+				connection.preparations.delete(`${id}:${phase}`);
+			}
+		}
+		for (const connection of participants)
+			if (connection.transaction === transaction.id) connection.transaction = undefined;
 	}
 }
 
@@ -146,14 +215,31 @@ export async function reconcileChild(host: HostImpl, connection: Connection): Pr
 		host.announceRetired(connection);
 		const id = ++reloadSeq;
 		const vote = awaitVote(connection, id, RECONCILE_DEADLINE);
+		const transaction = `${host.name}:reconcile:${id}`;
+		connection.transaction = transaction;
+		const phases = (["declared", "materialized"] as const).map((phase) =>
+			awaitPhase(connection, id, phase, RECONCILE_DEADLINE).then(() =>
+				connection.send({ t: "advance", reload: id, phase }),
+			),
+		);
+		for (const phase of phases) phase.catch(() => {});
 		connection.send({
 			t: "prepare",
 			reload: id,
+			transaction,
+			participants: [host.name, connection.name!],
 			codeVersion,
 			plugins: modulesFor(host.remoteModules, connection.name),
 			options: { remove: modulesFor(host.remoteRemoved, connection.name) },
 		});
-		await vote;
+		try {
+			await Promise.all([vote, ...phases]);
+		} finally {
+			for (const phase of ["declared", "materialized"]) {
+				connection.preparations.get(`${id}:${phase}`)?.reject(new ChordError("aborted", "reconciliation ended"));
+				connection.preparations.delete(`${id}:${phase}`);
+			}
+		}
 		if (host.current.id !== codeVersion) {
 			// The child owns its reload slot until rollback finishes, not merely until it receives abort.
 			let timer: ReturnType<typeof setTimeout> | undefined;
@@ -170,9 +256,12 @@ export async function reconcileChild(host: HostImpl, connection: Connection): Pr
 			});
 			connection.send({ t: "abort", reload: id });
 			await aborted.finally(() => clearTimeout(timer));
+			connection.transaction = undefined;
 			continue;
 		}
 		connection.send({ t: "commit", reload: id });
+		connection.finishCandidates(transaction, true);
+		connection.transaction = undefined;
 		connection.peerCodeVersion = codeVersion;
 	}
 }
@@ -183,6 +272,7 @@ interface ChildOperation {
 	reload: Reload | undefined;
 	state: "loading" | "preparing" | "prepared" | "rolling-back";
 	cancelled: boolean;
+	readonly barriers: Map<string, { promise: Promise<void>; resolve: () => void; reject: (error: unknown) => void }>;
 }
 
 /**
@@ -198,14 +288,28 @@ export class ChildReloads {
 		this.#host = host;
 	}
 
-	handle(connection: Connection, frame: Extract<Frame, { t: "prepare" | "commit" | "abort" }>): void {
+	handle(connection: Connection, frame: Extract<Frame, { t: "prepare" | "advance" | "commit" | "abort" }>): void {
 		if (frame.t === "prepare") {
 			if (this.#operation !== undefined) {
 				const error = new ChordError("unavailable", "a reload is already running", { reason: "reload_running" });
 				connection.send({ t: "vote", reload: frame.reload, error: toWireError(error) });
 				return;
 			}
-			const operation: ChildOperation = { id: frame.reload, reload: undefined, state: "loading", cancelled: false };
+			const operation: ChildOperation = {
+				id: frame.reload,
+				reload: undefined,
+				state: "loading",
+				cancelled: false,
+				barriers: new Map(
+					(["declared", "materialized"] as const).map((phase) => {
+						const barrier = Promise.withResolvers<void>();
+						barrier.promise.catch(() => {});
+						return [phase, barrier];
+					}),
+				),
+			};
+			connection.transaction = frame.transaction;
+			connection.transactionParticipants = frame.participants;
 			this.#operation = operation;
 			this.#run(operation, connection, frame).catch((error: unknown) => this.#host.report(error));
 			return;
@@ -214,6 +318,10 @@ export class ChildReloads {
 		if (operation === undefined || operation.id !== frame.reload) {
 			// A failed prepare has already unwound before voting no; its abort is already complete.
 			if (frame.t === "abort") connection.send({ t: "aborted", reload: frame.reload });
+			return;
+		}
+		if (frame.t === "advance") {
+			operation.barriers.get(frame.phase)?.resolve();
 			return;
 		}
 		if (frame.t === "abort") {
@@ -229,6 +337,8 @@ export class ChildReloads {
 			connection.link.close("reload commit failed");
 			void operation.reload?.rollback().catch((cleanup: unknown) => this.#host.report(cleanup));
 		} finally {
+			connection.transaction = undefined;
+			connection.transactionParticipants = [];
 			this.#operation = undefined;
 			endReload(this.#host);
 		}
@@ -242,6 +352,7 @@ export class ChildReloads {
 	#cancel(operation: ChildOperation, connection?: Connection): void {
 		if (operation.cancelled) return;
 		operation.cancelled = true;
+		for (const barrier of operation.barriers.values()) barrier.reject(new ChordError("aborted", "reload aborted"));
 		if (operation.state !== "prepared") {
 			// Loading or preparing: #run retains ownership and acknowledges only after unwind.
 			operation.reload?.rollback().catch((error: unknown) => this.#host.report(error));
@@ -253,6 +364,10 @@ export class ChildReloads {
 			.catch((error: unknown) => this.#host.report(error))
 			.finally(() => {
 				if (this.#operation === operation) this.#operation = undefined;
+				if (connection !== undefined) {
+					connection.transaction = undefined;
+					connection.transactionParticipants = [];
+				}
 				endReload(this.#host);
 				if (connection?.open) connection.send({ t: "aborted", reload: operation.id });
 			});
@@ -266,7 +381,14 @@ export class ChildReloads {
 		const cancelled = (): ChordError =>
 			new ChordError("aborted", "reload aborted by the server", { reason: "aborted" });
 		try {
-			operation.reload = await beginReload(this.#host, frame.plugins, frame.options, frame.codeVersion);
+			operation.reload = await beginReload(this.#host, frame.plugins, frame.options, frame.codeVersion, {
+				id: frame.transaction,
+				participants: frame.participants,
+				async barrier(phase) {
+					connection.send({ t: "prepared", reload: frame.reload, phase });
+					await operation.barriers.get(phase)!.promise;
+				},
+			});
 			if (operation.cancelled) throw cancelled();
 			operation.state = "preparing";
 			await operation.reload.prepare();
@@ -278,6 +400,8 @@ export class ChildReloads {
 				await operation.reload.rollback().catch((cleanup: unknown) => this.#host.report(cleanup));
 				endReload(this.#host);
 			}
+			connection.transaction = undefined;
+			connection.transactionParticipants = [];
 			if (this.#operation === operation) this.#operation = undefined;
 			if (!operation.cancelled) connection.send({ t: "vote", reload: frame.reload, error: toWireError(error) });
 			else if (connection.open) connection.send({ t: "aborted", reload: frame.reload });

@@ -218,6 +218,46 @@ Compatible changes (no state bump, no exclusive resource change) skip the gate: 
 
 State compatibility rule: reload prepare compares each cell's old and new schema and version. Unchanged: compatible (no gate). Version raised: gate + `migrate` (or the kept value), validated against the new schema. Schema changed without a raised version: reload refused. A lowered version: refused. A change of meaning with an identical schema needs a bump too (undetectable; author's responsibility). Initial values and migrate outputs are validated; per-write validation in dev mode.
 
+### Cross-host candidate transactions
+
+The coordinator issues an opaque transaction identity and fixes its trusted, configured host participants. Clients,
+newly connected hosts and hosts being reconciled are not participants in that transaction. The identity is not a
+capability by itself: a candidate hold must arrive over a participating host link (or the trusted parent, with its
+stamped participant). Relays preserve the transaction and stamp the origin participant; client `origin` holds may
+never request candidate access.
+
+Preparation has two receipts before the final vote. Each host loads its service table, declares replacement intent,
+runs its candidate factories to a fixpoint, and acknowledges the final declaration set and materialized graph.
+An ordinary shared hold is exempt from compatibility only while every live view is replaced by that transaction.
+Independent resource opens and reversible gates proceed while peers load, preserving loader/resource coordination;
+they do not wait at a global barrier. Final surviving-reference validation waits for every participant's declarations
+and graph receipt, and runs again at commit. Remote state dependencies wait naturally for the provider's prepared
+private snapshots, never preventing another host from declaring or materializing its own candidates.
+
+Candidate remote references use a separate pool and separate wire hold, even when their contract fingerprint and
+principal equal an ordinary binding. Candidate shape metadata may arrive before its snapshots so method-only
+dependencies can become ready; state consumers still wait for hydration. Snapshots contain the provider's validated
+migrated and derived candidate values, not its installed V1 state. Local dependency preparation is ordered; cross-host
+dependency cycles fail within the existing readiness/vote deadlines. Pending methods cannot be called over these
+private holds. No task or listener starts before commit.
+
+Commit promotes the transaction's private holds only after installation and the coordinator's FIFO commit frames.
+Ordinary/client holds never read pending replacements. Old replaced holds retain their old view until retirement
+releases them; abort revokes intents, releases private holds, restores subscriptions/resources and leaves installed
+code and state unchanged. Disconnect releases served/relayed private holds and aborts participant preparation;
+candidate holds are not re-held on an unrelated reconnect. A late ordinary hold must satisfy both the installed and
+prospective provider after compatibility validation, so it cannot invalidate a prepared vote.
+Adding an ordinary view before validation revokes intent; after preparation it is rejected with retryable
+`upgrade_conflict` rather than silently invalidating a vote. During reconciliation a synchronized sibling is not
+recruited: the coordinator routes the candidate's separate hold to that sibling's installed provider, without private
+transaction metadata or replacement exemptions, and normal compatibility checks still apply.
+
+First activations of unchanged types keep installed dependencies and normal runtime ownership; reaching one from
+a candidate does not grant it transaction-private state. Registry tables are validated after candidate dependency
+activation finishes, before the final vote, and revalidated synchronously before publication to include late ordinary
+activations. Declaration/materialization receipts are not successful votes.
+
+
 ## 8. Registries
 
 ```ts
@@ -236,14 +276,29 @@ Per-code-version immutable tables; order = first registration order, kept on rep
 - Principal stamping: the accepting side stamps the principal of what connects (from its authenticator); forwarded principals accepted only from the parent link; the parent's own requests (no forwarded principal) act as the principal given to `connect`; payload principal fields ignored.
 - A child that connects behind its parent's code version is fenced (nothing routed to it) and reconciled by a reload of its modules to the parent's code version. Calls its roots of the old code version make upstream are admitted in the parent's current code version (the parent never ran that code version), not rejected `superseded`.
 - Relay: server forwards a hold to the child link of its target host (`at`, resolved by the consumer from the contract's placement and the normalized input, and checked against both), mapping references per origin connection; authorizes before resolving/spawning and re-checks after.
-- Wire frames (JSON): `hello`/`bye`, `hold`/`release` (a reference over a link: `hold` returns `shape` or `gone`; there is no separate `get`), `shape`, `projections`, `call`/`result`/`cancel`, `sub`/`unsub`/`resync` and `state`, `gone`, `root_end`, `retire`, `invalidate`, `ping`/`pong`, `ack`, reload control (`prepare`/`vote`/`commit`/`abort`/`aborted`).
+- Wire frames (JSON): `hello`/`bye`, `hold`/`release`, transaction-scoped `replace_hold`, `shape`, `projections`, `call`/`result`/`cancel`, `sub`/`unsub`/`resync` and `state`, `gone`, `root_end`, `retire`, `invalidate`, `ping`/`pong`, `ack`, reload control (`prepare`/`prepared`/`advance`/`vote`/`commit`/`abort`/`aborted`).
 - State: a `hold` implies the state of its variant (`state: false`: none until `sub`; `unsub` stops it). The provider answers with units: a `shape` whose `state` lists the members the consumer lacks, followed by one `state` frame `as: "snap"` per listed member; the consumer applies the shape once those snapshots are here. Later `state` frames of a member (addressed by hold id and member `m`) are `ops` (per-stream delta encoder), `reset`, or `error`; a `snap`/`reset` without `value` carries `undefined`. A failed snapshot before the first hydration ends the reference with its error. A reload or variant change sends a unit with the members that are new; members that left stop. `again` marks a re-hold after a link loss (the consumer has values). `origin` names the client connection a hold comes from (stamped by the host that accepted the client, forwarded by relays, honored only from the parent link).
-- Protocol version: `hello` carries `protocol` (`PROTOCOL_VERSION`, now 7; absent means 1). Different versions close the link and report `LinkOptions.onProtocolMismatch`; update all peers together. Version 7 adds child-to-parent `aborted` acknowledgements once rollback completes and the child's reload slot is free. A stale reconciliation awaits this acknowledgement before replacement `prepare`, with the same 30 s deadline as its vote; disconnect or deadline ends reconciliation. Ordinary failed cluster reloads still return after coordinator rollback without waiting for child cleanup. Version 6 added control-only `projections` frames carrying `callVariants` and origin-specific `fencedCodeVersions`, sent immediately through relays independently of state windows. They update method metadata without applying a shape or completing pending hydration. Initial holds still require a committed implementation and their first shape unit. Version 5 introduced required `shape.callVariants`, bounded to the current and retained provider code versions and their consumer-view variants, plus `fencedCodeVersions`. Consumers project arguments with the matching consumer schema before serialization. Fenced roots pin the provider's first admitted version until `root_end`; relays use the origin connection's admission hints. State hydration remains unversioned. Earlier revisions introduced explicit code versions (2), normalized placement/input (3), and implicit state units/origin (4).
+- Protocol version: `hello` carries `protocol` (`PROTOCOL_VERSION`, now 8; absent means 1). Different versions close the link and report `LinkOptions.onProtocolMismatch`; update all peers together. Version 8 requires a transaction identity and participant list in `prepare`, adds the `declared` and `materialized` prepare barriers (`prepared`/`advance`), transaction-private `hold` metadata, and revocable `replace_hold` intents. There is no mixed-version shim. Version 7 introduced completed-rollback `aborted` acknowledgements before reconciliation retries; version 6 introduced control-only `projections`; version 5 introduced consumer-view call variants. Ordinary state hydration remains unversioned; transaction candidate snapshots are isolated from it. A stale reconciliation still awaits rollback acknowledgement, with a 30 s deadline; an ordinary failed cluster reload returns after coordinator rollback without waiting for child cleanup.
 - Flow control: both ends announce `acks` in their hello and acknowledge what they processed (`ack`, a cumulative count of every frame but `ack`). While the frames not yet acknowledged exceed the window (`window`, default 256 KiB of JSON text), state waits at the sender in slots flushed in creation order: one per member stream (ops are appended, a snapshot or reset replaces it, a release or `unsub` drops it) and one per hold for a unit (lazy: built from the current values when sent; a newer unit merges into it). Waiting ops are capped per link (`pendingCap`, default four windows): beyond, the oldest streams become a reset of their current value built at flush (a relay sends `resync` downstream and drops that member's ops until the reset arrives). The first unit of a hold that is not `again` and every frame but state are sent at once. Links that report no frame sizes (IPC) are never windowed; a peer without `acks` is neither windowed nor acknowledged. An acceptor can limit the calls a peer has in progress (`maxCalls`); calls beyond it are answered at once with `unavailable/too_many_calls`. Nothing outside the connection may add frames to a link: acknowledgements count them.
 
 ## 10. Host manager (library)
 
 `createHostManager({ driver, keepAlive })`: fork driver (entry, init, lock, env), serialized start/stop/replace, exit-before-replace, process-tree kill after grace, control channel (ready/fatal/shutdown), liveness callback (booting, activeCalls, viewers with heartbeats, durable tasks, idleFor).
+
+On Windows x64/arm64 the fork driver uses Chord's native launcher and N-API Job helper. The application Node process
+is created suspended with `PROC_THREAD_ATTRIBUTE_JOB_LIST` inside a noninheritable kill-on-close Job, before any
+preload or startup-snapshot callback runs. The launcher forwards Node's inherited fork IPC/stdio descriptors and
+original `execArgv`; `Instance.pid` is the application PID, not the launcher PID. Normal exit, fatal exit and forced
+stop terminate remaining descendants. `Instance.exited` settles only after the launcher exits and the Job reports
+zero active processes; a native cleanup error rejects it and the manager removes the unusable instance. Parent
+death closes the owning Job handle. There is no delayed assignment or `taskkill` fallback.
+
+The package includes both architectures under `native/prebuilds/win32-{x64,arm64}`. Rebuild with
+`npm run build:native:win32 --workspace packages/chord` (Microsoft C++ Build Tools on Windows, or a MinGW toolchain
+with `CHORD_WIN32_TOOLCHAIN=mingw` and `CC_X64`/`CC_ARM64`); `-- --current` builds only the host architecture.
+The launcher validates the private libuv CRT descriptor layout documented in its source and refuses unknown layouts.
+This is a Node/libuv upgrade compatibility constraint, not a portable IPC ABI. The Windows CI matrix exercises
+Node 22, 24 and 26; cross-compilation alone does not verify those runtime combinations.
 
 ## 11. Test coverage
 

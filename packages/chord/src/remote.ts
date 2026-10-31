@@ -35,6 +35,8 @@ export interface RemoteChannel {
 	call(hold: number, member: string, args: unknown, root: RootRef | undefined, signal: AbortSignal): Promise<unknown>;
 	/** Starts (`sub`) or stops (`unsub`) the state of a hold. */
 	wantState(hold: number, wanted: boolean): void;
+	/** Declares or revokes replacement of an ordinary hold by one reload transaction. */
+	replace(hold: number, transaction: string, replacing: boolean): Promise<void>;
 }
 
 /** What a binding needs from its host. */
@@ -87,6 +89,12 @@ export class RemoteBinding {
 	readonly input: unknown;
 	/** Forwarded principal (omitted for the host's own principal). */
 	readonly principal: unknown | undefined;
+	/** Separate from ordinary bindings until this host commits the owning reload. */
+	transaction: string | undefined;
+	readonly replacements = new Map<RemoteRef, string>();
+	#replacement: string | undefined;
+	readonly replacementReceipts = new Set<Promise<void>>();
+	#receiptTransaction: string | undefined;
 	/** `ended`: gone with `error`, or closed (no views, no linger). */
 	status: "loading" | "live" | "ended" = "loading";
 	error: unknown;
@@ -119,7 +127,14 @@ export class RemoteBinding {
 
 	constructor(
 		host: RemoteHost,
-		fields: { key: string; contract: AnyContract; at: string; input: unknown; principal: unknown | undefined },
+		fields: {
+			key: string;
+			contract: AnyContract;
+			at: string;
+			input: unknown;
+			principal: unknown | undefined;
+			transaction?: string;
+		},
 	) {
 		this.host = host;
 		this.key = fields.key;
@@ -127,6 +142,7 @@ export class RemoteBinding {
 		this.at = fields.at;
 		this.input = fields.input;
 		this.principal = fields.principal;
+		this.transaction = fields.transaction;
 	}
 
 	get ended(): boolean {
@@ -154,6 +170,7 @@ export class RemoteBinding {
 
 	addView(view: RemoteRef): void {
 		this.views.add(view);
+		this.#syncReplacement();
 		if (this.lingerTimer !== undefined) {
 			clearTimeout(this.lingerTimer);
 			this.lingerTimer = undefined;
@@ -164,6 +181,8 @@ export class RemoteBinding {
 
 	removeView(view: RemoteRef): void {
 		if (!this.views.delete(view)) return;
+		this.replacements.delete(view);
+		this.#syncReplacement();
 		for (const set of this.#listeners.values())
 			for (const readable of set) if (readable.view === view) set.delete(readable);
 		if (this.views.size === 0) {
@@ -171,6 +190,37 @@ export class RemoteBinding {
 			return;
 		}
 		this.#syncState();
+	}
+
+	/** Only a hold whose every live view is being replaced may stop constraining the next provider. */
+	replacing(view: RemoteRef, transaction: string | undefined): void {
+		if (transaction !== undefined && transaction !== this.#receiptTransaction) {
+			this.#receiptTransaction = transaction;
+			this.replacementReceipts.clear();
+		}
+		if (transaction === undefined) this.replacements.delete(view);
+		else this.replacements.set(view, transaction);
+		this.#syncReplacement();
+	}
+
+	#syncReplacement(): void {
+		const first = this.views.values().next().value;
+		const transaction = first === undefined ? undefined : this.replacements.get(first);
+		const next =
+			transaction !== undefined && [...this.views].every((view) => this.replacements.get(view) === transaction)
+				? transaction
+				: undefined;
+		if (next === this.#replacement) return;
+		if (this.hold !== undefined && this.#replacement !== undefined)
+			this.#trackReplacement(this.hold.channel.replace(this.hold.id, this.#replacement, false));
+		this.#replacement = next;
+		if (this.hold !== undefined && next !== undefined)
+			this.#trackReplacement(this.hold.channel.replace(this.hold.id, next, true));
+	}
+
+	#trackReplacement(receipt: Promise<void>): void {
+		this.replacementReceipts.add(receipt);
+		receipt.catch(() => {});
 	}
 
 	/** Tells the provider to start or stop state when the views' wish changed. */
@@ -254,6 +304,12 @@ export class RemoteBinding {
 		this.stateOn = this.wantsState;
 	}
 
+	/** Sent after the hold itself, including when reconnecting an ordinary replaced binding. */
+	announceReplacement(): void {
+		if (this.hold !== undefined && this.#replacement !== undefined)
+			this.#trackReplacement(this.hold.channel.replace(this.hold.id, this.#replacement, true));
+	}
+
 	/** Control-only metadata must leave a pending shape's missing snapshots and values untouched. */
 	projected(callVariants: readonly CallVariant[], fencedCodeVersions: readonly number[]): void {
 		if (this.ended) return;
@@ -279,6 +335,12 @@ export class RemoteBinding {
 		const wanted = new Set(this.#stateMembers(shape));
 		for (const name of [...missing]) if (!wanted.has(name) || !this.stateOn) missing.delete(name);
 		this.#pending = { shape, missing, values: previous?.values ?? new Map() };
+		if (this.transaction !== undefined) {
+			this.shape = shape;
+			this.status = "live";
+			this.#live.resolve();
+			for (const view of this.views) view.update();
+		}
 		if (missing.size === 0) this.#apply();
 	}
 
@@ -335,6 +397,10 @@ export class RemoteBinding {
 
 	/** The link went down but may come back (upstream reconnect): keep the values, wait for the re-hold. */
 	detached(): void {
+		if (this.transaction !== undefined) {
+			this.gone(new ChordError("aborted", "candidate link disconnected"));
+			return;
+		}
 		if (this.ended) return;
 		this.hold = undefined;
 		this.#pending = undefined;
@@ -372,6 +438,7 @@ export class RemoteBinding {
 	/** Calls `name` over the current hold, waiting for it while the binding (re)holds. */
 	async call(name: string, args: unknown, ctx: Ctx, given?: readonly unknown[]): Promise<unknown> {
 		for (;;) {
+			if (this.transaction !== undefined) throw new ChordError("not_ready", "candidate calls wait for commit");
 			if (this.ended) throw this.terminalError();
 			if (this.status !== "live" || this.hold === undefined) await raceSignal(this.#live.promise, ctx.signal);
 			const hold = this.hold;

@@ -3,7 +3,7 @@ import { type Encoder, encoder } from "./delta/index.ts";
 import { ChordError, invalid } from "./errors.ts";
 import type { HostImpl } from "./host.ts";
 import { type Link, Packed, unpack } from "./link.ts";
-import { type CtxImpl, RefImpl, variantOf } from "./object.ts";
+import { type CtxImpl, candidateSource, RefImpl, variantOf } from "./object.ts";
 import type { RemoteBinding, RemoteChannel } from "./remote.ts";
 import { assertValid } from "./schema.ts";
 import type { Ctx, Readable, Shape, StateEvent } from "./types.ts";
@@ -120,6 +120,10 @@ interface ServedLocal {
 	projectionCodeVersion: number | undefined;
 	/** The members whose snapshot the consumer has, with their streams. */
 	readonly feeds: Map<string, Feed>;
+	transaction: string | undefined;
+	replacement: string | undefined;
+	/** Candidate units publish metadata now and private snapshots once provider preparation is ready. */
+	candidateSending: boolean;
 }
 
 /** A hold the peer made on this host: served locally or relayed to another link. */
@@ -156,6 +160,8 @@ export class RelayRef {
 	readonly awaiting = new Set<string>();
 	readonly calls = new Map<number, RelayCall>();
 	readonly #waiters = new Set<Pending>();
+	replacement: string | undefined;
+	transaction: string | undefined;
 
 	constructor(
 		origin: Connection,
@@ -169,6 +175,7 @@ export class RelayRef {
 		this.originTag = originTag;
 		this.stateWanted = frame.state !== false;
 		this.generation = origin.generation;
+		this.transaction = frame.transaction;
 	}
 
 	get originId(): number {
@@ -210,7 +217,14 @@ export class RelayRef {
 			...(this.originTag === undefined ? {} : { origin: this.originTag }),
 			...(this.stateWanted ? {} : { state: false as const }),
 			...(this.frame.again === true ? { again: true as const } : {}),
+			...(this.frame.transaction === undefined || down.transaction !== this.frame.transaction
+				? {}
+				: { transaction: this.frame.transaction, participant: this.frame.participant }),
 		});
+		if (this.replacement !== undefined && down.transaction === this.replacement)
+			void down
+				.replace(this.downId, this.replacement, true)
+				.catch((error: unknown) => this.close(error, { releaseDown: true, notify: true }));
 		for (const waiter of this.#waiters) waiter.resolve(down);
 		this.#waiters.clear();
 	}
@@ -419,6 +433,12 @@ export class Connection implements RemoteChannel {
 	readonly votes = new Map<number, Pending>();
 	/** Child rollback completions awaited before reconciliation retries. */
 	readonly abortions = new Map<number, Pending>();
+	readonly preparations = new Map<string, Pending>();
+	readonly replacements = new Map<string, Pending[]>();
+	readonly pendingCandidates = new Map<number, Extract<Frame, { t: "hold" }>>();
+	/** Set by the coordinator, not by the downstream peer. */
+	transaction: string | undefined;
+	transactionParticipants: readonly string[] = [];
 
 	constructor(
 		host: HostImpl,
@@ -712,8 +732,76 @@ export class Connection implements RemoteChannel {
 			...(principal === undefined ? {} : { principal }),
 			...(binding.stateOn ? {} : { state: false as const }),
 			...(again ? { again: true as const } : {}),
+			...(binding.transaction === undefined ? {} : { transaction: binding.transaction }),
 		});
+		binding.announceReplacement();
 		return id;
+	}
+
+	replace(id: number, transaction: string, replacing: boolean): Promise<void> {
+		if (!this.open) return Promise.reject(unavailable("replacement link closed"));
+		const key = `${id}:${transaction}`;
+		return new Promise<void>((resolve, reject) => {
+			let receipts = this.replacements.get(key);
+			if (receipts === undefined) {
+				receipts = [];
+				this.replacements.set(key, receipts);
+			}
+			receipts.push({ resolve: () => resolve(), reject });
+			this.send({ t: "replace_hold", id, transaction, replacing });
+		});
+	}
+
+	replaces(ref: RefImpl, transaction: string): boolean {
+		return [...this.served.values()].some(
+			(served) => served.kind === "local" && served.ref === ref && served.replacement === transaction,
+		);
+	}
+
+	refreshCandidates(): void {
+		for (const [id, frame] of [...this.pendingCandidates]) {
+			this.pendingCandidates.delete(id);
+			this.#onHold(frame);
+		}
+		for (const served of this.served.values())
+			if (served.kind === "local" && served.transaction !== undefined) this.#candidateUnit(served);
+	}
+
+	finishCandidates(transaction: string, commit: boolean): void {
+		for (const [id, frame] of this.pendingCandidates)
+			if (frame.transaction === transaction) {
+				this.pendingCandidates.delete(id);
+				this.send({ t: "gone", id, error: toWireError(new ChordError("aborted", "candidate aborted")) });
+			}
+		for (const served of [...this.served.values()]) {
+			if (served.kind === "relay") {
+				if (served.relay.transaction === transaction) {
+					if (commit) served.relay.transaction = undefined;
+					else
+						served.relay.close(new ChordError("aborted", "candidate aborted"), {
+							releaseDown: true,
+							notify: true,
+						});
+				}
+				continue;
+			}
+			if (served.replacement === transaction && !commit) {
+				served.replacement = undefined;
+				served.ref.retained = undefined;
+				for (const feed of served.feeds.values()) feed.unsubscribe();
+				served.feeds.clear();
+				this.#unit(served);
+			}
+			if (served.transaction !== transaction) continue;
+			if (commit) {
+				served.transaction = undefined;
+				served.ref.candidate = false;
+				this.#unit(served);
+			} else {
+				this.#dropServed(served.id, true);
+				this.send({ t: "gone", id: served.id, error: toWireError(new ChordError("aborted", "candidate aborted")) });
+			}
+		}
 	}
 
 	release(id: number): void {
@@ -794,8 +882,50 @@ export class Connection implements RemoteChannel {
 				this.#onHold(frame);
 				return;
 			case "release":
+				this.pendingCandidates.delete(frame.id);
 				this.#dropServed(frame.id, true);
 				return;
+			case "replace_hold": {
+				if (!this.host.acceptsTransaction(this, frame.transaction)) {
+					if (frame.replacing) this.#violation("replacement intent outside transaction");
+					if (!frame.replacing) this.send({ t: "replaced_hold", id: frame.id, transaction: frame.transaction });
+					return;
+				}
+				const served = this.served.get(frame.id);
+				if (served?.kind === "local" && served.origin === undefined && served.transaction === undefined) {
+					served.replacement = frame.replacing ? frame.transaction : undefined;
+					served.ref.retained = frame.replacing ? served.ref.object.currentInstalled() : undefined;
+					if (frame.replacing) {
+						for (const feed of served.feeds.values()) feed.unsubscribe();
+						this.dropHoldState(served.id);
+					} else {
+						served.feeds.clear();
+						this.#unit(served);
+					}
+					this.send({ t: "replaced_hold", id: frame.id, transaction: frame.transaction });
+				} else if (served?.kind === "relay" && !served.relay.client) {
+					served.relay.replacement = frame.replacing ? frame.transaction : undefined;
+					void served.relay
+						.ready()
+						.then((down) =>
+							down.transaction === frame.transaction
+								? down.replace(served.relay.downId, frame.transaction, frame.replacing)
+								: undefined,
+						)
+						.then(
+							() => this.send({ t: "replaced_hold", id: frame.id, transaction: frame.transaction }),
+							(error: unknown) => served.relay.close(error, { releaseDown: true, notify: true }),
+						);
+				}
+				return;
+			}
+			case "replaced_hold": {
+				const key = `${frame.id}:${frame.transaction}`;
+				const receipts = this.replacements.get(key);
+				receipts?.shift()?.resolve(undefined);
+				if (receipts?.length === 0) this.replacements.delete(key);
+				return;
+			}
 			case "call":
 				this.#onCall(frame);
 				return;
@@ -827,6 +957,7 @@ export class Connection implements RemoteChannel {
 				return;
 			case "invalidate":
 			case "prepare":
+			case "advance":
 			case "commit":
 			case "abort":
 			case "retire":
@@ -840,6 +971,16 @@ export class Connection implements RemoteChannel {
 				} else if (frame.t === "retire") this.host.allowRetire(frame.codeVersion);
 				else this.host.onReloadFrame(this, frame);
 				return;
+			case "prepared": {
+				if (this.role !== "downstream" || this.peer.kind !== "host") {
+					this.#violation("prepared from a non-participant");
+					return;
+				}
+				const key = `${frame.reload}:${frame.phase}`;
+				this.preparations.get(key)?.resolve(undefined);
+				this.preparations.delete(key);
+				return;
+			}
 			case "aborted": {
 				if (this.role !== "downstream" || this.peer.kind !== "host") {
 					this.#violation("aborted from a non-participant");
@@ -922,6 +1063,17 @@ export class Connection implements RemoteChannel {
 		const principal = this.#principalOf(frame);
 		const origin = this.#originOf(frame);
 		const client = origin !== undefined;
+		if (frame.transaction !== undefined) {
+			if (client || !this.host.acceptsTransaction(this, frame.transaction, frame.participant)) {
+				this.send({
+					t: "gone",
+					id: frame.id,
+					error: toWireError(invalid("transaction", "candidate hold outside transaction")),
+				});
+				return;
+			}
+			frame = { ...frame, participant: this.role === "downstream" ? this.name : (frame.participant ?? this.name) };
+		}
 		if (frame.at !== this.host.name) {
 			if (this.role === "upstream") {
 				this.send({ t: "gone", id: frame.id, error: toWireError(unavailable(`${this.host.name} does not relay`)) });
@@ -932,6 +1084,15 @@ export class Connection implements RemoteChannel {
 			this.host.relay(relay).catch((error: unknown) => relay.close(error, { releaseDown: true, notify: true }));
 			return;
 		}
+		if (
+			frame.transaction !== undefined &&
+			this.transaction === frame.transaction &&
+			this.host.reloading &&
+			!this.host.reloadOperation?.materialized
+		) {
+			this.pendingCandidates.set(frame.id, frame);
+			return;
+		}
 		let ref: RefImpl;
 		try {
 			const token = contractFromDescription(frame.token);
@@ -939,7 +1100,14 @@ export class Connection implements RemoteChannel {
 			// Addressed here, so the input must place it here (also by this host's contract, checked when acquiring).
 			if (resolveHost(token.name, token.description.host!, frame.input) !== this.host.name)
 				throw invalid("placement", `${token.name} with this input does not live on ${this.host.name}`);
-			const acquired = this.host.acquire(token, frame.input, { principal }, client ? "client" : "connection");
+			const acquired = this.host.acquire(
+				token,
+				frame.input,
+				{ principal },
+				client ? "client" : "connection",
+				undefined,
+				frame.transaction !== undefined && this.host.reloadOperation?.transaction?.id === frame.transaction,
+			);
 			if (!(acquired instanceof RefImpl)) throw unavailable("not a local reference");
 			ref = acquired;
 		} catch (error) {
@@ -957,6 +1125,9 @@ export class Connection implements RemoteChannel {
 			unitSent: false,
 			projectionCodeVersion: undefined,
 			feeds: new Map(),
+			transaction: this.host.reloadOperation?.transaction?.id === frame.transaction ? frame.transaction : undefined,
+			replacement: undefined,
+			candidateSending: false,
 		};
 		this.served.set(frame.id, served);
 		ref.onShape(() => this.#unit(served));
@@ -978,6 +1149,11 @@ export class Connection implements RemoteChannel {
 	 * goes out with the shape and the members the consumer lacks. The first unit of a hold (not a re-hold) is urgent.
 	 */
 	#unit(served: ServedLocal): void {
+		if (served.replacement !== undefined) return;
+		if (served.transaction !== undefined) {
+			this.#candidateUnit(served);
+			return;
+		}
 		if (this.served.get(served.id) !== served) return;
 		const shape = served.ref.shape;
 		if (shape === undefined) return;
@@ -994,6 +1170,71 @@ export class Connection implements RemoteChannel {
 			this.#sendProjections(served);
 			this.#queueUnit(served.id, () => this.#sendUnit(served));
 		}
+	}
+
+	/** No installed streams are touched: candidate state is copied only into the transaction's private hold. */
+	#candidateUnit(served: ServedLocal): void {
+		if (served.candidateSending || this.served.get(served.id) !== served) return;
+		const reload = this.host.reloadOperation;
+		if (
+			reload === undefined ||
+			served.transaction === undefined ||
+			reload.transaction?.id !== served.transaction ||
+			!reload.materialized
+		)
+			return;
+		const installed = reload.candidateInstalled(served.ref.object);
+		if (installed === undefined) return;
+		const view = served.ref.viewOf(installed);
+		const shape = served.ref.shape;
+		if (shape === undefined) return;
+		served.candidateSending = true;
+		const members = served.wantsState ? this.#stateMembers(served.ref, shape) : [];
+		this.send({
+			t: "shape",
+			id: served.id,
+			...shape,
+			callVariants: [{ codeVersion: this.host.pending!.id, variant: shape.variant }],
+			fencedCodeVersions: [],
+			state: members,
+		});
+		void reload
+			.candidateState(served.ref.object)
+			.then((values) => {
+				if (this.served.get(served.id) !== served || reload.abort.signal.aborted) return;
+				const computing = new Set<Readable<unknown>>();
+				const read = (source: Readable<unknown>): unknown => {
+					if (values.has(source)) return values.get(source);
+					if (computing.has(source)) throw invalid("cycle", "candidate state cycle");
+					computing.add(source);
+					try {
+						const resolved = candidateSource(source, (object) => reload.candidateInstalled(object));
+						return resolved === source ? source.value : read(resolved);
+					} finally {
+						computing.delete(source);
+					}
+				};
+				const snapshots = members.map((m) => {
+					const value = read(view[m] as Readable<unknown>);
+					const description = served.ref.describe(shape.variant, m);
+					if (description?.kind === "state")
+						assertValid("state", `${served.ref.address}.${m}`, description.schema, value);
+					return {
+						t: "state" as const,
+						hold: served.id,
+						m,
+						as: "snap" as const,
+						...(value === undefined ? {} : { value }),
+					};
+				});
+				for (const snapshot of snapshots) this.send(snapshot);
+				served.unitSent = true;
+			})
+			.catch((error: unknown) => {
+				if (this.served.get(served.id) !== served) return;
+				this.#dropServed(served.id, true);
+				this.send({ t: "gone", id: served.id, error: toWireError(error) });
+			});
 	}
 
 	/** Current and retained consumer-view method variants, bounded by the host's retained code versions. */
@@ -1019,6 +1260,7 @@ export class Connection implements RemoteChannel {
 
 	/** Publishes only method metadata: never attaches streams, flushes state, or changes pending units. */
 	#sendProjections(served: ServedLocal): void {
+		if (served.transaction !== undefined || served.replacement !== undefined) return;
 		if (this.served.get(served.id) !== served || served.ref.shape === undefined) return;
 		const callVariants = this.#callVariants(served);
 		if (callVariants.length === 0) return;
@@ -1195,6 +1437,17 @@ export class Connection implements RemoteChannel {
 			this.send({ t: "result", id: frame.id, error: toWireError(new ChordError("gone", "unknown hold")) });
 			return;
 		}
+		if (
+			(served.kind === "local" && served.transaction !== undefined) ||
+			(served.kind === "relay" && served.relay.transaction !== undefined)
+		) {
+			this.send({
+				t: "result",
+				id: frame.id,
+				error: toWireError(new ChordError("not_ready", "candidate calls wait for commit")),
+			});
+			return;
+		}
 		const controller = new AbortController();
 		this.incoming.set(frame.id, controller);
 		// Roots are honored from hosts only; a request without one (or from a client) starts one here.
@@ -1334,6 +1587,10 @@ export class Connection implements RemoteChannel {
 		this.votes.clear();
 		for (const pending of this.abortions.values()) pending.reject(error);
 		this.abortions.clear();
+		for (const pending of this.preparations.values()) pending.reject(error);
+		this.preparations.clear();
+		for (const receipts of this.replacements.values()) for (const receipt of receipts) receipt.reject(error);
+		this.replacements.clear();
 		for (const waiter of this.#syncWaiters) waiter.reject(error);
 		this.#syncWaiters.clear();
 		// As downstream of relays: their origins lose the hold.
@@ -1342,6 +1599,7 @@ export class Connection implements RemoteChannel {
 		this.relayedCalls.clear();
 		const bindings = [...this.remotes.values()];
 		this.remotes.clear();
+		this.pendingCandidates.clear();
 		for (const binding of bindings) {
 			// An upstream link may be replaced (reconnect); a downstream host that went away is gone.
 			if (this.role === "upstream") binding.detached();

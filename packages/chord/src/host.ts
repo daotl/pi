@@ -24,6 +24,7 @@ import {
 	type Factory,
 	type HostCore,
 	hostLifetime,
+	type Installed,
 	makeService,
 	ObjectImpl,
 	type RefCore,
@@ -269,6 +270,8 @@ export class HostImpl implements Host, HostCore {
 	upstream: Connection | undefined;
 	/** Shared bindings of this host's remote references, by key (re-held after an upstream reconnect). */
 	readonly bindings = new Map<string, RemoteBinding>();
+	/** Transaction-private pools never coalesce with ordinary holds, even for identical tokens. */
+	readonly candidateBindings = new Map<string, Map<string, RemoteBinding>>();
 	/** Bindings without references that linger, least recently released first. */
 	readonly #lingering = new Map<string, RemoteBinding>();
 	readonly #lingerTypes: Readonly<Record<string, number>>;
@@ -511,6 +514,56 @@ export class HostImpl implements Host, HostCore {
 		return this.pending?.id;
 	}
 
+	candidateTransaction(): string | undefined {
+		return this.reloadOperation?.transaction?.id;
+	}
+
+	candidateInstalled(object: ObjectImpl): Installed | undefined {
+		return this.reloadOperation?.candidateInstalled(object);
+	}
+
+	/** Only a live coordinator-issued transaction on a trusted participant connection is authority. */
+	acceptsTransaction(connection: Connection, transaction: string, participant?: string): boolean {
+		const active = this.reloadOperation?.transaction;
+		if (connection.peer.kind !== "host") return false;
+		if (connection.role === "upstream")
+			return (
+				connection.transaction === transaction &&
+				connection.transactionParticipants.includes(participant ?? connection.name ?? "")
+			);
+		return (
+			connection.transaction === transaction &&
+			(active === undefined || (active.id === transaction && active.participants.includes(connection.name ?? "")))
+		);
+	}
+
+	replacedRemoteRef(ref: RefImpl, transaction: string | undefined): boolean {
+		return (
+			transaction !== undefined && [...this.connections].some((connection) => connection.replaces(ref, transaction))
+		);
+	}
+
+	finishCandidateBindings(transaction: string, commit: boolean): void {
+		const bindings = this.candidateBindings.get(transaction);
+		for (const object of this.objects.values())
+			for (const ref of object.refs) if (ref.candidate) ref.candidate = false;
+		this.candidateBindings.delete(transaction);
+		for (const binding of bindings?.values() ?? []) {
+			if (!commit) binding.close();
+			else {
+				binding.transaction = undefined;
+				this.bindings.set(`${binding.key}\u0000committed:${transaction}`, binding);
+				for (const view of binding.views) view.update();
+			}
+		}
+		for (const connection of this.connections) connection.finishCandidates(transaction, commit);
+	}
+
+	*allBindings(): Iterable<RemoteBinding> {
+		yield* this.bindings.values();
+		for (const bindings of this.candidateBindings.values()) yield* bindings.values();
+	}
+
 	/** The current code for a type; a type a running reload adds is served from the pending code version. */
 	service(typeName: string): Service | undefined {
 		return this.current.services.get(typeName) ?? this.pending?.services.get(typeName);
@@ -580,10 +633,15 @@ export class HostImpl implements Host, HostCore {
 		// holds addressed here must first bind the registered provider, then normalize only with its trusted schema.
 		if (!isReceivedContract(type)) {
 			const elsewhere = this.#elsewhere(type, input);
-			if (elsewhere !== undefined) return this.#acquireRemote(type, elsewhere.at, elsewhere.input, options, owner);
+			if (elsewhere !== undefined)
+				return this.#acquireRemote(type, elsewhere.at, elsewhere.input, options, owner, candidate);
 		}
 		if (service === undefined) throw unknownType(type.name, this.name);
 		bind(service.contract, service.options.accepts, type);
+		// A late ordinary hold cannot invalidate a participant's compatibility vote after replacement intent.
+		const prospective = this.pending?.services.get(type.name);
+		if (!candidate && this.reloadOperation?.materialized && prospective !== undefined && owner !== "client")
+			bind(prospective.contract, prospective.options.accepts, type);
 		const { address, normalized, principal } = this.#locate(
 			service,
 			input,
@@ -615,11 +673,23 @@ export class HostImpl implements Host, HostCore {
 			return ref;
 		}
 		let object = this.objects.get(address);
+		if (!candidate && object?.candidateOnly && this.current.services.has(type.name))
+			throw new ChordError("upgrade_conflict", "candidate-only object is not committed", { reason: "gate" });
+		if (
+			!candidate &&
+			this.current.services.has(type.name) &&
+			object?.service !== undefined &&
+			object.service !== this.current.services.get(type.name) &&
+			!object.implementations.has(this.current.id)
+		)
+			throw new ChordError("upgrade_conflict", "candidate-only object is not committed; retry after reload", {
+				reason: "gate",
+			});
 		if (from !== undefined && object !== undefined && (object === from || reaches(object, from))) {
 			throw invalid("cycle", `${from.address} -> ${address} would create a ref cycle`);
 		}
 		if (object === undefined) {
-			if (this.gating?.has(type.name)) {
+			if (!candidate && this.gating?.has(type.name)) {
 				throw new ChordError("upgrade_conflict", `${type.name} is being upgraded; retry`, { reason: "gate" });
 			}
 			const dying = this.#dying.get(address);
@@ -632,10 +702,14 @@ export class HostImpl implements Host, HostCore {
 				hostLifetime: hostLifetime(service),
 			});
 			this.objects.set(address, object);
+			object.candidateOnly = candidate && service !== this.current.services.get(type.name);
 			// A new object for an address still being disposed waits for that cleanup (exclusive resources).
-			object.start(dying?.status === "disposing" ? dying.dispose(false) : undefined);
+			object.start(
+				dying?.status === "disposing" ? dying.dispose(false) : undefined,
+				candidate && service !== this.current.services.get(type.name) ? service : undefined,
+			);
 		}
-		const ref = new RefImpl(object, type, owner);
+		const ref = new RefImpl(object, type, owner, candidate);
 		object.addRef(ref);
 		return ref;
 	}
@@ -1024,7 +1098,7 @@ export class HostImpl implements Host, HostCore {
 		try {
 			// Revoke every authority before any holder's asynchronous cleanup can stall the rest.
 			for (const object of matching) object.revoke(reason);
-			for (const binding of [...this.bindings.values()]) {
+			for (const binding of [...this.allBindings()]) {
 				if (binding.principal === undefined || this.isSelf(binding.principal) || !matches(binding.principal))
 					continue;
 				const hold = binding.hold;
@@ -1185,9 +1259,12 @@ export class HostImpl implements Host, HostCore {
 
 	/** The last reference to `binding` was released: it lingers if its type does (`HostOptions.linger`), else closes. */
 	bindingIdle(binding: RemoteBinding): void {
-		const ms = Object.hasOwn(this.#lingerTypes, binding.contract.name)
-			? this.#lingerTypes[binding.contract.name]!
-			: 0;
+		const ms =
+			binding.transaction !== undefined
+				? 0
+				: Object.hasOwn(this.#lingerTypes, binding.contract.name)
+					? this.#lingerTypes[binding.contract.name]!
+					: 0;
 		// A binding that never had a shape has nothing worth keeping.
 		if (ms <= 0 || binding.ended || !binding.applied || this.#lingerCap <= 0) {
 			binding.close();
@@ -1204,7 +1281,11 @@ export class HostImpl implements Host, HostCore {
 
 	forgetBinding(binding: RemoteBinding): void {
 		if (this.bindings.get(binding.key) === binding) this.bindings.delete(binding.key);
+		for (const [key, current] of this.bindings) if (current === binding) this.bindings.delete(key);
+		for (const [key, current] of this.#lingering) if (current === binding) this.#lingering.delete(key);
 		if (this.#lingering.get(binding.key) === binding) this.#lingering.delete(binding.key);
+		for (const bindings of this.candidateBindings.values())
+			if (bindings.get(binding.key) === binding) bindings.delete(binding.key);
 	}
 
 	/** A downstream host connection by its configured name (never by what a peer announced). */
@@ -1228,10 +1309,21 @@ export class HostImpl implements Host, HostCore {
 		input: unknown,
 		options: GetOptions | undefined,
 		owner: RefOwner,
+		candidate = false,
 	): RefCore {
 		const principal =
 			options?.principal === undefined || this.isSelf(options.principal) ? undefined : options.principal;
 		const key = this.#remoteKey(type, input, principal === undefined ? this.principal : principal);
+		const transaction = candidate ? this.reloadOperation?.transaction?.id : undefined;
+		let pool = this.bindings;
+		if (transaction !== undefined) {
+			let privatePool = this.candidateBindings.get(transaction);
+			if (privatePool === undefined) {
+				privatePool = new Map();
+				this.candidateBindings.set(transaction, privatePool);
+			}
+			pool = privatePool;
+		}
 		const revocation =
 			principal === undefined ? undefined : this.#revocations.find((entry) => entry.matches(principal));
 		if (revocation !== undefined) {
@@ -1241,11 +1333,17 @@ export class HostImpl implements Host, HostCore {
 			binding.gone(revocation.reason);
 			return ref;
 		}
-		let binding = this.bindings.get(key);
+		let binding = pool.get(key);
+		if (!candidate && this.reloadOperation?.materialized && binding !== undefined && binding.replacements.size > 0)
+			throw new ChordError(
+				"upgrade_conflict",
+				"ordinary reference would revoke a prepared replacement; retry after reload",
+				{ reason: "gate" },
+			);
 		const fresh = binding === undefined || binding.ended;
 		if (binding === undefined || binding.ended) {
-			binding = new RemoteBinding(this, { key, contract: type, at, input, principal });
-			this.bindings.set(key, binding);
+			binding = new RemoteBinding(this, { key, contract: type, at, input, principal, transaction });
+			pool.set(key, binding);
 		}
 		const ref = new RemoteRef(binding, owner, options?.state !== false);
 		this.#lingering.delete(key);
@@ -1365,7 +1463,10 @@ export class HostImpl implements Host, HostCore {
 			: runReload(this, plugins, options);
 	}
 
-	onReloadFrame(connection: Connection, frame: Extract<Frame, { t: "prepare" | "commit" | "abort" }>): void {
+	onReloadFrame(
+		connection: Connection,
+		frame: Extract<Frame, { t: "prepare" | "advance" | "commit" | "abort" }>,
+	): void {
 		this.#childReloads.handle(connection, frame);
 	}
 
@@ -1419,7 +1520,7 @@ export class HostImpl implements Host, HostCore {
 			);
 		} finally {
 			this.#closed = true;
-			for (const binding of [...this.bindings.values()]) binding.gone(reason);
+			for (const binding of [...this.allBindings()]) binding.gone(reason);
 			for (const connection of [...this.connections]) connection.link.close("host closed");
 		}
 	}
