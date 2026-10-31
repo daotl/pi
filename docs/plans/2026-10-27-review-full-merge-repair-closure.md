@@ -1780,3 +1780,318 @@ No fresh native Windows, real Kitty, fish, Nix publication, production Cloudflar
 
 **NOT COMPLETE / NOT MERGE APPROVAL.** All reachable reviewed repairs and regression gaps are integrated, but the original Windows manager and larger coordinated reload remain unfixed, and native Windows proof is missing. A local repair commit does not close those blockers. No push or PR.
 
+
+## Complete merge and subsequent diff review - 6a243f805
+
+Scope: `839dc79197595a4285d711e37d02fb623e5b6b7b` -> `6a243f805acb5c57baf8df594a5b6120d9f15852`, 1552 changed paths and 3546 hunks. This includes the complete merge interaction and every subsequent repair, not only the latest commit. Markdown report-only; no fixes, new commit, push or PR.
+
+### Review outcome and limits
+
+**NOT READY / REVIEW AND VALIDATION DEGRADED.** Twenty thematic correctness owners report all assigned hunks inspected across 1552/1552 paths. Forty-five selected reviewers returned terminal artifacts. Three initial split adversarial jobs were cancelled, excluded from the canonical roster, and contributed no findings. The fresh sole canonical adversarial reviewer inspected only 68/1552 paths; 1484 remain insufficient. This is not complete adversarial clearance or merge approval.
+
+Testing coverage was completed as a union of the original 70-path slice and ten thematic passes: 738/738 assigned paths. Maintainability union covers 594/598 paths; four generated/deleted bodies remain insufficient. Standards mechanically scanned all paths but manually checked only 65 candidate/context paths. Security inspected 96/358 paths with 262 insufficient; API inspected 242/403 nonhistorical paths with 161 historical documents insufficient; agent-native inspected 75 complete paths plus 15 partial, leaving 507 unread. Module-local checks do not erase those lens limitations.
+
+Cross-model review was not started: host serving family unattested. Graph project/coverage tools failed with WeakMap errors; exact source/history and available LSP fallback were used. No exhaustive external/dynamic caller claim. No unambiguous implementation plan selected; this ledger is historical evidence, not implementation requirements. Settlement suppression was not evaluated.
+
+### Source-supported findings
+
+65 raw returns -> 64 quote/confidence-gated candidates plus one suppressed advisory -> 60 distinct after four semantic duplicate removals. Twelve testing-only gaps and one low-impact standards advisory are separated below. One oversized source/history validator evaluated 48 candidates: 46 accepted, two rejected. The batch exceeds the normal cap of eight and is explicitly noncanonical; it does not clear degraded validation. Moving assertion-only #15 to testing leaves **45 source-supported findings: six P1 and 39 P2**. Of these, **43 are new source candidates (five P1, 38 P2)**; **#2 and #24 are already-known retained blockers**, not new discoveries. They remain diff-relative primary findings because their introducing code is within this complete BASE..HEAD range; this does not reset their historical status.
+
+Stable numbers below belong to this review epoch only; gaps are intentional. All items remain unapplied. Full impact/evidence/fix detail is preserved in the external report and hydrated JSON.
+
+| # | Priority | Location | Observable defect and concrete response |
+|---|---|---|---|
+| 1 | P1 | `.github/workflows/env.yml:126` | Build telemetry before the environment test matrices. Add npm run build --workspace packages/telemetry after dependency installation in both release-daemons and tests, before invoking Vitest. Verify each matrix from a fresh checkout without existing dist directories; do not rely on artifacts built by the separate check job. |
+| 2 | P1 retained | `packages/chord/src/manager.ts:265` | Terminate Windows descendants on graceful worker exit. Give Windows workers a process-tree lifetime primitive such as a kill-on-close Job Object, and join its termination before settling Instance.exited. At minimum, the graceful shutdown protocol must terminate and acknowledge descendants while the parent PID still exists; attempting taskkill only after the exit cannot reliably discover the tree. |
+| 3 | P1 | `packages/chord/src/link.ts:411` | Handle WebSocket errors before authenticating ws clients. In WebSocketLink's constructor, register socket.addEventListener("error", () => this.ended("socket error")) immediately when taking ownership of the socket. Keep the listener installed for the socket lifetime, including pre-authentication and connection failure. Add a bounded child-process regression using the existing ws server integration: complete a raw HTTP upgrade, send an unmasked frame while authentication is unresolved, assert that only that socket ends and a second authenticated client can still call a method. Also cover a failed outbound ws connection. |
+| 4 | P1 | `packages/coding-agent/src/modes/interactive/interactive-mode.ts:5015` | Cancel active extension dialogs before awaiting shutdown abort. Extract idempotent cancellation of extensionCustomDialogs and extensionDialogs from resetExtensionUI and invoke it immediately after marking shutdown in progress, before either runtimeHost.dispose({ fromSignal: true }) or session.abort(). Keep the remaining full UI/resource reset at invalidation, preserving the existing persistence-recovery ordering. |
+| 5 | P1 | `packages/coding-agent/src/modes/interactive/interactive-mode.ts:6582` | Cancel scheduled preflight before replacing its session. Capture the delivery session and an AbortController before calling prompt; pass preflightSignal for initial, streaming, and retry admissions, cancel unaccepted deliveries in before-session-invalidate and stop(), and suppress callbacks from retired session/generation owners. Retain cancellation ownership until preflightResult accepts the input, matching promptQueued in flushCompactionQueue. |
+| 6 | P1 | `packages/env/daemon/src/exec.rs:542` | Retain Unix process ownership until descendants are cleaned. Add a Unix completion cleanup before removing the PID: kill the owned process group, preserving the already recorded leader exit status, as Windows finish_job and Unix PTY completion do. Add a targeted case where the leader exits with a redirected background child, then verify that the child is no longer alive and the leader exit code is preserved. |
+| 8 | P2 | `packages/chord/src/cell.ts:208` | Consume rejected promises at synchronous callback boundaries. Before throwing the synchronous-only error in Cell.change, Derived.compute and ObjectImpl.run, attach a rejection handler to the rejected asynchronous result, following MutableReplicatedStateImpl.change's Promise.resolve(result).catch(() => undefined) pattern. Keep rejecting the callback synchronously and aborting/unwinding exactly as now; do not await or accept asynchronous callbacks. Add a focused regression that catches the synchronous error and lets an async callback reject after an await without producing an unhandled rejection. |
+| 9 | P2 | `packages/chord/src/object.ts:857` | Preserve teardown after readable cleanup throws. Make RefImpl.release remove its object reference and publish status in a finally block even when stopping readables fails. In ObjectImpl.#dispose, accumulate ref.gone cleanup errors and continue cancellation and all teardown steps, throwing the aggregate only after final disposal bookkeeping. |
+| 10 | P2 | `packages/chord/src/output.ts:191` | Count UTF-8 across string chunk boundaries. Account for a high-surrogate/low-surrogate pair spanning adjacent accepted string chunks when updating total and stored byte counts, before deciding that a head buffer is full. Preserve the trailing high surrogate until the next chunk/end establishes whether it is paired (and preserve the same interpretation through snapshots and tail compaction). Add a regression comparing split-string pushes against pushing the concatenated text, including maxBytes=6 head retention with an emoji followed by 'ab'. |
+| 11 | P2 | `packages/chord/src/remote.ts:185` | Complete pending shapes when their state demand disappears. When switching state off, discard pending state values and apply a pending shape whose missing set has become empty, then update the remaining views. Preserve the independent call-projection metadata and do not require a further provider frame to settle method-only readiness. |
+| 12 | P2 | `packages/chord/src/remote.ts:417` | Preserve ordinary JSON keys during argument projection. Replace Value.Clone at remote JSON argument/input ownership boundaries with a JSON-preserving clone that defines reserved names as own data (reuse copyJson with the boundary's existing undefined-omission policy where its strictness is appropriate); keep consumer/provider Value.Clean projection. Migrate remote.ts, object.ts and normalize together. Cover a real linked Pico write and a keyed input containing own constructor/prototype/__proto__ values, asserting exact data and distinct identities without prototype pollution. |
+| 13 | P2 | `packages/coding-agent/src/core/agent-session.ts:7216` | Invalidate exact counts after same-leaf history mutations. Capture sessionManager.getContextRevision() alongside leafId before building the final chat-token request, store that revision in _postCompactionContextTokens, and require it to equal the current revision before using counted.tokens. Reject late publication if that revision changed while counting. A conservative invalidation for state-only revisions is acceptable, or use a separately tracked model-context revision if preserving those counts is required. |
+| 14 | P2 | `packages/coding-agent/src/core/remote-catalog-provider.ts:223` | Preserve authoritative empty personalized catalogs. Make personalModels undefined until a personalized catalog is available and return personalModels ?? builtinModels(). Restore matching stored lists, including [], as defined values; use undefined only for unmatched or unverifiable stored identities. Keep successful personalized=[] intact on publication. |
+| 16 | P2 | `packages/agent/src/harness/pico3/kinds/frames.ts:61` | Preserve append intent for streamed raw tool tokens. Carry rawDelta append intent through the Pico transaction/membrane layer and apply it with Chord appendText on the underlying draft, initializing the optional raw member only once. Match the explicit append approach already used by packages/durable/src/harness/partial-changes.ts rather than assigning the full growing raw string on every flush; keep authoritative toolcall_end replacement behavior unchanged. |
+| 17 | P2 | `packages/agent/src/harness/pico3/view.ts:125` | Accept tracker fallback roots in the Pico bridge. Teach bridgeWatch/applyTracked to apply a legitimate root replacement as the new Pico view, retaining the bridge-owned publication status and replacing commit.events with that envelope's events, with one atomic publication. Preserve subsequent ops if the batch contains them. Add a namespace-projection regression that changes more than 4096 pre-existing scalar fields in one commit, compares the held Chord view with a fresh raw snapshot and then verifies another ordinary update still arrives. |
+| 18 | P2 | `packages/ai/src/api/openai-decisions.ts:174` | Enforce image capability in direct Decisions calls. Inside the Decisions classify try block, call assertClassifierInputSupported(model, context) before constructing or posting the payload, or add the same context.images?.length && !model.input.includes("image") guard used by classifySystemOne. Add a direct-adapter text-only-model case that asserts an error result and zero fetches. |
+| 19 | P2 | `packages/ai/src/providers/radius.ts:43` | Bind authoritative Radius catalogs to the current account. Persist a credential-and-gateway personalization fingerprint with Radius catalogs, derive the same identity during cache-only refresh, and restore only matching entries. When identity changes or cannot be established, publish dynamicModels = undefined so the shipped baseline is available until the current account's catalog is fetched; retain [] as authoritative only for a matching identity. |
+| 20 | P2 | `packages/ai/src/tokenize.ts:122` | Complete tokenizer migration to the canonical user agent. Import formatUserAgent from ./utils/identity.ts in tokenize.ts and use it for the default User-Agent in both countTokens and countChatTokens. Remove packages/ai/src/utils/pi-user-agent.ts once those remaining pi-ai callers are migrated; keep model/request header precedence unchanged. Add a focused counting-request assertion for the canonical default format. |
+| 23 | P2 | `packages/chord/src/connection.ts:1378` | Recheck cancellation after resolving the relay route. Immediately after awaiting the route race, check signal.aborted and throw abortError() before allocating RelayCall or forwarding. Also preserve an already-aborted check when handing ownership to onCancel if any synchronous extension hook can abort during that handoff. Add a controlled route-resolution/cancellation interleaving test asserting no downstream call frame or side effect. |
+| 24 | P2 retained | `packages/chord/src/connection.ts:942` | Carry candidate contract binding across coordinated reload holds. Add transaction-scoped candidate hold/drop metadata for trusted reload participants so candidate holds bind pending providers and compatibility checks exclude old holds the same transaction replaces; activate those bindings only on commit and discard them on abort. Keep ordinary/client holds bound to committed providers. |
+| 25 | P2 | `packages/chord/src/host.ts:1382` | Fence pending reloads when the host closes. Reject reload/install/serve after closing starts, and make close abort and join the currently owned reload operation before final teardown. Recheck the host shutdown signal after asynchronous module resolution and before setup/publication, aborting candidate facet-run signals and rolling back owned work rather than committing it. |
+| 26 | P2 | `packages/chord/src/reload.ts:103` | Evaluate derived consumers against candidate provider state. Resolve reference-backed sources through the candidate provider implementation and candidate migrated/derived values during dry runs, in dependency order. Do not invoke a typed derivation with undefined merely because its provider's new view is not yet current; preserve the all-candidate preflight before publication. |
+| 30 | P2 | `packages/codemode/src/source.ts:291` | Recognize declarations after automatic semicolon insertion. Preserve JavaScript statement boundaries across automatic semicolon insertion before function/class declarations, rather than deciding declaration versus expression solely from statementStart left by the preceding token. Add regressions with a semicolon-free variable statement followed by a declaration and a regexp containing a backtick or quote: actual later options comments must throw, while options-looking text inside a subsequent template literal must remain accepted. |
+| 32 | P2 | `packages/coding-agent/src/core/export-html/template.js:1061` | Keep empty collapsed read results expandable. Retain collapsed when it differs from expanded even when it is an empty string, then select the expandable branch by presence of the collapsed field rather than its truthiness. Supply a small visible expand hint for an empty preview so a collapsed read remains locally clickable; retain the O toggle's existing .tool-output.expandable handling. |
+| 33 | P2 | `packages/coding-agent/src/experimental/services/worker.ts:137` | Finish worker cleanup when attachment disposal fails. Cache the complete disposal promise and collect attachment-removal errors without exiting early. Always join reloadTail, then close the host and dispose the loaded plugin generation, aggregating their errors with the attachment failure; repeated dispose calls should join the same cleanup rather than return immediately. |
+| 34 | P2 | `packages/coding-agent/src/modes/interactive/interactive-mode.ts:3425` | Preserve drafts when cancelling an unmounted custom factory. Track whether this inline interaction actually mounted and only restore its captured editor state when it owned the editor slot. An unmounted cancellation/factory rejection must leave the current editor text untouched; also avoid restoring a hidden older interaction over a newer owner. |
+| 35 | P2 | `packages/coding-agent/src/modes/interactive/interactive-mode.ts:3490` | Reserve dialog stack order before awaiting custom factories. Allocate an interaction/stack token when showExtensionCustom starts and mount the resolved component into that reserved position without stealing focus from newer dialogs. Keep the currently visible dialog focused and reveal the custom component only after entries above it close; retain the existing late-cancellation disposal checks. |
+| 36 | P2 | `packages/coding-agent/src/package-manager-cli.ts:150` | Preserve managed releases still used by open sessions. Do not delete a release merely because it differs from the current updater's VERSION. Add per-release process leases with stale-owner cleanup and prune only releases proven unused; until such ownership exists, retain old releases rather than removing code from live processes. Verify with an older live process across two updates, then exercise a previously uninitialized lazy feature. |
+| 40 | P2 | `packages/durable/docs/spec.md:2128` | Remove obsolete retry promise after scheduler storage failure. Replace the final sentence at spec lines 2128-2130 with the current rule: a rejected scheduler fault or handover write ends the invocation and fails the Session; its durable running record is recovered and reserved only after reopening. Preserve the existing production behavior and regression test. |
+| 41 | P2 | `packages/durable/src/harness/partial-changes.ts:109` | Preserve pending scalar values in partial tool arguments. Before replacing tracked arguments with {}, ensure the collected changes reproduce the provider snapshot. For unclosed scalar values and depth-limited containers, assign the captured argument snapshot and stop delta tracking for that call (or explicitly reconcile those preview paths); keep the append fast path only when exactness is established. Add a regression that commits after '{"count":12' and after '{"flag":tr', before either delimiter/end event. |
+| 42 | P2 | `packages/durable/src/harness/scheduler.ts:1871` | Keep read-only inspection of running tasks truthful. For a read-only scheduler, map a committed record.state.status==="running" to the running inspection state before applying local readiness/definition checks. Extend the existing read-only running-session test to assert inspection.tasks' derived state, not only inspection.scheduling. |
+| 43 | P2 | `packages/durable/src/harness/scheduler.ts:542` | Exclude impossible migrations from paused Harness wake readiness. In wake(), also classify a fitting newer task with migrates:true and definition.migrate===undefined as blocked, matching blockedReason() and #inspectTask(), without executing migration code. Cover wake()/onWake before resume() with a stored version-1 task and an installed version-2 definition lacking migrate. |
+| 44 | P2 | `packages/durable/src/storage/scan.ts:33` | Reject null cursors without failing the Session. Before destructuring a supplied cursor, reject null and non-object values with StorageRequestError. Keep undefined as the no-cursor case. Add a regression through a Session/Conversation read proving null rejects with StorageRequestError and a subsequent valid commit still succeeds. |
+| 45 | P2 | `packages/durable/src/tools/image.ts:89` | Accept short lossless WebP headers. Move the WebP length checks into their chunk branches: require 25 bytes for VP8L and 30 bytes for VP8 and VP8X. Add a valid sub-30-byte lossless WebP fixture and verify that createReadTool() without an image processor returns its image block unchanged. |
+| 47 | P2 | `packages/durable/test/env-node.test.ts:685` | Launch the shell fixture with source export conditions. Insert "--conditions=source" before the fixture filename in this execFile argument array, matching env-truncate.test.ts; verify the focused transport cases with workspace dist outputs absent or stale. |
+| 48 | P2 | `packages/env/daemon/src/exec.rs:299` | Bound output before the reader-to-exec handoff. Bound queued raw Data bytes at the reader-to-exec boundary rather than only the final Output queue. Use a bounded data channel or byte-budgeted handoff with cancellation-aware waits, keeping exit/cancel notifications on a nonblocking control path so a full data queue cannot deadlock shutdown. Apply the equivalent bound to the PTY reader handoff, which repeats the same pattern. |
+| 50 | P2 | `packages/env/src/remote-env.ts:230` | Recheck cancellation after receiving line scan results. Immediately after awaiting the scanLines reply, return abortResult<LineScan>(context.abortSignal, this.#path) when present, and only otherwise return the decoded scan. Verify with a real completed daemon scan whose reply is held until after the local signal aborts. |
+| 51 | P2 | `packages/env/src/remote-env.ts:615` | Stop queued write chunks when cancellation arrives. For writeFile, carry its AbortSignal on write/writeChunk requests and check the request's Control before truncating/opening or starting a queued chunk (and after parent creation). Serialize signal-bearing chunks, or otherwise cancel queued chunks before they begin physical writes; retain the existing non-cancellable appendFile semantics. Verify cancellation behind an intentionally held first chunk and assert later queued bytes are not written. |
+| 52 | P2 | `packages/env/src/ssh.ts:403` | Hash filenames without checksum output escaping. Hash redirected standard input instead of passing the pathname as a checksum operand, e.g. sha256sum < "$1" and shasum -a 256 < "$1", then extract the digest. Add a GNU-sha256sum-backed deployment case with a backslash in remote.home so this is checked independently of the host's preferred hash implementation. |
+| 53 | P2 | `packages/mcp/src/oauth/flow.ts:403` | Persist challenged scopes through the OAuth code exchange. Add pending-authorization scope storage to OAuthClientProvider/McpOAuthProvider alongside the code verifier, save the resolved scope before redirecting, and use that stored scope when an authorization-code response omits scope. Clear it with verifier/all invalidation. Keep explicitly returned token scopes authoritative. |
+| 54 | P2 | `packages/mcp/src/oauth/flow.ts:409` | Honor OAuth cancellation before the cached redirect path. Check options.signal.throwIfAborted() at runFlow admission and immediately before saving the new verifier and invoking redirectToAuthorization, including after asynchronous provider/PKCE work. Preserve the explicit refreshSignal:null behavior for an already-dispatched refresh so rotated tokens are still saved. |
+| 56 | P2 | `packages/tui/src/tui-main-screen.ts:699` | Render image-bearing overlay rows instead of skipping them. Keep transcript-image protection separate from overlay-image output: identify image placements produced by overlay rendering, emit their anchor sequences at the overlay coordinates after the required text clears, and track/delete those placements on update/hide. Do not simply skip composed rows because isImageLine returns true. |
+| 57 | P2 | `packages/tui/src/tui-main-screen.ts:716` | Preserve native wrap metadata while repainting overlay footprints. Preserve soft-wrap relationships when painting/restoring physical rows. For text rows use a non-wrap-clearing cell erase such as ECH plus positioned writes where possible, and explicitly restore any wrap boundaries that must change; retain enough physical-row metadata to distinguish native continuations from real newlines. Add assertions on the emulator's isWrapped flags, not only translated row strings. |
+| 58 | P2 | `packages/tui/src/utils.ts:632` | Materialize independently rendered constituents as separate terminal cells. Reuse the terminal-glyph decomposition used by graphemeWidth/advanceTerminalCell when building materialized row cells. Represent independently advancing constituents as separate placements while continuing to treat actual two-cell glyphs such as CJK and emoji atomically; only delete the overwritten placement, not an entire Intl cluster that contains multiple terminal glyphs. |
+| 59 | P2 | `scripts/issues/triage.ts:178` | Cancel the running attempt before retriaging. Capture the current conversation ID, invalidate the prior attempt atomically, and explicitly abort the superseded conversation through Harness.conversation(id).abort(context), awaiting its settlement before the replacement is admitted. Keep routing available until the old run is stopped, or make superseded submit_triage calls terminate rather than returning a retryable Unknown conversation error. Preserve decision fields and the attempt/conversation ownership checks. |
+
+### Known retained blockers, not new findings
+
+- #2: original Chord Windows manager process-tree ownership. Retained; not fixed or newly discovered.
+- #24: larger coordinated breaking reload candidate binding. Retained; protocol 7 abort acknowledgement does not close it.
+
+The new source queue contains 43 items. The total 45 source-supported items includes these two historical blockers. Diff-relative pre_existing is false because both implementations were introduced within 839dc791..6a243f805; historical status is carried separately.
+
+### Testing-only gaps
+
+These twelve observations are narrower regression/fidelity gaps, not current product defects. #15 was source-validated as a blind assertion then moved here; the other eleven were soft-bucketed before source validation.
+
+| # | Location | Specific test response |
+|---|---|---|
+| 15 | `packages/durable/test/harness-lifecycle.test.ts:345` | Measure actual document observer registrations in cancellation test. Instrument SessionImpl.observeCommits rather than subscribeCommits, or assert the document-cache attached count returns to its pre-acquisition baseline. Include a successfully acquired watch as a positive control and a cancellation scheduled across the registration boundary, then prove a later commit cannot reach the cancelled observer. |
+| 21 | `packages/ai/test/bedrock-stream-state.test.ts:123` | Exercise malformed arguments through Bedrock and Mistral. Add one Bedrock contentBlockStop case and one Mistral terminal tool-call case whose streamed JSON has a valid prefix followed by invalid syntax (for example {"path":"a","mode":.5}). Assert the terminal toolcall_end and returned message contain arguments: {} plus argumentsError containing the received JSON, and pass that call to validateToolArguments with an optional-only schema to prove it rejects rather than executing defaults. |
+| 22 | `packages/ai/test/streaming-tool-arguments.test.ts:354` | Require actual intermediate tool preview progress. Gate delivery of the remaining upstream chunks with a deferred promise, consume the first argument deltas, and assert a specific non-empty strict prefix of content before releasing the final chunks. Assert a later strict increase before toolcall_end and retain the final exact-arguments assertion. Apply the same gate/assertion to bedrock-stream-state.test.ts so zero intermediate previews fails. |
+| 27 | `packages/chord/test/state-init.test.ts:428` | Actually observe the gated initializer admission boundary. Keep an old root suspended after it acquires the object's activation lease, start the gated reload without awaiting it, and assert the added initializer has not run while that root blocks the gate. Release the root and then assert the initializer runs and the initialized value is published. Prefer also having the initializer read a replaced exclusive resource so ordering against opening the new resource is behaviorally observable. |
+| 28 | `packages/chord/test/state-init.test.ts:84` | Assert initializer notifications without filtering undefined. After waiting until init has started but before opening the initializer latch, assert that seen is empty; after activation, assert seen equals [["a", "b"]] directly. Remove the misleading comment that describes undefined as a normal reference value before live. |
+| 29 | `packages/client/test/client.test.ts:80` | Actually queue frames in the reconnect regression. Exercise reconnect with inbound native frames queued before a link exists, reconnect to the second MemoryByteServer using the same server route, register a receiver on the fresh link, and assert it receives no former frames but does receive a newly sent frame. Keep the old-link shutdown check in a separate case or parameterize the queue stage to cover both pre-link and pre-receiver buffering. |
+| 37 | `packages/coding-agent/test/model-registry.test.ts:766` | Run the new sampling-merge regression in offline CI. Move the newly added samplingParamsByThinkingLevel custom-model merge case into an ungated describe using a synthetic custom provider. Keep the builtin-specific assertion in a separately locally enabled case using enableBuiltinProviders(), with Vitest env restoration; run the custom case with PI_DISABLE_CLOUD_PROVIDERS=1. |
+| 38 | `packages/coding-agent/test/native/tokenizer-fixture.ts:91` | Reject foreign tokenizer URLs in the native fixture. Before recording/answering tokenizer requests, require the exact fixture URLs https://tokenizer.invalid/tokenize and https://tokenizer.invalid/v1/chat/completions/input_tokens, or derive these from the explicitly selected fixture model. Add a negative-control case for another origin and a wrong /v1 prefix, asserting the fixture rejects rather than providing a synthetic successful count. |
+| 39 | `packages/coding-agent/test/suite/agent-session-prompt.test.ts:93` | Move request assertions outside swallowed faux callbacks. Capture the observed system sections and declared tool names in each faux callback, return the scripted response unconditionally, then assert the captured values after await session.continue()/session.prompt(). Also assert the expected successful assistant text or stopReason so an unrelated provider error cannot satisfy the scenario. Apply the same adjustment to agent-session-tool-orchestration.test.ts:91-98. Verify with counterfactual rejected discovery and wrong request-only tool declarations that each test fails. |
+| 46 | `packages/durable/test/codemode.test.ts:425` | Compare deterministic values before the restart. Issue the echo containing Date.now()/Math.random() before awaiting hold, so the first attempt durably records its arguments and the resumed attempt must match them; keep the assertion that echo executed once and assert the entire successful result. Confirm the revised test fails when codemode execute passes a fresh startedAt or seed on resume. |
+| 49 | `packages/env/daemon/src/special.rs:553` | Exercise interruption in the misclassified FIFO regression. Extend the Rust regression with a synchronized quick-pool interruption scenario: wait until a misclassified FIFO helper has registered, invoke quick.interrupt(true), receive the deferred completion and drive its transfer to the slow pool, and prove an ordinary open completes while the FIFO remains blocked. Add a successful-writer overlap case that invokes interruption around the rendezvous and verifies the transferred original descriptor yields EOF without requiring another writer. Install the daemon's SIGUSR2 handler in an isolated subprocess for these signal-bearing cases so the test runner's global signal state is not changed. |
+| 55 | `packages/telemetry/src/testing/conformance.ts:187` | Require fallback spans to exist in conformance. After the three operations, capture getSpans() once, require exactly three snapshots, and use findSpan(spans, `fallback-${index}`) for each carrier to assert parentContext and parentId are null. A focused counterfactual adapter that delegates ordinary spans but extracts fallback carriers to NOOP_TELEMETRY_CONTEXT should fail this case. |
+
+### Rejected and advisory findings
+
+- #7 raw-tool progress expectation: rejected. Queued events contain mutable partial snapshots and cloneToolCall copies argumentsError; terminal finalization can affect the consumed start snapshot. Parent current-code run of openai-completions-raw-tool-call.test.ts passed all six cases.
+- #31 user startup ownership: rejected. Baseline already prepares user hooks before run ownership; new foreign-preflight tests intentionally preserve that boundary. No newly introduced defect established.
+- #60 single-use image-row forwarding helper: low-impact standards advisory, not a validated source defect. One confidence-50 avoidable-any advisory is suppressed from primary findings.
+- Windows-manager reports were merged into #2; worker-cleanup product/testing reports into #33; empty-personalized-catalog product/testing reports into #14. Original detailed evidence and independent producer identities are retained.
+
+### Current-code verification
+
+Parent ran local throwaway smoke scripts without changing product source:
+
+- #3: real loopback WebSocket HTTP upgrade before authentication, then an unmasked frame. The isolated Node process exits 1 with unhandled error, MASK must be set and WS_ERR_EXPECTED_MASK. This is a current unauthenticated denial-of-service reproduction.
+- #6: current external pi-env daemon executes a shell that exits after spawning a redirected sleep child. Exec returns exitCode 0 while the child remains alive. Owned child explicitly killed in finally; connection and temporary directory cleaned.
+- #10: string chunks high surrogate, low surrogate, a, b under six-byte head limit retain only emoji+a and report three dropped bytes; the combined input emoji+ab is six bytes and should fit.
+- #19: a different synthetic Radius credential restores a prior empty catalog during cache-only refresh; baseline balanced disappears. No network.
+- #30: an ASI-separated function declaration followed by a regexp containing a backtick hides a misplaced timeout directive; parser accepts it with no timeout.
+- #54: cached OAuth discovery/client plus an already-aborted signal still writes a verifier and redirects. No network.
+- Counterevidence #7: focused raw-tool-call file six passed. No full suite was rerun in this report-only review. Historical bg_901 13034/0/938 and precommit No fixes applied remain baseline receipts, not proof that the newly reported scenarios pass.
+
+No paid-provider requests, native Windows, real Kitty/WezTerm graphics, production Cloudflare, Nix publication, fish or live SSH certification. Native Windows proof, including previous #56 classification, remains unavailable.
+
+### Scope integrity and artifacts
+
+Complete tracked manifest digest: `72f08eb7e7cad5aa722ca83b40d39a6daba0566647606c80f6ee04b86153c746`. Complete diff SHA-256: `399313a5a500cb5191f4b51be93d1d180b224d49bc4630727c7e528dcdf15167`. Snapshot includes 1552 changed paths and 2752 tracked files. The prior exact-final-product-hashes.json exists and binds the earlier 130-path bg_901 epoch; it is not reused as this full-review integrity proof.
+
+All source hashes matched the full captured manifest before this append. The preceding ledger bytes are preserved. HEAD remains `6a243f805acb5c57baf8df594a5b6120d9f15852`; my-merge remains cb3bee033ba853041609b874303dc625d5d30479; crystal remains 8322aa1d6808711a6e46bfbe67d8a788ca8cbd1e. Protected target files are not edited. Only this requested ledger append is left uncommitted.
+
+Full report, all 45 terminal artifacts, exact inspected/insufficient paths/ranges, mechanics, source details, semantic merges, 48 independent verdicts, current-code smoke receipts and honest coverage limits: `/tmp/compound-engineering-501/ce-code-review/20261030-complete-6a243f805`.
+
+### Verdict
+
+**NOT READY / REVIEW AND VALIDATION DEGRADED.** Address #3 WebSocket process crash, #1 fresh-CI telemetry dependency, #4/#5 shutdown and scheduled preflight, and #6 Unix descendant ownership first. #2 Windows manager and #24 coordinated breaking reload remain retained blockers. No fixes applied; no commit or push.
+
+## Fix-all repair closure after 6a243f805
+
+User authorization: fix all accepted findings from the preceding complete merge review. This is a local repair batch, not renewed whole-merge approval. The preceding ledger bytes remain unchanged; this ledger is excluded from the product commit.
+
+### Disposition of the 45 source findings
+
+43 new source findings have retained local repairs. Historical #2 and #24 remain blockers, not closed findings.
+
+| # | Retained repair | Verification |
+|---|---|---|
+| 1 | Build telemetry before the environment test matrices | Focused behavior exercised; exact final validation receipt below |
+| 2 | Terminate Windows descendants on graceful worker exit | Blocked; see retained blockers below |
+| 3 | Handle WebSocket errors before authenticating ws clients | Focused behavior exercised; exact final validation receipt below |
+| 4 | Cancel active extension dialogs before awaiting shutdown abort | Focused behavior exercised; exact final validation receipt below |
+| 5 | Cancel scheduled preflight before replacing its session | Focused behavior exercised; exact final validation receipt below |
+| 6 | Retain Unix process ownership until descendants are cleaned | Focused behavior exercised; exact final validation receipt below |
+| 8 | Consume rejected promises at synchronous callback boundaries | Focused behavior exercised; exact final validation receipt below |
+| 9 | Preserve teardown after readable cleanup throws | Focused behavior exercised; exact final validation receipt below |
+| 10 | Count UTF-8 across string chunk boundaries | Focused behavior exercised; exact final validation receipt below |
+| 11 | Complete pending shapes when their state demand disappears | Focused behavior exercised; exact final validation receipt below |
+| 12 | Preserve ordinary JSON keys during argument projection | Focused behavior exercised; exact final validation receipt below |
+| 13 | Invalidate exact counts after same-leaf history mutations | Focused behavior exercised; exact final validation receipt below |
+| 14 | Preserve authoritative empty personalized catalogs | Focused behavior exercised; exact final validation receipt below |
+| 16 | Preserve append intent for streamed raw tool tokens | Focused behavior exercised; exact final validation receipt below |
+| 17 | Accept tracker fallback roots in the Pico bridge | Focused behavior exercised; exact final validation receipt below |
+| 18 | Enforce image capability in direct Decisions calls | Focused behavior exercised; exact final validation receipt below |
+| 19 | Bind authoritative Radius catalogs to the current account | Focused behavior exercised; exact final validation receipt below |
+| 20 | Complete tokenizer migration to the canonical user agent | Focused behavior exercised; exact final validation receipt below |
+| 23 | Recheck cancellation after resolving the relay route | Focused behavior exercised; exact final validation receipt below |
+| 24 | Carry candidate contract binding across coordinated reload holds | Blocked; see retained blockers below |
+| 25 | Fence pending reloads when the host closes | Focused behavior exercised; exact final validation receipt below |
+| 26 | Evaluate derived consumers against candidate provider state | Focused behavior exercised; exact final validation receipt below |
+| 30 | Recognize declarations after automatic semicolon insertion | Focused behavior exercised; exact final validation receipt below |
+| 32 | Keep empty collapsed read results expandable | Focused behavior exercised; exact final validation receipt below |
+| 33 | Finish worker cleanup when attachment disposal fails | Focused behavior exercised; exact final validation receipt below |
+| 34 | Preserve drafts when cancelling an unmounted custom factory | Focused behavior exercised; exact final validation receipt below |
+| 35 | Reserve dialog stack order before awaiting custom factories | Focused behavior exercised; exact final validation receipt below |
+| 36 | Preserve managed releases still used by open sessions | Focused behavior exercised; exact final validation receipt below |
+| 40 | Remove obsolete retry promise after scheduler storage failure | Focused behavior exercised; exact final validation receipt below |
+| 41 | Preserve pending scalar values in partial tool arguments | Focused behavior exercised; exact final validation receipt below |
+| 42 | Keep read-only inspection of running tasks truthful | Focused behavior exercised; exact final validation receipt below |
+| 43 | Exclude impossible migrations from paused Harness wake readiness | Focused behavior exercised; exact final validation receipt below |
+| 44 | Reject null cursors without failing the Session | Focused behavior exercised; exact final validation receipt below |
+| 45 | Accept short lossless WebP headers | Focused behavior exercised; exact final validation receipt below |
+| 47 | Launch the shell fixture with source export conditions | Focused behavior exercised; exact final validation receipt below |
+| 48 | Bound output before the reader-to-exec handoff | Focused behavior exercised; exact final validation receipt below |
+| 50 | Recheck cancellation after receiving line scan results | Focused behavior exercised; exact final validation receipt below |
+| 51 | Stop queued write chunks when cancellation arrives | Focused behavior exercised; exact final validation receipt below |
+| 52 | Hash filenames without checksum output escaping | Focused behavior exercised; exact final validation receipt below |
+| 53 | Persist challenged scopes through the OAuth code exchange | Focused behavior exercised; exact final validation receipt below |
+| 54 | Honor OAuth cancellation before the cached redirect path | Focused behavior exercised; exact final validation receipt below |
+| 56 | Render image-bearing overlay rows instead of skipping them | Focused behavior exercised; exact final validation receipt below |
+| 57 | Preserve native wrap metadata while repainting overlay footprints | Focused behavior exercised; exact final validation receipt below |
+| 58 | Materialize independently rendered constituents as separate terminal cells | Focused behavior exercised; exact final validation receipt below |
+| 59 | Cancel the running attempt before retriaging | Focused behavior exercised; exact final validation receipt below |
+
+### Disposition of the 12 testing-only gaps
+
+| # | Strengthened coverage |
+|---|---|
+| 21 | Exercise malformed arguments through Bedrock and Mistral |
+| 22 | Require actual intermediate tool preview progress |
+| 27 | Actually observe the gated initializer admission boundary |
+| 28 | Assert initializer notifications without filtering undefined |
+| 29 | Actually queue frames in the reconnect regression |
+| 37 | Run the new sampling-merge regression in offline CI |
+| 38 | Reject foreign tokenizer URLs in the native fixture |
+| 39 | Move request assertions outside swallowed faux callbacks |
+| 46 | Compare deterministic values before the restart |
+| 49 | Exercise interruption in the misclassified FIFO regression |
+| 55 | Require fallback spans to exist in conformance |
+| 15 | Measure actual document observer registrations in cancellation test |
+
+### Independent repair review
+
+- Sixteen local reviewers completed the initial 90-path repair review. All assigned changed hunks were reported inspected, including the sole complete-scope adversarial pass. Fourteen raw reports became nine distinct findings: eight source defects and one testing-only gap. One normal-cap batch of eight independently accepted all eight source defects.
+- Repairs cover independent schema projections and getter snapshots, live-only candidate preflight, cancellation-owned retirement waits, scheduled preflight shutdown ordering, scalar preview reconciliation with resumed appends, and image clipping and stacking. The candidate-close regression now independently holds both resource open and asynchronous close.
+- A four-reader narrow review found three further distinct source defects; one bounded independent batch accepted all three. Actual adapter regressions exposed empty/raw-only parser cadence mismatch; graphics regressions exposed left-hand text erasure; six recovery scenarios exposed retained canceled-preflight ownership. All were repaired with observed red/green evidence. A later two-reader pass corroborated a fourth transport-layer defect: empty credit-bearing deltas were discarded by frame encoding/reduction. An independent one-candidate validator accepted it; actual OpenAI-to-frame roundtrips failed before the two guarded codec changes and passed afterwards. Both readers then returned zero new findings for the codec closure.
+- New source epochs invalidate older review snapshots. Final narrow rereview and final exact source hashes are recorded below. Local independent reviews are not cross-model certification. The original 1552-path review remains historically DEGRADED; the old oversized validator is not retroactively canonicalized.
+
+### Maintenance and API decisions
+
+- Managed releases are retained rather than pruned by age; a live old process successfully loads a previously unused module after two updates. This deliberately uses more disk space, as documented; automatic bounded garbage collection or retroactive process leases are not claimed.
+- Remote appendFile keeps its documented complete-operation-then-report-abort semantics. Cancellable writeFile stops queued chunks; append semantics were not silently changed.
+- OAuth code-verifier persistence includes challenged scope and required authorizationScope() access; maintained implementations and docs migrate together. Explicit returned scope remains authoritative.
+- AI utility exports now honor the source condition, avoiding stale dist parser semantics in source-based Durable verification. No unnecessary parser API was retained.
+
+### Retained blockers
+
+- #2, packages/chord/src/manager.ts:265: Windows graceful worker exit still lacks creation-owned process-tree lifetime and joined descendant termination. GNU cross-compilation is not native Windows proof.
+- #24, packages/chord/src/connection.ts:942: coordinated breaking reload still lacks transaction-private candidate hold/drop binding and atomic commit/abort activation. Protocol 7 abort acknowledgement does not implement that contract.
+
+### Verification and integrity
+
+- Final exact-epoch root `./test.sh`, bg_1019: **13175 passed, 0 failed, 939 skipped**, exit 0, 504.76 s. Vitest worker count was bounded to two through a temporary npm launcher; original PATH and the runner's empty-environment credential isolation remained intact. No tests were excluded, assertions weakened, or per-test timeouts raised. Full output: `artifact://15408`.
+- Final `npm run check`, bg_1011: checked 1980 files, **No fixes applied**; pinned/runtime dependencies, import paths, entry graphs, install lock, TypeScript and browser smoke passed. Normal precommit checks run again on the same owned paths.
+- Final native Rust daemon: 34 passed, zero failed; Clippy `-D warnings` passed. Windows GNU test metadata compiled; zero native Windows tests executed. All Cargo output stayed in the external target directory.
+- Frame closure: actual OpenAI-to-frame regression was red in four cases, then 50 focused AI tests and 14 downstream transcript tests passed. Two independent narrow readers reported no remaining actionable finding.
+- Actual export HTML desktop/mobile interactions passed with no console errors; screenshot capture timed out, so no pixel screenshot claim. Actual TUI renderer output and xterm text cells prove clipping, stacking, left-text preservation and restoration; not native graphics pixels.
+- Exact final product source manifest: `/tmp/pi-fixall-6a243f805/product-frame-final-epoch.json`, 98 product paths, zero before/after drift. Protected target manifest: 749 files, zero changed hashes. Lockfiles and changelogs unchanged; ledger excluded from the product commit.
+- Complete repair artifacts, per-finding packets, red/green receipts, failed attempts, exact hashes and independent reviews: `/tmp/pi-fixall-6a243f805`.
+
+Historical attempts are retained, not counted as green: bg_957 had nine failures, bg_976 and bg_991 timed out, bg_1007 passed on the preceding 97-path epoch but was superseded by the codec repair, and bg_1012 completed with two native-watch failures (13173/2/939). The exact Env remote file then passed twice in separately isolated homes with the same daemon (33/0/3 each); this establishes nondeterminism, not a proven OS/load root cause. No native-watch assertion, overflow report, or timeout was suppressed.
+
+The later unchanged-source bg_1016 attempt timed out after a legacy WSL fixture remained in its temporary win32 platform state; the complete fixture then passed 35/0/1 and its exact case passed alone. These observations support nondeterministic execution, not a proven load-only root cause. The final bounded-concurrency run above passed every package.
+
+**Verdict: bounded repair batch verified; whole merge remains NOT READY because #2 and #24 are retained blockers.** No push or PR. No native Windows, real Kitty/WezTerm pixel rendering, production Cloudflare, Nix publication, fish, or live SSH certification. Virtual-terminal cells and emitted graphics controls are not native graphical proof.
+
+## Complete merge review attempt - 93e5f034
+
+**Scope:** `839dc79197595a4285d711e37d02fb623e5b6b7b` -> `93e5f034cf20792a5b697cd35eaf674a1eb477cb`, including pre-existing tracked ledger WIP. The immutable capture contains 1558 changed paths and 2753 tracked files. This is the full merge plus subsequent changes, not just the latest 98-path repair commit.
+
+**Intent:** Reassess the complete merge and all later repairs.
+**Mode:** markdown report-only; no product fixes, tests, commit, push or PR.
+
+### Actionable Findings
+
+No new finding conclusion is available. This is not "Actionable findings: none" and is not a clean review. No independent reviewer returned usable evidence. Do not treat historical ledger findings or fixes as newly reviewed results.
+
+### Known Retained Blockers
+
+These retain their historical identifiers and are not new discoveries or independently revalidated findings in this attempt.
+
+| Historical ID | Location | Unclosed requirement |
+|---|---|---|
+| #2 | `packages/chord/src/manager.ts:265` | Windows graceful worker exit still needs creation-owned descendant lifetime and joined termination, with native Windows proof. |
+| #24 | `packages/chord/src/connection.ts:942` | Coordinated breaking reload still needs transaction-private candidate hold/drop binding and atomic commit/abort activation. |
+
+Parent spot reads found the same relevant exit and ordinary-acquire branches. These two small reads do not constitute independent validation or whole-scope coverage.
+
+### Coverage
+
+- **FAILED / INCOMPLETE:** 0 of 1558 paths have usable independent review evidence in this attempt; all 1558 remain insufficient. Partition assignment is not inspection.
+- 39 canonical reviewers were selected. Five initial launches failed. Thirty-two replacement launches then produced 22 transport failures and ten cancellations. Total: 37 launches, 27 failed transports, ten cancelled, zero usable reports. All started jobs are terminal. Seven selected risk lenses were never dispatched after the transport failure stop.
+- Failures reported first-event stream timeouts or a closed socket after ten transport retries. No finding was reconstructed from these errors. The unchanged large packets and replacement fanout were workflow deviations; they did not produce coverage.
+- The deterministic mechanics helper ran on an empty return array only. There were no candidate findings to deduplicate or independently validate. Validator status: not started. No validation success or clean-result claim.
+- Cross-model review: not started; host serving family unattested. Graph project/coverage devices failed with WeakMap errors. No exhaustive external or dynamic caller claim.
+- No unambiguous implementation plan was selected; settlement suppression was not evaluated. The requested closure ledger is historical evidence, not implementation requirements.
+- No new tests or runtime reproductions were run. The earlier `13175 passed, 0 failed, 939 skipped` receipt belongs to the preceding repair verification and is not a new review result. Native Windows, actual terminal graphics pixels, production Cloudflare, Nix, fish and live SSH proof remain unavailable.
+
+### Scope Integrity and Artifacts
+
+- Complete tracked-change digest: `7530c9dbb250c3d9075ddfead3a596f3dd5dc593327df1098d99dcb635f6e359`.
+- Captured diff SHA-256: `f105bc651a52e209aaaf34fcac5c38886a98897c7ec08ff1a7784908a1284297`.
+- The pre-existing dirty ledger was frozen before this attempt. This new appendix was not part of reviewer input. No historical bytes are rewritten.
+- Run artifacts: `/tmp/compound-engineering-501/ce-code-review/20261031-complete-93e5f034`. See `failed-review-receipt.json`, `initial-reviewer-failures.json`, `transport-stop-receipts.json`, `transport-failure-disposition.json`, `partition-coverage.json`, the captured manifest/snapshot and `metadata.json`.
+
+---
+
+### Verdict
+
+**NOT READY / COMPLETE REVIEW NOT PERFORMED.** The requested full review remains blocked by reviewer transport failure. Restore a working review channel and rerun the frozen complete scope; do not use this failed attempt as merge approval. Historical blockers #2 and #24 remain unclosed.
+
+### Actionable Recap
+
+1. Review infrastructure: rerun the complete 1558-path scope after the transport is usable. Required review work, not a source finding.
+2. Historical P1 #2, `packages/chord/src/manager.ts:265`: Windows descendant ownership and native termination proof; design/implementation gate remains.
+3. Historical P2 #24, `packages/chord/src/connection.ts:942`: coordinated candidate binding across reload commit/abort; design/implementation gate remains.
+
+## Retained blocker reassessment after failed review - 93e5f034
+
+User requested fixes after the failed complete-review attempt. That attempt produced zero usable independent reports, so it provides no new validated finding queue. Its 1558-path frozen input included the pre-existing dirty closure ledger; it was not a clean code-only diff.
+
+### #2 Windows worker process-tree lifetime - not fixed
+
+- `packages/chord/src/manager.ts:203` starts the worker with Node `fork`; no creation-owned Job is attached. The graceful exit branch at lines 265-268 can settle `Instance.exited` without descendant termination.
+- The existing kill-on-close Job implementation belongs to the Rust env daemon, not the Chord Node IPC worker launcher. Reusing it would require a new launcher/IPC ownership architecture; depending on the TUI native module would put platform process control in the wrong dependency layer.
+- A correct implementation must create the worker inside a noninheritable kill-on-close Job before user code executes, terminate remaining descendants on normal/fatal/crash/parent-loss paths, and wait for zero active Job processes before replacement. Native Windows tests must exercise immediate descendants, detached descendants, parent death and replacement.
+- No Windows execution host is configured in this session. The repository does have a Windows `chord-native` CI matrix, but it was not executed here. No delayed Job assignment or taskkill-after-exit fallback was added.
+
+### #24 Coordinated breaking-reload binding - reproduced, not fixed
+
+A throwaway script used the real Chord runtime and a memory link: server provider v1 and worker consumer v1 were upgraded together to v2 with `remote: { worker: ["consumer"] }`. Observed result:
+
+```json
+{"success":false,"code":"contract_mismatch","message":"contract_mismatch: reload aborted: contract_mismatch: repro.provider: provider version 2, consumer version 1, no accepts adapter","versions":[1,1],"oldStillUsable":"old"}
+```
+
+- `SelfImpl.get` passes candidate intent to `HostImpl.acquire`, but remote routing at `host.ts:583` drops it; `connection.ts:942` always acquires against the committed provider. LSP found eight `acquire` references.
+- `reload.ts:514-529` computes dropped references only from local candidate declarations. It cannot exclude an old remote hold that another participant replaces in the same transaction. LSP found the prepare call and declaration of `checkRefs`.
+- The current `hold` schema has no transaction-scoped candidate/drop identity. Fixing only the candidate flag or skipping `checkRefs` would either leave preparation blocked or violate committed-provider isolation for ordinary/client holds.
+- The required protocol must bind trusted participant candidate holds privately, carry replacement/drop intent, supply private migrated/derived candidate state for readiness, validate surviving holds after participant intent collection, then activate on commit or remove all private authority on abort/disconnect. This complete contract and implementation were not introduced in this session. No partial protocol bump or acknowledgement is claimed as a fix.
+
+### Verification and disposition
+
+The actual reproduction ran with `node --conditions=source`, exited 0 after reporting the expected failure, and closed both hosts in `finally`. The temporary script was removed. Exact evidence and prerequisites: `/tmp/pi-retained-blockers-93e5/reassessment.json`. No product or permanent test files changed; no build, full tests or `npm run check` were run for this investigation. Earlier green receipts are not new proof.
+
+**Not fixed:** both historical blockers remain open. No new successful repair, commit, push or merge-readiness claim.
+
