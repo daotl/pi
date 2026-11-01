@@ -474,6 +474,10 @@ export function createHostManager(options: HostManagerOptions): HostManager {
 			await current.exited;
 			throw failure;
 		}
+		if (instance !== current) {
+			const exit = await current.exited;
+			throw new ChordError("unavailable", `child exited before ready (${exit.code ?? exit.signal})`);
+		}
 		booting = false;
 		if (report.activeCalls + report.viewers + report.durableTasks === 0) idleSince ??= Date.now();
 		status = "running";

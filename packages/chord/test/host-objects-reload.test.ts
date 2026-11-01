@@ -10,6 +10,7 @@ import {
 	local,
 	memoryLinkPair,
 	method,
+	opaque,
 	type Self,
 } from "../src/index.ts";
 
@@ -410,4 +411,106 @@ for (const initial of ["referenced", "host"] as const) {
 		}
 		assert.deepEqual(errors, []);
 	});
+}
+
+for (const identity of ["guest", "nondefault-input"] as const) {
+	for (const status of ["live", "activating"] as const) {
+		test(`referenced-to-host rejects a ${status} ${identity} object until it drains, then preserves the canonical singleton`, async () => {
+			const errors: unknown[] = [];
+			const host = new HostImpl({ self: "host", onError: (error) => errors.push(error) });
+			const entered = Promise.withResolvers<void>();
+			const resume = Promise.withResolvers<void>();
+			onTestFinished(async () => {
+				resume.resolve();
+				await host.close();
+			});
+			type Seen = { principal: unknown; scope: string | undefined; lifetime: "referenced" | "host" };
+			const Kept = local(`t.promote-${identity}-${status}`, {
+				version: 1,
+				input: Type.Object({ scope: Type.Optional(Type.String({ default: "all" })) }),
+				members: { seen: opaque<Seen>("t.promotion-identity@1") },
+			});
+			const Entries = defineRegistry<Seen>(`t.promote-${identity}-${status}-entries`);
+			let opened = 0;
+			const facet = (lifetime: "referenced" | "host"): Facet => ({
+				name: "kept",
+				setup: ({ serve }) =>
+					serve(
+						Kept,
+						(input, principal, self) => {
+							const seen = { principal, scope: input.scope, lifetime };
+							self.resource("life", {
+								version: 1,
+								open: async () => {
+									opened++;
+									if (status === "activating" && (principal === "guest" || input.scope === "other")) {
+										entered.resolve();
+										await resume.promise;
+									}
+								},
+							});
+							if (lifetime === "host") self.register(Entries, { current: seen });
+							return { seen };
+						},
+						{ lifetime },
+					),
+			});
+			await host.install(facet("referenced"));
+			const canonical = await host.get(Kept, { scope: "all" });
+			const canonicalObject = host.objects.get(host.addressOf(Kept, {}, host.principal))!;
+			const noncanonical = host.hold(
+				Kept,
+				identity === "guest" ? {} : { scope: "other" },
+				identity === "guest" ? { principal: "guest" } : undefined,
+			);
+			if (status === "activating") await entered.promise;
+			else await noncanonical.ready;
+			const noncanonicalObject = [...host.objects.values()].find((object) => object !== canonicalObject)!;
+			assert.equal(noncanonicalObject.status, status);
+			const codeVersion = host.codeVersion;
+			const reloading = host.reload([facet("host")]);
+			try {
+				await assert.rejects(
+					Promise.race([
+						reloading,
+						(async () => {
+							for (let turn = 0; turn < 100; turn++) await new Promise<void>((resolve) => setImmediate(resolve));
+							throw new Error("lifetime conflict waited for activation");
+						})(),
+					]),
+					(error) => isChordError(error, "upgrade_conflict"),
+				);
+			} finally {
+				resume.resolve();
+				await reloading.catch(() => {});
+			}
+			await noncanonical.ready;
+			assert.equal(host.codeVersion, codeVersion);
+			assert.equal(canonicalObject.hostLifetime, false);
+			assert.equal(noncanonicalObject.hostLifetime, false);
+			assert.equal(host.hostObjects.has(Kept.name), false);
+			assert.equal(host.registry(Entries).get("current"), undefined);
+			assert.deepEqual(noncanonical.seen, {
+				principal: identity === "guest" ? "guest" : "host",
+				scope: identity === "guest" ? "all" : "other",
+				lifetime: "referenced",
+			});
+			assert.equal(canonical.seen?.lifetime, "referenced");
+			noncanonical.release();
+			await noncanonicalObject.dispose(false);
+			await host.reload([facet("host")]);
+			await host.ready();
+			const guest = await host.get(Kept, {}, { principal: "guest" });
+			assert.equal(host.hostObjects.get(Kept.name)?.object, canonicalObject);
+			assert.deepEqual([...host.objects.values()], [canonicalObject]);
+			assert.deepEqual(canonical.seen, { principal: "host", scope: "all", lifetime: "host" });
+			assert.equal(guest.seen, canonical.seen);
+			assert.equal(host.registry(Entries).get("current"), canonical.seen);
+			assert.equal(opened, 2, "the canonical resource survives promotion without reopening");
+			canonical.release();
+			guest.release();
+			assert.equal(canonicalObject.status, "live");
+			assert.deepEqual(errors, []);
+		});
+	}
 }

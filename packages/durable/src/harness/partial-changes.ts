@@ -32,6 +32,7 @@ type ToolCallCommit = {
 /** What a tracked tool call changed since the last commit, and whether any commit took its changes yet. */
 type ToolCallState = {
 	readonly parser: StreamingJsonParser;
+	aligned: boolean;
 	changes: JsonChange[];
 	exact: boolean;
 	committed: boolean;
@@ -46,8 +47,8 @@ type ToolCallState = {
  *   plus the deltas has the new string's length, and compares otherwise. A block's `*_end` event drops them, because
  *   providers may replace the text when a block ends.
  * - Tool-call arguments starting empty: a `StreamingJsonParser` per call, fed with each `toolcall_delta`, reports what
- *   each piece changed. The commit applies those changes and leaves arguments out of the message assignment.
- *   Calls starting with nonempty arguments retain provider snapshots: subsequent deltas omit their initial prefix.
+ *   each piece changed. Before trusting edits, its first nonempty object is compared once with the provider snapshot.
+ *   An empty start snapshot can hide an omitted JSON prefix. Unaligned calls retain snapshots for the rest of the call.
  *   Pending scalars, depth-limited previews and copy-credit lag retain provider snapshots when parser edits are not
  *   exact. Those commits reconcile their snapshots; later exact deltas resume append tracking from that snapshot.
  *   `toolcall_end` ends the tracking; the call's last commit assigns its final arguments.
@@ -76,6 +77,7 @@ export class PartialChanges {
 				}
 				this.#toolCalls.set(event.contentIndex, {
 					parser: new StreamingJsonParser(),
+					aligned: false,
 					changes: [],
 					exact: true,
 					committed: false,
@@ -95,7 +97,23 @@ export class PartialChanges {
 				}
 				// Match the provider's one snapshot per append, keeping both parsers' copy credit in step. This also
 				// detects stale previews: parse edits alone can be exact while the provider snapshot still lags.
-				call.parser.snapshot();
+				const snapshot = call.parser.snapshot();
+				if (
+					!call.aligned &&
+					typeof snapshot === "object" &&
+					snapshot !== null &&
+					!Array.isArray(snapshot) &&
+					Object.keys(snapshot).length > 0
+				) {
+					const block = event.partial.content[event.contentIndex];
+					// Compare only the first nonempty object, never growing arguments on every delta. Empty snapshots
+					// cannot prove alignment: Responses can omit an incomplete object or non-object root prefix.
+					if (block?.type !== "toolCall" || JSON.stringify(snapshot) !== JSON.stringify(block.arguments)) {
+						this.#toolCalls.delete(event.contentIndex);
+						return;
+					}
+					call.aligned = true;
+				}
 				call.exact &&= call.parser.changesMatchSnapshot;
 				return;
 			}
@@ -124,7 +142,7 @@ export class PartialChanges {
 			const block = message.content[index];
 			// A tracked call is the tool call its `toolcall_start` named; the narrowing only tells TypeScript.
 			if (block?.type !== "toolCall") continue;
-			toolCalls.set(index, { changes: call.changes, snapshot: block.arguments, exact: call.exact });
+			toolCalls.set(index, { changes: call.changes, snapshot: block.arguments, exact: call.aligned && call.exact });
 			block.arguments = {};
 			blocks.set(index, { kind: "fields", fields: new Map([["arguments", { kind: "keep" }]]) });
 			call.changes = [];

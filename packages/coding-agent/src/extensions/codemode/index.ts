@@ -9,7 +9,7 @@
 import type { ExtensionAPI, ExtensionFactory } from "../../core/extensions/types.ts";
 import { SETTINGS_DEFAULTS } from "../../core/settings-defaults.ts";
 import type { CodemodeMode } from "../../core/settings-manager.ts";
-import { createCodemodeToolDefinition } from "./tool.ts";
+import { type CodemodeToolOptions, createCodemodeToolDefinition } from "./tool.ts";
 
 export interface CodemodeExtensionOptions {
 	/** Overrides the `codemode.mode` setting. */
@@ -18,6 +18,8 @@ export interface CodemodeExtensionOptions {
 	inlineBudget?: number;
 	/** Expose the model catalog and classifiers to scripts as `models`. Default: `true`. */
 	models?: boolean;
+	/** Save original image bytes at a tools-readable path; throw on failure. Default: a local temp file. */
+	saveImage?: CodemodeToolOptions["saveImage"];
 }
 
 function readMode(pi: ExtensionAPI): CodemodeMode {
@@ -35,6 +37,7 @@ export function createCodemodeExtension(options: CodemodeExtensionOptions = {}):
 			...createCodemodeToolDefinition({
 				appendEntry: (customType, data) => pi.appendEntry(customType, data),
 				models: options.models ?? true,
+				saveImage: options.saveImage,
 				getToolNamespace: (name) => pi.getAllTools().find((tool) => tool.name === name)?.namespace,
 				getToolGuidelines: () =>
 					new Map(pi.getAllTools().map((tool) => [tool.name, tool.promptGuidelines ?? []] as const)),

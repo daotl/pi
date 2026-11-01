@@ -798,7 +798,9 @@ describe("Session worker native channels", () => {
 			const failure = disposal.catch((error: unknown) => error);
 			await closing.promise;
 			expect(services.dispose()).toBe(disposal);
-			expect(closed).toEqual([]);
+			// Host cancellation starts immediately; loaders must outlive blocked attachment cleanup.
+			expect(closed).not.toContain("loader");
+			expect(closed).not.toContain("attachment");
 			finishClose.resolve();
 			const error = await failure;
 			const flatten = (value: unknown): unknown[] =>

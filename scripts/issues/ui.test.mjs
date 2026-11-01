@@ -67,6 +67,51 @@ test("only the newest deferred snapshot can install after focus leaves a select"
 	assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 30/);
 });
 
+for (const failure of ["http", "network"]) {
+	test(`a failed ${failure} poll keeps category decisions authoritative over later stale refreshes`, async () => {
+		const ui = harness();
+		await ui.respond(ui.requests[0], snapshot([issue(10)]));
+		ui.poll();
+		ui.focusCategory(10);
+		ui.requests[1].resolve(failure === "http"
+			? { ok: false, status: 503, text: async () => "unavailable" }
+			: Promise.reject(new Error("offline")));
+		await tick();
+		assert.match(ui.nodes.status.innerHTML, /State refresh failed/);
+		ui.nodes.sync.retry();
+		await ui.respond(ui.requests[2], snapshot([issue(99)]));
+		ui.changeCategory("features");
+		assert.deepEqual(ui.requests[3].body, { number: 10, category: "features" });
+		await ui.blurCategory();
+		await ui.respond(ui.requests[3]);
+		const updated = issue(10); updated.decision = { category: "features" };
+		await ui.respond(ui.requests[4], snapshot([updated]));
+		assert.match(ui.nodes.main.innerHTML, /features ✎/);
+		assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 99/);
+		assert.doesNotMatch(ui.nodes.status.innerHTML, /State refresh failed/);
+	});
+}
+
+for (const action of ["retriage", "sync"]) {
+	test(`a category decision supersedes the deferred refresh of an unrelated ${action}`, async () => {
+		const ui = harness();
+		await ui.respond(ui.requests[0], snapshot([issue(10), issue(20)]));
+		if (action === "sync") ui.nodes.sync.retry();
+		else ui.click({ act: action, n: "20" });
+		ui.focusCategory(10);
+		await ui.respond(ui.requests[1]);
+		await ui.respond(ui.requests[2], snapshot([issue(99)]));
+		ui.changeCategory("features");
+		assert.deepEqual(ui.requests[3].body, { number: 10, category: "features" });
+		await ui.blurCategory();
+		await ui.respond(ui.requests[3]);
+		const updated = issue(10); updated.decision = { category: "features" };
+		await ui.respond(ui.requests[4], snapshot([updated, issue(20)]));
+		assert.match(ui.nodes.main.innerHTML, /features ✎/);
+		assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 99/);
+	});
+}
+
 test("bulk none decides only done suggestions in the displayed category", async () => {
 	const ui = harness();
 	await ui.respond(ui.requests[0], snapshot([issue(1), issue(2, "queued"), issue(3, "running"), issue(4, "failed"), issue(5, "done", "none", "features")]));

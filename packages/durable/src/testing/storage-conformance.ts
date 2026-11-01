@@ -700,6 +700,50 @@ export function createStorageConformance(options: StorageConformanceOptions): re
 			}
 		}),
 
+		...(["conversation", "task", "submission"] as const).map((kind) =>
+			createCase(
+				options,
+				`scans the maximum safe ${kind} ID and excludes it after a descending cursor`,
+				async (storage) => {
+					const rootId = await createRoot(storage);
+					const writes: StorageWrite[] = [];
+					for (const number of [2, Number.MAX_SAFE_INTEGER]) {
+						if (kind === "conversation") {
+							writes.push({ type: "conversation", value: { id: idFromNumber<ConversationId>(number) } });
+						} else if (kind === "task") {
+							writes.push({ type: "task", value: pendingTask(idFromNumber<TaskId<JsonValue>>(number), rootId) });
+						} else {
+							writes.push({
+								type: "submission",
+								value: {
+									id: idFromNumber<SubmissionId>(number),
+									conversationId: rootId,
+									type: "input",
+									status: "queued",
+								},
+							});
+						}
+					}
+					await storage.commit(writes, adopt, context);
+					const scan = (order: ScanOrder, limit: number, cursor?: Cursor): Promise<Page<Identified, Cursor>> => {
+						if (kind === "conversation") return storage.scanConversations({ order }, limit, cursor, context);
+						if (kind === "task") return storage.scanTasks({ order }, limit, cursor, context);
+						return storage.scanSubmissions({ order }, limit, cursor, context);
+					};
+					const ascending =
+						kind === "conversation" ? [rootId, 2, Number.MAX_SAFE_INTEGER] : [2, Number.MAX_SAFE_INTEGER];
+					expect((await scan("ascending", 10)).items.map(({ id }) => id)).toEqual(ascending);
+					expect((await scan("descending", 10)).items.map(({ id }) => id)).toEqual([...ascending].reverse());
+					const first = await scan("descending", 1);
+					expect(first.items.map(({ id }) => id)).toEqual([Number.MAX_SAFE_INTEGER]);
+					expect(first.next).toBeDefined();
+					const next = await scan("descending", 10, first.next);
+					expect(next.items.map(({ id }) => id)).toEqual(ascending.slice(0, -1).reverse());
+					expect(next.next).toBeUndefined();
+				},
+			),
+		),
+
 		createCase(options, "replaces complete task records and pages filtered task scans", async (storage) => {
 			const rootId = await createRoot(storage);
 			const firstId = await storage.mintId<TaskId<JsonValue>>();

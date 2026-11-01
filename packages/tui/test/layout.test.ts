@@ -6,7 +6,7 @@ import { Text } from "../src/components/text.ts";
 import { VStack } from "../src/components/v-stack.ts";
 import { renderLayoutFrame } from "../src/layout.ts";
 import { encodeKitty, registerKittyImageMetadata } from "../src/terminal-image.ts";
-import { setWrapLinesToWidth, stripTerminalSequences } from "../src/utils.ts";
+import { setWrapLinesToWidth, stripTerminalSequences, terminalLineRows } from "../src/utils.ts";
 
 function visibleLines(lines: string[]): string[] {
 	return lines.map((line) => stripTerminalSequences(line).trimEnd());
@@ -144,6 +144,44 @@ describe("viewport layout", () => {
 
 		assert.ok(frame.lines[2]?.includes("y=0,h=34,r=1"));
 	});
+
+	for (const [forward, offset, scrollWidth, scrollbar, expectedColumn] of [
+		[2, 0, 10, "hidden", 4],
+		[99, 3, 8, "always", 9],
+	] as const) {
+		it(`preserves a scrolled Kitty anchor after CUF ${forward} in its local content width`, () => {
+			const imageId = 125 + offset;
+			const sequence = encodeKitty("AAAA", { columns: 1, rows: 3, imageId, moveCursor: false });
+			registerKittyImageMetadata({ imageId, columns: 1, rows: 3, widthPx: 10, heightPx: 90 });
+			const transcript = new ScrollView(
+				{
+					render: () => [`ab\x1b[${forward}C${sequence}`, "", "", "after"],
+					invalidate: () => {},
+				},
+				{ scrollbar },
+			);
+			const root =
+				offset === 0
+					? transcript
+					: new HStack([
+							{ component: new Text("L\nL", 0, 0), basis: offset, shrink: 0 },
+							{ component: transcript, basis: scrollWidth, shrink: 0 },
+						]);
+			const width = offset + scrollWidth;
+			renderLayoutFrame(root, width, 2, () => {});
+			transcript.scrollBy(1);
+			const frame = renderLayoutFrame(root, width, 2, () => {});
+			const line = frame.lines[0]!;
+			const imageStart = line.indexOf("\x1b_G");
+			assert.ok(imageStart >= 0, "the offscreen anchor must replay its visible continuation");
+			const cursor = { index: imageStart, row: 0, col: 0 };
+			terminalLineRows(line, width, cursor);
+			assert.strictEqual(cursor.col, expectedColumn);
+			assert.strictEqual(cursor.row, 0);
+			assert.ok(line.includes("y=30,h=60,r=2"));
+			assert.ok(!line.includes("ab"), "offscreen text is not replayed with the cropped graphics");
+		});
+	}
 
 	it("composes horizontal children at allocated widths", () => {
 		const frame = renderLayoutFrame(

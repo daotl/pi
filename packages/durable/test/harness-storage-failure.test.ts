@@ -574,41 +574,80 @@ describe("listener and report errors", () => {
 		await harness.close(context);
 	});
 
-	it("faults only the task, and ends only the watch, for a thrown value that cannot be formatted", async () => {
-		const unformattable = Object.create(null) as object;
-		const Throws = defineTask<null, { phase: "work" }, null>({
-			name: "test.throws-unformattable",
-			version: 1,
-			initial: () => ({ phase: "work" }),
-			phases: {
-				work: async () => {
-					throw unformattable;
+	for (const [name, createFailure] of [
+		["a null-prototype object", () => Object.create(null) as object],
+		[
+			"throwing coercion and toStringTag",
+			() => ({
+				[Symbol.toPrimitive]() {
+					throw new Error("coercion failed");
 				},
+				get [Symbol.toStringTag]() {
+					throw new Error("tag failed");
+				},
+			}),
+		],
+		[
+			"a revoked proxy",
+			() => {
+				const { proxy, revoke } = Proxy.revocable({}, {});
+				revoke();
+				return proxy;
 			},
-			abort: async () => {},
+		],
+		[
+			"a throwing Error.message getter",
+			() =>
+				Object.defineProperty(new Error(), "message", {
+					get() {
+						throw new Error("message failed");
+					},
+				}) as Error,
+		],
+	] as const) {
+		it(`faults only the task, and ends only the watch, for ${name}`, async () => {
+			const failure = createFailure();
+			const Throws = defineTask<null, { phase: "work" }, null>({
+				name: "test.throws-unformattable",
+				version: 1,
+				initial: () => ({ phase: "work" }),
+				phases: {
+					work: async () => {
+						throw failure;
+					},
+				},
+				abort: async () => {},
+			});
+			const opened = await openTasks(new MemoryStorage(), [Throws]);
+			try {
+				const root = await opened.harness.root(context);
+				const watch = (await opened.harness.watchDoc(LiveDoc, root.id, context))!;
+				watch.start(async () => {
+					throw failure;
+				});
+				const id = await root.commit(
+					(tx) => tx.createTask(Throws, null, { ownership: { kind: "conversation" } }),
+					context,
+				);
+				opened.harness.resume();
+				expect((await opened.harness.waitForTask(id, context)).state.outcome).toEqual({
+					status: "faulted",
+					error: { message: expect.any(String) },
+				});
+				await root.commit(async (tx) => {
+					(await tx.doc(LiveDoc, root.id)).compactions = [];
+				}, context);
+				expect((await watch.closed).reason).toBe("listener_error");
+				expect(opened.reports[0]).toBe(failure);
+				expect(opened.reports[1]).toBe(failure);
+				expect(opened.infos.map((info) => info.type).sort()).toEqual(["listener_error", "task_faulted"]);
+				const entry = await root.commit((tx) => tx.appendEntry(root.id, { kind: "note.after-fault" }), context);
+				expect((await root.entries({}, 10, undefined, context)).items).toContainEqual(entry);
+			} finally {
+				await opened.harness.close(context);
+			}
 		});
-		const opened = await openTasks(new MemoryStorage(), [Throws]);
-		const root = await opened.harness.root(context);
-		const watch = (await opened.harness.watchDoc(LiveDoc, root.id, context))!;
-		watch.start(async () => {
-			throw unformattable;
-		});
-		const id = await root.commit(
-			(tx) => tx.createTask(Throws, null, { ownership: { kind: "conversation" } }),
-			context,
-		);
-		opened.harness.resume();
-		expect((await opened.harness.waitForTask(id, context)).state.outcome).toEqual({
-			status: "faulted",
-			error: { message: "[object Object]" },
-		});
-		await root.commit(async (tx) => {
-			(await tx.doc(LiveDoc, root.id)).compactions = [];
-		}, context);
-		expect(await watch.closed).toMatchObject({ reason: "listener_error" });
-		await expect(root.commit((tx) => tx.appendEntry(root.id, { kind: "note" }), context)).resolves.toBeDefined();
-		await opened.harness.close(context);
-	});
+	}
 
 	it("reports a throwing clock once, also when the report handler reads the clock again", () => {
 		const reports: unknown[] = [];

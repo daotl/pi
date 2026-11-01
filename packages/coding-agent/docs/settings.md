@@ -60,6 +60,8 @@ This replaces `bash` with `powershell` and enables `grep`: `["-bash", "+powershe
 
 Tools selected by `defaultTools`, including newly added tools on `/reload`, remain selected until they register, even when registered inactive. An explicit loadout that deactivates a tool, or the next agent run, clears selections still waiting for registration. On resume, the transcript's recorded loadout replaces configured defaults; invocation `+name` and `-name` entries still apply.
 
+On resume and tree navigation, tools removed on the selected branch stay inactive even if they register later, for example during `session_start` or an MCP connection. Previously unmentioned direct tools still activate normally. This restored registration state, like pending selections, is replaced by a loadout that deactivates a tool and cleared when the next agent run starts. Explicitly enabling a registered tool overrides its restored removal.
+
 CLI tool options override this setting for one invocation. `--tools` with only `+name` and `-name` entries changes the resolved `defaultTools` selection instead, for example `pi --tools +codemode`. On `/reload`, these entries apply to the reloaded setting too, so a tool removed with `-name` stays removed. See [Command Line](cli.md#tools).
 
 ## Sessions and context

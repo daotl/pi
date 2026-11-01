@@ -326,7 +326,7 @@ async function readCommands(
 	handlers: {
 		onShutdown(): void;
 		onDiscovery(): void;
-		onDemand(command: Extract<SessionWorkerCommand, { type: "session_demand" }>): Promise<void>;
+		onDemand(command: Extract<SessionWorkerCommand, { type: "session_demand" }>): void;
 		onFrame(command: Static<typeof WorkerFrameSchema>): void;
 		onServerConnected(serverConnectionId: string): void;
 		onServerDisconnected(serverConnectionId: string): void;
@@ -348,9 +348,12 @@ async function readCommands(
 		}
 		if (message.type !== "message" || !Check(SessionWorkerCommandSchema, message.payload)) continue;
 		const command: SessionWorkerCommand = message.payload;
-		if (command.type === "shutdown") handlers.onShutdown();
-		else if (command.type === "discover_workers") handlers.onDiscovery();
-		else if (command.type === "session_demand") await handlers.onDemand(command);
+		if (command.type === "shutdown") {
+			handlers.onShutdown();
+			return;
+		}
+		if (command.type === "discover_workers") handlers.onDiscovery();
+		else if (command.type === "session_demand") handlers.onDemand(command);
 		else handlers.onFrame(command);
 	}
 }
@@ -525,13 +528,24 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 	}
 
 	let removeLifecycleListeners: (() => void)[] = [];
+	const demandOperations = new Map<string, Promise<void>>();
 	let closing: Promise<void> | undefined;
 	const close = (): Promise<void> => {
 		if (closing) return closing;
 		lifecycle?.close();
 		for (const remove of removeLifecycleListeners) remove();
 		removeLifecycleListeners = [];
-		closing = closeResources({ harness, services, repo, executionEnv, releaseOwnership });
+		closing = (async () => {
+			// Start service shutdown before joining demand cleanup: it cancels native
+			// activations and calls that those operations may be waiting for.
+			const results = await Promise.allSettled([
+				closeResources({ harness, services, repo, executionEnv, releaseOwnership }),
+				...demandOperations.values(),
+			]);
+			const errors = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
+			if (errors.length === 1) throw errors[0];
+			if (errors.length > 1) throw new AggregateError(errors, "Session worker cleanup failed");
+		})();
 		return closing;
 	};
 	const closeAndExit = (): void => {
@@ -606,53 +620,68 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 	void readCommands(control, {
 		onShutdown: closeAndExit,
 		onDiscovery: announce,
-		onDemand: async (command) => {
+		onDemand: (command) => {
 			const releaseRetirement = lifecycle?.holdRetirement() ?? (() => {});
-			try {
-				try {
-					if (command.attached)
-						services.attach({
-							serverConnectionId: command.serverConnectionId,
-							attachmentId: command.attachmentId,
-						});
-					else {
-						await services.removeAttachments(
-							(scope) =>
-								scope.serverConnectionId === command.serverConnectionId &&
-								scope.attachmentId === command.attachmentId,
-						);
-						for (const [key, call] of activeCalls) {
-							if (
-								call.scope.serverConnectionId !== command.serverConnectionId ||
-								call.scope.attachmentId !== command.attachmentId
-							)
-								continue;
-							activeCalls.delete(key);
-							call.release();
+			const key = demandKey(command.serverConnectionId, command.attachmentId);
+			const previous = demandOperations.get(key) ?? Promise.resolve();
+			const operation = previous
+				.catch(() => {})
+				.then(async () => {
+					try {
+						try {
+							if (closing) throw new Error("Session worker is shutting down");
+							if (command.attached)
+								services.attach({
+									serverConnectionId: command.serverConnectionId,
+									attachmentId: command.attachmentId,
+								});
+							else {
+								await services.removeAttachments(
+									(scope) =>
+										scope.serverConnectionId === command.serverConnectionId &&
+										scope.attachmentId === command.attachmentId,
+								);
+								for (const [key, call] of activeCalls) {
+									if (
+										call.scope.serverConnectionId !== command.serverConnectionId ||
+										call.scope.attachmentId !== command.attachmentId
+									)
+										continue;
+									activeCalls.delete(key);
+									call.release();
+								}
+							}
+							if (closing) throw new Error("Session worker is shutting down");
+							lifecycle?.setDemand(command.serverConnectionId, command.attachmentId, command.attached);
+						} catch (error) {
+							await control.send({
+								type: "demand_rejected",
+								token,
+								sessionKey,
+								requestId: command.requestId,
+								message: error instanceof Error ? error.message : String(error),
+							});
+							return;
 						}
+						await control.send({
+							type: "demand_applied",
+							token,
+							sessionKey,
+							requestId: command.requestId,
+							attachmentId: command.attachmentId,
+							attached: command.attached,
+						});
+					} finally {
+						releaseRetirement();
 					}
-					lifecycle?.setDemand(command.serverConnectionId, command.attachmentId, command.attached);
-				} catch (error) {
-					await control.send({
-						type: "demand_rejected",
-						token,
-						sessionKey,
-						requestId: command.requestId,
-						message: error instanceof Error ? error.message : String(error),
-					});
-					return;
-				}
-				await control.send({
-					type: "demand_applied",
-					token,
-					sessionKey,
-					requestId: command.requestId,
-					attachmentId: command.attachmentId,
-					attached: command.attached,
 				});
-			} finally {
-				releaseRetirement();
-			}
+			demandOperations.set(key, operation);
+			void operation.then(
+				() => {
+					if (demandOperations.get(key) === operation) demandOperations.delete(key);
+				},
+				() => closeAndExit(),
+			);
 		},
 		onFrame: handleFrame,
 		onServerConnected: (serverConnectionId) => lifecycle?.serverConnected(serverConnectionId),

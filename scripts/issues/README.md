@@ -18,7 +18,7 @@ All state lives in `data/` (gitignored):
 - `triage.sqlite`: pi-durable storage with one conversation per triaged issue, the triage results, and your decisions in the `triage.state` document
 - `token`: the UI access token
 
-Restarting the server resumes any triage runs that were in flight.
+Restarting the server resumes any triage runs that were in flight. If a recovered run finishes before its queued runner claims the issue, its completed result is retained rather than reclaimed.
 
 ## Files
 
@@ -57,3 +57,5 @@ The agent authenticates through `~/.pi/agent/auth.json`, the same credentials pi
 - `j`/`k`: move between issues
 - `0`, `1`, `n`: set p0, p1, none
 - `o`: open the issue on GitHub
+
+Background state refreshes and unrelated Sync or retriage completions leave a focused category selector in place, including when a refresh fails. Errors appear in the status line immediately; deferred controls and snapshots update after focus leaves all selectors. Submitting a decision still disables decision controls until an authoritative state refresh succeeds.

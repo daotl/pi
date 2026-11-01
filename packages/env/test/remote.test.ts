@@ -378,6 +378,63 @@ describe("RemoteExecutionEnv", () => {
 		}
 	});
 
+	it.each([1, 512 * 1024])(
+		"rejects a completed %i-byte binary read after cancellation and closes its handle",
+		async (size) => {
+			const { env, connection } = environment();
+			const path = join(env.cwd, "cancelled-read.bin");
+			writeFileSync(path, Buffer.alloc(size, 0x61));
+			const controller = new AbortController();
+			const request = connection.request.bind(connection);
+			let handle: number | undefined;
+			const gate = vi.spyOn(connection, "request").mockImplementation(async (op, json, options) => {
+				const reply = await request(op, json, options);
+				if (op === "open") handle = reply.json.handle as number;
+				if (op === "pread") controller.abort();
+				return reply;
+			});
+			try {
+				expect(await env.readBinaryFile(path, withAbortSignal(controller.signal, context))).toMatchObject({
+					ok: false,
+					error: { code: "aborted", path },
+				});
+				expect(handle).toBeDefined();
+				await expect(request("fstat", { handle })).rejects.toMatchObject({ code: "EBADF" });
+			} finally {
+				gate.mockRestore();
+			}
+		},
+	);
+
+	it.each(["binary", "text"] as const)(
+		"rejects cancelled unknown-size %s EOF and closes its handle",
+		async (encoding) => {
+			const { env, connection } = environment();
+			const path = join(env.cwd, "empty-read");
+			writeFileSync(path, "");
+			const controller = new AbortController();
+			const request = connection.request.bind(connection);
+			let handle: number | undefined;
+			const gate = vi.spyOn(connection, "request").mockImplementation(async (op, json, options) => {
+				const reply = await request(op, json, options);
+				if (op === "open") handle = reply.json.handle as number;
+				if (op === "pread" && reply.payload.length === 0) controller.abort();
+				return reply;
+			});
+			try {
+				const read = encoding === "binary" ? env.readBinaryFile.bind(env) : env.readTextFile.bind(env);
+				expect(await read(path, withAbortSignal(controller.signal, context))).toMatchObject({
+					ok: false,
+					error: { code: "aborted", path },
+				});
+				expect(handle).toBeDefined();
+				await expect(request("fstat", { handle })).rejects.toMatchObject({ code: "EBADF" });
+			} finally {
+				gate.mockRestore();
+			}
+		},
+	);
+
 	it.each([false, true])(
 		"stops cancellable writes at a held chunk boundary but finishes appends (%s)",
 		async (append) => {

@@ -96,7 +96,11 @@ const page = <T extends { readonly id: Id<string> }>(
 const scanSql = (start: ScanStart): { readonly clause: string; readonly param: number; readonly direction: string } =>
 	start.order === "ascending"
 		? { clause: "id > ?", param: start.after ?? -1, direction: "ASC" }
-		: { clause: "id < ?", param: start.after ?? Number.MAX_SAFE_INTEGER, direction: "DESC" };
+		: {
+				clause: start.after === undefined ? "id <= ?" : "id < ?",
+				param: start.after ?? Number.MAX_SAFE_INTEGER,
+				direction: "DESC",
+			};
 
 const scopeColumns = (scope: DocumentRecord["scope"]): ScopeColumns => {
 	switch (scope.kind) {

@@ -411,7 +411,10 @@ const IMAGE_EXTENSIONS: Record<string, string> = {
  * image but has no other way to reach its bytes: scripts cannot write files, and `write` only takes
  * text. Images shown more than once are saved once.
  */
-async function saveImages(items: (TextContent | ImageContent)[]): Promise<(TextContent | ImageContent)[]> {
+async function saveImages(
+	items: (TextContent | ImageContent)[],
+	saveImage: CodemodeToolOptions["saveImage"],
+): Promise<(TextContent | ImageContent)[]> {
 	const labels = new Map<string, Promise<string>>();
 	const label = async ({ data, mimeType }: ImageContent): Promise<string> => {
 		const bytes = Buffer.from(data, "base64");
@@ -421,7 +424,9 @@ async function saveImages(items: (TextContent | ImageContent)[]): Promise<(TextC
 		// A failed write (disk full, unwritable temp dir) must not discard the result of a script whose
 		// tool calls already ran, so it becomes part of the label.
 		try {
-			const path = await writeOutputFile("pi-codemode", extension, bytes);
+			const path = await (saveImage
+				? saveImage(bytes, extension)
+				: writeOutputFile("pi-codemode", extension, bytes));
 			return `[Image saved to ${path} (${kind})]`;
 		} catch (error) {
 			return `[Image (${kind}) could not be saved: ${error instanceof Error ? error.message : String(error)}]`;
@@ -638,7 +643,7 @@ export async function executeCodemode(
 	);
 	// After truncation, which joins the text items and moves images after them, so each path stays
 	// next to its image and is never cut.
-	const output = joinAdjacentText(await saveImages(truncated.items));
+	const output = joinAdjacentText(await saveImages(truncated.items, options.saveImage));
 	const wallTime = ((performance.now() - startedAt) / 1000).toFixed(1);
 	const header = `${result.ok ? "Script completed" : "Script failed"}\nWall time ${wallTime} seconds\nOutput:\n`;
 	const details = snapshot();

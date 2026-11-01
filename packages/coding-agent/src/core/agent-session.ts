@@ -642,6 +642,8 @@ export class AgentSession {
 	 * `setActiveToolsByName()` deactivates a tool or the next agent run starts.
 	 */
 	private _pendingToolNames = new Set<string>();
+	/** Names the restored branch added or removed, so late registration does not undo its loadout. */
+	private _restoredToolNames = new Set<string>();
 	private _usesDefaultTools: boolean;
 	private _defaultToolModifiers: string[];
 	/** Matches the `--tools` entries: tool names or patterns. */
@@ -1950,10 +1952,12 @@ export class AgentSession {
 	setActiveToolsByName(toolNames: string[]): void {
 		const previous = this.getActiveToolNames();
 		this._setActiveTools(toolNames);
-		// A loadout that deactivates a tool replaces the restored one, whose pending tools are dropped.
-		// One that only adds tools, like activating tool_search, keeps them.
+		// A loadout that deactivates a tool replaces the restored one; additions keep pending selections.
 		const active = new Set(this.getActiveToolNames());
-		if (previous.some((name) => !active.has(name))) this._pendingToolNames.clear();
+		if (previous.some((name) => !active.has(name))) {
+			this._pendingToolNames.clear();
+			this._restoredToolNames.clear();
+		}
 	}
 
 	private _setActiveTools(toolNames: string[]): void {
@@ -3264,6 +3268,7 @@ export class AgentSession {
 	 */
 	private _restoreToolsFromTranscript(modifiers: readonly string[] = [], persist = true): boolean {
 		this._pendingToolNames.clear();
+		this._restoredToolNames.clear();
 		const branchSystemMessages = this.sessionManager
 			.getBranch()
 			.flatMap((entry) =>
@@ -3279,14 +3284,16 @@ export class AgentSession {
 			: branchSystemMessages;
 		if (systemMessages.length === 0) return false;
 		// Earlier removals distinguish an intentionally disabled extension from a newly registered one.
-		const mentioned = new Set(
+		this._restoredToolNames = new Set(
 			[...systemMessages, ...branchSystemMessages].flatMap((message) =>
 				[...(message.toolsAdded ?? []), ...(message.toolsRemoved ?? [])].map((tool) => tool.name),
 			),
 		);
 		const newTools = [...this._toolRegistry.keys()].filter(
 			(name) =>
-				!mentioned.has(name) && !this._baseToolDefinitions.has(name) && this._isActivatedOnRegistration(name),
+				!this._restoredToolNames.has(name) &&
+				!this._baseToolDefinitions.has(name) &&
+				this._isActivatedOnRegistration(name),
 		);
 		const names = applyToolModifiers(
 			[...getCurrentTools(systemMessages).map((tool) => tool.name), ...newTools],
@@ -3653,6 +3660,7 @@ export class AgentSession {
 			// Only the captured prefix belongs to this request; callbacks may enqueue the next batch.
 			if (prepared.nextTurnMessageCount > 0) this._pendingNextTurnMessages.splice(0, prepared.nextTurnMessageCount);
 			this._pendingToolNames.clear();
+			this._restoredToolNames.clear();
 			preflightResult?.("started");
 			await this.agent.prompt(prepared.messages);
 			// Always restore a captured prefix before honoring cancellation after a retry.
@@ -6356,7 +6364,11 @@ export class AgentSession {
 			}
 		} else if (!options?.activeToolNames) {
 			for (const toolName of this._toolRegistry.keys()) {
-				if (!previousActivatedOnRegistration.has(toolName) && this._isActivatedOnRegistration(toolName)) {
+				if (
+					!previousActivatedOnRegistration.has(toolName) &&
+					!this._restoredToolNames.has(toolName) &&
+					this._isActivatedOnRegistration(toolName)
+				) {
 					nextActiveToolNames.push(toolName);
 				}
 			}

@@ -1,4 +1,4 @@
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import {
@@ -18,6 +18,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "../../src/core/extensions/types.ts";
 import type { CustomEntry } from "../../src/core/session-manager.ts";
+import { createReadTool } from "../../src/core/tools/read.ts";
 import { createToolDefinitionFromAgentTool } from "../../src/core/tools/tool-definition-wrapper.ts";
 import { readCodemodeStore } from "../../src/extensions/codemode/execute.ts";
 import { createCodemodeExtension } from "../../src/extensions/codemode/index.ts";
@@ -390,6 +391,112 @@ describe("AgentSession codemode tool", () => {
 		]);
 		expect(checkSavedImages(lines[2])).toBe("<saved>");
 		expect(result.content[2]).toEqual({ type: "image", data: TINY_PNG_BASE64, mimeType: "image/png" });
+	});
+
+	it("saves images where routed tools can read and copy the original bytes", async () => {
+		let remoteRoot = "";
+		const toRemote = (path: string) => join(remoteRoot, path);
+		const harness = await createHarness({
+			initialActiveToolNames: ["codemode", "read", "copy_image"],
+			extensionFactories: [
+				createCodemodeExtension({
+					saveImage: async (bytes, extension) => {
+						const path = `/remote-tmp/image${extension}`;
+						mkdirSync(toRemote("/remote-tmp"), { recursive: true });
+						writeFileSync(toRemote(path), bytes);
+						return path;
+					},
+				}),
+				(pi) => {
+					pi.registerTool(
+						createToolDefinitionFromAgentTool(
+							createReadTool("/workspace", {
+								autoResizeImages: false,
+								operations: {
+									access: async (path) => accessSync(toRemote(path)),
+									readFile: async (path) => readFileSync(toRemote(path)),
+									detectImageMimeType: async () => "image/png",
+								},
+							}),
+						),
+					);
+					pi.registerTool({
+						name: "copy_image",
+						label: "Copy image",
+						description: "Copy a file inside the routed filesystem",
+						parameters: Type.Object({ source: Type.String(), destination: Type.String() }),
+						async execute(_id, { source, destination }) {
+							copyFileSync(toRemote(source), toRemote(destination));
+							return { content: [{ type: "text", text: "copied" }], details: undefined };
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		remoteRoot = join(harness.tempDir, "remote-root");
+		mkdirSync(remoteRoot);
+		harness.setResponses([
+			fauxAssistantMessage(
+				[fauxToolCall("codemode", { code: `image("data:image/png;base64,${TINY_PNG_BASE64}");` })],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("done"),
+		]);
+		await harness.session.prompt("show the fixture");
+		const path = TINY_PNG_LABEL.exec(resultText(codemodeResult(harness)).split("\n")[0])?.[1];
+		if (!path) throw new Error("No saved image path");
+		try {
+			harness.setResponses([
+				fauxAssistantMessage(
+					[
+						fauxToolCall("codemode", {
+							code: `const image = await tools.read({ path: ${JSON.stringify(path)} });
+							text(image.data);
+							await tools.copy_image({ source: ${JSON.stringify(path)}, destination: "/copied.png" });`,
+						}),
+					],
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("done"),
+			]);
+			await harness.session.prompt("reuse the saved image");
+			expect(resultText(codemodeResult(harness))).toBe(TINY_PNG_BASE64);
+			expect(readFileSync(toRemote("/copied.png"))).toEqual(Buffer.from(TINY_PNG_BASE64, "base64"));
+		} finally {
+			// Also remove the host temp file when this regression is run against the unfixed implementation.
+			if (path !== "/remote-tmp/image.png") rmSync(path, { force: true });
+		}
+	});
+
+	it("reports a routed image save failure without advertising an inaccessible host file", async () => {
+		const harness = await createHarness({
+			initialActiveToolNames: ["codemode"],
+			extensionFactories: [
+				createCodemodeExtension({
+					saveImage: async () => {
+						throw new Error("remote filesystem unavailable");
+					},
+				}),
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(
+				[fauxToolCall("codemode", { code: `image("data:image/png;base64,${TINY_PNG_BASE64}");` })],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("done"),
+		]);
+		await harness.session.prompt("show the fixture");
+		const result = codemodeResult(harness);
+		try {
+			expect(resultText(result)).toContain("could not be saved: remote filesystem unavailable]");
+			expect(resultText(result)).not.toContain("[Image saved to ");
+			expect(result.content.at(-1)).toEqual({ type: "image", data: TINY_PNG_BASE64, mimeType: "image/png" });
+		} finally {
+			checkSavedImages(resultText(result));
+		}
 	});
 
 	it("marks where each text item starts and puts console lines last in one text block", async () => {

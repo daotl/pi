@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	allocateImageId,
 	cropKittyImageLine,
 	deleteKittyImage,
 	getKittyImagePlacement,
@@ -546,7 +547,27 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			this.terminal.write(`\x1b_Ga=d,d=i,i=${image.id},q=2\x1b\\`);
 			this.hiddenKittyImages.add(image.id);
 		}
-		this.paintViewportRows(reset, this.overlaidRows, false, imageCoverage, this.renderedOverlayImages);
+		// Reserve caller IDs before assigning anonymous replay IDs, including images
+		// emitted later in this frame. Component render caches remain untouched.
+		let overlayImages = this.renderedOverlayImages;
+		if (overlayImages.length > 0) {
+			const reservedIds = new Set(this.previousKittyImageIds);
+			for (const image of overlayImages) {
+				for (const id of extractKittyImageIds(image.line)) reservedIds.add(id);
+			}
+			overlayImages = overlayImages.map((image) => {
+				const header = parseKittyImageHeader(image.line);
+				if (!header || header.ids.length > 0) return image;
+				const start = image.line.indexOf(KITTY_SEQUENCE_PREFIX);
+				const end = image.line.indexOf(";", start);
+				if (!/(?:^|,)a=T(?:,|$)/.test(image.line.slice(start + KITTY_SEQUENCE_PREFIX.length, end))) return image;
+				let id = allocateImageId();
+				while (reservedIds.has(id)) id = allocateImageId();
+				reservedIds.add(id);
+				return { ...image, line: `${image.line.slice(0, end)},i=${id}${image.line.slice(end)}` };
+			});
+		}
+		this.paintViewportRows(reset, this.overlaidRows, false, imageCoverage, overlayImages);
 		if (overlayCursor) {
 			this.positionHardwareCursor(overlayCursor, {
 				offsets: Array.from({ length: height }, (_, row) => this.previousViewportTop + row),

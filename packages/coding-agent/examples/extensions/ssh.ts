@@ -14,10 +14,14 @@
  */
 
 import { spawn } from "node:child_process";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	type BashOperations,
 	createBashTool,
+	createCodemodeExtension,
 	createEditTool,
 	createReadTool,
 	createWriteTool,
@@ -26,14 +30,16 @@ import {
 	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 
-function sshExec(remote: string, command: string): Promise<Buffer> {
+function sshExec(remote: string, command: string, input?: Uint8Array): Promise<Buffer> {
 	return new Promise((resolve, reject) => {
-		const child = spawn("ssh", [remote, command], { stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn("ssh", [remote, command], { stdio: ["pipe", "pipe", "pipe"] });
 		const chunks: Buffer[] = [];
 		const errChunks: Buffer[] = [];
 		child.stdout.on("data", (data) => chunks.push(data));
 		child.stderr.on("data", (data) => errChunks.push(data));
 		child.on("error", reject);
+		child.stdin.on("error", reject);
+		child.stdin.end(input);
 		child.on("close", (code) => {
 			if (code !== 0) {
 				reject(new Error(`SSH failed (${code}): ${Buffer.concat(errChunks).toString()}`));
@@ -124,6 +130,26 @@ export default function (pi: ExtensionAPI) {
 	let resolvedSsh: { remote: string; remoteCwd: string } | null = null;
 
 	const getSsh = () => resolvedSsh;
+
+	// Replaces the CLI's codemode extension, keeping saved images in the same filesystem as read/bash.
+	createCodemodeExtension({
+		saveImage: async (bytes, extension) => {
+			const ssh = getSsh();
+			if (!ssh) {
+				if (pi.getFlag("ssh")) throw new Error("SSH routing has not initialized");
+				const dir = await mkdtemp(join(tmpdir(), "pi-codemode-"));
+				const path = join(dir, `image${extension}`);
+				await writeFile(path, bytes, { mode: 0o600, flag: "wx" });
+				return path;
+			}
+			const path = await sshExec(
+				ssh.remote,
+				`umask 077; dir=$(mktemp -d) && path="$dir/image${extension}" && cat > "$path" && printf '%s\\n' "$path"`,
+				bytes,
+			);
+			return path.toString().trim();
+		},
+	})(pi);
 
 	pi.registerTool({
 		...localRead,

@@ -134,7 +134,8 @@ function misplacedOptionsLine(input: string): number | undefined {
 		label: boolean;
 		conditionals: number;
 	}[] = [];
-	let control: false | "control" | "switch" = false;
+	let control: false | "control" | "switch" | "for" = false;
+	let pendingFor = false;
 	let member = false;
 	let label = false;
 	while (index < input.length) {
@@ -293,10 +294,15 @@ function misplacedOptionsLine(input: string): number | undefined {
 		if (char === "(") {
 			parentheses.push(
 				functionParameters ??
-					(classBody?.phase === "member" || directObject?.property ? "method" : control ? control : "expression"),
+					(classBody?.phase === "member" || directObject?.property
+						? "method"
+						: control === "for"
+							? "control"
+							: control || "expression"),
 			);
 			functionParameters = undefined;
 			control = false;
+			pendingFor = false;
 			expressionStart = true;
 			statementStart = false;
 			index++;
@@ -322,6 +328,7 @@ function misplacedOptionsLine(input: string): number | undefined {
 				expressionStart = false;
 				statementStart = false;
 				control = false;
+				pendingFor = false;
 				member = false;
 				continue;
 			}
@@ -341,12 +348,16 @@ function misplacedOptionsLine(input: string): number | undefined {
 			expressionStart =
 				statementKeyword ||
 				(!member && /^(?:return|throw|case|delete|void|typeof|new|in|of|yield|await|instanceof)$/.test(word));
+			// `for await` keeps the loop's control parentheses across the optional `await`.
 			control =
 				!member && word === "switch"
 					? "switch"
-					: !member && /^(?:if|while|for|with|catch)$/.test(word)
-						? "control"
-						: false;
+					: !member && (word === "for" || (word === "await" && pendingFor))
+						? "for"
+						: !member && /^(?:if|while|with|catch)$/.test(word)
+							? "control"
+							: false;
+			pendingFor = !member && word === "for";
 			// async can precede a function declaration without changing its statement context.
 			statementStart = statementKeyword || (!member && /^(?:async|export|default)$/.test(word) && statementStart);
 			member = false;
@@ -429,6 +440,7 @@ function misplacedOptionsLine(input: string): number | undefined {
 			statementStart = (char === ";" && !classBody) || labelColon || switchLabelColon;
 		}
 		control = false;
+		pendingFor = false;
 		member = char === "." || char === "#";
 		index++;
 	}

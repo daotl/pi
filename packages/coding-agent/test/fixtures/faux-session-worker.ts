@@ -63,16 +63,46 @@ const createFauxHarness: CreateSessionWorkerHarness = async (session, options) =
 				{ linger: 0 },
 			);
 			serve(KeyedProbe, ({ key }, _principal, self) => {
+				const cleanupDirectory = process.env.__PI_TEST_WORKER_CLEANUP_DIR;
+				if (cleanupDirectory !== undefined) {
+					self.resource("principal-cleanup", {
+						version: 1,
+						open: () => ({}),
+						close: async () => {
+							if (key === "gated-cleanup") {
+								await writeFile(join(cleanupDirectory, "cleanup-entered"), "closing");
+								while (true) {
+									try {
+										await access(join(cleanupDirectory, "allow-cleanup"));
+										break;
+									} catch (error) {
+										if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+									}
+									await new Promise<void>((resolve) => setTimeout(resolve, 10));
+								}
+								await writeFile(join(cleanupDirectory, "cleanup-finished"), "closed");
+							} else await writeFile(join(cleanupDirectory, "shutdown-entered"), "closing sibling");
+						},
+					});
+				}
 				const probe = self.get(ProbeState, { key }, { principal: "worker" });
 				return {
 					variant: "active",
 					state: probe.state,
 					replace: (value, ctx) => probe.replace(value, ctx),
+					echo: (value) => value,
 					async wait(ctx) {
 						ctx.signal.throwIfAborted();
-						await new Promise<void>((_resolve, reject) =>
-							ctx.signal.addEventListener("abort", () => reject(abortError(ctx.signal)), { once: true }),
-						);
+						if (cleanupDirectory !== undefined) await writeFile(join(cleanupDirectory, "wait-entered"), key);
+						try {
+							await new Promise<void>((_resolve, reject) => {
+								const abort = () => reject(abortError(ctx.signal));
+								if (ctx.signal.aborted) abort();
+								else ctx.signal.addEventListener("abort", abort, { once: true });
+							});
+						} finally {
+							if (cleanupDirectory !== undefined) await writeFile(join(cleanupDirectory, "wait-cancelled"), key);
+						}
 					},
 				};
 			});

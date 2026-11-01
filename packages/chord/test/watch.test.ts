@@ -476,6 +476,48 @@ describe("Watch ends", () => {
 		expect(end.reason).toBe("listener_error");
 		expect(end.reason === "listener_error" && end.error.message).toBe("plain");
 	});
+
+	for (const [name, createFailure] of [
+		[
+			"throwing coercion and toStringTag",
+			() => ({
+				[Symbol.toPrimitive]() {
+					throw new Error("coercion failed");
+				},
+				get [Symbol.toStringTag]() {
+					throw new Error("tag failed");
+				},
+			}),
+		],
+		[
+			"a revoked proxy",
+			() => {
+				const { proxy, revoke } = Proxy.revocable({}, {});
+				revoke();
+				return proxy;
+			},
+		],
+	] as const) {
+		it(`settles listener_error for ${name} without replacing the reported value`, async () => {
+			const failure = createFailure();
+			const { watch, recorded } = recordedWatch(0);
+			const settled = endOf(watch);
+			try {
+				watch.start(async () => {
+					throw failure;
+				});
+				watch.advance(1, [["r", 1]], context);
+				await flush();
+				expect(settled.end?.reason).toBe("listener_error");
+				if (settled.end?.reason === "listener_error") expect(settled.end.error).toBeInstanceOf(Error);
+				expect(recorded.reported[0]).toBe(failure);
+				expect(recorded.detached).toBe(1);
+				expect(await watch.stop()).toBe(settled.end);
+			} finally {
+				await watch.stop();
+			}
+		});
+	}
 });
 
 describe("Watch references", () => {

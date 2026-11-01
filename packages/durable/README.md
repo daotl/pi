@@ -518,6 +518,8 @@ Commits that land while a callback runs are delivered together in the next callb
 
 Partial answers and tool output are committed at most every 100 ms by default, and watches see each commit at once. Storage gets them later and together, as deferred commits (see [Your Own State](#your-own-state)): with the next commit that reads `pi.live`, such as the end of the answer or of a tool, and at the latest after `settings.progress.persistWithinMs` (default 1,000 ms). A crash loses at most about that window of an answer or of tool output; a stream that crashes in its first second may leave no aborted entry, and that attempt's usage is not recorded. `settings.progress` changes the intervals; a host whose storage is remote can commit less often, for example `{ partialIntervalMs: 500, outputIntervalMs: 500 }`.
 
+Streamed tool arguments keep the provider's partial snapshot authoritative, including when the provider starts with an incomplete JSON prefix. Incremental argument edits are used only after their parser aligns with that snapshot; otherwise snapshots are reconciled until the call ends. An interrupted partial retains the same argument nesting when reopened.
+
 ## Busy Conversations
 
 A conversation is busy while a run is working on an input. Submitting to a busy conversation queues the submission in the conversation's inbox, `docs["pi.inbox"]` in the view:
@@ -806,6 +808,8 @@ const usage = await harness.usage(context); // { models: { "openai/gpt-6-sol": U
 In a browser, open IndexedDB storage with `await IndexedDbStorage.open(name)`. One owner must hold the database at a
 time; use a [Web Lock](https://developer.mozilla.org/docs/Web/API/Web_Locks_API) around its lifetime rather than opening
 it in competing tabs or workers. Call `await navigator.storage.persist()` when durable retention matters.
+
+Conversation, task, and submission scans include every valid ID through `Number.MAX_SAFE_INTEGER` in either order. A continuation cursor excludes its last returned ID.
 
 SQLite storage can namespace its tables and indexes when sharing a database: pass `{ prefix: "pi_" }` to
 `SqliteStorage.open(database, options)`, `openNodeSqliteStorage(path, options)`, or

@@ -560,6 +560,21 @@ export class Reload {
 					(object.status === "live" || object.status === "activating"),
 			);
 			if (todo.length === 0) return;
+			// A lifetime promotion can preserve only the self/empty-input object. Check activating objects before
+			// awaiting them or running any candidate factory: neither may turn a guest/input object into a singleton.
+			for (const object of todo) {
+				const service = this.services.get(object.typeName)!;
+				if (
+					!object.hostLifetime &&
+					hostLifetime(service) &&
+					object.address !== this.host.addressOf(service.contract, {}, this.host.principal, true)
+				)
+					throw new ChordError(
+						"upgrade_conflict",
+						`${object.typeName} cannot become host-lifetime while noncanonical objects remain; drain them and retry`,
+						{ reason: "lifetime" },
+					);
+			}
 			await raceSignal(Promise.allSettled(todo.map((object) => object.ready)), this.abort.signal);
 			this.#alive();
 			for (const object of todo) {

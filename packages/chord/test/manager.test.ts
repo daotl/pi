@@ -522,6 +522,7 @@ function controlledDriver() {
 		instance: Instance;
 		emit(message: ControlMessage): void;
 		finish(): void;
+		fail(error: Error): void;
 		readonly killed: boolean;
 		readonly shutdown: boolean;
 	}[] = [];
@@ -552,6 +553,7 @@ function controlledDriver() {
 					for (const listener of controls) listener(message);
 				},
 				finish: () => exit.resolve({ code: 0, signal: null }),
+				fail: (error) => exit.reject(error),
 				get killed() {
 					return killed;
 				},
@@ -622,6 +624,40 @@ describe("manager terminal lifetime", () => {
 			await manager.stop();
 			assert.equal(manager.status, "stopped");
 			assert.equal(manager.liveness.booting, false);
+		});
+	}
+
+	for (const terminal of ["exit", "rejected exit"] as const) {
+		it(`${terminal} immediately after ready rejects the dead instance and permits a fresh start`, async () => {
+			const controlled = controlledDriver();
+			const manager = createHostManager({ driver: controlled.driver });
+			const adopted = controlled.next();
+			const started = manager.start();
+			const cleanupError = new Error("native tree cleanup failed during readiness");
+			const rejected = assert.rejects(started, (error) =>
+				terminal === "rejected exit" ? error === cleanupError : isChordError(error, "unavailable"),
+			);
+			await adopted;
+			const child = controlled.spawned[0]!;
+			child.emit({ type: "ready" });
+			if (terminal === "exit") child.finish();
+			else child.fail(cleanupError);
+			await rejected;
+			assert.equal(manager.status, "stopped");
+			assert.equal(manager.instance, undefined);
+			assert.equal(manager.liveness.booting, false);
+			const replacementSpawned = controlled.next();
+			const replacement = manager.start();
+			await replacementSpawned;
+			const fresh = controlled.spawned[1]!;
+			fresh.emit({ type: "ready" });
+			assert.equal(await replacement, fresh.instance);
+			assert.notEqual(fresh.instance, child.instance);
+			assert.equal(manager.instance, fresh.instance);
+			assert.equal(manager.status, "running");
+			const stopped = manager.stop();
+			fresh.finish();
+			await stopped;
 		});
 	}
 

@@ -110,6 +110,9 @@ async function bundlePluginPackage(packagePath: string, outdir: string): Promise
 		const result = await build({
 			entryPoints: [path],
 			bundle: true,
+			banner: {
+				js: 'import { createRequire as __piCreateRequire } from "node:module"; const require = __piCreateRequire(import.meta.url);',
+			},
 			write: false,
 			format: "esm",
 			platform: "node",

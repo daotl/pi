@@ -8,6 +8,7 @@ import {
 	getActiveBackgroundAnsi,
 	getGraphemeCellRange,
 	sliceByColumn,
+	terminalLineRows,
 	visibleWidth,
 } from "./utils.ts";
 
@@ -372,7 +373,9 @@ function paintBox(box: LayoutBox, screen: string[], totalWidth: number): void {
 				const visibleRows = Math.min(box.rect.height, metadata.rows - hiddenRows);
 				const cropped = cropKittyImageLine(imageLine, hiddenRows, visibleRows);
 				const imageStart = cropped.indexOf("\x1b_G");
-				const imageColumn = box.rect.x + visibleWidth(cropped.slice(0, imageStart));
+				const imageCursor = { index: imageStart, row: 0, col: 0 };
+				terminalLineRows(cropped.slice(0, imageStart), box.children[0]?.rect.width ?? box.rect.width, imageCursor);
+				const imageColumn = box.rect.x + imageCursor.col;
 				const controls = cropped.slice(imageStart).match(/^(?:\x1b_G[^\x1b]*\x1b\\)+/)?.[0];
 				if (controls) {
 					const row = screen[box.rect.y] ?? "";

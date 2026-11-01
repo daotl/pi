@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { ChordError, defineFacet, type Host, type JsonValue, local } from "@earendil-works/chord";
+import { ChordError, type Ctx, defineFacet, type Host, type JsonValue, local } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
 	CombinedAutocompleteProvider,
@@ -272,7 +272,8 @@ export class ExperimentalClientTui implements Component {
 								title: string,
 								items: readonly { value: string; label: string; description?: string }[],
 								selectedValue: string | undefined,
-							) => this.#select(title, items, selectedValue),
+								context: Ctx,
+							) => this.#select(title, items, selectedValue, context),
 							showStatus: (status: string) => {
 								this.#status = status;
 								this.#rebuild();
@@ -401,8 +402,9 @@ export class ExperimentalClientTui implements Component {
 			this.#selectList = new SelectList(items, Math.min(Math.max(items.length, 1), 12), selectTheme);
 			const selectedIndex = items.findIndex((item) => item.value === this.#selection?.selectedValue);
 			if (selectedIndex >= 0) this.#selectList.setSelectedIndex(selectedIndex);
-			this.#selectList.onSelect = (item) => this.#completeSelection(item.value);
-			this.#selectList.onCancel = () => this.#completeSelection(undefined);
+			const selection = this.#selection;
+			this.#selectList.onSelect = (item) => this.#completeSelection(item.value, selection);
+			this.#selectList.onCancel = () => this.#completeSelection(undefined, selection);
 			selector.addChild(this.#selectList);
 			this.#editorContainer.addChild(selector);
 		} else {
@@ -414,22 +416,38 @@ export class ExperimentalClientTui implements Component {
 		this.#requestRender();
 	}
 
-	#select(title: string, items: readonly SelectItem[], selectedValue?: string): Promise<string | undefined> {
+	#select(
+		title: string,
+		items: readonly SelectItem[],
+		selectedValue: string | undefined,
+		context: Ctx,
+	): Promise<string | undefined> {
+		if (context.signal.aborted) return Promise.resolve(undefined);
 		if (this.#selection !== undefined) throw new Error("A slash command selector is already active");
-		return new Promise((resolve) => {
-			this.#selection = { title, items, ...(selectedValue === undefined ? {} : { selectedValue }), resolve };
-			this.#screen = "select";
-			this.#rebuild();
-		});
+		const { promise, resolve } = Promise.withResolvers<string | undefined>();
+		const selection: PendingSelection = {
+			title,
+			items,
+			...(selectedValue === undefined ? {} : { selectedValue }),
+			resolve(value) {
+				context.signal.removeEventListener("abort", onAbort);
+				resolve(value);
+			},
+		};
+		const onAbort = () => this.#completeSelection(undefined, selection);
+		this.#selection = selection;
+		context.signal.addEventListener("abort", onAbort, { once: true });
+		this.#screen = "select";
+		this.#rebuild();
+		return promise;
 	}
 
-	#completeSelection(value: string | undefined): void {
-		const selection = this.#selection;
-		if (selection === undefined) return;
+	#completeSelection(value: string | undefined, selection = this.#selection, redraw = true): void {
+		if (selection === undefined || this.#selection !== selection) return;
 		this.#selection = undefined;
 		this.#screen = "chat";
 		selection.resolve(value);
-		if (!this.#closed) this.#rebuild();
+		if (redraw && !this.#closed) this.#rebuild();
 	}
 
 	#updateAutocomplete(): void {
@@ -470,6 +488,7 @@ export class ExperimentalClientTui implements Component {
 			return;
 		}
 		this.#attachmentGeneration++;
+		this.#completeSelection(undefined, this.#selection, false);
 		// The Client ends remote references before notifying connection listeners.
 		// Drop the stale consumer view before any footer or autocomplete redraw.
 		this.#session = undefined;
@@ -484,6 +503,7 @@ export class ExperimentalClientTui implements Component {
 	#handleAttachmentState(server: ClientTuiServer, state: SessionAttachmentState): void {
 		if (this.#closed || this.#selectedServerId !== server.serverId || this.#sessionId === undefined) return;
 		const generation = ++this.#attachmentGeneration;
+		this.#completeSelection(undefined, this.#selection, false);
 		if (state.status === "attached" && state.sessionId === this.#sessionId) {
 			this.#busy = true;
 			this.#status = "Reattaching Session…";

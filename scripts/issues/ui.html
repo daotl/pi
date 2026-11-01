@@ -67,6 +67,7 @@ let data = null, view = "inbox", cat = "", selectedNumber = null, openDetails = 
 let loadGeneration = 0, pendingMutations = 0, decisionPending = false;
 let loadError = "", mutationError = "";
 let deferredSnapshot = null;
+let deferredRender = false;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 const gh = (n) => `https://github.com/${data.repo}/issues/${n}`;
@@ -101,8 +102,8 @@ async function load() {
 	} catch (error) {
 		if (generation === loadGeneration && !pendingMutations) {
 			loadError = `${error instanceof Error ? error.message : String(error)}. State refresh failed; use Sync to retry.`;
-			if (data) render();
-			else $("status").innerHTML = `<span class="err">${esc(loadError)}</span>`;
+			if (data) render(true);
+			else renderStatus();
 		}
 		return false;
 	}
@@ -123,7 +124,7 @@ async function post(path, body) {
 		mutationError = `Operation failed: ${error instanceof Error ? error.message : String(error)}`;
 	} finally {
 		pendingMutations--;
-		if (data) render();
+		if (data) render(true);
 		await load();
 	}
 }
@@ -180,12 +181,11 @@ function card(it) {
 	</div>`;
 }
 
-function render() {
-	const items = visible();
-	if (!items.some((it) => it.number === selectedNumber)) selectedNumber = null;
-	const sel0 = $("cat").value;
-	$("cat").innerHTML = `<option value="">All categories</option>` + data.categories.map((c) => `<option value="${c.name}">${c.name}${c.owner ? ` (${c.owner})` : ""}</option>`).join("");
-	$("cat").value = sel0;
+function renderStatus() {
+	if (!data) {
+		$("status").innerHTML = `<span class="err">${esc(loadError)}</span>`;
+		return;
+	}
 	const undecided = data.items.filter((it) => !it.decision?.priority).length;
 	const q = data.queue;
 	$("status").innerHTML = [
@@ -197,6 +197,20 @@ function render() {
 		loadError ? `<span class="err">${esc(loadError)}</span>` : "",
 		mutationError ? `<span class="err">${esc(mutationError)}</span>` : "",
 	].filter(Boolean).join(" · ");
+}
+
+function render(deferForSelect = false) {
+	renderStatus();
+	if (deferForSelect && document.querySelector("select:focus")) {
+		deferredRender = true;
+		return;
+	}
+	deferredRender = false;
+	const items = visible();
+	if (!items.some((it) => it.number === selectedNumber)) selectedNumber = null;
+	const sel0 = $("cat").value;
+	$("cat").innerHTML = `<option value="">All categories</option>` + data.categories.map((c) => `<option value="${c.name}">${c.name}${c.owner ? ` (${c.owner})` : ""}</option>`).join("");
+	$("cat").value = sel0;
 	let html = "";
 	for (const [name, list] of groups(items)) {
 		if (!list.length) continue;
@@ -227,6 +241,7 @@ document.addEventListener("focusout", (e) => {
 	// Check after focus settles so moving between selects does not replace either control.
 	queueMicrotask(() => {
 		if (deferredSnapshot) installSnapshot(deferredSnapshot.snapshot, deferredSnapshot.generation);
+		if (deferredRender && !document.querySelector("select:focus")) render();
 	});
 });
 document.addEventListener("change", (e) => {

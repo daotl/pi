@@ -3,7 +3,9 @@ import {
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
 	type Message,
+	type Model,
 	type Models,
+	normalizeContext,
 	PI_ATTRIBUTION,
 	type SimpleStreamOptions,
 	type SystemMessage,
@@ -28,6 +30,7 @@ import {
 	wrapSection,
 } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "vitest";
+import { stream as streamOpenAIResponses } from "../../ai/src/api/openai-responses.ts";
 import { resolveSettings } from "../src/harness/agent.ts";
 import type { SessionImpl } from "../src/session/session.ts";
 import { allEntries, type ChatSetup, chatSetup, openChat, textOf, unanswered, waitFor } from "./chat-support.ts";
@@ -154,6 +157,101 @@ describe("generation", () => {
 		expect(aborted?.model?.[0]?.content).toEqual(partial.content);
 		await opened.harness.close(context);
 	});
+
+	it.each([false, true])(
+		"persists Responses initial JSON prefixes at the right depth through reopen (split object: %s)",
+		async (splitObject) => {
+			const setup = chatSetup();
+			setup.settings.progress = { partialIntervalMs: 1, outputIntervalMs: 100, persistWithinMs: 0 };
+			const model: Model<"openai-responses"> = {
+				id: "prefix-test",
+				name: "Prefix test",
+				api: "openai-responses",
+				provider: "openai",
+				baseUrl: "https://example.test/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 200_000,
+				maxTokens: 64_000,
+			};
+			const deltasReady = Promise.withResolvers<void>();
+			const models = withStream(setup.models, (_model, request, options) => {
+				const fetch: typeof globalThis.fetch = async () => {
+					const encoder = new TextEncoder();
+					return new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								const send = (event: object) =>
+									controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+								send({
+									type: "response.output_item.added",
+									output_index: 0,
+									item: {
+										type: "function_call",
+										id: "fc_prefix",
+										call_id: "call_prefix",
+										name: "write",
+										arguments: '{"payload":',
+									},
+								});
+								void deltasReady.promise.then(() => {
+									if (options?.signal?.aborted) return;
+									for (const delta of splitObject ? ["{", '"text":"hello'] : ['{"text":"hello']) {
+										send({ type: "response.function_call_arguments.delta", output_index: 0, delta });
+									}
+								});
+								// No terminal toolcall_end: closing the Harness interrupts the paused provider stream.
+								options?.signal?.addEventListener("abort", () => controller.error(new Error("Interrupted")), {
+									once: true,
+								});
+							},
+						}),
+						{ status: 200, headers: { "content-type": "text/event-stream" } },
+					);
+				};
+				return streamOpenAIResponses(model, normalizeContext(request), {
+					...options,
+					apiKey: "test",
+					fetch,
+					maxRetries: 0,
+				});
+			});
+			const storage = new ControlledStorage();
+			let opened = await openChat(storage, { ...setup, models });
+			const expected = [
+				{ type: "toolCall", id: "call_prefix|fc_prefix", name: "write", arguments: { payload: { text: "hello" } } },
+			];
+			opened.harness.resume();
+			const submission = await opened.root.submit({ type: "input", content: "write" }, context);
+			try {
+				await waitFor(async () => (await live(opened.harness, opened.root))?.generation?.message !== undefined);
+				expect((await live(opened.harness, opened.root))?.generation?.message?.content).toEqual([
+					{ type: "toolCall", id: "call_prefix|fc_prefix", name: "write", arguments: {} },
+				]);
+				deltasReady.resolve();
+				await waitFor(async () => {
+					const call = (await live(opened.harness, opened.root))?.generation?.message?.content[0];
+					return call?.type === "toolCall" && Object.keys(call.arguments).length > 0;
+				});
+				expect((await live(opened.harness, opened.root))?.generation?.message?.content).toEqual(expected);
+			} finally {
+				await opened.harness.close(context);
+			}
+			setup.faux.setResponses([fauxAssistantMessage("recovered")]);
+			opened = await openChat(storage.reopen(), setup);
+			try {
+				opened.harness.resume();
+				await (await opened.harness.submission(submission.id, context))!.wait(context);
+				const aborted = (await allEntries(opened.root)).find((entry) =>
+					entry.model?.some((message) => message.role === "assistant" && message.stopReason === "aborted"),
+				);
+				expect(aborted?.model?.[0]?.content).toEqual(expected);
+			} finally {
+				await opened.harness.close(context);
+			}
+		},
+	);
 
 	it("stores partials as deltas and a complete base once nothing is in flight", async () => {
 		const setup = chatSetup({ tokensPerSecond: 200, tokenSize: { min: 1, max: 1 } });

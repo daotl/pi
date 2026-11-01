@@ -53,6 +53,8 @@ export type CodemodeModelRuntime = Pick<
 >;
 
 export interface CodemodeToolOptions {
+	/** Save original bytes at a tools-readable path; throw on failure. Extensions: .png/.jpg/.gif/.webp. Default: local temp. */
+	saveImage?: (bytes: Uint8Array, extension: string) => Promise<string>;
 	/** Namespace of a tool, for `searchTools()` ranking and its `namespace` filter. */
 	getToolNamespace?: (toolName: string) => ToolNamespace | undefined;
 	/** Prompt guidelines of every tool, by tool name, shown with declarations by `describeTool()` and `ALL_TOOLS`. */

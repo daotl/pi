@@ -33,10 +33,15 @@ env conformance suite and `test/differential.test.ts` check each rule below.
   `noFollow` refuses a final symbolic link (`O_NOFOLLOW`).
 - `readBinaryFile`, `readTextFile` and `openTextLineReader` open any file like `open(path, "r")`: `/dev/null` reads
   empty, a FIFO blocks until it has a writer, and a directory fails when read (a line reader at `readLine`). A regular
-  file is read up to its size at open; other files to their end.
+  file is read up to its size at open; other files to their end. `readBinaryFile` and `readTextFile` check for
+  cancellation after each reply, including a single-chunk binary read and unknown-size EOF, and close the file
+  before returning an abort.
 - `listFiles` has no `NodeExecutionEnv` counterpart: the daemon implements it for remote and local environments
   alike (`LocalExecutionEnv` runs a daemon on the same machine), so both list with the same code. Unlike `fd`,
   symbolic links are not followed; unlike `git ls-files`, a tracked file that matches an ignore rule is left out.
+  Abort and timeout checkpoints include directory enumeration and ignored or excluded entries, not just emitted
+  paths. A timeout returns `truncated: true`; an abort fails with `aborted`. Completed listings remain depth first
+  with siblings in name order.
 - `readBinaryFile` returns a `Buffer`, reader reads a plain `Uint8Array`, as Node does.
 - Windows: error codes are libuv's translations; `rm` of a symbolic link or junction to a directory removes the link;
   creating a file where a directory exists fails with `EISDIR`; modification times before 1970 are negative.

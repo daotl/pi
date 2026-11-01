@@ -181,6 +181,114 @@ function setup(providerAt: "server" | "provider", consumerAt: "server" | "consum
 }
 
 describe("cluster candidate transactions (#24)", () => {
+	for (const linger of [0, 60_000]) {
+		it(`shares committed bindings after retiring old views with consumer linger ${linger}`, async () => {
+			const Provider = remote(`transaction.promoted-${linger}`, {
+				version: 1,
+				input: Type.Object({}),
+				host: hostNamed("server"),
+				variants: {
+					main: {
+						state: { value: Type.Number() },
+						methods: { read: method(undefined, Type.Number()), set: method(Type.Number()) },
+					},
+				},
+			});
+			const Panel = local(`transaction.promoted-panel-${linger}`, {
+				version: 1,
+				input: Type.Object({}),
+				members: { read: method(undefined, Type.Number()), set: method(Type.Number()) },
+			});
+			const consumer: Facet = {
+				name: "panel",
+				setup: ({ serve }) =>
+					serve(
+						Panel,
+						(_input, _principal, self) => {
+							const ref = self.get(Provider, {});
+							return { read: (ctx) => ref.read(ctx), set: (value, ctx) => ref.set(value, ctx) };
+						},
+						{ lifetime: "host" },
+					),
+			};
+			const frames: Frame[] = [];
+			const errors: unknown[] = [];
+			const server = createHost({ name: "server", self: {}, onError: (error) => errors.push(error) });
+			const [down, up] = memoryLinkPair();
+			server.accept(down, { kind: "host", name: "worker", principal: {} });
+			const worker = createHost({
+				name: "worker",
+				self: {},
+				upstream: { link: tap(up, (frame) => frames.push(frame)), principal: {} },
+				loader: async () => [consumer],
+				linger: { types: { [Provider.name]: linger } },
+				onError: (error) => errors.push(error),
+			});
+			const entered = latch();
+			const resume = latch();
+			onTestFinished(async () => {
+				resume.resolve();
+				await worker.close();
+				await server.close();
+			});
+			server.serve(Provider, (_input, _principal, self) => {
+				const value = self.state("value", Type.Number(), 0);
+				return {
+					variant: "main",
+					value,
+					read: () => value.value,
+					set: (next, ctx) => value.replace(ctx, next),
+				};
+			});
+			await worker.install(consumer);
+			await tick();
+			const panel = await worker.get(Panel, {});
+			// Bound a broken cross-host projection wait; this is an integration deadline, not a scheduling sleep.
+			const oldRoot = worker.root(
+				async (ctx) => {
+					assert.equal(await panel.read(ctx), 0);
+					entered.resolve();
+					await resume.promise;
+					return panel.read(ctx);
+				},
+				{ signal: AbortSignal.timeout(2000) },
+			);
+			oldRoot.catch(() => {});
+			try {
+				await entered.promise;
+				await server.reload([], { remote: { worker: ["panel"] }, voteDeadline: 2000 });
+				assert.notEqual(worker.previousCodeVersion, undefined, "the old root still owns its displaced view");
+				const holds = frames.filter((frame) => frame.t === "hold");
+				assert.equal(holds.length, 2, "installed and candidate holds remain separate until commit");
+				resume.resolve();
+				assert.equal(await oldRoot, 0, "promotion must not close the displaced old-code view");
+				for (let n = 0; n < 100 && worker.previousCodeVersion !== undefined; n++) await tick();
+				assert.equal(worker.previousCodeVersion, undefined);
+				await tick();
+				const ordinary = await worker.get(Provider, {}, { signal: AbortSignal.timeout(1000) });
+				assert.equal(
+					frames.filter((frame) => frame.t === "hold").length,
+					holds.length,
+					"an ordinary acquisition must share the committed hold",
+				);
+				await panel.set(9);
+				await tick();
+				assert.equal(ordinary.value.value, 9, "ordinary state must not come from the frozen replaced hold");
+				assert.equal(await worker.root((ctx) => ordinary.read(ctx), { signal: AbortSignal.timeout(1000) }), 9);
+				assert.ok(
+					frames.some((frame) => frame.t === "release" && frame.id === holds[0]!.id),
+					"a displaced binding closes after its old views drain, even with consumer linger",
+				);
+				ordinary.release();
+				assert.equal(await panel.read(), 9, "releasing an ordinary view must retain the consumer's shared hold");
+				assert.deepEqual(errors, []);
+			} finally {
+				resume.resolve();
+				await oldRoot.catch(() => {});
+			}
+		});
+	}
+
 	it("fresh unchanged objects retain installed dependency state across a transaction abort", async () => {
 		const [down, up] = memoryLinkPair();
 		const entered = latch();

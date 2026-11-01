@@ -34,6 +34,8 @@ The client applies ordered out-of-band attachment changes but does not interpret
 
 On disconnect or disposal, pending requests reject locally, but accepted work may still complete remotely before the attachment is released. The client clears its live attachment route. It never reconnects or replays requests automatically. After disconnection, call `reconnect()`, attach through the application's management service again, and explicitly repeat only operations known to be safe.
 
+`connect()` and `reconnect()` reject while already connecting or connected. These rejected attempts leave the current handshake, server identity and routed Chord links intact; disconnect first to start a new connection.
+
 The experimental local coordinator only provides a stable endpoint and relays traffic. Replaceable server processes own Session and worker lifecycle outside the public client protocol.
 
 Call transport handlers as follows:

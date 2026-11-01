@@ -554,7 +554,14 @@ export class HostImpl implements Host, HostCore {
 			if (!commit) binding.close();
 			else {
 				binding.transaction = undefined;
-				this.bindings.set(`${binding.key}\u0000committed:${transaction}`, binding);
+				const displaced = this.bindings.get(binding.key);
+				if (displaced !== undefined && displaced !== binding) {
+					// Existing old-code views still own this hold, including across reconnect and host teardown.
+					// It must no longer be discoverable by ordinary acquisitions or linger after those views drain.
+					if (displaced.views.size === 0) displaced.close();
+					else this.bindings.set(`${binding.key}\u0000retained:${transaction}`, displaced);
+				}
+				this.bindings.set(binding.key, binding);
 				for (const view of binding.views) view.update();
 			}
 		}
@@ -1271,7 +1278,13 @@ export class HostImpl implements Host, HostCore {
 					? this.#lingerTypes[binding.contract.name]!
 					: 0;
 		// A binding that never had a shape has nothing worth keeping.
-		if (ms <= 0 || binding.ended || !binding.applied || this.#lingerCap <= 0) {
+		if (
+			ms <= 0 ||
+			binding.ended ||
+			!binding.applied ||
+			this.#lingerCap <= 0 ||
+			this.bindings.get(binding.key) !== binding
+		) {
 			binding.close();
 			return;
 		}

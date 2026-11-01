@@ -1,4 +1,5 @@
 import type * as Zlib from "node:zlib";
+import { isJsonValue } from "./json.ts";
 import type { Frame } from "./wire.ts";
 
 /** An ordered (FIFO), bidirectional frame channel between two hosts. */
@@ -132,6 +133,30 @@ export function unpack(value: unknown): unknown {
 	if (!(value instanceof Packed)) return value;
 	if (zlib === undefined) throw new TypeError("packed payload without zlib");
 	return JSON.parse(zlib.inflateRawSync(value.bytes).toString("utf8"));
+}
+
+/**
+ * Encode a frame for a strict-JSON bridge, inflating transport-packed payloads and omitting undefined protocol fields.
+ * Application data must already be strict JSON; undefined inside a payload is rejected, never omitted or coerced.
+ */
+export function stringifyFrame(frame: Frame): string {
+	const field = payloadField(frame);
+	const value = field === undefined ? undefined : (frame as Record<string, unknown>)[field];
+	const normalized = value instanceof Packed ? { ...frame, [field!]: unpack(value) } : frame;
+	const application: unknown[] = [];
+	if (normalized.t === "call") application.push(normalized.args);
+	else if (normalized.t === "result") application.push(normalized.value);
+	else if (normalized.t === "state") application.push(normalized.value, normalized.ops);
+	else if (normalized.t === "hold") {
+		if (!isJsonValue(normalized.input)) throw new TypeError("Frame input must be strict JSON");
+		application.push(normalized.principal);
+	} else if (normalized.t === "invalidate") {
+		if (!isJsonValue(normalized.pattern)) throw new TypeError("Frame pattern must be strict JSON");
+	}
+	for (const value of application) {
+		if (value !== undefined && !isJsonValue(value)) throw new TypeError("Frame application data must be strict JSON");
+	}
+	return JSON.stringify(normalized);
 }
 
 type PayloadField = "args" | "value";

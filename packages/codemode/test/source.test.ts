@@ -92,6 +92,25 @@ describe("parseCodemodeSource", () => {
 		}
 	});
 
+	it("preserves for-await control parentheses across whitespace and comments", () => {
+		for (const header of [
+			"for await (const x of [])",
+			"for /* loop */ await /* values */ (const x of [])",
+			"for\nawait\n(const x of [])",
+			"for // loop\nawait // values\n(const x of [])",
+		]) {
+			const prefix = `${header} /\`/.test('x');`;
+			expect(() => parseCodemodeSource(`${prefix}\n// @options: {"timeout_ms": 1}\nwhile (true) {}`)).toThrow(
+				`found one on line ${prefix.split("\n").length + 1}`,
+			);
+			const literal = `${prefix}\nconst source = \`example\n// @options: {}\n\`; return source;`;
+			expect(parseCodemodeSource(literal)).toEqual({ code: literal, options: {} });
+		}
+		// A member named `for` must not make a later await expression a control header.
+		const expression = "obj.for; await (value) / `example\n// @options: {}\n`;";
+		expect(parseCodemodeSource(expression)).toEqual({ code: expression, options: {} });
+	});
+
 	it("rejects misplaced deadlines after statement-block and statement-keyword regexps", () => {
 		for (const prefix of [
 			"if (true) {} /`/.test('x');",

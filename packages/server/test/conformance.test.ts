@@ -1,5 +1,17 @@
-import { createHost, type Host, type Ref } from "@earendil-works/chord";
+import {
+	createHost,
+	type Frame,
+	type Host,
+	hostNamed,
+	memoryLinkPair,
+	method,
+	PACK_THRESHOLD,
+	type Ref,
+	remote,
+} from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, type SessionMetadata } from "@earendil-works/pi-agent-core";
+import { encodeClientMessage } from "@earendil-works/pi-protocol";
+import { Type } from "typebox";
 import { afterEach, describe, expect, test } from "vitest";
 import { Client, createClientChordLink } from "../../client/src/index.ts";
 import type { ByteConnectionHandler } from "../src/connection.ts";
@@ -20,7 +32,7 @@ const servers = new Set<Server>();
 const clients = new Set<Client>();
 const hosts = new Set<Host>();
 
-async function connect(server: Server) {
+async function connectClient(server: Server): Promise<Client> {
 	let handler: ByteConnectionHandler;
 	let closed = false;
 	const client = new Client({
@@ -53,6 +65,11 @@ async function connect(server: Server) {
 	});
 	clients.add(client);
 	await client.connect();
+	return client;
+}
+
+async function connect(server: Server) {
+	const client = await connectClient(server);
 	const host = createHost({ name: "presentation-server", self: null, kind: "client" });
 	hosts.add(host);
 	host.connect(
@@ -190,6 +207,147 @@ describe("native routed Chord sessions", () => {
 		expect(harness.closeCount).toBe(0);
 		await server.close();
 		expect(harness.closeCount).toBe(1);
+	});
+});
+
+describe("packed payloads across routed JSON bridges", () => {
+	const PackedContract = remote("test.packed-bridge", {
+		version: 1,
+		input: Type.Object({}),
+		host: hostNamed("worker:packed"),
+		variants: {
+			live: {
+				state: { snapshot: Type.String() },
+				methods: { store: method(Type.String(), Type.String()), ping: method() },
+			},
+		},
+	});
+
+	test.each(["routed pair", "client requests", "client responses"] as const)(
+		"preserves packed calls, results, and snapshots through %s",
+		async (bridge) => {
+			const payload = `request:${"x".repeat(PACK_THRESHOLD + 1)}`;
+			const snapshot = `snapshot:${"s".repeat(PACK_THRESHOLD + 1)}`;
+			const result = `result:${"r".repeat(PACK_THRESHOLD + 1)}`;
+			const calls: string[] = [];
+			const provider = createHost({ name: "worker:packed", self: null, readyTimeout: 1_000 });
+			const consumer = createHost({ name: "presentation", self: null, kind: "client", readyTimeout: 1_000 });
+			for (const host of [provider, consumer]) hosts.add(host);
+			provider.serve(PackedContract, (_input, _principal, self) => ({
+				variant: "live",
+				snapshot: self.state("snapshot", Type.String(), snapshot),
+				store: (value) => {
+					calls.push(value);
+					return result;
+				},
+				ping: () => {},
+			}));
+			const [providerLink, providerRelay] = memoryLinkPair();
+			provider.accept(providerLink, { principal: null });
+			const [consumerLink, consumerRelay] = memoryLinkPair();
+			consumer.connect(consumerLink, { principal: null });
+			const [routed, native] = createRoutedLinkPair();
+			let down = routed;
+			let up = native;
+			if (bridge !== "routed pair") {
+				const server = createServer({
+					serverServices: {
+						attachClient: () => ({ link: routed, release: () => routed.close() }),
+					},
+					resolveSession: async () => {
+						throw new Error("No Session route");
+					},
+					openSession: async () => {
+						throw new Error("No Session route");
+					},
+				});
+				const client = await connectClient(server);
+				const clientLink = createClientChordLink(client, () => ({ serverId }));
+				down = bridge === "client requests" ? native : clientLink;
+				up = bridge === "client requests" ? clientLink : native;
+			}
+			// Relays retain Packed values until they reach the JSON bridge.
+			providerRelay.receive((frame) => down.send(frame));
+			down.receive((frame) => providerRelay.send(frame));
+			consumerRelay.receive((frame) => up.send(frame));
+			up.receive((frame) => consumerRelay.send(frame));
+			providerRelay.onClose((reason) => down.close(reason));
+			down.onClose((reason) => providerRelay.close(reason));
+			consumerRelay.onClose((reason) => up.close(reason));
+			up.onClose((reason) => consumerRelay.close(reason));
+			const ref = await consumer.get(PackedContract, {});
+			expect(ref.snapshot.value).toBe(snapshot);
+			await expect(consumer.root((ctx) => ref.store(payload, ctx))).resolves.toBe(result);
+			expect(calls).toEqual([payload]);
+			await expect(consumer.root((ctx) => ref.ping(ctx))).resolves.toBeUndefined();
+			ref.release();
+		},
+	);
+
+	test("counts normalized JSON characters and routed encoded bytes for packed frames", async () => {
+		const [sender, receiver] = memoryLinkPair();
+		const [routed, native] = createRoutedLinkPair();
+		const server = createServer(new TestServerHost());
+		const client = await connectClient(server);
+		const clientLink = createClientChordLink(client, () => ({ serverId }));
+		const frame: Frame = { t: "result", id: 1, value: "é".repeat(PACK_THRESHOLD + 1) };
+		const packed = new Deferred<Frame>();
+		receiver.receive((received) => packed.resolve(received));
+		try {
+			sender.send(frame);
+			const received = await packed.promise;
+			const delivered = new Deferred<Frame>();
+			native.receive((copy) => delivered.resolve(copy));
+			expect(routed.send(received)).toBe(JSON.stringify(frame).length);
+			await expect(delivered.promise).resolves.toEqual(frame);
+			expect(clientLink.send(received)).toBe(
+				encodeClientMessage({ type: "chord", target: { serverId }, frame }).byteLength,
+			);
+		} finally {
+			sender.close();
+			routed.close();
+		}
+	});
+
+	test("omits optional frame fields without coercing undefined inside application payloads", async () => {
+		const [routed, native] = createRoutedLinkPair();
+		try {
+			const received = new Deferred<unknown>();
+			native.receive((frame) => received.resolve(frame));
+			const size = routed.send({ t: "result", id: 1, value: undefined, error: undefined });
+			await expect(received.promise).resolves.toEqual({ t: "result", id: 1 });
+			expect(size).toBe(JSON.stringify({ t: "result", id: 1 }).length);
+			const metadata = new Deferred<Frame>();
+			native.receive((frame) => metadata.resolve(frame));
+			routed.send({
+				t: "prepare",
+				reload: 1,
+				transaction: "reload:1",
+				participants: ["worker:packed"],
+				codeVersion: 2,
+				plugins: [],
+				options: { remove: undefined, gateDeadline: undefined, retireDeadline: undefined },
+			});
+			await expect(metadata.promise).resolves.toEqual({
+				t: "prepare",
+				reload: 1,
+				transaction: "reload:1",
+				participants: ["worker:packed"],
+				codeVersion: 2,
+				plugins: [],
+				options: {},
+			});
+			expect(() => routed.send({ t: "result", id: 2, value: { missing: undefined } })).toThrow(TypeError);
+			expect(() => routed.send({ t: "call", id: 3, hold: 1, member: "store", args: [undefined] })).toThrow(
+				TypeError,
+			);
+		} finally {
+			routed.close();
+		}
+		const server = createServer(new TestServerHost());
+		const client = await connectClient(server);
+		const link = createClientChordLink(client, () => ({ serverId }));
+		expect(() => link.send({ t: "result", id: 1, value: { missing: undefined } })).toThrow(TypeError);
 	});
 });
 

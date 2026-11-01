@@ -208,6 +208,8 @@ type ImageBlock = { type: "image"; data: string; mimeType: string };
 
 Show generated images with `image(block)`. Do not print `data` with `text()`, `console`, or `return`: it is large and the model cannot read it as text. `image()` also saves each image to a temp file and puts its path in the result, so a later turn can copy or move the file.
 
+The supplied SSH and Gondolin routing extensions save these files in the remote or guest filesystem, respectively, so their `read` and `bash` tools can reuse the returned paths. Guest-only temp files last for the VM's lifetime; copy images into `/workspace` to keep them on the host.
+
 ```js
 // @options: {"timeout_ms": 300000}
 const painter = await models.getModelOfType("image", "openrouter", "google/gemini-2.5-flash-image");

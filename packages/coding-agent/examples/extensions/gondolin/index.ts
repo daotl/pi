@@ -25,6 +25,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
 	type BashOperations,
 	createBashTool,
+	createCodemodeExtension,
 	createEditTool,
 	createFindTool,
 	createGrepTool,
@@ -406,6 +407,18 @@ export default function (pi: ExtensionAPI) {
 		}
 		return vmStarting;
 	}
+
+	// The CLI's replaceable codemode extension yields to this one, so every advertised image path is a guest path.
+	createCodemodeExtension({
+		saveImage: async (bytes, extension) => {
+			const activeVm = await ensureVm();
+			const created = await activeVm.exec(["/bin/sh", "-lc", "umask 077; mktemp -d"]);
+			if (created.exitCode !== 0) throw new Error(`Could not create image directory: ${created.stderr.trim()}`);
+			const imagePath = path.posix.join(created.stdout.trim(), `image${extension}`);
+			await activeVm.fs.writeFile(imagePath, bytes);
+			return imagePath;
+		},
+	})(pi);
 
 	pi.on("session_start", async (_event, ctx) => {
 		await ensureVm(ctx);

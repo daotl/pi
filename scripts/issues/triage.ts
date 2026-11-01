@@ -273,7 +273,7 @@ export class Triage {
 			}
 			let claimed = false;
 			await this.update(number, (state) => {
-				if (!owns(state)) return;
+				if (!owns(state) || (state.status !== "queued" && state.status !== "running")) return;
 				state.conversationId = conversation!.id;
 				state.status = "running";
 				claimed = true;

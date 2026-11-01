@@ -227,14 +227,15 @@ export function remote<const D extends RemoteDef>(
 	// A JSON copy: the description travels, and a placement object may carry nothing else.
 	const host: Placement =
 		"name" in placement ? { name: placement.name } : { prefix: placement.prefix, key: placement.key };
-	const variants: Record<string, Record<string, MemberDescription>> = {};
+	const variants: Record<string, Record<string, MemberDescription>> = Object.create(null);
 	if (Object.keys(def.variants).length === 0) throw new TypeError(`remote contract ${name} has no variants`);
 	for (const [kind, variant] of Object.entries(def.variants)) {
-		const members: Record<string, MemberDescription> = {};
+		const members: Record<string, MemberDescription> = Object.create(null);
 		for (const [key, schema] of Object.entries(variant.state ?? {}))
 			members[key] = describeMember(key, schema, "remote");
 		for (const [key, spec] of Object.entries(variant.methods ?? {})) {
-			if (key in members) throw new TypeError(`member ${key} is both state and method in ${name}.${kind}`);
+			if (Object.hasOwn(members, key))
+				throw new TypeError(`member ${key} is both state and method in ${name}.${kind}`);
 			members[key] = describeMember(key, spec, "remote");
 			if (members[key].kind !== "method") throw new TypeError(`methods.${key} is not a method()`);
 		}
@@ -253,7 +254,7 @@ export function remote<const D extends RemoteDef>(
 
 export function local<const D extends LocalDef>(name: string, def: D): LocalContract<D> {
 	checkHeader(name, def.version);
-	const members: Record<string, MemberDescription> = {};
+	const members: Record<string, MemberDescription> = Object.create(null);
 	for (const [key, member] of Object.entries(def.members ?? {})) members[key] = describeMember(key, member, "local");
 	const description: Description = {
 		name,

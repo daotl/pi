@@ -7,7 +7,13 @@ import {
 	ProtocolValidationError,
 } from "@earendil-works/pi-protocol";
 import { describe, expect, test } from "vitest";
-import { type ByteTransportFactory, Client, ClientDisposedError, createClientChordLink } from "../src/index.ts";
+import {
+	type ByteTransportFactory,
+	Client,
+	ClientDisposedError,
+	createClientChordLink,
+	DisconnectedError,
+} from "../src/index.ts";
 import { MemoryByteServer } from "./support.ts";
 
 const serverId = "00000000-0000-4000-8000-000000000001";
@@ -37,6 +43,34 @@ describe("native routed Chord links", () => {
 		expect(server.messages.at(-1)).toEqual({ type: "chord", target, frame: { t: "cancel", id: 3 } });
 		await client.dispose();
 	});
+
+	test.each(["connect", "reconnect"] as const)(
+		"rejected duplicate %s preserves the live server route",
+		async (operation) => {
+			const server = new MemoryByteServer();
+			const client = await connectClient(server);
+			try {
+				const hello = client.hello;
+				const link = createClientChordLink(client, () => target);
+				const frames: Frame[] = [];
+				link.receive((frame) => frames.push(frame));
+				await expect(client[operation]()).rejects.toBeInstanceOf(DisconnectedError);
+				link.send({ t: "ping", n: 7 });
+				expect(server.messages.at(-1)).toEqual({ type: "chord", target, frame: { t: "ping", n: 7 } });
+				server.send({ type: "chord", target, frame: { t: "ping", n: 8 } });
+				expect(frames).toEqual([{ t: "ping", n: 8 }]);
+				expect(link.closed).toBe(false);
+				expect(client.connected).toBe(true);
+				expect(client.hello).toBe(hello);
+				link.close();
+				const replacement = createClientChordLink(client, () => target);
+				replacement.send({ t: "ping", n: 9 });
+				expect(server.messages.at(-1)).toEqual({ type: "chord", target, frame: { t: "ping", n: 9 } });
+			} finally {
+				await client.dispose();
+			}
+		},
+	);
 
 	test("fences Session links across attachment changes and ignores stale frames", async () => {
 		const server = new MemoryByteServer();

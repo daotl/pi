@@ -628,6 +628,37 @@ describe("defaultTools setting", () => {
 			session.dispose();
 		});
 
+		it.each(["late_tool", "mcp__server__lookup"])(
+			"keeps removed default-active %s inactive when session_start registers it",
+			async (name) => {
+				const manager = createRecordedSession(["read", name]);
+				recordLoadoutChange(manager, [], [name]);
+				const session = await resume(manager, {}, [
+					(pi) => {
+						pi.on("session_start", () => {
+							pi.registerTool({
+								name,
+								label: name,
+								description: "Direct tool registered after restoration",
+								parameters: Type.Object({}),
+								execute: async () => ({ content: [{ type: "text", text: "late result" }], details: {} }),
+							});
+						});
+					},
+				]);
+				try {
+					expect(session.getActiveToolNames()).toEqual(["read", "active_tool"]);
+					expect(session.getAllTools().map((tool) => tool.name)).not.toContain(name);
+					await session.bindExtensions({});
+					expect(session.getAllTools().map((tool) => tool.name)).toContain(name);
+					expect(session.getActiveToolNames()).toEqual(["read", "active_tool"]);
+					expect(session.getCallableToolNames()).toEqual(["read", "active_tool"]);
+				} finally {
+					session.dispose();
+				}
+			},
+		);
+
 		// Finding #24: a checkpoint can be the only owner of the effective declaration.
 		it("restores checkpoint-only tools on reopen and replays visible later deltas", async () => {
 			const manager = SessionManager.create(tempDir, join(tempDir, "sessions"));

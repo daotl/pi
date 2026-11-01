@@ -43,6 +43,7 @@ export async function createSessionWorkerServices(options: {
 	let reloadTail = Promise.resolve();
 	let disposed = false;
 	let disposal: Promise<void> | undefined;
+	const disposalErrors: unknown[] = [];
 	const pluginLoader = options.facetLoader ?? (async () => ({ facets: [], async dispose() {} }));
 	let loadedPlugins = await pluginLoader();
 	const reloadPlugins = (): Promise<void> => {
@@ -59,13 +60,19 @@ export async function createSessionWorkerServices(options: {
 				try {
 					await candidate.dispose();
 				} catch (cleanupError) {
+					if (disposed) disposalErrors.push(cleanupError);
 					throw new AggregateError([error, cleanupError], "Session plugin reload and cleanup failed");
 				}
 				throw error;
 			}
 			const retired = loadedPlugins;
 			loadedPlugins = candidate;
-			await retired.dispose();
+			try {
+				await retired.dispose();
+			} catch (error) {
+				if (disposed) disposalErrors.push(error);
+				throw error;
+			}
 		});
 		reloadTail = operation.catch(() => {});
 		return operation;
@@ -136,17 +143,17 @@ export async function createSessionWorkerServices(options: {
 			if (disposal) return disposal;
 			disposed = true;
 			disposal = (async () => {
-				const errors: unknown[] = [];
+				const errors = disposalErrors;
+				// Host shutdown synchronously cancels candidate activation, which attachment
+				// invalidation and reloadTail may both be waiting for.
+				const closingHost = host.close();
+				const results = await Promise.allSettled([closingHost, removeAttachments(() => true), reloadTail]);
 				try {
-					await removeAttachments(() => true);
+					// Loader artifacts must outlive every host resource using that generation.
+					await loadedPlugins.dispose();
 				} catch (error) {
 					errors.push(error);
 				}
-				await reloadTail;
-				const results = await Promise.allSettled([
-					Promise.resolve().then(() => host.close()),
-					Promise.resolve().then(() => loadedPlugins.dispose()),
-				]);
 				errors.push(...results.flatMap((result) => (result.status === "rejected" ? [result.reason] : [])));
 				if (errors.length === 1) throw errors[0];
 				if (errors.length > 1) throw new AggregateError(errors, "Failed to dispose Session facets");

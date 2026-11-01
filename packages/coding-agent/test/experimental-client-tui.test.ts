@@ -38,12 +38,14 @@ import type {
 } from "../src/experimental/services/connection.ts";
 import { Models, type ModelsState } from "../src/experimental/services/models.ts";
 import { PresentationPlugins, SessionPlugins } from "../src/experimental/services/plugins.ts";
+import { PresentationUI } from "../src/experimental/services/presentation-ui.ts";
 import {
 	SessionDirectory,
 	type SessionDirectoryState,
 	SessionManagement,
 	type SessionSummary,
 } from "../src/experimental/services/sessions.ts";
+import { SlashCommands } from "../src/experimental/services/slash-commands.ts";
 import { Transcript, type TranscriptState } from "../src/experimental/services/transcript.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
@@ -171,6 +173,11 @@ describe("experimental client TUI", () => {
 		["connected-attaching", { command: "client" as const }, "two", 1],
 		["connected-degraded", { command: "client" as const }, "two", 1],
 		["connected-other-session", { command: "client" as const }, "two", 1],
+		["selector-model-connection", { command: "client" as const }, "two", 1],
+		["selector-model-attachment", { command: "client" as const }, "two", 1],
+		["selector-thinking-connection", { command: "client" as const }, "two", 1],
+		["selector-thinking-attachment", { command: "client" as const }, "two", 1],
+		["selector-context", { command: "client" as const }, "two", 1],
 	] as const)(
 		"opens a %s Session and preserves its presentation lifecycle",
 		async (kind, command, sessionId, creates) => {
@@ -344,12 +351,13 @@ describe("experimental client TUI", () => {
 			const host = createHost({ name: "presentation", kind: "client", self: "presentation" });
 			const [serverLink, serverRemote] = createRoutedLinkPair();
 			const [sessionLink, sessionRemote] = createRoutedLinkPair();
+			let routedSessionRemote = sessionRemote;
 			serverProvider.accept(serverLink, { principal: "presentation", kind: "client" });
 			sessionProvider.accept(sessionLink, { principal: "presentation", kind: "client" });
 			host.route("server", { authorize: () => true, resolve: async () => serverRemote, principal: () => "server" });
 			host.route("session", {
 				authorize: () => true,
-				resolve: async () => sessionRemote,
+				resolve: async () => routedSessionRemote,
 				principal: () => "session",
 			});
 			const serverServices: ServerServiceSource = { host, connection: connectionState, async dispose() {} };
@@ -447,6 +455,119 @@ describe("experimental client TUI", () => {
 				expect(component.render(80).join("\n")).not.toContain("Experimental Sessions");
 				expect(component.render(80).join("\n")).not.toContain("Experimental Models");
 
+				if (kind === "selector-context") {
+					const presentation = await host.get(PresentationUI, {});
+					try {
+						const firstController = new AbortController();
+						let firstSignal: AbortSignal | undefined;
+						const first = host.root(
+							(ctx) => {
+								firstSignal = ctx.signal;
+								return presentation.ui!.select(
+									"First selector",
+									[{ value: "old", label: "Old choice" }],
+									undefined,
+									ctx,
+								);
+							},
+							{ signal: firstController.signal },
+						);
+						await vi.waitFor(() => expect(component.render(80).join("\n")).toContain("First selector"));
+						firstController.abort();
+						expect(await first).toBeUndefined();
+						const second = host.root((ctx) =>
+							presentation.ui!.select(
+								"Second selector",
+								[{ value: "new", label: "New choice" }],
+								undefined,
+								ctx,
+							),
+						);
+						await vi.waitFor(() => expect(component.render(80).join("\n")).toContain("Second selector"));
+						// Even a delayed duplicate event from the old invocation cannot retire its replacement.
+						firstSignal!.dispatchEvent(new Event("abort"));
+						expect(component.render(80).join("\n")).toContain("Second selector");
+						component.handleInput("\r");
+						expect(await second).toBe("new");
+						const aborted = new AbortController();
+						aborted.abort();
+						await expect(
+							host.root((ctx) => presentation.ui!.select("Never mounted", [], undefined, ctx), {
+								signal: aborted.signal,
+							}),
+						).resolves.toBeUndefined();
+						expect(component.render(80).join("\n")).not.toContain("Never mounted");
+					} finally {
+						presentation.release();
+					}
+					return;
+				}
+
+				if (kind.startsWith("selector-")) {
+					const thinking = kind.includes("thinking");
+					const name = thinking ? "thinking" : "model";
+					const title = thinking ? "Select thinking level:" : "Select model:";
+					const commands = await host.get(SlashCommands, {});
+					const oldCommand = commands.registry!.list().find((candidate) => candidate.name === name)!;
+					const pending = host.root((ctx) => oldCommand.run("", ctx));
+					try {
+						await vi.waitFor(() => expect(component.render(80).join("\n")).toContain(title));
+						sessionRemote.close("selector attachment retired");
+						if (kind.endsWith("connection")) {
+							publishReplacement(connectionState, {
+								status: "disconnected",
+								since: "interrupted",
+								reason: "selector interruption",
+								retryAt: null,
+							});
+						} else {
+							publishReplacement(attachment, { status: "attaching", sessionId });
+						}
+						await expect(pending).resolves.toBeUndefined();
+						if (kind.endsWith("connection")) {
+							// The real Session source hydrates through attaching before publishing attached again.
+							publishReplacement(attachment, { status: "attaching", sessionId });
+						}
+						expect(component.render(80).join("\n")).not.toContain(title);
+						component.handleInput("\u001b[B");
+						component.handleInput("\r");
+						expect(select).not.toHaveBeenCalled();
+						expect(selectThinking).not.toHaveBeenCalled();
+						const [nextLink, nextRemote] = createRoutedLinkPair();
+						sessionProvider.accept(nextLink, { principal: "presentation", kind: "client" });
+						routedSessionRemote = nextRemote;
+						publishReplacement(connectionState, { status: "connected", since: "recovered" });
+						publishReplacement(attachment, { status: "attached", sessionId });
+						await vi.waitFor(() => {
+							expect(component.render(80).join("\n")).toContain("test/one");
+							expect(component.render(80).join("\n")).not.toContain("Reattaching");
+						});
+						const current = await host.get(SlashCommands, {});
+						try {
+							const command = current.registry!.list().find((candidate) => candidate.name === name)!;
+							expect(command).not.toBe(oldCommand);
+							const next = host.root((ctx) => command.run("", ctx));
+							await vi.waitFor(() => expect(component.render(80).join("\n")).toContain(title));
+							component.handleInput("\u001b[B");
+							component.handleInput("\r");
+							await next;
+							if (thinking) {
+								expect(modelsState.value.configuration.thinkingLevel).toBe("high");
+								expect(selectThinking).toHaveBeenCalledOnce();
+								expect(select).not.toHaveBeenCalled();
+							} else {
+								expect(modelsState.value.configuration.model).toEqual({ provider: "test", modelId: "two" });
+								expect(select).toHaveBeenCalledOnce();
+								expect(selectThinking).not.toHaveBeenCalled();
+							}
+						} finally {
+							current.release();
+						}
+					} finally {
+						commands.release();
+					}
+					return;
+				}
 				if (kind.startsWith("connected-")) {
 					// Match Client ordering: the Session link ends before attachment notification.
 					sessionRemote.close("attachment replaced while connected");

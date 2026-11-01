@@ -143,6 +143,135 @@ describe("AgentSession tool orchestration", () => {
 		},
 	);
 
+	it.each(["late_tool", "mcp__server__lookup"])(
+		"keeps restored removals out of requests when %s connects after session_start",
+		async (name) => {
+			const manager = SessionManager.inMemory();
+			manager.appendMessage({
+				role: "system",
+				content: "",
+				toolsAdded: ["read", name, "mcp__server__selected"].map((toolName) => ({
+					name: toolName,
+					description: toolName,
+					parameters: Type.Object({}),
+				})),
+				timestamp: 0,
+			});
+			manager.appendMessage({
+				role: "system",
+				content: "",
+				toolsRemoved: [{ name }],
+				timestamp: 1,
+			});
+			let connect: (() => void) | undefined;
+			const harness = await createHarness({
+				sessionManager: manager,
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_start", () => {
+							connect = () => {
+								for (const toolName of [name, "mcp__server__selected", "new_tool"]) {
+									pi.registerTool({
+										name: toolName,
+										label: toolName,
+										description: "Late direct tool",
+										parameters: Type.Object({}),
+										...(toolName === "mcp__server__selected" ? { defaultActive: false } : {}),
+										execute: async () => ({ content: [{ type: "text", text: "connected" }], details: {} }),
+									});
+								}
+							};
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.session.refreshContext();
+			await harness.session.bindExtensions({});
+			expect(harness.session.getActiveToolNames()).toEqual(["read"]);
+			if (!connect) throw new Error("Missing connection callback");
+			connect();
+			const expected = ["read", "mcp__server__selected", "new_tool"];
+			expect(harness.session.getActiveToolNames()).toEqual(expected);
+			expect(harness.session.getCallableToolNames()).toEqual(expected);
+			// Explicit activation must still override the restored removal, even across another refresh.
+			harness.session.setActiveToolsByName([...expected, name]);
+			connect();
+			expect(harness.session.getActiveToolNames()).toEqual([...expected, name]);
+			harness.session.setActiveToolsByName(expected);
+			let declared: string[] | undefined;
+			harness.setResponses([
+				(context) => {
+					declared = getCurrentTools(context.messages).map((tool) => tool.name);
+					return fauxAssistantMessage("restored tools received");
+				},
+			]);
+			await harness.session.prompt("inspect restored tools");
+			expect(declared).toEqual(expected);
+		},
+	);
+
+	it.each(["branch", "replacement", "next run"] as const)(
+		"drops abandoned restored removals at the %s boundary",
+		async (boundary) => {
+			const manager = SessionManager.inMemory();
+			const unmentioned = manager.appendMessage({
+				role: "system",
+				content: "",
+				toolsAdded: ["read", "write"].map((name) => ({ name, description: name, parameters: Type.Object({}) })),
+				timestamp: 0,
+			});
+			manager.appendMessage({
+				role: "system",
+				content: "",
+				toolsAdded: [{ name: "late_tool", description: "late tool", parameters: Type.Object({}) }],
+				timestamp: 1,
+			});
+			manager.appendMessage({ role: "system", content: "", toolsRemoved: [{ name: "late_tool" }], timestamp: 2 });
+			let registerLate: (() => void) | undefined;
+			const harness = await createHarness({
+				sessionManager: manager,
+				extensionFactories: [
+					(pi) => {
+						registerLate = () => {
+							pi.registerTool({
+								name: "late_tool",
+								label: "Late tool",
+								description: "Late direct tool",
+								parameters: Type.Object({}),
+								execute: async () => ({ content: [{ type: "text", text: "late result" }], details: {} }),
+							});
+						};
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.session.refreshContext();
+			await harness.session.bindExtensions({});
+			expect(harness.session.getActiveToolNames()).toEqual(["read", "write"]);
+			if (boundary === "branch") await harness.session.navigateTree(unmentioned, { summarize: false });
+			else if (boundary === "replacement") harness.session.setActiveToolsByName(["read"]);
+			else {
+				harness.setResponses([fauxAssistantMessage("completed before registration")]);
+				await harness.session.prompt("start the next run");
+			}
+			if (!registerLate) throw new Error("Missing registration callback");
+			registerLate();
+			const expected = boundary === "replacement" ? ["read", "late_tool"] : ["read", "write", "late_tool"];
+			expect(harness.session.getActiveToolNames()).toEqual(expected);
+			expect(harness.session.getCallableToolNames()).toEqual(expected);
+			let declared: string[] | undefined;
+			harness.setResponses([
+				(context) => {
+					declared = getCurrentTools(context.messages).map((tool) => tool.name);
+					return fauxAssistantMessage("current tools received");
+				},
+			]);
+			await harness.session.prompt("inspect current tools");
+			expect(declared).toEqual(expected);
+		},
+	);
+
 	// #22: invocation modifiers must survive every selected-branch restoration path.
 	it.each(["navigate", "swipe", "regenerate"] as const)(
 		"keeps invocation tool modifiers across repeated %s restoration and provider requests",

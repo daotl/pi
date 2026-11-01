@@ -55,6 +55,7 @@ export const Index = local("pi.index", {
 - Remote calls validate args/results and state values at the provider boundary. Local calls are not validated per call.
 - Remote method results with a value are copied into owned strict JSON after schema validation, including in-host calls. Undefined results and void methods preserve their omission semantics; non-JSON values reject with `invalid/result`. If sending either a success or error response fails, the affected link closes so its pending calls settle.
 - Local contracts list every member (`members: { search: method(...), harness: opaque(...), status: Schema }`). A reference that is still `loading` must know whether `h.x` is a method (a caller that waits until live), a state member (a readable) or an opaque value, before any implementation exists. Members missing from the contract are found only once the reference is live.
+- Variant and member names are own properties, including inherited JavaScript names such as `toString` and computed `["__proto__"]` keys. Remote state and methods may not declare the same member; reference-owned names remain reserved.
 - Every bundle embeds the contract tokens it was built against (its own copy). Fingerprint = hash of the canonical description.
 - Placement (remote types, required): `host: hostNamed(name)` (one host) or `hostFamily(prefix, key)` (the host `prefix` + the input's required string field `key`). Data only, in the description (and so the fingerprint and the `hold` token); there is no `at` option. A `get` normalizes the input with the caller's contract, resolves the host and acquires locally if that is this host, else remotely. `serve` (and a reload that loads a facet) refuses a type whose placement excludes the host's name. A host refuses a hold whose input its own contract places elsewhere (`invalid/placement`), and a relay refuses a hold whose target disagrees with its token's placement and input. Coverage requires equal placements, and an `accepts` adapter never bridges two placements: a moved type is a breaking change. A remote reference's address is the type, the normalized input and the principal: no host name.
 
@@ -150,8 +151,10 @@ Inside the factory, placeholders must not be used (`resource.value` and an `init
   `invalid/input`. Other references do not change its lifetime: the host keeps its own until it closes.
 - Only `"host"` objects may register (`invalid/not_host_lifetime` otherwise).
 - A `"host"` object whose activation fails is started again by the next reload that changes its type. A reload that
-  makes a type `"host"` creates its object; one that makes it `"referenced"` releases the host's reference, so the
-  object lives on only while others reference it.
+  makes a type `"host"` creates its object, or preserves the surviving host-principal object at the candidate's
+  normalized empty-input address. Live or activating objects at other addresses (guest principals or noncanonical
+  inputs) reject that transition with `upgrade_conflict/lifetime`; drain them before retrying. A reload that makes
+  the type `"referenced"` releases the host's reference, so the object lives on only while others reference it.
 
 ### Host objects readiness
 
@@ -245,9 +248,11 @@ dependency cycles fail within the existing readiness/vote deadlines. Pending met
 private holds. No task or listener starts before commit.
 
 Commit promotes the transaction's private holds only after installation and the coordinator's FIFO commit frames.
-Ordinary/client holds never read pending replacements. Old replaced holds retain their old view until retirement
-releases them; abort revokes intents, releases private holds, restores subscriptions/resources and leaves installed
-code and state unchanged. Disconnect releases served/relayed private holds and aborts participant preparation;
+The promoted binding becomes the ordinary lookup for its key, so later acquisitions share its hold and current state.
+Ordinary/client holds never read pending replacements. Displaced old bindings remain owned for reconnect and teardown,
+but only their existing old-code views may use them; once those views drain they close without consumer-side linger.
+Abort revokes intents, releases private holds, restores subscriptions/resources and leaves installed code and state
+unchanged. Disconnect releases served/relayed private holds and aborts participant preparation;
 candidate holds are not re-held on an unrelated reconnect. A late ordinary hold must satisfy both the installed and
 prospective provider after compatibility validation, so it cannot invalidate a prepared vote.
 Adding an ordinary view before validation revokes intent; after preparation it is rejected with retryable
@@ -287,6 +292,10 @@ Per-code-version immutable tables; order = first registration order, kept on rep
 ## 10. Host manager (library)
 
 `createHostManager({ driver, keepAlive })`: fork driver (entry, init, lock, env), serialized start/stop/replace, exit-before-replace, process-tree kill after grace, control channel (ready/fatal/shutdown), liveness callback (booting, activeCalls, viewers with heartbeats, durable tasks, idleFor).
+
+`start()` publishes `running` only while the ready instance is still live. An exit observed during the readiness
+handoff rejects startup, even if `ready` arrived first in the same turn; an exit-cleanup rejection keeps its original
+error. The manager remains stopped with no instance, and a later `start()` spawns a fresh child.
 
 On Windows x64/arm64 the fork driver uses Chord's native launcher and N-API Job helper. The application Node process
 is created suspended with `PROC_THREAD_ATTRIBUTE_JOB_LIST` inside a noninheritable kill-on-close Job, before any

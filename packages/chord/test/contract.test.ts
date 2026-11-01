@@ -2,7 +2,19 @@ import assert from "node:assert/strict";
 import { type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
 import { describe, it } from "vitest";
-import { bind, coverage, hostFamily, hostNamed, isChordError, local, method, opaque, remote } from "../src/index.ts";
+import {
+	bind,
+	coverage,
+	createHost,
+	hostFamily,
+	hostNamed,
+	isChordError,
+	local,
+	memoryLinkPair,
+	method,
+	opaque,
+	remote,
+} from "../src/index.ts";
 import { canonicalIdentity, fits, normalize } from "../src/schema.ts";
 
 const View = Type.Object({ text: Type.String() });
@@ -292,6 +304,94 @@ describe("contracts", () => {
 		const copy = remote("t.chat", chatV1.def);
 		assert.equal(copy.fingerprint, chatV1.fingerprint);
 		assert.notEqual(remote("t.chat", { ...chatV1.def, version: 2 }).fingerprint, chatV1.fingerprint);
+	});
+
+	for (const variant of ["main", "__proto__"] as const) {
+		it(`calls inherited-name and computed __proto__ methods over a link in variant ${variant}`, async () => {
+			const contract = remote(`t.member-names-${variant}`, {
+				version: 1,
+				input: Type.Object({}),
+				host: hostNamed("server"),
+				variants: {
+					[variant]: {
+						methods: {
+							toString: method(undefined, Type.String()),
+							valueOf: method(undefined, Type.String()),
+							hasOwnProperty: method(undefined, Type.String()),
+							constructor: method(undefined, Type.String()),
+							["__proto__"]: method(undefined, Type.String()),
+						},
+					},
+				},
+			});
+			const server = createHost({ self: {}, name: "server" });
+			const [down, up] = memoryLinkPair();
+			server.accept(down, { principal: {} });
+			const client = createHost({
+				self: {},
+				name: "client",
+				kind: "client",
+				upstream: { link: up, principal: {} },
+			});
+			try {
+				server.serve(contract, () => ({
+					variant,
+					toString: () => "toString result",
+					valueOf: () => "valueOf result",
+					hasOwnProperty: () => "hasOwnProperty result",
+					constructor: () => "constructor result",
+					["__proto__"]: () => "__proto__ result",
+				}));
+				const ref = client.hold(contract, {});
+				await ref.ready;
+				assert.equal(ref.variant, variant);
+				assert.equal(await ref.toString(), "toString result");
+				assert.equal(await ref.valueOf(), "valueOf result");
+				// biome-ignore lint/suspicious/noPrototypeBuiltins: This invokes the remote contract member, not Object.prototype.
+				assert.equal(await ref.hasOwnProperty(), "hasOwnProperty result");
+				assert.equal(await ref.constructor(), "constructor result");
+				assert.equal(await ref.__proto__(), "__proto__ result");
+			} finally {
+				await client.close();
+				await server.close();
+			}
+		});
+	}
+
+	it("calls a computed __proto__ member through a local reference", async () => {
+		const contract = local("t.local-prototype-member", {
+			version: 1,
+			input: Type.Object({}),
+			members: { ["__proto__"]: method(undefined, Type.String()) },
+		});
+		assert.throws(
+			() => bind(local(contract.name, { version: 1, input: Type.Object({}) }), undefined, contract),
+			(error) => isChordError(error, "contract_mismatch"),
+		);
+		const host = createHost({ self: {}, name: "server" });
+		try {
+			host.serve(contract, () => ({ ["__proto__"]: () => "local result" }));
+			const ref = host.hold(contract, {});
+			await ref.ready;
+			assert.equal(await ref.__proto__(), "local result");
+		} finally {
+			await host.close();
+		}
+	});
+
+	it("rejects actual state and method collisions, including computed __proto__", () => {
+		for (const name of ["send", "toString", "__proto__"]) {
+			assert.throws(
+				() =>
+					remote("t.duplicate-member", {
+						version: 1,
+						input: Type.Object({}),
+						host: hostNamed("server"),
+						variants: { main: { state: { [name]: Type.String() }, methods: { [name]: method() } } },
+					}),
+				TypeError,
+			);
+		}
 	});
 
 	it("rejects reserved member names and opaque remote members", () => {

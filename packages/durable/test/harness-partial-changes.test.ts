@@ -20,7 +20,7 @@ type Live = { generation: NonNullable<LiveState["generation"]> };
  * A response streaming one text block (started empty) and then one tool call, as a provider produces it: the partial
  * message it mutates and the events it emits. Partial commits go into a tracked document, as Durable's generation does.
  */
-function setup() {
+function setup(initialPrefix = "") {
 	const partial: AssistantMessage = {
 		role: "assistant",
 		content: [{ type: "text", text: "" }],
@@ -53,7 +53,12 @@ function setup() {
 		},
 		argument(delta: string) {
 			if (partial.content[1] === undefined) {
-				partial.content.push({ type: "toolCall", id: "c1", name: "write", arguments: {} });
+				partial.content.push({
+					type: "toolCall",
+					id: "c1",
+					name: "write",
+					arguments: initialPrefix ? args.append(initialPrefix) : {},
+				});
 				emit({ type: "toolcall_start", contentIndex: 1, partial });
 			}
 			(partial.content[1] as { arguments: Record<string, unknown> }).arguments = args.append(delta);
@@ -145,6 +150,35 @@ describe("PartialChanges", () => {
 		changes.observe({ type: "toolcall_delta", contentIndex: 1, delta: '.ts"}', partial: stream.partial });
 		commit();
 		expect(stream.committed().arguments).toEqual({ path: "src/a.ts" });
+	});
+
+	it.each([
+		['{"payload":', ['{"text":"hello', ' world"}}'], { payload: { text: "hello world" } }],
+		['{"payload":', ["{", '"text":"hello', ' world"}}'], { payload: { text: "hello world" } }],
+		["[", ["{", '"text":"hello', ' world"}]'], {}],
+	] as const)("reconciles suffixes when an empty preview hides the initial prefix %s", (prefix, deltas, expected) => {
+		const stream = setup(prefix);
+		for (const delta of deltas) {
+			stream.argument(delta);
+			stream.commit();
+			expect(stream.committed().arguments).toEqual((stream.partial.content[1] as ToolCall).arguments);
+		}
+		expect(stream.committed().arguments).toEqual(expected);
+	});
+
+	it("keeps suffix-only commits after empty deltas establish argument alignment", () => {
+		const stream = setup();
+		stream.argument("{");
+		stream.commit();
+		const content = "x".repeat(64 * 1024);
+		stream.argument(`"content":"${content}`);
+		stream.commit();
+		stream.argument(" tail");
+		commitWithoutPrefixRead(stream, content.length);
+		expect(stream.committed().arguments).toEqual({ content: `${content} tail` });
+		expect(stream.ops.at(-1)).toEqual([
+			["a", ["generation", "message", "content", 1, "arguments", "content"], " tail"],
+		]);
 	});
 	it("commits tool-call arguments equal to the final parse, at every piece size and commit rhythm", () => {
 		const text = JSON.stringify(ARGUMENTS);

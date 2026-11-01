@@ -1,4 +1,4 @@
-import type { Frame, Link } from "@earendil-works/chord";
+import { type Frame, type Link, stringifyFrame } from "@earendil-works/chord";
 
 /** A JSON-only in-process link for endpoints tunneled over the routed byte protocol. */
 export function createRoutedLinkPair(): [Link, Link] {
@@ -12,7 +12,7 @@ export function createRoutedLinkPair(): [Link, Link] {
 
 		send(frame: Frame): number | undefined {
 			if (this.closed) return undefined;
-			const json = JSON.stringify(frame);
+			const json = stringifyFrame(frame);
 			const copy = JSON.parse(json) as Frame;
 			this.#tail = this.#tail.then(() => this.peer.deliver(copy));
 			return json.length;

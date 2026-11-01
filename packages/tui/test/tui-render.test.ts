@@ -103,6 +103,38 @@ class LoggingVirtualTerminal extends VirtualTerminal {
 	}
 }
 
+// Models Kitty upload completion, placement ownership and explicit deletion, not pixels.
+// Text erases deliberately do not remove placements: xterm does not model Kitty graphics.
+class KittyPlacementModel {
+	readonly placements = new Map<number, { controls: Record<string, string>; payload: string }>();
+	private pending?: { controls: Record<string, string>; payload: string };
+	private anonymousId = -1;
+
+	apply(output: string): void {
+		for (const match of output.matchAll(/\x1b_G([^;\x1b]*)(?:;([^\x1b]*))?\x1b\\/g)) {
+			const controls: Record<string, string> = Object.fromEntries(
+				match[1].split(",").map((control) => control.split("=")),
+			);
+			if (controls.a === "d") {
+				assert.ok(controls.d === "I" || controls.d === "i", "expected image-scoped deletion");
+				this.placements.delete(Number(controls.i));
+				continue;
+			}
+			const upload = this.pending ?? { controls, payload: "" };
+			upload.payload += match[2] ?? "";
+			if (controls.m === "1") {
+				this.pending = upload;
+				continue;
+			}
+			this.pending = undefined;
+			assert.strictEqual(upload.controls.a, "T", "these scenarios use transmit-and-display commands");
+			const id = Number(upload.controls.i) || this.anonymousId--;
+			this.placements.set(id, upload);
+		}
+		assert.strictEqual(this.pending, undefined, "each replay must finish its chunked upload");
+	}
+}
+
 async function withEnv<T>(updates: Record<string, string | undefined>, run: () => Promise<T>): Promise<T> {
 	const previousValues = new Map<string, string | undefined>();
 	for (const [key, value] of Object.entries(updates)) {
@@ -1185,6 +1217,146 @@ describe("TUI overlays over native-reflow content", () => {
 			tui.stop();
 			resetCapabilitiesCache();
 			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
+	for (const api of ["encodeKitty", "renderImage"] as const) {
+		for (const chunked of [false, true]) {
+			for (const callerId of [undefined, 6201]) {
+				it(`cleans up ${callerId === undefined ? "anonymous" : "caller-ID"} ${api} ${chunked ? "chunked" : "single"} overlay placements`, async () => {
+					setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+					setCellDimensions({ widthPx: 10, heightPx: 20 });
+					const png =
+						"iVBORw0KGgoAAAANSUhEUgAAAAMAAABaCAYAAAB9qeyAAAAAGUlEQVR4nGP4z8DwH4YZRjmjnFHOKGcgOQB2mRoDbjkRtQAAAABJRU5ErkJggg==";
+					let sequence =
+						api === "encodeKitty"
+							? encodeKitty(png, { columns: 3, rows: 3, imageId: callerId, moveCursor: false })
+							: renderImage(
+									png,
+									{ widthPx: 3, heightPx: 90 },
+									{
+										maxWidthCells: 3,
+										maxHeightCells: 3,
+										imageId: callerId,
+										moveCursor: false,
+									},
+								)?.sequence;
+					assert.ok(sequence);
+					if (chunked) {
+						const headerEnd = sequence.indexOf(";");
+						sequence = `${sequence.slice(0, headerEnd)},m=1;${png.slice(0, 32)}\x1b\\\x1b_Gm=0;${png.slice(32)}\x1b\\`;
+					}
+					const terminal = new LoggingVirtualTerminal(20, 4);
+					const tui = new TuiMainScreen(terminal);
+					tui.addChild(new Text("base zero\nbase one\nbase two\nbase three", 0, 0));
+					const component = new TestComponent();
+					component.lines = [sequence, "", ""];
+					const cachedLines = component.lines;
+					const model = new KittyPlacementModel();
+					const consume = () => {
+						model.apply(terminal.getWrites());
+						terminal.clearWrites();
+						assert.strictEqual(component.lines, cachedLines);
+						assert.deepStrictEqual(component.lines, [sequence, "", ""]);
+					};
+					const assertPlacement = (rows: string) => {
+						assert.strictEqual(model.placements.size, 1, "redraw must replace, not accumulate placements");
+						const entry = [...model.placements.entries()][0]!;
+						assert.ok(entry[0] > 0, "anonymous replay needs an owned, deletable Kitty ID");
+						if (callerId !== undefined) assert.strictEqual(entry[0], callerId);
+						assert.strictEqual(entry[1].controls.r, rows);
+						assert.strictEqual(entry[1].payload, png, "all continuation chunks retain their payload");
+						return entry[0];
+					};
+					try {
+						tui.start();
+						await terminal.waitForRender();
+						const before = terminal.getViewport();
+						terminal.clearWrites();
+						const overlay = tui.showOverlay(component, { width: 5, row: 0, col: 4, maxHeight: 1 });
+						await terminal.waitForRender();
+						consume();
+						const firstId = assertPlacement("1");
+						assert.strictEqual(model.placements.get(firstId)?.controls.h, "30");
+						tui.requestRender();
+						await terminal.waitForRender();
+						consume();
+						assertPlacement("1");
+						const covering = tui.showOverlay(new Text("YES", 0, 0), { width: 3, row: 0, col: 4 });
+						await terminal.waitForRender();
+						consume();
+						assert.strictEqual(model.placements.size, 0, "a covering dialog must delete the old graphics");
+						assert.strictEqual(terminal.getViewport()[0].slice(4, 7), "YES");
+						covering.hide();
+						await terminal.waitForRender();
+						consume();
+						assertPlacement("1");
+						overlay.setHidden(true);
+						await terminal.waitForRender();
+						consume();
+						assert.strictEqual(model.placements.size, 0);
+						overlay.setHidden(false);
+						await terminal.waitForRender();
+						consume();
+						assertPlacement("1");
+						overlay.hide();
+						await terminal.waitForRender();
+						consume();
+						assert.strictEqual(model.placements.size, 0, "permanent hide must free the image");
+						tui.showOverlay(component, { width: 5, row: 0, col: 4 });
+						await terminal.waitForRender();
+						consume();
+						assertPlacement("3");
+						tui.hideOverlay();
+						await terminal.waitForRender();
+						consume();
+						assert.strictEqual(model.placements.size, 0);
+						assert.deepStrictEqual(terminal.getViewport(), before);
+					} finally {
+						tui.stop();
+						resetCapabilitiesCache();
+						setCellDimensions({ widthPx: 9, heightPx: 18 });
+					}
+				});
+			}
+		}
+	}
+
+	it("does not assign anonymous overlays an ID already used by the transcript or another overlay", async (context) => {
+		const terminal = new LoggingVirtualTerminal(20, 4);
+		const tui = new TuiMainScreen(terminal);
+		const base = new TestComponent();
+		base.lines = [
+			"base zero",
+			"base one",
+			"base two",
+			encodeKitty("AAAA", { columns: 1, rows: 1, imageId: 6300, moveCursor: false }),
+		];
+		tui.addChild(base);
+		const anonymous = new TestComponent();
+		anonymous.lines = [encodeKitty("BBBB", { columns: 1, rows: 1, moveCursor: false })];
+		const identified = new TestComponent();
+		identified.lines = [encodeKitty("CCCC", { columns: 1, rows: 1, imageId: 6301, moveCursor: false })];
+		const model = new KittyPlacementModel();
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			model.apply(terminal.getWrites());
+			terminal.clearWrites();
+			const candidates = [6300, 6301, 6302, 6302, 6303];
+			context.mock.method(Math, "random", () => ((candidates.shift() ?? 6304) - 1) / 0xfffffffe);
+			tui.showOverlay(anonymous, { width: 1, row: 0, col: 4 });
+			tui.showOverlay(anonymous, { width: 1, row: 1, col: 4 });
+			tui.showOverlay(identified, { width: 1, row: 2, col: 4 });
+			await terminal.waitForRender();
+			model.apply(terminal.getWrites());
+			assert.deepStrictEqual([...model.placements.keys()].sort(), [6300, 6301, 6302, 6303]);
+			assert.strictEqual(model.placements.get(6300)?.payload, "AAAA");
+			assert.strictEqual(model.placements.get(6301)?.payload, "CCCC");
+			assert.strictEqual(model.placements.get(6302)?.payload, "BBBB");
+			assert.strictEqual(model.placements.get(6303)?.payload, "BBBB");
+		} finally {
+			tui.stop();
 		}
 	});
 

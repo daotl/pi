@@ -221,7 +221,7 @@ the `WatchEnd`:
 - `cancelled`: the context the watch was acquired with was cancelled;
 - `retired`: the source was retired, an explicit event after a last frame `[["r", null]]`;
 - `ended`: the source closed (its owner ended or closed);
-- `listener_error` with `error`: the listener threw or rejected;
+- `listener_error` with `error`: the listener threw or rejected; normalization cannot strand `closed`, even if type checks or string conversion throw. The reporter receives the original thrown value, and an unformattable value gets a fixed fallback `Error`;
 - `failed` with `error`: the source failed.
 
 An ended watch drops every reference into its source, so a stopped watch that is
@@ -233,3 +233,21 @@ Sources implement handles with `Watch<T>`, fed through `advance(value, ops, cont
 in-process values: the listener gets `(value, context)` without ops, one call per
 value in order; past 100 pending values they collapse to one, the value of the
 optional `replace()` or the newest.
+
+## Custom JSON links
+
+A relayed `Frame` can contain a transport-packed call argument, result, or state
+snapshot. Custom links bridging to JSON or another strict-JSON codec must call
+`stringifyFrame(frame)` from `@earendil-works/chord` before encoding, rather than
+stringifying the native frame directly. It inflates packed `args`/`value` and
+returns JSON text, omitting undefined optional protocol fields (including nested
+protocol metadata). Parse that text for an alias-free tree to feed another codec.
+Application payloads remain strict JSON: undefined inside an object or array is
+rejected, not silently omitted or changed to null. An absent or undefined top-level
+optional `args`/`value` remains absent.
+
+Inflating a packed payload requires Node's zlib; browser links already inflate
+received packed payloads before delivering their frames. `Link.send` must continue
+reporting the size in its transport's existing units: JSON text length for a JSON
+link, encoded byte length for a routed byte link, or undefined when sizes are not
+reported. Count the normalized frame as actually encoded, not its packed source.

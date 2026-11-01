@@ -245,11 +245,15 @@ abstract class WatchLifecycle<T, L, D extends Delivery<T>> {
 }
 
 function toError(error: unknown): Error {
-	if (error instanceof Error) return error;
 	try {
+		if (error instanceof Error) return error;
 		return new Error(String(error));
 	} catch {
-		return new Error(Object.prototype.toString.call(error));
+		try {
+			return new Error(Object.prototype.toString.call(error));
+		} catch {
+			return new Error("Unformattable error");
+		}
 	}
 }
 

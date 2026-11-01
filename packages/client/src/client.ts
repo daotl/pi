@@ -1,4 +1,4 @@
-import type { Frame, Link } from "@earendil-works/chord";
+import { type Frame, type Link, stringifyFrame } from "@earendil-works/chord";
 import {
 	type AttachmentEnvelope,
 	encodeClientMessage,
@@ -78,7 +78,6 @@ export class Client {
 
 	connect(): Promise<ServerHello> {
 		if (this.#disposed) return Promise.reject(new ClientDisposedError());
-		this.#hello = undefined;
 		return this.#connection.connect();
 	}
 
@@ -114,7 +113,7 @@ export class Client {
 			(frame) => {
 				if (!this.connected || !this.#targetIsCurrent(captured)) throw new DisconnectedError();
 				// Native frames use optional undefined fields. A JSON link omits those before the strict CBOR boundary.
-				const normalized = JSON.parse(JSON.stringify(frame)) as Frame;
+				const normalized = JSON.parse(stringifyFrame(frame)) as Frame;
 				const encoded = encodeClientMessage(
 					{ type: "chord", target: captured, frame: normalized },
 					{ maxFrameLength: this.#connection.maxFrameLength },
@@ -154,6 +153,7 @@ export class Client {
 	}
 
 	#handleConnectionStateChange(change: ConnectionStateChange): void {
+		if (change.state === "connecting") this.#hello = undefined;
 		if (change.state === "disconnected") {
 			this.#hello = undefined;
 			for (const link of [...this.#links]) link.end(change.error?.message ?? "disconnected");

@@ -2571,3 +2571,140 @@ The user subsequently requested `fix all findings`, then `then commit fix with d
 ### Local save disposition
 
 All 29 original review findings (the preceding 27 plus the formerly excluded #15 and #17) now have local source repairs and verification, plus the adjacent presentation invalidation repair. The user-authorized local save comprises all 69 owned paths and this closure update. The separate out-of-scope worker-retirement observation and historical native Windows acceptance do not change that bounded repair result; they prevent a claim of unconditional whole-merge readiness. No push or PR.
+
+
+## Fresh complete merge review after 323eab703
+
+**Scope:** `98dfe28cbeec4e1f2f61516e227420b2407dcdf9 -> 323eab7039dc26d4e75989429e3a8dbbe564952d`, including merge `8322aa1d` and every later change. The user-authorized pre-review save is `323eab703`; worktree was clean. **Mode:** markdown local-apply. No push or PR.
+
+### Actionable Findings
+
+The following 22 findings passed independent source validation and await behavioral repair verification. IDs belong only to this round. They are not closed by the prior green suite.
+
+| # | Severity | Location | Finding | Confidence |
+|---|---|---|---|---|
+| 2 | P1 | `packages/coding-agent/src/experimental/services/worker.ts:141` | Cancel worker reload activation before joining disposal | 75 |
+| 3 | P1 | `packages/coding-agent/src/experimental/session-worker.ts:619` | Keep native traffic flowing while attachment cleanup waits | 75 |
+| 5 | P2 | `packages/chord/src/contract.ts:237` | Inherited names falsely collide with remote state members | 100 |
+| 6 | P2 | `packages/chord/src/host.ts:557` | Promote candidate bindings under their canonical lookup key | 100 |
+| 7 | P2 | `packages/chord/src/reload.ts:934` | Reject noncanonical objects before promoting a type's lifetime | 100 |
+| 8 | P2 | `packages/chord/src/watch.ts:252` | Make error normalization genuinely non-throwing | 100 |
+| 9 | P2 | `packages/client/src/client.ts:115` | Rejected reconnect clears live server routing | 100 |
+| 11 | P2 | `packages/env/src/remote-env.ts:494` | Check cancellation after the single-chunk binary read | 100 |
+| 12 | P2 | `packages/tui/src/layout.ts:375` | Preserve cursor-forward offsets when restoring scrolled images | 100 |
+| 14 | P2 | `packages/chord/src/manager.ts:472` | Reject readiness when the child already exited | 75 |
+| 15 | P2 | `packages/codemode/src/source.ts:344` | Preserve for-await control state when scanning regexps | 75 |
+| 16 | P2 | `packages/coding-agent/src/core/agent-session.ts:3287` | Preserve disabled loadouts when late tools register | 75 |
+| 17 | P2 | `packages/coding-agent/src/experimental/client-tui.ts:486` | Retire active selectors when the attachment changes | 75 |
+| 18 | P2 | `packages/coding-agent/src/experimental/plugins/package.ts:114` | Provide require for bundled CommonJS plugin dependencies | 75 |
+| 19 | P2 | `packages/coding-agent/src/extensions/codemode/execute.ts:424` | Save generated images in the agent-accessible filesystem | 75 |
+| 20 | P2 | `packages/durable/src/harness/partial-changes.ts:73` | Initial JSON prefixes corrupt Durable streamed tool arguments | 75 |
+| 21 | P2 | `packages/env/daemon/src/list.rs:143` | Enforce listing deadlines while traversing filtered entries | 75 |
+| 22 | P2 | `packages/server/src/link.ts:15` | Preserve packed payloads across native JSON bridges | 75 |
+| 23 | P2 | `packages/tui/src/tui-main-screen.ts:780` | Assign IDs before replaying anonymous Kitty overlays | 75 |
+| 24 | P2 | `scripts/issues/triage.ts:276` | Do not reclaim completed triage during restart recovery | 75 |
+| 25 | P2 | `scripts/issues/ui.html:104` | Preserve focused selects on failed background refreshes | 75 |
+| 26 | P3 | `packages/durable/src/storage/sqlite/storage.ts:99` | Descending SQLite scans omit the maximum valid ID | 100 |
+
+### Rejected Findings
+
+- #1: The missing-contentBlockStop case predates this diff: base 98dfe28cb also accepts messageStop(tool_use), preserves parseStreamingJson's partial arguments, and deletes partialJson without a final parse, while partial-json's parseObj catches the malformed .5 value and returns the same valid prefix, so the proposed failure is not a newly introduced or worsened behavior.
+- #4: The deterministic-failure claim assumes immutable event-time partials, but EventStream queues shared mutable events (event-stream.ts:43–57,72–82), so this mock's toolcall_start can be consumed after finishBlock has attached argumentsError and cloneToolCall preserves it in the start frame (assistant-message-frame.ts:221–235); Main additionally reports the unmodified targeted file passed all nine tests, so progress-frame field limitations alone do not establish this finding.
+- #10: Although the new live tests deliberately resolve stored credentials and can refresh them during collection, their credential-based skip comments match the repository's explicit preexisting AGENTS.md:34 policy that full direct suites may activate live E2E tests and must instead run through credential-isolated test.sh, so requiring PI_E2E_TESTS for Durable changes an intentional test policy rather than establishing a defect in its supported isolated execution path.
+- #13: The new shared classifier helper does have no deadline when timeoutMs is omitted, but the public contract expressly makes timeout support provider-specific and cites SDK defaults only as examples (types.ts:200–204), while the extracted pre-existing System One path used the same optional-only timeout policy; no inspected contract establishes the proposed mandatory ten-minute default, making this an unsupported API-policy change rather than a verified regression.
+
+### Coverage
+
+- 33 fresh reports: 20 disjoint changed-hunk owners and 13 whole-inventory risk lenses, including mandatory independent correctness. All 1293 paths accounted exactly once by module owners; no missing or duplicate paths. 1281 paths have source-semantic review; 12 explicitly limited paths comprise four Windows binaries, six generated dependency lockfiles, and two minified vendor libraries. All textual changed hunks were reported read; dependency integrity and minified/native implementation equivalence are not certified. Whole-inventory lenses are risk-selected, not separate exhaustive semantic audits.
+- 27 raw candidates -> one manager-race semantic duplicate merged -> 26 stable IDs -> 22 accepted, four rejected. No malformed finding survived. The initial 26-item independent validation exceeded the normal cap and is supplemental. Three fresh eight-item source gates independently covered the remaining candidate sets. This intentionally differs from the skill's single-batch default rather than silently dropping concrete candidates; disagreement on #1/#10 resolved conservatively against acceptance. #4's alleged deterministic failure was contradicted by nine passing unmodified tests (bg_1224).
+- Cross-model skipped: serving family unattested; no external code egress. Native adversarial review supplied that lens. Graph tools failed with WeakMap errors; parent TypeScript LSP references succeeded for public contract, routed-link and worker-service boundaries, while children used exact-source/history fallback. No exhaustive external/dynamic caller claim. CE config files absent, so docs root is `docs`. Applicable standards were supplied active context; no additional context-file discovery. No unambiguous implementation-ready plan selected; settlement suppression not evaluated.
+- Standards, testing, maintainability, agent-native, security, performance, API, migration, reliability, adversarial, async UI and deployment/rollback lenses selected for concrete changed surfaces. No learnings corpus or Swift surface; no PR-comment review. Model override selector unavailable; local workers inherited the session model. All reviewer launches collected; no source edits or tests performed by reviewer workers.
+
+### Deployment Notes
+
+SQLite schema 2 rebuild is forward-only for older binaries. Production rollout requires coherent WAL-aware backup/restore rehearsal, exclusive ownership, exact row/schema/allocator comparison, namespace preservation and disk/lock headroom. Protocol cohorts and all platform daemon assets require actual release receipts. These operational gates are not new source defects or proof of deployment readiness.
+
+### Verdict
+
+**NOT READY / REPAIRS IN PROGRESS.** 22 independently validated source findings await locally verified repairs. Historical native Windows acceptance remains unexecuted. Immutable diff, snapshot, per-reviewer full reports, path accounting and validation evidence: `/tmp/compound-engineering-501/ce-code-review/20261101-complete-323eab703-a2155a14`.
+
+
+
+## Fresh repair implementation checkpoint - 323eab703
+
+This section supersedes the preceding repair-in-progress status for source implementation only. All 22 accepted findings now have applied product changes, behavioral regressions and relevant documentation. Final full-root verification is still running; no complete-suite success is claimed here. Source changes span 68 owned paths including this ledger.
+
+### Applied
+
+| # | File | Repair | Reviewer |
+|---|---|---|---|
+| 2 | `packages/coding-agent/src/experimental/services/worker.ts` (+ behavioral regressions/docs) | Start worker Host cancellation before joining reload/principal cleanup; retain plugin files and errors. | Experimental |
+| 3 | `packages/coding-agent/src/experimental/session-worker.ts` (+ behavioral regressions/docs) | Own per-attachment demand queues without blocking native command reader; join shutdown work. | Experimental |
+| 5 | `packages/chord/src/contract.ts` (+ behavioral regressions/docs) | Use own-property/null-prototype contract dictionaries for inherited names and __proto__. | ChordContractsSqlite |
+| 6 | `packages/chord/src/host.ts` (+ behavioral regressions/docs) | Promote candidate binding at canonical key; retain displaced existing views without stale linger. | ChordLifecycle |
+| 7 | `packages/chord/src/reload.ts` (+ behavioral regressions/docs) | Reject live/activating noncanonical referenced-to-host promotions before preparation. | ChordLifecycle |
+| 8 | `packages/chord/src/watch.ts` (+ behavioral regressions/docs) | Contain all hostile error conversion fallbacks with fixed literal; task faults remain local. | maintainability-reviewer |
+| 9 | `packages/client/src/client.ts` (+ behavioral regressions/docs) | Clear hello only when a new connecting transition is accepted. | TransportSessions |
+| 11 | `packages/env/src/remote-env.ts` (+ behavioral regressions/docs) | Check cancellation after single/unknown-size read completion and preserve handle closure. | EnvNative |
+| 12 | `packages/tui/src/layout.ts` (+ behavioral regressions/docs) | Measure scrolled image anchors with terminal cursor movement and local width. | TuiRenderer |
+| 14 | `packages/chord/src/manager.ts` (+ behavioral regressions/docs) | Reject ready handoff after fulfilled/rejected child exit; retain restartability. | correctness-reviewer, ChordLifecycle |
+| 15 | `packages/codemode/src/source.ts` (+ behavioral regressions/docs) | Preserve for-await control context across comments/whitespace with explicit pending state. | ToolsTelemetry |
+| 16 | `packages/coding-agent/src/core/agent-session.ts` (+ behavioral regressions/docs) | Retain restored negative tool mentions until registration; clear at intentional loadout/run/branch boundaries. | CoreSession |
+| 17 | `packages/coding-agent/src/experimental/client-tui.ts` (+ behavioral regressions/docs) | Identity-scope active selector cancellation to Ctx and attachment/connection generation. | julik-frontend-races-reviewer |
+| 18 | `packages/coding-agent/src/experimental/plugins/package.ts` (+ behavioral regressions/docs) | Supply createRequire in ESM plugin bundle for bundled CommonJS builtins. | Experimental |
+| 19 | `packages/coding-agent/src/extensions/codemode/execute.ts` (+ behavioral regressions/docs) | Save generated image bytes through strict execution-aware callback wired to SSH/Gondolin. | agent-native-reviewer |
+| 20 | `packages/durable/src/harness/partial-changes.ts` (+ behavioral regressions/docs) | Verify initial parser/provider alignment once; preserve authoritative snapshots on omitted prefix. | adversarial-reviewer |
+| 21 | `packages/env/daemon/src/list.rs` (+ behavioral regressions/docs) | Check deadline/cancel during filtered enumeration and incremental deterministic sorting using ignore matchers. | EnvNative |
+| 22 | `packages/server/src/link.ts` (+ behavioral regressions/docs) | Normalize Packed args/results/state with public strict-JSON serializer in both routed bridges. | TransportSessions |
+| 23 | `packages/tui/src/tui-main-screen.ts` (+ behavioral regressions/docs) | Assign owned replay-only IDs to anonymous Kitty graphics and delete on redraw/hide. | TuiRenderer |
+| 24 | `scripts/issues/triage.ts` (+ behavioral regressions/docs) | Claim triage only while current persisted status is queued/running plus matching ownership. | ReleaseConfig |
+| 25 | `scripts/issues/ui.html` (+ behavioral regressions/docs) | Update error/status without replacing focused category controls; defer background render. | julik-frontend-races-reviewer |
+| 26 | `packages/durable/src/storage/sqlite/storage.ts` (+ behavioral regressions/docs) | Use inclusive maximum upper bound for cursor-free descending scans, exclusive cursors preserved. | DurableSource |
+
+### Verification
+
+- Worker ownership: bg_1239 reproduced five failures before product integration; bg_1240 passed 20. Full-root inspection then found the old worker-disposal fixture required Host cleanup not to start until attachment cleanup ended. That incidental ordering contradicted cancellation-first disposal. The fixture now checks that neither the blocked attachment nor loader has closed, while allowing Host cancellation to start; all attachment/Host/loader error aggregation and idempotency assertions remain. Broader bg_1282 passed 42 tests.
+- Contract members/ready-exit: bg_1234 reproduced five failures; bg_1236 passed 47 with 10 skipped. Client duplicate connect/reconnect: bg_1235 reproduced two failures; bg_1237 passed 12. Error normalization: bg_1230/bg_1231 reproduced two watch and three task faults; bg_1232/bg_1233 passed 36 and 27 without unhandled errors.
+- Candidate bindings/lifetimes: bg_1248 reproduced duplicate holds, stale ordinary state and wrong/waiting lifetime conflicts; bg_1249 passed 28. Loadout: bg_1243 reproduced four disabled-late-tool failures; a separate replacement assertion exposed an unhydrated faux Agent fixture. Adding the same recorded context hydration used by SDK resume, without changing expected results or product scope, gave bg_1247 66 passed.
+- Graphics: bg_1245 reproduced CUF anchor and anonymous placement ownership failures; bg_1246 passed 114. Proof uses terminal cells and protocol placement state, not native Kitty/iTerm2 pixels.
+- Parser/persistence: bg_1256 reproduced the for-await misplaced directive failure; bg_1258 passed 20. bg_1257 reproduced five wrong-depth argument snapshots including actual Responses prefixes and reopen; bg_1259 passed 57. Storage conformance bg_1263 passed 205 across SQLite/memory/JSONL. Maximum-ID behavior is covered there; the initially requested nonexistent conformance filename did not execute that surface.
+- Env: bg_1253 reproduced four post-read cancellation failures; bg_1265 passed 57 with three skipped against the rebuilt daemon. Rust filtered-listing bg_1254 reproduced three deadline/cancel failures; bg_1255 passed 10, and complete Rust bg_1279 passed 39. Windows cases executed zero. Matching 1.96 Clippy bg_1285 passed with `-D warnings` and an external target. Whole-repository cargo fmt check showed existing unchanged formatting differences; only the changed listing file was formatted, not unrelated files. An unavailable 1.98 rustfmt was replaced with the installed 1.96 formatter.
+- Selectors: bg_1251 reproduced five stuck operations; two subsequent connection cases needed the fixture's real hydration transition through attaching rather than re-publishing identical attached state. bg_1262 passed 24 across TUI/plugin tests. CommonJS passes in Vitest did not establish native loading; actual standalone Node smoke bg_1270 loaded the bundled CommonJS Node helper. The throwaway script was removed.
+- Routed images: bg_1266 reproduced host-path ENOENT through routed read and incorrect fallback on save failure; bg_1268 passed 27, including byte-identical routed read/copy. SSH/Gondolin external hosts were not exercised; their source integrations were independently reviewed.
+- Packed bridges: initial bg_1267 had two target failures and three fixture failures before target due to invalid intermediary Host roles. Literal bidirectional transport relays corrected the fixture without changing peer authorization. bg_1272 passed 17, including real memory packing for args/results/state through both Client orientations and routed links.
+- Issue triage: bg_1250 reproduced a completed recommendation changing from done to failed; bg_1261 passed 30. Native Chromium served the actual old/current dashboard code with a controlled loopback request: old failed poll removed the focused select (identity false, connected false); repaired code retained it (both true) while showing the error. Screenshot observed; browser and server released. Initial incomplete DTO and cross-world execution attempts were corrected, not counted as proof.
+- Actual emitted-runtime smoke bg_1280 rejected a for-await misplaced deadline, returned `{count:0,truncated:true}` for a fully filtered listing at zero deadline, and verified the daemon remained usable. Temporary script removed. Hostile error formatting was also exercised directly.
+- Full `npm run check` bg_1273: 1985 files, **No fixes applied**, all gates passed. Earlier checks formatted only owned files and exposed two type errors plus test lint diagnostics; these were corrected without casts or suppressing real errors. Offline build bg_1275 passed: 76 files, 9.4 MiB.
+- Root bg_1274 exceeded its 900-second command deadline before an aggregate total and exposed the old worker ordering assertion above; it is not a passing root receipt. Final isolated root bg_1283 is pending with that fixture migration. No API credentials or live paid providers are used.
+
+### Coverage and limits
+
+Three fresh bounded closure readers found all 22 assigned source findings closed; they inspected actual consumers, ignore-crate matching semantics, retained bindings, selector cancellation and routed image factories. This is source review, not a whole-merge or platform certification. Twelve original dependency/vendor/native paths retain their disclosed review limitations. Initial 26-item supplemental validation and three bounded source gates differ from the skill's one-batch default; this deviation is disclosed rather than represented as exact workflow compliance.
+
+All 749 protected Cargo target hashes remained unchanged at the integrity checkpoint; earlier ledger prefix remains byte-identical. No package manifests, lockfiles or changelogs are intentionally changed. Historical native Windows acceptance and the separately observed last-demand worker retirement race remain outside this repair proof. No push or PR.
+
+### Actionable Findings
+
+No accepted source finding remains unimplemented. Final root-suite completion and final source integrity are still verification gates.
+
+### Verdict
+
+**Source repairs implemented; final verification pending.** Do not infer unconditional merge readiness or native Windows acceptance from targeted green checks.
+
+## Fresh complete merge repair closure - final verification
+
+The final authoritative credential-isolated root run bg_1289 passed: **13496 passed, 0 failed, 949 skipped**, exit 0, 752.34 seconds. Full output: `artifact://16895`. No assertions, test exclusions, memory limits, or per-test deadlines were weakened to obtain this result.
+
+The preceding run bg_1283 completed with **13495 passed, 1 failed, 949 skipped** (`artifact://16879`). Its sole failure was the existing real-child kernel-lock/replace test's 5000-ms deadline. The unchanged manager file passed separately in bg_1288 (24 passed, 10 skipped); the unchanged full suite then passed in bg_1289. This is disclosed as timing-sensitive verification, not hidden as an uninterrupted first-pass green.
+
+Final code check bg_1286 passed with **1985 files, No fixes applied**. Offline build bg_1275 passed (76 files, 9.4 MiB). Native Rust tests bg_1279 passed 39 cases; matching-toolchain Clippy bg_1285 passed `-D warnings`. All Cargo output used external targets; Windows cases executed zero. The post-Clippy named type alias is behavior-neutral and was included in the final source/check epoch.
+
+All 22 accepted findings in this round are implemented, covered by targeted behavioral verification and bounded independent source closure. Source-owned scope is **68 paths including this ledger**; no unrelated paths, package/lockfile/changelog edits, or protected target changes. All 749 protected hashes and preserved `my-merge`/`crystal` refs remain intact; the pre-review ledger prefix is byte-identical. The clean pre-review tree permits an isolated local review-fix commit. No push or PR.
+
+### Actionable Findings
+
+No unimplemented accepted source finding remains in this round. Historical native Windows acceptance remains an operational gate. The separate last-demand worker-retirement observation is not claimed fixed. Public contract, concurrency and routed-execution edits retain the bounded platform limitations above.
+
+### Verdict
+
+**All 22 accepted source findings repaired and locally verified. Whole merge remains NOT READY for unconditional native-platform acceptance.** Validation used additional bounded batches rather than the skill's single-batch topology; that procedural deviation remains explicit. Local source correctness evidence does not certify Windows, external SSH/Gondolin, native image pixels, production Cloudflare, or release publication.

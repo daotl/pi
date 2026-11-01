@@ -481,6 +481,7 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 					while (true) {
 						if (aborted()) throw abort();
 						const bytes = await handle.pread(undefined, READ_FILE_UNKNOWN_CHUNK, signal);
+						if (aborted()) throw abort();
 						if (bytes.length === 0) break;
 						total += bytes.length;
 						chunks.push(bytes);
@@ -491,7 +492,11 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 				}
 				if (!encoding) {
 					// A single read of the whole size, or reads of 512 KiB until the size or the end of the file.
-					if (size <= READ_FILE_CHUNK) return Buffer.from(await handle.pread(0, size));
+					if (size <= READ_FILE_CHUNK) {
+						const bytes = await handle.pread(0, size);
+						if (aborted()) throw abort();
+						return Buffer.from(bytes);
+					}
 					const read = await readRange(
 						(at, length) => handle.pread(at, length),
 						0,

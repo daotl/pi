@@ -51,6 +51,7 @@ export {
 	type Link,
 	memoryLinkPair,
 	PACK_THRESHOLD,
+	stringifyFrame,
 	type WebSocketLike,
 	type WebSocketLinkOptions,
 	webSocketLink,
