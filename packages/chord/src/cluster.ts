@@ -165,11 +165,11 @@ export async function runClusterReload(
 			}
 			throw error;
 		}
-		host.rememberRemoteModules(options.remote, options.remoteRemove);
 		const children: Record<string, ReloadReport> = {};
 		for (const [name, child] of await Promise.all(votes)) {
 			if (child !== undefined) children[name] = child;
 		}
+		host.rememberRemoteModules(options.remote, options.remoteRemove, Object.values(children));
 		return { ...report, children };
 	} catch (error) {
 		if (host.failed === undefined && !reload.rolledBack) {
@@ -217,6 +217,19 @@ export async function reconcileChild(host: HostImpl, connection: Connection): Pr
 		const vote = awaitVote(connection, id, RECONCILE_DEADLINE);
 		const transaction = `${host.name}:reconcile:${id}`;
 		connection.transaction = transaction;
+		const additions = new Map<string, string>();
+		const removed = new Set<string>();
+		for (const operation of host.remoteHistory) {
+			for (const name of modulesFor(operation.remove, connection.name)) {
+				removed.add(name);
+				additions.delete(name);
+			}
+			for (const module of modulesFor(operation.remote, connection.name)) {
+				const name = host.moduleNames.get(module) ?? module;
+				additions.set(name, module);
+				removed.delete(name);
+			}
+		}
 		const phases = (["declared", "materialized"] as const).map((phase) =>
 			awaitPhase(connection, id, phase, RECONCILE_DEADLINE).then(() =>
 				connection.send({ t: "advance", reload: id, phase }),
@@ -229,11 +242,12 @@ export async function reconcileChild(host: HostImpl, connection: Connection): Pr
 			transaction,
 			participants: [host.name, connection.name!],
 			codeVersion,
-			plugins: modulesFor(host.remoteModules, connection.name),
-			options: { remove: modulesFor(host.remoteRemoved, connection.name) },
+			plugins: [...additions.values()],
+			options: { remove: [...removed] },
 		});
+		let report: ReloadReport | undefined;
 		try {
-			await Promise.all([vote, ...phases]);
+			[report] = await Promise.all([vote as Promise<ReloadReport | undefined>, ...phases]);
 		} finally {
 			for (const phase of ["declared", "materialized"]) {
 				connection.preparations.get(`${id}:${phase}`)?.reject(new ChordError("aborted", "reconciliation ended"));
@@ -260,6 +274,7 @@ export async function reconcileChild(host: HostImpl, connection: Connection): Pr
 			continue;
 		}
 		connection.send({ t: "commit", reload: id });
+		for (const [module, name] of report?.moduleNames ?? []) host.moduleNames.set(module, name);
 		connection.finishCandidates(transaction, true);
 		connection.transaction = undefined;
 		connection.peerCodeVersion = codeVersion;
@@ -394,7 +409,14 @@ export class ChildReloads {
 			await operation.reload.prepare();
 			if (operation.cancelled) throw cancelled();
 			operation.state = "prepared";
-			connection.send({ t: "vote", reload: frame.reload, report: operation.reload.summary() });
+			connection.send({
+				t: "vote",
+				reload: frame.reload,
+				report: {
+					...operation.reload.summary(),
+					moduleNames: frame.plugins.map((module, index) => [module, operation.reload!.facets[index]!.name]),
+				},
+			});
 		} catch (error) {
 			if (operation.reload !== undefined) {
 				await operation.reload.rollback().catch((cleanup: unknown) => this.#host.report(cleanup));

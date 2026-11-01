@@ -538,7 +538,8 @@ export abstract class TuiBase extends Container implements TUI {
 	private focusOrderCounter = 0;
 	private overlayStack: OverlayStackEntry[] = [];
 	protected renderedOverlayLayouts: RenderedOverlayLayout[] = [];
-	protected renderedOverlayImages: Array<{ row: number; rows: number; col: number; line: string }> = [];
+	protected renderedOverlayImages: Array<{ row: number; rows: number; anchorRow: number; col: number; line: string }> =
+		[];
 
 	get hasOverlayEntries(): boolean {
 		return this.overlayStack.length > 0;
@@ -1445,28 +1446,44 @@ export abstract class TuiBase extends Container implements TUI {
 					const line = overlayLines[i];
 					if (!isImageLine(line)) continue;
 					const metadata = getKittyImageMetadata(line);
-					const imageRow = row + i;
-					const imageRows = getKittyImagePlacementRows(line) ?? 1;
-					const visibleRows = Math.min(imageRows, overlayLines.length - i, termHeight - imageRow);
 					const kittyStart = line.indexOf("\x1b_G");
 					const imageStart = kittyStart !== -1 ? kittyStart : line.indexOf("\x1b]1337;File=");
+					let anchorOffset = 0;
+					if (kittyStart === -1) {
+						// iTerm2 emits on the final reserved row, moving up to the image's top.
+						for (let offset = 0; offset < imageStart; ) {
+							const ansi = extractAnsiCode(line, offset);
+							if (ansi) {
+								const moveUp = /^\x1b\[(\d*)A$/.exec(ansi.code);
+								if (moveUp) anchorOffset += Number(moveUp[1] || 1);
+								offset += ansi.length;
+							} else offset++;
+						}
+						anchorOffset = Math.min(anchorOffset, i);
+					}
+					const imageRow = row + i - anchorOffset;
+					const imageRows = getKittyImagePlacementRows(line) ?? anchorOffset + 1;
+					const visibleRows = Math.min(imageRows, overlayLines.length - i + anchorOffset, termHeight - imageRow);
 					const imageCol = col + visibleWidth(line.slice(0, imageStart));
-					const imageColumns = metadata?.columns ?? w;
-					const covered =
-						kittyStart !== -1 &&
-						this.renderedOverlayLayouts.some(
-							(overlay) =>
-								overlay.entry.focusOrder > entry.focusOrder &&
-								overlay.col < imageCol + imageColumns &&
-								overlay.col + overlay.width > imageCol &&
-								overlay.row < imageRow + visibleRows &&
-								overlay.row + overlay.height > imageRow,
-						);
+					const itermColumns =
+						kittyStart === -1
+							? /;width=(\d+)(?:;|$)/.exec(line.slice(imageStart, line.indexOf(":", imageStart)))
+							: null;
+					const imageColumns = metadata?.columns ?? (itermColumns ? Number(itermColumns[1]) : w);
+					const covered = this.renderedOverlayLayouts.some(
+						(overlay) =>
+							overlay.entry.focusOrder > entry.focusOrder &&
+							overlay.col < imageCol + imageColumns &&
+							overlay.col + overlay.width > imageCol &&
+							overlay.row < imageRow + visibleRows &&
+							overlay.row + overlay.height > imageRow,
+					);
 					if (visibleRows > 0 && !covered) {
 						const clipped = metadata ? cropKittyImageLine(line, 0, visibleRows) : line;
 						this.renderedOverlayImages.push({
 							row: imageRow,
 							rows: visibleRows,
+							anchorRow: row + i,
 							col: imageCol,
 							line: clipped,
 						});
@@ -1475,7 +1492,9 @@ export abstract class TuiBase extends Container implements TUI {
 					for (let offset = 0; offset < line.length; ) {
 						const ansi = extractAnsiCode(line, offset);
 						if (ansi) {
-							if (ansi.code.endsWith("m") || ansi.code.startsWith("\x1b]8;")) text += ansi.code;
+							if (ansi.code === CURSOR_MARKER || ansi.code.endsWith("m") || ansi.code.startsWith("\x1b]8;")) {
+								text += ansi.code;
+							}
 							offset += ansi.length;
 						} else text += line[offset++];
 					}

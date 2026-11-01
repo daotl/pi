@@ -506,7 +506,7 @@ describe("cluster candidate transactions (#24)", () => {
 		await tick();
 		await s.server.reload([]);
 		const server = s.server as HostImpl;
-		server.remoteModules.consumer = ["consumer-old"];
+		server.rememberRemoteModules({ consumer: ["consumer-old"] }, undefined, []);
 		const [down, up] = memoryLinkPair();
 		s.server.accept(down, { kind: "host", name: "consumer", principal: {} });
 		s.consumer.connect(up, { principal: {} });

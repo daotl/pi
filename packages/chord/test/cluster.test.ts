@@ -7,6 +7,7 @@ import {
 	type Facet,
 	type FacetLoader,
 	type Frame,
+	type Host,
 	hostFamily,
 	hostNamed,
 	isChordError,
@@ -129,6 +130,143 @@ function setup() {
 }
 
 describe("cross-host reload", () => {
+	it("retains module identities learned by reconciliation before a later removal", async () => {
+		const server = createHost({ self: "server", name: "server", onError: () => {} });
+		const Token = local("t.reconcile-identity", {
+			version: 1,
+			input: Type.Object({}),
+			members: { read: method(undefined, Type.String()) },
+		});
+		const facet: Facet = {
+			name: "file:///facets/learned.ts",
+			setup: ({ serve }) => serve(Token, () => ({ read: () => "loaded" })),
+		};
+		let removed = false;
+		const loader: FacetLoader = async (names) =>
+			names.map(() => {
+				assert.equal(removed, false, "removed module cannot be loaded");
+				return facet;
+			});
+		const children: Host[] = [];
+		const connect = async (name: string) => {
+			const [down, up] = memoryLinkPair();
+			const child = createHost({ self: "worker", name, loader, onError: () => {} });
+			children.push(child);
+			server.accept(down, { principal: "worker", kind: "host", name });
+			child.connect(up, { principal: "server" });
+			for (let n = 0; n < 100 && child.codeVersion !== server.codeVersion; n++) await tick();
+			return child;
+		};
+		try {
+			await server.reload([], { remote: { "worker:": ["./learned.ts"] } });
+			const first = await connect("worker:first");
+			assert.equal(await (await first.get(Token, {})).read(), "loaded");
+			await first.close();
+			await tick();
+			await server.reload([], { remoteRemove: { "worker:": [facet.name] } });
+			removed = true;
+			const second = await connect("worker:second");
+			assert.equal(second.codeVersion, server.codeVersion);
+			assert.throws(
+				() => second.hold(Token, {}),
+				(error) => isChordError(error, "unavailable"),
+			);
+		} finally {
+			await Promise.all(children.map((child) => child.close()));
+			await server.close();
+		}
+	});
+
+	it.each([false, true])("reconciles resolved removals with mixed prefixes=%s", async (mixedPrefixes) => {
+		const server = createHost({ self: "server", name: "server", onError: () => {} });
+		const tokens = ["a", "b", "c"].map((name) =>
+			local(`t.journal-${name}`, {
+				version: 1,
+				input: Type.Object({}),
+				members: { read: method(undefined, Type.String()) },
+			}),
+		);
+		const modules = new Map<string, Facet>(
+			tokens.map((token, index) => [
+				`./${index}.ts`,
+				{
+					name: `file:///facets/${index}.ts`,
+					setup: ({ serve }) => {
+						serve(token, () => ({ read: () => String(index) }));
+					},
+				},
+			]),
+		);
+		const loader: FacetLoader = async (names) =>
+			names.map((name) => {
+				const facet = modules.get(String(name));
+				assert.ok(facet, `removed module must not be loaded: ${name}`);
+				return facet;
+			});
+		const connect = (worker: Host) => {
+			const [down, up] = memoryLinkPair();
+			server.accept(down, { principal: "worker", kind: "host", name: worker.name });
+			worker.connect(up, { principal: "server" });
+		};
+		const worker = createHost({ self: "worker", name: "worker:special-live", loader, onError: () => {} });
+		connect(worker);
+		await tick();
+		try {
+			await server.reload([], { remote: { "worker:": ["./0.ts"] } });
+			await server.reload([], { remote: { [mixedPrefixes ? "worker:special" : "worker:"]: ["./1.ts"] } });
+			await server.reload([], { remote: { "worker:": ["./2.ts"] } });
+			for (const [index, token] of tokens.entries())
+				assert.equal(await worker.hold(token, {}).read(), String(index));
+			const cold = createHost({ self: "worker", name: "worker:special-cold", loader, onError: () => {} });
+			connect(cold);
+			try {
+				for (let i = 0; i < 100 && cold.codeVersion !== server.codeVersion; i++) await tick();
+				for (const [index, token] of tokens.entries())
+					assert.equal(await cold.hold(token, {}).read(), String(index));
+			} finally {
+				await cold.close();
+			}
+			await server.reload([], { remoteRemove: { "worker:": ["file:///facets/0.ts"] } });
+			modules.delete("./0.ts");
+			const reconnect = createHost({ self: "worker", name: "worker:special-reconnect", loader, onError: () => {} });
+			await reconnect.install({
+				name: "file:///facets/0.ts",
+				setup: ({ serve }) => {
+					serve(tokens[0]!, () => ({ read: () => "stale" }));
+				},
+			});
+			connect(reconnect);
+			try {
+				for (let i = 0; i < 100 && reconnect.codeVersion !== server.codeVersion; i++) await tick();
+				assert.equal(reconnect.codeVersion, server.codeVersion);
+				assert.throws(
+					() => reconnect.hold(tokens[0]!, {}),
+					(error) => isChordError(error, "unavailable"),
+				);
+				assert.equal(await reconnect.hold(tokens[1]!, {}).read(), "1");
+			} finally {
+				await reconnect.close();
+			}
+			modules.set("./0.ts", {
+				name: "file:///facets/0.ts",
+				setup: ({ serve }) => {
+					serve(tokens[0]!, () => ({ read: () => "readded" }));
+				},
+			});
+			await server.reload([], { remote: { "worker:": ["./0.ts"] } });
+			const readded = createHost({ self: "worker", name: "worker:special-readded", loader, onError: () => {} });
+			connect(readded);
+			try {
+				for (let i = 0; i < 100 && readded.codeVersion !== server.codeVersion; i++) await tick();
+				assert.equal(await readded.hold(tokens[0]!, {}).read(), "readded");
+			} finally {
+				await readded.close();
+			}
+		} finally {
+			await worker.close();
+			await server.close();
+		}
+	});
 	it("prepares every host, commits the server first, then the workers; code versions stay in step", async () => {
 		const { server, worker, modules } = setup();
 		await tick();

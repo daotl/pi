@@ -5001,6 +5001,14 @@ export class InteractiveMode {
 		this.shutdownRecoveryEditor = undefined;
 		this.isShuttingDown = true;
 		this.cancelScheduledPreflights();
+		const delivery = this.compactionQueueDeliveryPending;
+		delivery?.submitting?.controller.abort();
+		if (delivery) {
+			// Retire the canceled preflight, but retain unsubmitted messages if shutdown fails.
+			this.compactionQueuedMessages = [...delivery.messages, ...this.compactionQueuedMessages];
+			this.compactionQueueDeliveryPending = undefined;
+			this.updatePendingMessagesDisplay();
+		}
 		this.cancelExtensionDialogs();
 		// Keep signal handlers registered until terminal cleanup has completed.
 		// `signal-exit` checks the listener list during the same SIGTERM/SIGHUP

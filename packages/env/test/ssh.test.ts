@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { getOrThrow } from "@earendil-works/pi-durable/env";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { Connection } from "../src/connection.ts";
+import { Connection, nodePlatform } from "../src/connection.ts";
 import { LocalExecutionEnv } from "../src/list-files.ts";
 import { RemoteExecutionEnv } from "../src/remote-env.ts";
 import {
@@ -27,8 +27,10 @@ import {
 	forgetHostKey,
 	HostKeyChangedError,
 	HostKeyUnknownError,
+	launchCommand,
 	type SshTarget,
 	scanHostKey,
+	sshArguments,
 	sshConnection,
 } from "../src/ssh.ts";
 import { daemon } from "./daemon.ts";
@@ -258,6 +260,41 @@ describe.skipIf(process.platform === "win32")("Windows POSIX SSH shells", () => 
 	}
 });
 
+describe.skipIf(process.platform !== "win32")("Windows cmd daemon launch", () => {
+	for (const name of ["A&B", "native home"]) {
+		it(`authenticates a daemon launched by cmd from ${name}`, async () => {
+			const root = mkdtempSync(join(tmpdir(), "pi-env-cmd-"));
+			// Relative to the transport's cwd so an unrelated space in the local temp directory cannot mask A&B.
+			const home = name;
+			const file = join(home, ".pi", "mobile", "tools", `${deployedName}.exe`);
+			mkdirSync(join(root, file, ".."), { recursive: true });
+			copyFileSync(daemon, join(root, file));
+			const launch = launchCommand(
+				{ platform: "windows", arch: "x64", home, shell: "cmd", warnings: [] },
+				file,
+				false,
+			);
+			// Model OpenSSH's joined command using the real native cmd interpreter, not a shell emulator.
+			const script = [
+				'const { spawn } = require("node:child_process");',
+				`const command = ${JSON.stringify(launch)} + " " + process.argv.slice(1).join(" ");`,
+				`const child = spawn(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", '"' + command + '"'], { cwd: ${JSON.stringify(root)}, stdio: "inherit", windowsVerbatimArguments: true });`,
+				'child.on("error", error => { console.error(error); process.exit(1); });',
+				'child.on("exit", code => process.exit(code ?? 1));',
+			].join("\n");
+			const connection = new Connection({ command: [process.execPath, "-e", script, "--"] });
+			try {
+				const info = await connection.info();
+				expect(info.protocol).toBe(1);
+				expect(nodePlatform(info).platform).toBe("win32");
+			} finally {
+				connection.close();
+				rmSync(root, { recursive: true, force: true, maxRetries: 50, retryDelay: 100 });
+			}
+		}, 70_000);
+	}
+});
+
 async function waitForPort(port: number): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt++) {
 		const open = await new Promise<boolean>((resolve) => {
@@ -317,6 +354,51 @@ describe.skipIf(sshd === undefined)("SSH bootstrap", () => {
 		server?.kill();
 		rmSync(root, { recursive: true, force: true });
 	});
+
+	it("requires application acceptance even when SSH config supplies the server key", async () => {
+		const configFile = join(root, "alternate-trust-config");
+		const keys = join(root, "command_known_hosts");
+		const key = readFileSync(join(root, "host_key.pub"), "utf8").split(" ").slice(0, 2).join(" ");
+		const scoped: SshTarget = {
+			...target,
+			host: "alternate-trust-route",
+			knownHostsFile: join(root, "alternate-trust-known-hosts"),
+			configFile,
+		};
+		writeFileSync(keys, `${scoped.hostKeyAlias} ${key}\n`);
+		writeFileSync(
+			configFile,
+			[
+				`Host ${scoped.host}`,
+				"  HostName 127.0.0.1",
+				`  KnownHostsCommand /bin/cat ${keys}`,
+				"  VerifyHostKeyDNS yes",
+				"",
+			].join("\n"),
+		);
+		const args = sshArguments(scoped);
+		// Exercise OpenSSH's resolved configuration, including the retained route, not just argv spelling.
+		const configured = execFileSync("ssh", ["-G", ...args], { encoding: "utf8" });
+		expect(configured).toMatch(/^hostname 127\.0\.0\.1$/m);
+		// Prove the configured command really can authenticate this server in the absence of our override.
+		const inherited = args.flatMap((argument, index) => {
+			if (argument === "-o" && args[index + 1] === "KnownHostsCommand=none") return [];
+			return argument === "KnownHostsCommand=none" ? [] : [argument];
+		});
+		expect(execFileSync("ssh", [...inherited, "echo alternate-trust"], { encoding: "utf8" }).trim()).toBe(
+			"alternate-trust",
+		);
+		await expect(detectPlatform(scoped)).rejects.toBeInstanceOf(HostKeyUnknownError);
+		expect(configured).toMatch(/^verifyhostkeydns (?:false|no)$/m);
+		await acceptHostKey(scoped, [`${scoped.hostKeyAlias} ${key}`]);
+		const { connection, remote } = await connectSsh({ ...scoped, binary: daemon });
+		try {
+			expect(remote.home).toBe(home);
+			expect((await connection.info()).home).toBe(home);
+		} finally {
+			connection.close();
+		}
+	}, 60_000);
 
 	it("refuses an untrusted host, then deploys and runs the daemon once its key is accepted", async () => {
 		await expect(connectSsh({ ...target, binary: daemon })).rejects.toBeInstanceOf(HostKeyUnknownError);

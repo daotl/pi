@@ -113,7 +113,7 @@ export type HeldDocument = {
 export type AdoptedDocuments = {
 	/** This commit's own changes, as memory adopted them. */
 	readonly observed: readonly DocumentCommitChange[];
-	/** What Storage got: `observed`, unless the commit also stored held changes, which precede its own. */
+	/** What Storage got: differs when a commit stores held changes or a migration base. */
 	readonly stored: readonly DocumentCommitChange[];
 };
 
@@ -843,13 +843,14 @@ export class Transaction implements Tx {
 	/** Adopt every prepared change by pointer swap after Storage success and describe the publication. */
 	adopt(seq: Seq): AdoptedDocuments {
 		const publications: DocumentCommitChange[] = [];
-		// Only when the commit stored held changes: then what Storage got differs from what memory adopted.
+		// Allocate separately only when storage operations differ from what memory adopted.
 		let stored: DocumentCommitChange[] | undefined;
 		for (const plan of this.#plans) {
 			const committed = "createdAt" in plan.record;
 			let record: DocumentRecord = committed ? (plan.record as DocumentRecord) : { ...plan.record, createdAt: seq };
 			if (plan.retire) record = { ...record, retiredAt: seq };
 			const change = plan.change;
+			const migrated = change?.loaded !== undefined && change.loaded.storedVersion < change.version;
 			if (change !== undefined) {
 				const { tracker, prepared, loaded, version } = change;
 				// A new incarnation is adopted unless it retires in the same commit; a loaded one only when it changed.
@@ -875,6 +876,13 @@ export class Transaction implements Tx {
 			if (plan.retire && committed) this.#host.evict(plan.addressId, record.id);
 			const publication = describe(plan, record);
 			if (publication === undefined) continue;
+			if (migrated && publication.type === "document" && !plan.retire) {
+				stored ??= [...publications];
+				publications.push(publication);
+				// The tracker began at the migrated shape; stored-state replicas still have the old shape.
+				stored.push({ ...publication, ops: [["r", change!.prepared.value]] });
+				continue;
+			}
 			const held = plan.held;
 			if (held === undefined) {
 				publications.push(publication);

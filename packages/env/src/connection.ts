@@ -89,7 +89,7 @@ type Pending = {
 
 export interface RequestOptions {
 	payload?: Uint8Array;
-	/** Aborting sends `cancel`; the request still settles with the daemon's result or error. */
+	/** Before dispatch, aborting rejects with `aborted`; after dispatch it sends `cancel` and awaits the daemon. */
 	signal?: AbortSignal;
 	/** Progress events of the request, such as `exec` output. */
 	onEvent?: (json: Json, payload: Uint8Array) => void;
@@ -201,6 +201,8 @@ export class Connection {
 	}
 
 	async request(op: string, json: Json, options: RequestOptions = {}): Promise<Reply> {
+		const signal = options.signal;
+		if (signal?.aborted) throw new RemoteError({ code: "aborted", message: "aborted" });
 		if (options.session !== undefined) {
 			const current = this.#session;
 			if (current === undefined || current.id !== options.session || !current.live) {
@@ -208,7 +210,23 @@ export class Connection {
 			}
 			return this.#send(current, op, json, options);
 		}
-		const { session } = await this.#connect();
+		const ready = this.#connect();
+		let onAbort: (() => void) | undefined;
+		const aborted =
+			signal === undefined
+				? undefined
+				: new Promise<never>((_resolve, reject) => {
+						onAbort = () => reject(new RemoteError({ code: "aborted", message: "aborted" }));
+						signal.addEventListener("abort", onAbort, { once: true });
+						if (signal.aborted) onAbort();
+					});
+		let session: Session;
+		try {
+			// Only this caller stops waiting: other requests still need the shared startup.
+			({ session } = await (aborted === undefined ? ready : Promise.race([ready, aborted])));
+		} finally {
+			if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
+		}
 		return this.#send(session, op, json, options);
 	}
 
@@ -238,6 +256,7 @@ export class Connection {
 	}
 
 	#send(session: Session, op: string, json: Json, options: RequestOptions): Promise<Reply> {
+		if (options.signal?.aborted) return Promise.reject(new RemoteError({ code: "aborted", message: "aborted" }));
 		if (!session.live) return Promise.reject(lost("pi-env connection lost"));
 		const id = this.#nextId++;
 		return new Promise((resolve, reject) => {

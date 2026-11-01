@@ -183,11 +183,18 @@ export function fits(subSchema: unknown, supSchema: unknown, mode: "value" | "cl
 		return false;
 	if (Array.isArray(sub.anyOf)) return sub.anyOf.every((branch) => fits(branch, sup, mode));
 	if (Array.isArray(sup.anyOf)) return sup.anyOf.some((branch) => fits(sub, branch, mode));
-	if ("const" in sup) return "const" in sub && deepEqual(sub.const, sup.const);
+	// Finite membership alone does not prove sibling validation constraints. Do not execute peer schemas.
+	if (
+		("const" in sup || Array.isArray(sup.enum)) &&
+		Object.keys(sup).some((key) => key !== "const" && key !== "enum" && !deepEqual(sub[key], sup[key]))
+	)
+		return false;
+	if ("const" in sup && !("const" in sub && deepEqual(sub.const, sup.const))) return false;
 	if (Array.isArray(sup.enum)) {
 		const values = "const" in sub ? [sub.const] : Array.isArray(sub.enum) ? sub.enum : undefined;
 		return values?.every((item) => (sup.enum as unknown[]).some((allowed) => deepEqual(allowed, item))) ?? false;
 	}
+	if ("const" in sup) return true;
 	for (const key of CONSTRAINTS) if (key in sup && !deepEqual(sub[key], sup[key])) return false;
 	const supTypes = typesOf(sup);
 	const subTypes = typesOf(sub);

@@ -217,3 +217,70 @@ test("wires and installs a pnpm consumer without registry fallbacks", (t) => {
 		assert.ok(lockContents.includes(basename(artifactSet.getPackage(packageName).tarballPath)), `${packageName} lock entry must reference its artifact`);
 	}
 });
+
+function executableConsumer(t, executable) {
+	const directory = mkdtempSync(join(tmpdir(), "pi-executable-consumer-"));
+	t.after(() => rmSync(directory, { recursive: true, force: true }));
+	const packageName = "@earendil-works/pi-coding-agent";
+	const installedDirectory = join(directory, "node_modules", packageName);
+	writeFileSync(join(directory, "package.json"), '{"private":true,"type":"module"}');
+	writePackage(installedDirectory, {
+		name: packageName,
+		version: "1.0.0",
+		type: "module",
+		main: "./index.js",
+		types: "./index.d.ts",
+		exports: { ".": "./index.js", "./rpc-entry": "./rpc-entry.js", "./feature": "./feature.js" },
+	}, {
+		"index.js": 'import { writeFileSync } from "node:fs"; writeFileSync(new URL("./root-loaded", import.meta.url), "yes");',
+		"index.d.ts": "export {};",
+		"feature.js": 'import { writeFileSync } from "node:fs"; writeFileSync(new URL("./feature-loaded", import.meta.url), "yes");',
+		"rpc-entry.js": executable,
+	});
+	const artifact = { name: packageName, version: "1.0.0", tarballPath: join(directory, "coding-agent.tgz") };
+	writeFileSync(join(directory, "package-lock.json"), JSON.stringify({ packages: {
+		[`node_modules/${packageName}`]: { version: "1.0.0", resolved: `file:./coding-agent.tgz` },
+	} }));
+	return { directory, installedDirectory, packageName, artifactSet: { packages: [artifact], getPackage: () => artifact } };
+}
+
+test("consumer smoke imports libraries but runs the RPC executable with isolated config and closed stdin", (t) => {
+	for (const [name, value] of Object.entries({ OPENAI_API_KEY: "caller-secret", NODE_OPTIONS: "--trace-warnings", PI_CODING_AGENT_DIR: "/caller-agent-config" })) {
+		const original = process.env[name];
+		t.after(() => { if (original === undefined) delete process.env[name]; else process.env[name] = original; });
+		process.env[name] = value;
+	}
+	const fixture = executableConsumer(t, `import assert from "node:assert/strict";
+import { readFileSync, writeFileSync } from "node:fs";
+assert.deepEqual(process.argv.slice(2), ["--version"], "executable exports must not be statically imported");
+assert.equal(readFileSync(0, "utf8"), "", "RPC smoke stdin must be closed");
+assert.equal(process.env.OPENAI_API_KEY, undefined);
+assert.equal(process.env.NODE_OPTIONS, undefined);
+assert.notEqual(process.env.HOME, ${JSON.stringify(process.env.HOME)});
+assert.equal(process.env.USERPROFILE, process.env.HOME);
+assert.equal(process.env.XDG_CONFIG_HOME, process.env.HOME);
+assert.equal(process.env.PI_TELEMETRY, "0");
+assert.equal(process.env.PI_OFFLINE, "1");
+assert.ok(process.env.PI_CODING_AGENT_DIR.startsWith(process.env.HOME));
+writeFileSync(new URL("./rpc-checked", import.meta.url), process.env.HOME);
+console.log("1.0.0");
+`);
+	smokeTestNpmConsumer(fixture);
+	assert.equal(readFileSync(join(fixture.installedDirectory, "root-loaded"), "utf8"), "yes");
+	assert.equal(readFileSync(join(fixture.installedDirectory, "feature-loaded"), "utf8"), "yes");
+	const isolatedHome = readFileSync(join(fixture.installedDirectory, "rpc-checked"), "utf8");
+	assert.equal(existsSync(isolatedHome), false, "temporary RPC configuration must be removed");
+	writeFileSync(join(fixture.installedDirectory, "feature.js"), 'import "./missing.js";');
+	assert.throws(() => smokeTestNpmConsumer(fixture));
+});
+
+test("consumer smoke rejects an executable export reporting the wrong package version", (t) => {
+	const fixture = executableConsumer(t, 'console.log("9.9.9");');
+	assert.throws(() => smokeTestNpmConsumer(fixture), /Unexpected version from .*rpc-entry/);
+});
+
+test("consumer smoke still rejects a missing executable export file", (t) => {
+	const fixture = executableConsumer(t, 'console.log("1.0.0");');
+	rmSync(join(fixture.installedDirectory, "rpc-entry.js"));
+	assert.throws(() => smokeTestNpmConsumer(fixture), /export \.\/rpc-entry does not exist/);
+});

@@ -955,6 +955,8 @@ System One services take images in three forms. The model's `compat.imageInput` 
 - **Clef on Workers AI** takes up to four PNG, JPEG, or WebP images as an `images` list of data URLs, next to the unchanged state.
 - **OpenRouter** takes images as `{ type: "image_url", image_url: { url } }` parts before the state: `[part, ..., state]`. It answers requests with `assets` but drops the images, without an error.
 
+The image opt-in header is an API default: model headers override it, request headers override model headers, and `null` suppresses it. Header names are matched case-insensitively.
+
 Built-in catalog entries set `compat` explicitly, so they keep their form when `baseUrl` points at a proxy. For models without it, the APIs detect the form: OpenRouter by provider `openrouter` or a `baseUrl` containing `openrouter.ai`, Clef by a model ID starting with `@cf/cloudflare/clef`, and TypeSafe's form with the opt-in header otherwise. A custom provider that reaches OpenRouter through a proxy matches neither check and must set `compat.imageInput: "state-image-urls"` and `compat.sendImageOptInHeader: false`; otherwise OpenRouter drops its images.
 
 Vercel AI Gateway and OpenCode list their Jev models with text input only.
@@ -1382,6 +1384,8 @@ Use `models.refresh({ providers: ['openrouter'] })` to restrict work to selected
 `RefreshModelsContext.auth` carries effective request authentication, including configured headers and an auth-resolved endpoint; `baseUrl` uses that endpoint before the provider's configured URL. `identity` carries the collection's client identity. Catalog requests must apply identity defaults below credential auth and configured headers, including case-insensitive overrides and `null` header removal.
 
 Credential-specific catalog wrappers may persist a non-secret `ModelsStoreEntry.personalizationKey` fingerprint and restore only matching auth/endpoint identities. Providers can implement `resolveCachedModelAuth(credential, ctx)` to derive cache-only auth from the supplied credential, static configuration and environment. This hook must never execute commands, make network requests, refresh OAuth or interact with the user. Omit it, or return `undefined`, when auth cannot be derived safely; personalized wrappers then use the unpersonalized baseline rather than another account's saved catalog. Generic catalog restoration never runs the request auth resolver offline.
+
+Radius catalog requests use effective auth headers, including organization routing, case-insensitive overrides, and `null` removal. Radius OAuth credentials carry a non-secret `catalogId` per login; token refresh preserves it, so cached account catalogs survive token rotation and failed catalog requests. A new login creates a different identity. Older credentials derive this identity from their current access token. A matching older token-bound catalog is migrated during restoration before catalog-driven token refresh; if request authentication already rotated an older credential before that migration, the old catalog cannot be attributed safely and must be fetched again. API-key catalog identities remain key-bound.
 
 Custom models can carry `headers` (e.g. proxies behind bot detection) and `compat` flags. `Models.getAuth(model)` includes those model headers, and stream methods merge them before explicit request headers and `transformHeaders`. See [OpenAI Compatibility Settings](#openai-compatibility-settings).
 

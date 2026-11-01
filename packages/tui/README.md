@@ -248,8 +248,8 @@ tui.hasOverlay();
 
 `TuiMainScreen` composes overlays on physical viewport rows, including native-autowrapped continuations, separately from transcript history and layout. Previous overlay cells are restored before transcript updates can scroll them into history. Repainting is relative to the tracked hardware cursor rather than an assumed row-zero screen origin, preserving preceding shell output through open/update/hide.
 
-Main-screen Kitty image overlays are cropped to their visible height, including `maxHeight` and viewport limits. A higher overlay intersecting any row of an image suppresses that placement; focusing the image or closing the covering overlay restores it from the component without mutating its cached render lines.
-Graphics replay uses the image's actual anchor column and sends no printable padding, preserving transcript text and disjoint overlays to its left. Protocol-required iTerm2 upward anchor movement is retained.
+Main-screen Kitty image overlays are cropped to their visible height, including `maxHeight` and viewport limits. For both Kitty and iTerm2 image overlays, a higher overlay intersecting any row of the image's actual footprint suppresses graphics replay; focusing the image or closing the covering overlay restores it from the component without mutating its cached render lines.
+Graphics replay uses the image's actual anchor column and sends no printable padding, preserving transcript text and disjoint overlays to its left. Protocol-required iTerm2 upward anchor movement is retained. Fully visible retained Kitty images keep their source crop, placement ID, offsets and stacking controls when restored after an overlapping dialog closes.
 
 Carriage-return overwrites are materialized into final row cells before overlay composition: `abc\rZ` backs an overlay with `Zbc`, not the original write sequence. Existing supported styling and OSC 8 links stay attached to surviving cells; row-local cursor-forward movement preserves cells it skips.
 
@@ -351,6 +351,8 @@ When a `Focusable` component has focus, TUI:
 Draw the cursor cell with direct reverse-video SGR (`\x1b[7m` followed by `\x1b[27m`). When `showHardwareCursor` is enabled, TUI removes the reverse-video opener immediately after `CURSOR_MARKER`, so the focused component shows only the terminal cursor. Drawn cursors without a preceding marker stay visible. No `renderFakeCursor` helper is exported.
 
 The hardware cursor remains hidden by default. This keeps the fake cursor rendering, while still positioning the hardware cursor for terminals that track IME candidate windows with hidden cursors. Some terminals require a visible hardware cursor for IME positioning; enable it with the renderer constructor's `showHardwareCursor` argument or `setShowHardwareCursor(true)`. The `Editor` and `Input` built-in components already implement this interface.
+
+Main-screen overlay image extraction preserves cursor markers in the text layer, including an `Input` beside an `Image` in an `HStack`. IME positioning and the selected hardware/drawn cursor mode remain attached to the focused input.
 
 **Container components with embedded inputs:** When a container component (dialog, selector, etc.) contains an `Input` or `Editor` child, the container must implement `Focusable` and propagate the focus state to the child:
 

@@ -44,11 +44,13 @@ function requestHeaders(
 	apiKey: string,
 	optionsHeaders?: ProviderHeaders,
 	identity?: ClientIdentity,
+	defaultHeaders?: ProviderHeaders,
 ): Record<string, string> {
 	return (
 		providerHeadersToRecord(
 			getIdentityHeaders(model, identity),
 			{ authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+			defaultHeaders,
 			model.headers,
 			optionsHeaders,
 		) ?? {}
@@ -67,6 +69,7 @@ export async function postClassifierRequest(
 	body: unknown,
 	options: ClassifierOptions | undefined,
 	noRetryStatuses?: readonly number[],
+	defaultHeaders?: ProviderHeaders,
 ): Promise<unknown> {
 	if (!options?.apiKey) throw new Error(`No API key for provider: ${model.provider}`);
 	const apiKey = options.apiKey;
@@ -74,7 +77,7 @@ export async function postClassifierRequest(
 	const transformed = await options.onPayload?.(payload, model);
 	if (transformed !== undefined) payload = transformed;
 	const requestFetch = options.fetch ?? globalThis.fetch;
-	const headers = requestHeaders(model, apiKey, options.headers, options.identity);
+	const headers = requestHeaders(model, apiKey, options.headers, options.identity, defaultHeaders);
 	const serializedPayload = JSON.stringify(payload);
 	const { response, json } = await retryProviderRequest(
 		async () => {

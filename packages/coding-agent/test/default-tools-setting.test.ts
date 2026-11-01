@@ -191,6 +191,70 @@ describe("defaultTools setting", () => {
 		toolLess.dispose();
 	});
 
+	it.each([undefined, "builtin"] as const)(
+		"retains +name until inactive session_start tools register with noTools=%s",
+		async (noTools) => {
+			const session = await createSession(["read"], { tools: ["+late_tool"], noTools }, [
+				(pi) => {
+					pi.on("session_start", () => {
+						pi.registerTool({
+							name: "late_tool",
+							label: "Late tool",
+							description: "Explicitly selected late tool",
+							parameters: Type.Object({}),
+							defaultActive: false,
+							execute: async () => ({ content: [{ type: "text", text: "late result" }], details: {} }),
+						});
+					});
+				},
+			]);
+			try {
+				expect(session.getActiveToolNames()).toEqual(noTools ? [] : ["read"]);
+				await session.bindExtensions({});
+				const expected = noTools ? ["late_tool"] : ["read", "late_tool"];
+				expect(session.getActiveToolNames()).toEqual(expected);
+				expect(session.getCallableToolNames()).toEqual(expected);
+			} finally {
+				session.dispose();
+			}
+		},
+	);
+
+	it.each(["replacement", "negative modifier", "excluded"] as const)(
+		"does not retain a late positive selection after %s",
+		async (selection) => {
+			const session = await createSession(
+				["read", "write"],
+				{
+					tools: selection === "negative modifier" ? ["+late_tool", "-late_tool"] : ["+late_tool"],
+					excludeTools: selection === "excluded" ? ["late_tool"] : undefined,
+				},
+				[
+					(pi) => {
+						pi.on("session_start", () => {
+							pi.registerTool({
+								name: "late_tool",
+								label: "Late tool",
+								description: "Inactive late tool",
+								parameters: Type.Object({}),
+								defaultActive: false,
+								execute: async () => ({ content: [{ type: "text", text: "late result" }], details: {} }),
+							});
+						});
+					},
+				],
+			);
+			try {
+				if (selection === "replacement") session.setActiveToolsByName(["read"]);
+				await session.bindExtensions({});
+				expect(session.getActiveToolNames()).toEqual(selection === "replacement" ? ["read"] : ["read", "write"]);
+				expect(session.getCallableToolNames()).not.toContain("late_tool");
+			} finally {
+				session.dispose();
+			}
+		},
+	);
+
 	it("keeps negative modifiers effective after extension and SDK activation on startup and reload", async () => {
 		const definition = (name: string) => ({
 			name,

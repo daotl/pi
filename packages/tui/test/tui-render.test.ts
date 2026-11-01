@@ -76,6 +76,17 @@ class BoundedWriteTerminal implements Terminal {
 
 class LoggingVirtualTerminal extends VirtualTerminal {
 	private writes: string[] = [];
+	cursorVisible = true;
+
+	override hideCursor(): void {
+		this.cursorVisible = false;
+		super.hideCursor();
+	}
+
+	override showCursor(): void {
+		this.cursorVisible = true;
+		super.showCursor();
+	}
 
 	override write(data: string): void {
 		this.writes.push(data);
@@ -1123,9 +1134,14 @@ describe("TUI overlays over native-reflow content", () => {
 		});
 	}
 
-	for (const dialogRow of [0, 1]) {
-		it(`honors focus order when a text dialog intersects Kitty overlay row ${dialogRow}`, async () => {
-			setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+	for (const [protocol, dialogRow] of [
+		["kitty", 0],
+		["kitty", 1],
+		["iterm2", 0],
+		["iterm2", 1],
+	] as const) {
+		it(`honors focus order when a text dialog intersects ${protocol} overlay row ${dialogRow}`, async () => {
+			setCapabilities({ images: protocol, trueColor: true, hyperlinks: true });
 			setCellDimensions({ widthPx: 10, heightPx: 20 });
 			const terminal = new LoggingVirtualTerminal(20, 4);
 			const tui = new TuiMainScreen(terminal);
@@ -1137,7 +1153,10 @@ describe("TUI overlays over native-reflow content", () => {
 				{ maxWidthCells: 3, maxHeightCells: 2, imageId: 6102 },
 				{ widthPx: 30, heightPx: 40 },
 			);
-			const hasPlacement = () => /\x1b_Ga=(?:T|p),[^;]*\bi=6102(?:,|;)/.test(terminal.getWrites());
+			const hasPlacement = () =>
+				protocol === "kitty"
+					? /\x1b_Ga=(?:T|p),[^;]*\bi=6102(?:,|;)/.test(terminal.getWrites())
+					: terminal.getWrites().includes("\x1b]1337;File=");
 			try {
 				tui.start();
 				await terminal.waitForRender();
@@ -1495,6 +1514,60 @@ describe("TUI overlays over native-reflow content", () => {
 		}
 	});
 
+	it("preserves custom Kitty crop and placement controls after an overlapping dialog closes", async () => {
+		const terminal = new LoggingVirtualTerminal(20, 5);
+		const tui = new TuiMainScreen(terminal);
+		const base = new TestComponent();
+		const placement = {
+			i: "6190",
+			p: "7",
+			c: "3",
+			r: "2",
+			x: "4",
+			y: "6",
+			w: "30",
+			h: "40",
+			X: "1",
+			Y: "2",
+			U: "0",
+			z: "-3",
+			P: "9",
+			Q: "1",
+			H: "2",
+			V: "3",
+		};
+		const controls = Object.entries(placement)
+			.map(([key, value]) => `${key}=${value}`)
+			.join(",");
+		const payload = "custom-image-data";
+		base.lines = [`\x1b_Ga=T,f=100,t=d,C=0,q=0,${controls};${payload}\x1b\\`, "", "after"];
+		tui.addChild(base);
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			const before = terminal.getScrollBuffer();
+			const dialog = tui.showOverlay(new Text("X", 0, 0), { width: 1, row: 1, col: 1 });
+			await terminal.waitForRender();
+			assert.strictEqual(terminal.getViewport()[1].trimEnd(), " X");
+			assert.ok(terminal.getWrites().includes("\x1b_Ga=d,d=i,i=6190,q=2\x1b\\"));
+			terminal.clearWrites();
+			dialog.hide();
+			await terminal.waitForRender();
+			const restored = /\x1b_G([^;\x1b]+)\x1b\\/.exec(terminal.getWrites());
+			assert.ok(restored, "the custom placement must be restored without retransmission");
+			assert.deepStrictEqual(Object.fromEntries(restored[1].split(",").map((control) => control.split("="))), {
+				a: "p",
+				...placement,
+				C: "1",
+				q: "2",
+			});
+			assert.ok(!terminal.getWrites().includes(payload));
+			assert.deepStrictEqual(terminal.getScrollBuffer(), before);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	for (const row of [0, 1, 2]) {
 		for (const col of [0, 3, 7]) {
 			it(`protects an offset Kitty placement from a disjoint overlay at row ${row}, column ${col}`, async () => {
@@ -1812,6 +1885,60 @@ describe("TUI drawn cursor", () => {
 		assert.ok(!terminal.getWrites().includes("\x1b_pi:"));
 		tui.stop();
 	});
+
+	for (const showHardwareCursor of [false, true]) {
+		it(`keeps the focused cursor beside an overlay image with hardware cursor ${showHardwareCursor}`, async () => {
+			setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+			const terminal = new LoggingVirtualTerminal(24, 5);
+			const tui = new TuiMainScreen(terminal, showHardwareCursor);
+			const input = new Input();
+			input.setValue("abc");
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (text) => text },
+				{ maxWidthCells: 3, maxHeightCells: 1, imageId: 6191 },
+				{ widthPx: 30, heightPx: 18 },
+			);
+			const stack = new HStack([
+				{ component: input, basis: 8 },
+				{ component: image, basis: 8 },
+			]);
+			const dialog = {
+				get focused(): boolean {
+					return input.focused;
+				},
+				set focused(value: boolean) {
+					input.focused = value;
+				},
+				render: (width: number) => stack.render(width),
+				handleInput: (data: string) => input.handleInput(data),
+				invalidate: () => stack.invalidate(),
+			};
+			try {
+				tui.addChild(new Text("base\nbase\nbase", 0, 0));
+				tui.start();
+				await terminal.waitForRender();
+				tui.showOverlay(dialog, { width: 16, row: 1, col: 3 });
+				await terminal.waitForRender();
+				assert.ok(terminal.getWrites().includes("\x1b_Ga=T"));
+				assert.deepStrictEqual(terminal.getCursorPosition(), { x: 5, y: 1 });
+				assert.strictEqual(terminal.cursorVisible, showHardwareCursor);
+				// The known emulator exposes rendered cell attributes outside Terminal's public surface.
+				const emulator = terminal as unknown as { xterm: XtermTerminalType };
+				const cell = emulator.xterm.buffer.active.getLine(1)?.getCell(5);
+				assert.ok(cell);
+				assert.strictEqual(Boolean(cell.isInverse()), !showHardwareCursor);
+				terminal.sendInput("\x1b[C");
+				await terminal.waitForRender();
+				assert.deepStrictEqual(terminal.getCursorPosition(), { x: 6, y: 1 });
+				assert.strictEqual(terminal.cursorVisible, showHardwareCursor);
+			} finally {
+				tui.stop();
+				resetCapabilitiesCache();
+			}
+		});
+	}
 
 	it("keeps the drawn cursor of an unfocused input when the hardware cursor is shown", async () => {
 		const terminal = new LoggingVirtualTerminal(20, 5);

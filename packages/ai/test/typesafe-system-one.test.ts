@@ -173,6 +173,35 @@ describe("TypeSafe System One", () => {
 		expect(requests[1]?.headers.has("typesafe-danger-zone-images")).toBe(false);
 	});
 
+	it.each([
+		{ modelValue: "model", requestValue: undefined, expected: "model" },
+		{ modelValue: "model", requestValue: "request", expected: "request" },
+		{ modelValue: "model", requestValue: null, expected: null },
+	])("honors image opt-in header precedence ($modelValue, $requestValue)", async (testCase) => {
+		let sentHeaders: Headers | undefined;
+		const result = await classify(
+			{
+				...model,
+				input: ["text", "image"],
+				headers: { "typesafe-danger-zone-images": testCase.modelValue },
+			},
+			{ ...context, images: [{ type: "image", data: "cG5n", mimeType: "image/png" }] },
+			{
+				apiKey: "secret",
+				headers:
+					testCase.requestValue === undefined
+						? undefined
+						: { "TYPESAFE-DANGER-ZONE-IMAGES": testCase.requestValue },
+				fetch: async (_input, init) => {
+					sentHeaders = new Headers(init?.headers);
+					return Response.json({ answers: wireAnswers });
+				},
+			},
+		);
+		expect(result.stopReason).toBe("stop");
+		expect(sentHeaders?.get("TypeSafe-Danger-Zone-Images")).toBe(testCase.expected);
+	});
+
 	it("rejects image formats TypeSafe does not accept before sending", async () => {
 		const fetch = vi.fn(async () => Response.json({ answers: wireAnswers }));
 		const result = await classify(

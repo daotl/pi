@@ -191,11 +191,16 @@ class Recorder implements SqliteTelemetry, TelemetryPropagation {
 		try {
 			return await callback(span);
 		} catch (error) {
-			if (!explicit)
-				status =
-					error instanceof Error
-						? { status: "error", error: { name: error.name, message: error.message } }
-						: { status: "error" };
+			if (!explicit) {
+				status = { status: "error" };
+				try {
+					if (error instanceof Error) {
+						status = { status: "error", error: { name: error.name, message: error.message } };
+					}
+				} catch {
+					// Rejection inspection must never replace the callback's original failure.
+				}
+			}
 			throw error;
 		} finally {
 			settled = true;

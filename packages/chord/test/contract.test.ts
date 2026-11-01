@@ -96,6 +96,33 @@ describe("contracts", () => {
 		}
 	});
 
+	it("finite result and state coverage retains sibling validation constraints", () => {
+		for (const finite of [{ enum: ["a", "bb"] }, { const: "a" }]) {
+			const offered = Type.String({ ...finite, enum: ["a"] });
+			const wanted = Type.String({ ...finite, minLength: 2 });
+			assert.equal(Value.Check(offered, "a"), true);
+			assert.equal(Value.Check(wanted, "a"), false);
+			for (const member of ["result", "state"] as const) {
+				const contract = (schema: typeof offered) =>
+					remote(`t.finite-${member}`, {
+						version: 1,
+						input: Type.Object({}),
+						host: hostNamed("server"),
+						variants: {
+							main:
+								member === "result"
+									? { methods: { read: method(undefined, schema) } }
+									: { state: { value: schema } },
+						},
+					});
+				assert.throws(
+					() => bind(contract(offered), undefined, contract(wanted)),
+					(error) => isChordError(error, "contract_mismatch") && error.message.includes(member),
+				);
+			}
+		}
+	});
+
 	it("named properties must fit every matching provider pattern without rejecting additive methods", () => {
 		const consumerArgs = Type.Object({ x: Type.String() }, { additionalProperties: false });
 		const conflictingArgs = Type.Object(

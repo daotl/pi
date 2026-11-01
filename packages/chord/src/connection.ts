@@ -847,7 +847,7 @@ export class Connection implements RemoteChannel {
 	// ─── receiving ───
 
 	#receive(frame: unknown): void {
-		if (this.#mismatched) return;
+		if (this.#mismatched || this.link.closed) return;
 		this.#lastSeen = Date.now();
 		if (!isFrame(frame)) {
 			this.#violation("malformed frame");

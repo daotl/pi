@@ -96,11 +96,11 @@ function renderSummary({ baseUrl, sha, refs, names }) {
 	const lines = ["### Preview packages", "", `Built from \`${sha.slice(0, 7)}\`.`, ""];
 	if (refs.length > 0) {
 		lines.push(`Latest build of \`${refs[0]}\` (updates with new pushes):`, "", "```sh");
-		for (const name of names) lines.push(`npm i ${baseUrl}/${name}@${refs[0]}`);
+		for (const name of names) lines.push(`npm i --ignore-scripts ${baseUrl}/${name}@${refs[0]}`);
 		lines.push("```", "");
 	}
 	lines.push("<details><summary>Pinned to this commit</summary>", "", "```sh");
-	for (const name of names) lines.push(`npm i ${baseUrl}/${name}@${sha}`);
+	for (const name of names) lines.push(`npm i --ignore-scripts ${baseUrl}/${name}@${sha}`);
 	lines.push("```", "", "</details>", "");
 	lines.push(`Installs need a token in \`.npmrc\`: \`//${new URL(baseUrl).host}/:_authToken=...\``);
 	return `${lines.join("\n")}\n`;

@@ -454,7 +454,7 @@ describe("host manager (real child processes)", () => {
 		const fake: Driver = {
 			spawn: () => ({
 				pid: 0,
-				link: ipcLink({ connected: false, send: () => false, on: () => undefined, off: () => undefined }),
+				link: ipcLink({ connected: true, send: () => true, on: () => undefined, off: () => undefined }),
 				exited: new Promise(() => {}),
 				send: () => {},
 				killTree: () => {},
@@ -657,7 +657,7 @@ describe("manager failure boundaries", () => {
 						adopted.resolve();
 						return {
 							pid: 1,
-							link: ipcLink({ connected: false, send: () => false, on: () => {}, off: () => {} }),
+							link: ipcLink({ connected: true, send: () => true, on: () => {}, off: () => {} }),
 							exited: exit.promise,
 							send: () => {
 								exit.reject(cleanupError);
@@ -713,7 +713,7 @@ describe("manager failure boundaries", () => {
 				const exited = Promise.withResolvers<{ code: number; signal: null }>();
 				return {
 					pid: 0,
-					link: ipcLink({ connected: false, send: () => false, on: () => undefined, off: () => undefined }),
+					link: ipcLink({ connected: true, send: () => true, on: () => undefined, off: () => undefined }),
 					exited: exited.promise,
 					send: () => exited.resolve({ code: 0, signal: null }),
 					killTree: () => exited.resolve({ code: 0, signal: null }),

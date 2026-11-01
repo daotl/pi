@@ -63,53 +63,72 @@ describe("pi mcp", () => {
 		]);
 	});
 
-	it("cancels a stalled initialize at the whole-login deadline", async () => {
-		const methods: unknown[] = [];
-		const initialized = Promise.withResolvers<void>();
-		const deadline = new AbortController();
-		const originalTimeout = AbortSignal.timeout;
-		const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
-			return milliseconds === 50 ? deadline.signal : originalTimeout(milliseconds);
-		});
-		const server = createServer((request, response) => {
-			if (request.method === "POST") {
-				let body = "";
-				request.setEncoding("utf8");
-				request.on("data", (chunk: string) => {
-					body += chunk;
-				});
-				request.on("end", () => {
-					const message: unknown = JSON.parse(body);
-					if (message !== null && typeof message === "object" && "method" in message) {
-						methods.push(message.method);
-						if (message.method === "initialize") initialized.resolve();
-					}
-				});
-			} else response.end();
-		});
-		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-		try {
-			const address = server.address();
-			if (address === null || typeof address === "string") throw new Error("Expected loopback address");
-			let settled = false;
-			const pending = run(["login", "stalled", "--timeout", "0.05"], {
-				stalled: { url: `http://127.0.0.1:${address.port}/mcp`, timeout: 2 },
-			}).finally(() => {
-				settled = true;
+	it.each(["0.05", "1.001", "0.0001"])(
+		"cancels a stalled initialize at a %s-second login deadline",
+		async (seconds) => {
+			const methods: unknown[] = [];
+			const initialized = Promise.withResolvers<void>();
+			const deadline = new AbortController();
+			const originalTimeout = AbortSignal.timeout;
+			const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+				// Keep Node's integer/range validation, but release the deadline only after initialize arrives.
+				const signal = originalTimeout(milliseconds);
+				return milliseconds === Math.max(1, Math.ceil(Number(seconds) * 1000)) ? deadline.signal : signal;
 			});
-			await initialized.promise;
-			expect(timeout).toHaveBeenCalledWith(50);
-			expect(settled).toBe(false);
-			deadline.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
-			const result = await pending;
-			expect(result.exitCode).toBe(1);
-			expect(methods).toContain("initialize");
-			expect(result.output).toContain("timed out before connection completed.");
-		} finally {
-			timeout.mockRestore();
-			server.closeAllConnections();
-			await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-		}
+			const server = createServer((request, response) => {
+				if (request.method === "POST") {
+					let body = "";
+					request.setEncoding("utf8");
+					request.on("data", (chunk: string) => {
+						body += chunk;
+					});
+					request.on("end", () => {
+						const message: unknown = JSON.parse(body);
+						if (message !== null && typeof message === "object" && "method" in message) {
+							methods.push(message.method);
+							if (message.method === "initialize") initialized.resolve();
+						}
+					});
+				} else response.end();
+			});
+			await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+			try {
+				const address = server.address();
+				if (address === null || typeof address === "string") throw new Error("Expected loopback address");
+				let settled = false;
+				const pending = run(["login", "stalled", "--timeout", seconds], {
+					stalled: { url: `http://127.0.0.1:${address.port}/mcp`, timeout: 2 },
+				}).finally(() => {
+					settled = true;
+				});
+				await Promise.race([
+					initialized.promise,
+					pending.then(() => {
+						throw new Error("Login settled before initialize reached the server");
+					}),
+				]);
+				expect(settled).toBe(false);
+				deadline.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+				const result = await pending;
+				expect(result.exitCode).toBe(1);
+				expect(methods).toContain("initialize");
+				expect(result.output).toContain("timed out before connection completed.");
+			} finally {
+				timeout.mockRestore();
+				server.closeAllConnections();
+				await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+			}
+		},
+	);
+
+	it.each(["2147483.648", "1e308"])("rejects an unsupported %s-second login timeout normally", async (seconds) => {
+		const result = await run(["login", "example", "--timeout", seconds], {
+			example: { url: "http://127.0.0.1:1/mcp" },
+		});
+		expect(result).toMatchObject({
+			exitCode: 1,
+			output: "--timeout must not exceed 2147483.647 seconds.",
+		});
 	});
 
 	it("rejects unknown servers and servers without OAuth for login and logout", async () => {

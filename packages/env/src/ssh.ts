@@ -104,6 +104,8 @@ export function sshArguments(
 		...option(`StrictHostKeyChecking=${strictHostKeys ? "yes" : "accept-new"}`),
 		...option(`UserKnownHostsFile=${configPath("known hosts file", knownHostsFile)}`),
 		...option("GlobalKnownHostsFile=none"),
+		...option("KnownHostsCommand=none"),
+		...option("VerifyHostKeyDNS=no"),
 		...option("HashKnownHosts=no"),
 		...option(`HostKeyAlias=${target.hostKeyAlias}`),
 		...(target.user === undefined ? [] : ["-l", target.user]),
@@ -485,13 +487,13 @@ export interface SshConnectOptions extends SshTarget {
 }
 
 /** The remote command that starts the daemon at `file`, before the `serve` arguments. */
-function launchCommand(remote: RemotePlatform, file: string, loginShell: boolean): string {
+export function launchCommand(remote: RemotePlatform, file: string, loginShell: boolean): string {
 	if (remote.platform === "windows") {
 		// Git Bash/MSYS/Cygwin accept forward-slash Windows paths as POSIX-quoted executable names.
 		if (remote.shell === "posix") return quotePosix(file.replaceAll("\\", "/"));
 		// PowerShell runs a quoted path only with the call operator; cmd.exe keeps one pair of quotes around a program.
 		if (remote.shell === "powershell") return `& ${quotePowerShell(file)}`;
-		return file.includes(" ") ? `"${file}"` : file;
+		return `"${file}"`;
 	}
 	if (loginShell) {
 		// Dispatch inside `sh`, not the outer SSH shell. Fish puts all extra -c arguments in $argv;

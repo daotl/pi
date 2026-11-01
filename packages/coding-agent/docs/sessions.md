@@ -127,6 +127,8 @@ Use `/export` to write the current session as HTML or JSONL. Use `/share` to upl
 
 Review exported or shared sessions first. They can contain prompts, model responses, tool arguments, command output, file contents, and extension messages.
 
+HTML exports retain tool arguments even when an extension customizes only the result display. If the first recorded system state on a branch is a compaction checkpoint, the viewer shows its baseline prompt and available tools before later system updates; that baseline is also searchable.
+
 The HTML viewer vendors Marked 18.0.11 with a task-list tokenizer backport that associates each checkbox marker with its own paragraph, preserving literal markers in later paragraphs. To regenerate it from a checkout with dependencies installed, run `node scripts/generate-export-marked.mjs` at the repository root, then `node scripts/generate-export-marked.mjs --check`. The generator authenticates the installed Marked source map by exact version and SHA-256, applies the readable TypeScript backport, and bundles it with pinned esbuild 0.28.2 while preserving the upstream license and UMD exports. Do not edit the minified asset or move tokenizer internals into the viewer; upgrades require reviewing the source pin and backport together.
 
 ## Report a bug

@@ -94,6 +94,12 @@ jobs:
             node: 24
           - os: windows-latest
             node: 26
+          - os: windows-11-arm
+            node: 22
+          - os: windows-11-arm
+            node: 24
+          - os: windows-11-arm
+            node: 26
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -107,8 +113,12 @@ jobs:
         run: npm ci --ignore-scripts
       - name: Build telemetry runtime dependency
         run: npm run build --workspace packages/telemetry
+      # Release packing copies these checked-in prebuilds; exercise them before the build overwrites them.
+      - name: Test shipped native Chord lifecycle
+        run: npm run test --workspace packages/chord
       - name: Build Chord Windows lifecycle helpers
         if: runner.os == 'Windows'
         run: npm run build:native:win32 --workspace packages/chord -- --current
-      - name: Test native Chord lifecycle
+      - name: Test rebuilt Windows Chord lifecycle
+        if: runner.os == 'Windows'
         run: npm run test --workspace packages/chord

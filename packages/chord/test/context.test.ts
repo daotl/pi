@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	awaitWithContext,
 	BACKGROUND_CONTEXT,
+	type Context,
 	createContextKey,
 	TODO_CONTEXT,
 	traceIn,
@@ -12,8 +13,45 @@ import {
 	withoutAbortSignal,
 	withTelemetry,
 } from "../src/context/index.ts";
+import { Watch } from "../src/watch.ts";
 
 describe("Context", () => {
+	it("inherits structural telemetry through value, cancellation and watch cleanup contexts", async () => {
+		const telemetry = new InMemoryTelemetryContext();
+		await telemetry.startSpan({ name: "custom" }, async (span) => {
+			const custom: Context = {
+				telemetry: span,
+				abortSignal: undefined,
+				value: () => undefined,
+				toString: () => "custom",
+			};
+			const key = createContextKey<string>("custom-value");
+			const controller = new AbortController();
+			const value = withContextValue(key, "kept", custom);
+			for (const derived of [
+				value,
+				withAbortSignal(controller.signal, custom),
+				withCancel(custom).context,
+				withoutAbortSignal(custom),
+			])
+				expect(derived.telemetry).toBe(span);
+			expect(value.value(key)).toBe("kept");
+			const watch = new Watch(
+				0,
+				() => {},
+				(error) => {
+					throw error;
+				},
+			);
+			const delivered = Promise.withResolvers<Context>();
+			watch.start(async (_value, _ops, context) => {
+				delivered.resolve(context);
+			});
+			watch.advance(1, [["r", 1]], custom);
+			expect((await delivered.promise).telemetry).toBe(span);
+			await watch.stop();
+		});
+	});
 	it("provides distinct empty root contexts", () => {
 		const key = createContextKey<string>("value");
 

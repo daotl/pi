@@ -30,8 +30,14 @@ const lazyEnv = new RemoteExecutionEnv({ connection: lazy.connection, id: "pi-en
 
 The package ships the daemon for every supported remote system in `bin/`. `ssh` runs with `BatchMode`, strict host-key
 checking against the application's own known-hosts file under a fixed alias, no forwarding of any kind, no shared
-connections or configured commands, and without forwarding the local locale. On Windows, detection and deployment go
-through PowerShell, and the daemon starts through the server's default shell (cmd.exe or PowerShell).
+connections or configured commands, and without forwarding the local locale. Inherited `KnownHostsCommand` and DNS
+host-key trust are disabled; SSH configuration still supplies routing and jump hosts. On Windows, detection and
+deployment go through PowerShell, and the daemon starts through the server's default shell (cmd.exe or PowerShell),
+with its executable path quoted even when it contains no spaces.
+
+Cancelling a request while detection, deployment or the daemon handshake is pending settles that request with
+`aborted` without dispatching it. Other callers still share the same startup. Once dispatched, cancellation sends
+`cancel` and waits for the daemon's result, including process cleanup.
 
 `env.listFiles(path, options, context)` lists the tree below a directory in the daemon, as `fd --hidden --exclude .git`
 does without following symbolic links: files, directories and links as relative `/` paths, skipping what git ignores

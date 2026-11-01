@@ -637,7 +637,7 @@ export class AgentSession {
 	private _standardStreamFunction?: Agent["streamFunction"];
 	private _initialActiveToolNames?: string[];
 	/**
-	 * Tools of the restored or reloaded loadout that are not registered yet, such as tools of MCP
+	 * Tools of the initial, restored or reloaded loadout that are not registered yet, such as tools of MCP
 	 * servers that are still connecting. They are activated when they are registered, and dropped when
 	 * `setActiveToolsByName()` deactivates a tool or the next agent run starts.
 	 */
@@ -749,6 +749,9 @@ export class AgentSession {
 			includeAllExtensionTools: true,
 		});
 		if (this._usesDefaultTools) this._restoreToolsFromTranscript(this._defaultToolModifiers);
+		for (const name of applyToolModifiers([], this._defaultToolModifiers)) {
+			if (!this._toolRegistry.has(name) && this._isAllowedTool(name)) this._pendingToolNames.add(name);
+		}
 	}
 
 	get modelRuntime(): ModelRuntime {

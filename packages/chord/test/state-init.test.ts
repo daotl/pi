@@ -118,6 +118,51 @@ describe("state init", () => {
 		assert.deepEqual(ref.notes.value, ["ok"]);
 	});
 
+	it("aborts sibling initializers before joining a failed batch", async () => {
+		const host = createHost({ self: "host", onError: () => {} });
+		const Service = local("t.failed-init-batch", { version: 1, input: Type.Object({}) });
+		const log: string[] = [];
+		const started = Promise.withResolvers<void>();
+		host.serve(
+			Service,
+			(_input, _principal, self) => {
+				self.resource("native", {
+					version: 1,
+					open: () => "native",
+					close: () => {
+						log.push("closed");
+					},
+				});
+				self.state("failure", Type.String(), {
+					init: async () => {
+						await started.promise;
+						throw new Error("first init failed");
+					},
+				});
+				self.state("waiting", Type.String(), {
+					init: (ctx) =>
+						new Promise<string>((resolve) => {
+							started.resolve();
+							const aborted = () => {
+								log.push("aborted");
+								resolve("cancelled");
+							};
+							if (ctx.signal.aborted) aborted();
+							else ctx.signal.addEventListener("abort", aborted, { once: true });
+						}),
+				});
+				return {};
+			},
+			{ lifetime: "host" },
+		);
+		try {
+			await assert.rejects(host.ready(), /first init failed/);
+			assert.deepEqual(log, ["aborted", "closed"]);
+		} finally {
+			await host.close();
+		}
+	});
+
 	it("init runs in a root: it can call other objects", async () => {
 		const host = createHost({ self: { kind: "host" }, onError: () => {} });
 		const Source = local("t.source", {

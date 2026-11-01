@@ -60,6 +60,41 @@ describe("AgentSession tool orchestration", () => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
 	});
 
+	it.each([false, true])(
+		"declares an inactive late tool selected by +name with builtins disabled=%s",
+		async (builtinless) => {
+			const harness = await createHarness({
+				initialActiveToolNames: builtinless ? [] : undefined,
+				defaultToolModifiers: ["+late_tool"],
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_start", () => {
+							pi.registerTool({
+								name: "late_tool",
+								label: "Late tool",
+								description: "Explicitly selected late tool",
+								parameters: Type.Object({}),
+								defaultActive: false,
+								execute: async () => ({ content: [{ type: "text", text: "late result" }], details: {} }),
+							});
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			await harness.session.bindExtensions({});
+			let declared: string[] | undefined;
+			harness.setResponses([
+				(context) => {
+					declared = getCurrentTools(context.messages).map((tool) => tool.name);
+					return fauxAssistantMessage("late tool loadout received");
+				},
+			]);
+			await harness.session.prompt("inspect late tool selection");
+			expect(declared).toEqual(builtinless ? ["late_tool"] : ["read", "bash", "edit", "write", "late_tool"]);
+		},
+	);
+
 	// #22: invocation modifiers must survive every selected-branch restoration path.
 	it.each(["navigate", "swipe", "regenerate"] as const)(
 		"keeps invocation tool modifiers across repeated %s restoration and provider requests",

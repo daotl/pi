@@ -66,6 +66,7 @@ pre{white-space:pre-wrap;word-break:break-word;font:12.5px/1.45 ui-monospace,Men
 let data = null, view = "inbox", cat = "", selectedNumber = null, openDetails = new Set();
 let loadGeneration = 0, pendingMutations = 0, decisionPending = false;
 let loadError = "", mutationError = "";
+let deferredSnapshot = null;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 const gh = (n) => `https://github.com/${data.repo}/issues/${n}`;
@@ -74,19 +75,29 @@ const category = (it) => it.decision?.category || it.triage?.result?.category ||
 const WARN = new Set(["theoretical", "AI-written", "third-party", "upstream", "maybe fixed", "no repro"]);
 const BAD = new Set(["regression", "spam", "empty", "duplicate cluster"]);
 
+function installSnapshot(snapshot, generation) {
+	if (generation !== loadGeneration || pendingMutations) return false;
+	if (document.querySelector("select:focus")) {
+		deferredSnapshot = { snapshot, generation };
+		return false;
+	}
+	deferredSnapshot = null;
+	data = snapshot;
+	loadError = "";
+	decisionPending = false;
+	render();
+	return true;
+}
+
 async function load() {
 	if (pendingMutations) return false;
 	const generation = ++loadGeneration;
+	deferredSnapshot = null;
 	try {
 		const res = await fetch("/api/state");
 		if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
 		const snapshot = await res.json();
-		if (generation !== loadGeneration || pendingMutations) return false;
-		data = snapshot;
-		loadError = "";
-		decisionPending = false;
-		render();
-		return true;
+		return installSnapshot(snapshot, generation);
 	} catch (error) {
 		if (generation === loadGeneration && !pendingMutations) {
 			loadError = `${error instanceof Error ? error.message : String(error)}. State refresh failed; use Sync to retry.`;
@@ -103,6 +114,7 @@ async function post(path, body) {
 	if (!pendingMutations) mutationError = "";
 	if (decision) { decisionPending = true; render(); }
 	++loadGeneration;
+	deferredSnapshot = null;
 	pendingMutations++;
 	try {
 		const res = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -209,6 +221,13 @@ document.addEventListener("click", (e) => {
 	}
 	const c = e.target.closest(".card");
 	if (c) { selectedNumber = Number(c.dataset.n); document.querySelectorAll(".card").forEach((x) => x.classList.toggle("sel", x === c)); }
+});
+document.addEventListener("focusout", (e) => {
+	if (e.target.tagName !== "SELECT") return;
+	// Check after focus settles so moving between selects does not replace either control.
+	queueMicrotask(() => {
+		if (deferredSnapshot) installSnapshot(deferredSnapshot.snapshot, deferredSnapshot.generation);
+	});
 });
 document.addEventListener("change", (e) => {
 	if (decisionPending && e.target.dataset.act === "cat") { render(); return; }

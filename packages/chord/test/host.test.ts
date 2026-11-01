@@ -153,6 +153,48 @@ describe("host: activation and lifetime", () => {
 		assert.equal(again.status, "live");
 	});
 
+	it("aborts sibling opens before joining a failed resource batch", async () => {
+		const host = quiet();
+		const Service = local("t.failed-open-batch", { version: 1, input: Type.Object({}) });
+		const log: string[] = [];
+		host.serve(
+			Service,
+			(_input, _principal, self) => {
+				self.resource("failure", {
+					version: 1,
+					open: () => {
+						throw new Error("first open failed");
+					},
+				});
+				self.resource("waiting", {
+					version: 1,
+					open: ({ signal }) =>
+						new Promise<string>((resolve) => {
+							signal.addEventListener(
+								"abort",
+								() => {
+									log.push("aborted");
+									resolve("late value");
+								},
+								{ once: true },
+							);
+						}),
+					close: (value) => {
+						log.push(`closed ${value}`);
+					},
+				});
+				return {};
+			},
+			{ lifetime: "host" },
+		);
+		try {
+			await assert.rejects(host.ready(), /first open failed/);
+			assert.deepEqual(log, ["aborted", "closed late value"]);
+		} finally {
+			await host.close();
+		}
+	});
+
 	it("propagates activation failures to dependents and retries on the next get", async () => {
 		const host = quiet();
 		let fail = true;

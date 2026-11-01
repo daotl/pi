@@ -76,6 +76,8 @@ Other options:
 const HELP_HINT = chalk.dim(`Use "${APP_NAME} mcp --help" for usage.`);
 
 const DEFAULT_LOGIN_TIMEOUT_SECONDS = 300;
+/** Largest delay supported by the timers behind AbortSignal.timeout. */
+const MAX_LOGIN_TIMEOUT_MS = 2_147_483_647;
 
 export interface McpCommandOptions {
 	cwd: string;
@@ -248,13 +250,18 @@ export async function runMcpCommand(args: string[], options: McpCommandOptions):
 				error("--timeout must be a positive number of seconds.");
 				return 1;
 			}
-			const signal = AbortSignal.timeout(timeout * 1000);
+			const timeoutMs = Math.max(1, Math.ceil(timeout * 1000));
+			if (timeoutMs > MAX_LOGIN_TIMEOUT_MS) {
+				error(`--timeout must not exceed ${MAX_LOGIN_TIMEOUT_MS / 1000} seconds.`);
+				return 1;
+			}
+			const signal = AbortSignal.timeout(timeoutMs);
 			const cancelConnection = () => {
 				void connection.close().catch(() => undefined);
 			};
 			signal.addEventListener("abort", cancelConnection, { once: true });
 			try {
-				return await login(entry, connection, url, timeout * 1000, signal, options, credentials, log, error);
+				return await login(entry, connection, url, timeoutMs, signal, options, credentials, log, error);
 			} finally {
 				signal.removeEventListener("abort", cancelConnection);
 				const closing = connection.close();

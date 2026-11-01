@@ -1,5 +1,6 @@
 import type { OAuthCredential } from "../auth/types.ts";
-import type { Model, ThinkingLevelMap } from "../types.ts";
+import type { Model, ProviderHeaders, ThinkingLevelMap } from "../types.ts";
+import { providerHeadersToRecord } from "../utils/headers.ts";
 import { ownedSlice } from "../utils/text.ts";
 
 export const DEFAULT_RADIUS_GATEWAY = "https://radius.pi.dev";
@@ -21,8 +22,20 @@ export type RadiusGatewayConfig = {
 };
 
 export type RadiusOAuthCredential = OAuthCredential & {
+	/** Non-secret login identity, retained when access and refresh tokens rotate. */
+	catalogId?: string;
 	gatewayConfig?: RadiusGatewayConfig;
 };
+
+/** Legacy credentials acquire a stable non-secret identity before their first token rotation. */
+export async function getRadiusCatalogId(credential: OAuthCredential): Promise<string> {
+	const catalogId = (credential as RadiusOAuthCredential).catalogId;
+	if (catalogId) return catalogId;
+	return Array.from(
+		new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(credential.access))),
+		(byte) => byte.toString(16).padStart(2, "0"),
+	).join("");
+}
 
 function isRadiusGatewayModel(value: unknown): value is RadiusGatewayModel {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
@@ -82,9 +95,12 @@ export async function loadRadiusGatewayConfig(
 	gateway: string,
 	apiKey?: string,
 	signal?: AbortSignal,
+	authHeaders?: ProviderHeaders,
 ): Promise<RadiusGatewayConfig> {
-	const headers: Record<string, string> = { accept: "application/json" };
-	if (apiKey) headers.authorization = `Bearer ${apiKey}`;
+	const headers = providerHeadersToRecord(
+		{ accept: "application/json", ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
+		authHeaders,
+	);
 	const response = await fetch(new URL("/v1/config", gateway), { headers, signal });
 	if (!response.ok) {
 		throw new Error(

@@ -204,7 +204,7 @@ export async function classifySystemOne(
 	try {
 		if (model.api !== transport.api) throw new Error(`Unsupported classifier API: ${model.api}`);
 		const request = wireRequest(context);
-		let requestOptions = options;
+		let defaultHeaders: typeof IMAGE_OPT_IN_HEADERS | undefined;
 		if (context.images?.length) {
 			if (!model.input.includes("image")) {
 				throw new Error(`${transport.label} does not support image input for ${model.id}`);
@@ -213,7 +213,7 @@ export async function classifySystemOne(
 			const imageInput = model.compat?.imageInput ?? detected.imageInput;
 			addImages(transport.label, model, imageInput, context.images, request);
 			if (model.compat?.sendImageOptInHeader ?? detected.sendImageOptInHeader) {
-				requestOptions = { ...options, headers: { ...IMAGE_OPT_IN_HEADERS, ...options?.headers } };
+				defaultHeaders = IMAGE_OPT_IN_HEADERS;
 			}
 		}
 		const body = await postClassifierRequest(
@@ -221,7 +221,9 @@ export async function classifySystemOne(
 			transport.url(model),
 			model,
 			transport.payload(model, request),
-			requestOptions,
+			options,
+			undefined,
+			defaultHeaders,
 		);
 		const result = transport.output(body);
 		// Set before parsing answers: a request with malformed answers was still billed.

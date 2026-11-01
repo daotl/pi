@@ -39,6 +39,8 @@ interface TranscriptStream {
 	runId: string;
 	messageId: string;
 	reducer: AssistantMessageFrameReducer;
+	/** Immutable reducer previews already projected into the transcript, keyed by content index. */
+	argumentSnapshots: Map<number, object>;
 }
 
 export function createTranscriptServiceFacet(lane: AgentLane): Facet {
@@ -142,6 +144,7 @@ export function createTranscriptServiceFacet(lane: AgentLane): Facet {
 										messageId: event.entryId,
 										sequence: event.frameSequence,
 										reducer: new AssistantMessageFrameReducer(),
+										argumentSnapshots: new Map(),
 									};
 									stream.reducer.apply(event.frame);
 									forwarded = {
@@ -209,6 +212,7 @@ export function createTranscriptServiceFacet(lane: AgentLane): Facet {
 											streamingMessage,
 											forwarded.frame,
 											stream.reducer.toolArgumentChanges,
+											stream.argumentSnapshots,
 										);
 									}
 									if (stream && checkpoint) {
@@ -333,6 +337,7 @@ function hydrateStream(snapshot: LaneSnapshot): TranscriptStream | undefined {
 				runId: operation.id,
 				messageId: state.messageId,
 				reducer: new AssistantMessageFrameReducer(operation.streamingMessage, state.checkpoint),
+				argumentSnapshots: new Map(),
 			}
 		: undefined;
 }
@@ -343,11 +348,16 @@ function applyFrameMessage(
 	message: AssistantMessage,
 	frame: JsonRepresentation<AssistantMessageFrame>,
 	argumentChanges: readonly JsonChange[] | undefined,
+	argumentSnapshots: Map<number, object>,
 ): void {
 	if (frame.type === "start") {
 		operation.streamingMessage = copyJson(message, {
 			omitUndefinedProperties: true,
 		}) as JsonRepresentation<AssistantMessage>;
+		argumentSnapshots.clear();
+		for (const [index, content] of message.content.entries()) {
+			if (content.type === "toolCall") argumentSnapshots.set(index, content.arguments);
+		}
 		return;
 	}
 	const target = operation.streamingMessage;
@@ -361,45 +371,53 @@ function applyFrameMessage(
 		appendText(block, "thinking", frame.delta);
 		return;
 	}
-	if (frame.type === "toolcall_delta" && block?.type === "toolCall" && argumentChanges !== undefined) {
-		for (const change of argumentChanges) {
-			if (change.path.length === 0) {
-				if (change.kind === "set") {
-					const value = copyJson(change.value);
-					block.arguments = isJsonRecord(value) ? value : {};
-				}
-				continue;
-			}
-			let parent: JsonValue = block.arguments;
-			for (const part of change.path.slice(0, -1)) {
-				if (typeof parent !== "object" || parent === null || !Object.hasOwn(parent, part))
-					throw new Error("Transcript argument delta has no parent");
-				parent = (parent as Record<string | number, JsonValue>)[part]!;
-			}
-			if (typeof parent !== "object" || parent === null)
-				throw new Error("Transcript argument delta has no container");
-			const key = change.path[change.path.length - 1]!;
-			if (change.kind === "append") {
-				if (Array.isArray(parent)) {
-					const current = parent[Number(key)];
-					if (typeof current !== "string") throw new Error("Transcript argument append has no string");
-					parent[Number(key)] = current + change.text;
-				} else appendText(parent as Draft<Record<string, string>>, String(key), change.text);
-			} else (parent as Record<string | number, JsonValue>)[key] = copyJson(change.value);
+	const content = message.content[frame.contentIndex];
+	if (content === undefined) throw new Error("Transcript frame has no decoded content block");
+	if (frame.type === "toolcall_delta" && block?.type === "toolCall" && content.type === "toolCall") {
+		// Copy-credit lag can expose the exact same immutable preview for many frames.
+		if (argumentChanges === undefined && argumentSnapshots.get(frame.contentIndex) !== content.arguments) {
+			assignJsonField(block as Draft<Record<string, JsonValue>>, "arguments", copyJson(content.arguments));
 		}
+		if (argumentChanges !== undefined) {
+			for (const change of argumentChanges) {
+				if (change.path.length === 0) {
+					if (change.kind === "set") {
+						const value = copyJson(change.value);
+						block.arguments = isJsonRecord(value) ? value : {};
+					}
+					continue;
+				}
+				let parent: JsonValue = block.arguments;
+				for (const part of change.path.slice(0, -1)) {
+					if (typeof parent !== "object" || parent === null || !Object.hasOwn(parent, part))
+						throw new Error("Transcript argument delta has no parent");
+					parent = (parent as Record<string | number, JsonValue>)[part]!;
+				}
+				if (typeof parent !== "object" || parent === null)
+					throw new Error("Transcript argument delta has no container");
+				const key = change.path[change.path.length - 1]!;
+				if (change.kind === "append") {
+					if (Array.isArray(parent)) {
+						const current = parent[Number(key)];
+						if (typeof current !== "string") throw new Error("Transcript argument append has no string");
+						parent[Number(key)] = current + change.text;
+					} else appendText(parent as Draft<Record<string, string>>, String(key), change.text);
+				} else (parent as Record<string | number, JsonValue>)[key] = copyJson(change.value);
+			}
+		}
+		argumentSnapshots.set(frame.contentIndex, content.arguments);
 		if (frame.rawDelta !== undefined) {
 			if (block.raw === undefined) block.raw = frame.rawDelta;
 			else appendText(block as Draft<{ raw: string }>, "raw", frame.rawDelta);
 		}
 		return;
 	}
-	const content = message.content[frame.contentIndex];
-	if (content === undefined) throw new Error("Transcript frame has no decoded content block");
 	assignJsonField(
 		target.content as Draft<JsonValue[]>,
 		frame.contentIndex,
 		copyJson(content, { omitUndefinedProperties: true }),
 	);
+	if (content.type === "toolCall") argumentSnapshots.set(frame.contentIndex, content.arguments);
 }
 
 /** Reconcile a tool/block checkpoint leaf by leaf so unchanged prefixes are not sent as container sets. */

@@ -1,4 +1,4 @@
-import type { Op } from "@earendil-works/chord/delta";
+import { applyImmutable, type Op } from "@earendil-works/chord/delta";
 import {
 	defineDoc,
 	defineDocFamily,
@@ -422,7 +422,9 @@ describe("Session document migrations", () => {
 		});
 		expect(checkpoints).toBe(0);
 		// The migration-only base is published, so the older-shape watch receives the new value as a root replacement.
-		expect(documentChanges(publications.at(-1)!)).toMatchObject([{ version: 3, value: { count: 4 }, ops: [] }]);
+		expect(documentChanges(publications.at(-1)!)).toMatchObject([
+			{ version: 3, value: { count: 4 }, ops: [["r", { count: 4 }]] },
+		]);
 		expect(frames).toEqual([{ value: { count: 4 }, ops: [["r", { count: 4 }]] }]);
 		expect(currentFrames).toEqual([]);
 		await watch.stop();
@@ -810,6 +812,54 @@ describe("Session tracker cache across definition versions", () => {
 		scope: "session",
 		initial: () => ({ names: [] }),
 		migrate: (value) => ({ names: [value.name as string] }),
+	});
+
+	it.each([false, true])("replays a migration base into a stored-state replica with draft edits: %s", async (edit) => {
+		const { session, storage } = openTestSession();
+		await session.commit((tx) => tx.doc(V1Doc), context);
+		const record = await storage.findDocument(
+			{ kind: V1Doc.definition.kind, scope: { kind: "session" } },
+			"current",
+			context,
+		);
+		let replica = (await storage.document(record!.id, "current", context))!.value;
+		const unsubscribe = session.subscribeCommits((publication) => {
+			for (const change of documentChanges(publication)) {
+				if (change.record.id === record!.id) replica = applyImmutable(replica, change.ops);
+			}
+		});
+		const watch = (await session.watchDoc(V2Doc, context))!;
+		let observed: Readonly<JsonObject> = watch.value!;
+		const frames: (readonly Op[])[] = [];
+		watch.start(async (value, ops) => {
+			observed = applyImmutable(observed, ops);
+			expect(observed).toEqual(value);
+			frames.push(ops);
+		});
+		await session.commit(async (tx) => {
+			const draft = await tx.doc(V2Doc);
+			if (edit) draft.names.push("second");
+		}, context);
+		await flush();
+		const expected = { names: edit ? ["first", "second"] : ["first"] };
+		expect((await storage.document(record!.id, "current", context))!.value).toEqual(expected);
+		expect(replica).toEqual(expected);
+		expect(observed).toEqual(expected);
+		if (edit) {
+			expect(frames).toHaveLength(1);
+			expect(frames[0]!.some((op) => op[0] === "r")).toBe(false);
+		} else expect(frames).toEqual([]);
+
+		await session.commit(async (tx) => {
+			(await tx.doc(V2Doc)).names.push("later");
+		}, context);
+		await flush();
+		expect(replica).toEqual({ names: [...expected.names, "later"] });
+		expect(replica).toEqual((await storage.document(record!.id, "current", context))!.value);
+		expect(observed).toEqual(replica);
+		unsubscribe();
+		await watch.stop();
+		await session.close(context);
 	});
 
 	it("migrates a document cached by an older token without unloading", async () => {

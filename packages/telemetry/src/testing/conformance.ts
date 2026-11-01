@@ -270,6 +270,43 @@ export function createTelemetryAdapterConformance(
 				}
 			},
 		),
+		...(["message", "prototype"] as const).flatMap((unreadable) =>
+			[false, true].map((asynchronous) =>
+				createCase(
+					factory,
+					"callback lifecycle",
+					`preserves ${asynchronous ? "asynchronous" : "synchronous"} rejection with unreadable ${unreadable}`,
+					async (fixture) => {
+						const rejection =
+							unreadable === "message"
+								? Object.defineProperty(new Error(), "message", {
+										get() {
+											throw new Error("Cannot read message");
+										},
+									})
+								: new Proxy(
+										{},
+										{
+											getPrototypeOf() {
+												throw new Error("Cannot inspect prototype");
+											},
+										},
+									);
+						const name = `unreadable-${unreadable}-${asynchronous}`;
+						await rejectsWithSameValue(
+							fixture.context.startSpan({ name }, () => {
+								if (asynchronous) return Promise.reject(rejection);
+								throw rejection;
+							}),
+							rejection,
+						);
+						const span = findSpan(await fixture.getSpans(), name);
+						deepStrictEqual(span.status, { status: "error" });
+						strictEqual(span.settled, true);
+					},
+				),
+			),
+		),
 
 		createCase(factory, "status", "uses last explicit status without automatic overwrite", async (fixture) => {
 			await fixture.context.startSpan({ name: "last-status" }, (span) => {

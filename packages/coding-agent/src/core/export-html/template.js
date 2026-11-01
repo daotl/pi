@@ -385,7 +385,7 @@
         return parts.join(', ');
       }
 
-      const hasSystemEntries = entries.some(entry => entry.type === 'message' && entry.message.role === 'system');
+      const hasSystemEntries = entries.some(carriesSystemState);
 
       /**
        * Parse a skill block from message text.
@@ -428,6 +428,11 @@
             break;
           case 'compaction':
             parts.push('compaction');
+            if (entry.systemMessage && isLeadingSystemEntry(entry)) {
+              parts.push('system prompt', getSystemMessageText(entry.systemMessage));
+              for (const name of Object.keys(entry.systemMessage.sections || {})) parts.push(name);
+              for (const tool of entry.systemMessage.toolsAdded || []) parts.push(tool.name);
+            }
             break;
           case 'branch_summary':
             parts.push('branch summary', entry.summary);
@@ -1004,6 +1009,49 @@
         return out;
       }
 
+      function renderToolCallArguments(name, args) {
+        const invalidArg = '<span class="tool-error">[invalid arg]</span>';
+        switch (name) {
+          case 'bash': {
+            const command = str(args.command);
+            return `<div class="tool-command">$ ${command === null ? invalidArg : escapeHtml(command || '...')}</div>`;
+          }
+          case 'read': {
+            const filePath = str(args.file_path ?? args.path);
+            const readLineRange = formatReadLineRange(args.offset, args.limit);
+            let pathHtml = filePath === null ? invalidArg : escapeHtml(shortenPath(filePath || ''));
+            if (filePath !== null && readLineRange) pathHtml += `<span class="line-numbers">${escapeHtml(readLineRange)}</span>`;
+            return `<div class="tool-header"><span class="tool-name">read</span> <span class="tool-path">${pathHtml}</span></div>`;
+          }
+          case 'write': {
+            const filePath = str(args.file_path ?? args.path);
+            const content = str(args.content);
+            let html = `<div class="tool-header"><span class="tool-name">write</span> <span class="tool-path">${filePath === null ? invalidArg : escapeHtml(shortenPath(filePath || ''))}</span>`;
+            if (content !== null && content) {
+              const lines = content.split('\n');
+              if (lines.length > 10) html += ` <span class="line-count">(${lines.length} lines)</span>`;
+            }
+            html += '</div>';
+            if (content === null) html += '<div class="tool-error">[invalid content arg - expected string]</div>';
+            else if (content) html += formatExpandableOutput(content, 10, filePath ? getLanguageFromPath(filePath) : null);
+            return html;
+          }
+          case 'edit': {
+            const filePath = str(args.file_path ?? args.path);
+            return `<div class="tool-header"><span class="tool-name">edit</span> <span class="tool-path">${filePath === null ? invalidArg : escapeHtml(shortenPath(filePath || ''))}</span></div>`;
+          }
+          case 'ls': {
+            const dirPath = str(args.path);
+            let pathHtml = dirPath === null ? invalidArg : escapeHtml(shortenPath(dirPath || '.'));
+            if (args.limit !== undefined) pathHtml += ` <span class="line-count">(limit ${escapeHtml(String(args.limit))})</span>`;
+            return `<div class="tool-header"><span class="tool-name">ls</span> <span class="tool-path">${pathHtml}</span></div>`;
+          }
+          default:
+            return `<div class="tool-header"><span class="tool-name">${escapeHtml(name)}</span></div>` +
+              `<div class="tool-output"><pre>${escapeHtml(JSON.stringify(args, null, 2))}</pre></div>`;
+        }
+      }
+
       function renderToolCall(call, ownerEntryId) {
         const resultEntry = findToolResult(ownerEntryId, call.id);
         const result = resultEntry?.message;
@@ -1049,14 +1097,13 @@
         const args = call.arguments || {};
         const name = call.name;
 
-        const invalidArg = '<span class="tool-error">[invalid arg]</span>';
         const rendered = (resultEntry && renderedTools?.[JSON.stringify([ownerEntryId, call.id, resultEntry.id])]) ||
           renderedTools?.[JSON.stringify([ownerEntryId, call.id])];
         if (rendered?.callHtml || rendered?.resultHtmlCollapsed || rendered?.resultHtmlExpanded) {
           if (rendered.callHtml) {
             html += `<div class="tool-header ansi-rendered">${rendered.callHtml}</div>`;
           } else {
-            html += `<div class="tool-header"><span class="tool-name">${escapeHtml(name)}</span></div>`;
+            html += renderToolCallArguments(name, args);
           }
           if (rendered.resultHtmlCollapsed !== undefined && rendered.resultHtmlExpanded !== undefined && rendered.resultHtmlCollapsed !== rendered.resultHtmlExpanded) {
             html += `<div class="tool-output expandable ansi-rendered" onclick="if(window.getSelection().toString())return;this.classList.toggle('expanded')">
@@ -1074,11 +1121,9 @@
           return html + '</div>';
         }
 
+        html += renderToolCallArguments(name, args);
         switch (name) {
           case 'bash': {
-            const command = str(args.command);
-            const cmdDisplay = command === null ? invalidArg : escapeHtml(command || '...');
-            html += `<div class="tool-command">$ ${cmdDisplay}</div>`;
             if (result) {
               const output = getResultText().trim();
               if (output) html += formatExpandableOutput(output, 5);
@@ -1087,13 +1132,6 @@
           }
           case 'read': {
             const filePath = str(args.file_path ?? args.path);
-            const readLineRange = formatReadLineRange(args.offset, args.limit);
-            let pathHtml = filePath === null ? invalidArg : escapeHtml(shortenPath(filePath || ''));
-            if (filePath !== null && readLineRange) {
-              pathHtml += `<span class="line-numbers">${escapeHtml(readLineRange)}</span>`;
-            }
-
-            html += `<div class="tool-header"><span class="tool-name">read</span> <span class="tool-path">${pathHtml}</span></div>`;
             if (result) {
               html += renderResultImages();
               const output = getResultText();
@@ -1103,22 +1141,6 @@
             break;
           }
           case 'write': {
-            const filePath = str(args.file_path ?? args.path);
-            const content = str(args.content);
-
-            html += `<div class="tool-header"><span class="tool-name">write</span> <span class="tool-path">${filePath === null ? invalidArg : escapeHtml(shortenPath(filePath || ''))}</span>`;
-            if (content !== null && content) {
-              const lines = content.split('\n');
-              if (lines.length > 10) html += ` <span class="line-count">(${lines.length} lines)</span>`;
-            }
-            html += '</div>';
-
-            if (content === null) {
-              html += `<div class="tool-error">[invalid content arg - expected string]</div>`;
-            } else if (content) {
-              const lang = filePath ? getLanguageFromPath(filePath) : null;
-              html += formatExpandableOutput(content, 10, lang);
-            }
             if (result) {
               const output = getResultText().trim();
               if (output) html += `<div class="tool-output"><div>${escapeHtml(output)}</div></div>`;
@@ -1126,9 +1148,6 @@
             break;
           }
           case 'edit': {
-            const filePath = str(args.file_path ?? args.path);
-            html += `<div class="tool-header"><span class="tool-name">edit</span> <span class="tool-path">${filePath === null ? invalidArg : escapeHtml(shortenPath(filePath || ''))}</span></div>`;
-
             if (result?.details?.diff) {
               const diffLines = result.details.diff.split('\n');
               html += '<div class="tool-diff">';
@@ -1144,15 +1163,6 @@
             break;
           }
           case 'ls': {
-            const dirPath = str(args.path);
-            const limit = args.limit;
-
-            let pathHtml = dirPath === null ? invalidArg : escapeHtml(shortenPath(dirPath || '.'));
-            if (limit !== undefined) {
-              pathHtml += ` <span class="line-count">(limit ${escapeHtml(String(limit))})</span>`;
-            }
-
-            html += `<div class="tool-header"><span class="tool-name">ls</span> <span class="tool-path">${pathHtml}</span></div>`;
             if (result) {
               const output = getResultText().trim();
               if (output) html += formatExpandableOutput(output, 20);
@@ -1160,8 +1170,6 @@
             break;
           }
           default: {
-            html += `<div class="tool-header"><span class="tool-name">${escapeHtml(name)}</span></div>`;
-            html += `<div class="tool-output"><pre>${escapeHtml(JSON.stringify(args, null, 2))}</pre></div>`;
             if (result) {
               const output = getResultText();
               if (output) html += formatExpandableOutput(output, 10);
@@ -1406,9 +1414,7 @@
           if (msg.role === 'system') {
             let html = '';
             if (isLeadingSystemEntry(entry)) {
-              const text = getSystemMessageText(msg);
-              if (text) html += renderSystemPromptBlock('System Prompt', text);
-              html += renderToolsList('Available Tools', msg.toolsAdded);
+              html += renderInitialSystemMessage(msg);
             } else {
               const text = renderSystemMessageUpdate(msg);
               const changes = describeSystemUpdate(msg);
@@ -1427,11 +1433,14 @@
         }
 
         if (entry.type === 'compaction') {
-          return `<div class="compaction" id="${entryDomId}" onclick="if(window.getSelection().toString())return;this.classList.toggle('expanded')">
+          const systemHtml = entry.systemMessage && isLeadingSystemEntry(entry)
+            ? renderInitialSystemMessage(entry.systemMessage) : '';
+          const compactionHtml = `<div class="compaction"${systemHtml ? '' : ` id="${entryDomId}"`} onclick="if(window.getSelection().toString())return;this.classList.toggle('expanded')">
             <div class="compaction-label">[compaction]</div>
             <div class="compaction-collapsed">Compacted from ${entry.tokensBefore.toLocaleString()} tokens</div>
             <div class="compaction-content"><strong>Compacted from ${entry.tokensBefore.toLocaleString()} tokens</strong>\n\n${escapeHtml(entry.summary)}</div>
           </div>`;
+          return systemHtml ? `<div id="${entryDomId}"><div class="system-entry">${systemHtml}</div>${compactionHtml}</div>` : compactionHtml;
         }
 
         if (entry.type === 'branch_summary') {
@@ -1527,14 +1536,19 @@
             </div>
           </div>`;
 
-        // Sessions with system entries render the prompt and tools in the transcript, where they
-        // occur. Older sessions have none, so fall back to the exporting agent's current state.
+        // Sessions with recorded system state, including compaction checkpoints, render it in
+        // the transcript. Older sessions fall back to the exporting agent's current state.
         if (!hasSystemEntries) {
           if (systemPrompt) html += renderSystemPromptBlock('System Prompt', systemPrompt);
           html += renderToolsList('Available Tools', tools);
         }
 
         return html;
+      }
+
+      function renderInitialSystemMessage(msg) {
+        const text = getSystemMessageText(msg);
+        return (text ? renderSystemPromptBlock('System Prompt', text) : '') + renderToolsList('Available Tools', msg.toolsAdded);
       }
 
       function renderSystemPromptBlock(title, text) {

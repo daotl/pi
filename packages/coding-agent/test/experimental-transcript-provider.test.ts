@@ -1073,6 +1073,110 @@ test("matches reducer previews for incomplete scalars, deep paths, and snapshot-
 	}
 });
 
+test.each([4096, 16384])(
+	"does not revisit %i array elements while the published tool preview lags",
+	async (size) => {
+		let listener: EventListener | undefined;
+		const host = createHost({ name: "session", self: null });
+		const snapshot = laneSnapshot();
+		const reducer = new AssistantMessageFrameReducer();
+		let sequence = 0;
+		let measureLag = false;
+		let laggedArrayVisits = 0;
+		const descriptor = Object.getOwnPropertyDescriptor;
+		const spy = vi.spyOn(Object, "getOwnPropertyDescriptor").mockImplementation((value, key) => {
+			if (measureLag && Array.isArray(value) && value.length >= size && String(key) !== "length")
+				laggedArrayVisits++;
+			return descriptor(value, key);
+		});
+		try {
+			await host.load([
+				createTranscriptServiceFacet({
+					watch: async () => ({
+						snapshot,
+						start(next: EventListener) {
+							listener = next;
+						},
+						unsubscribe() {},
+						resnapshot: async () => snapshot,
+					}),
+				} as unknown as AgentLane),
+			]);
+			const transcript = await host.get(Transcript, {});
+			await listener!({ type: "run_start", lane: "main", runId: "run", startedAt: 1 }, BACKGROUND_CONTEXT);
+			let lagged = 0;
+			let caughtUp = 0;
+			const send = async (frame: AssistantMessageFrame) => {
+				const previous = reducer.message?.content[0];
+				const previousArgs = previous?.type === "toolCall" ? previous.arguments : undefined;
+				reducer.apply(frame);
+				const message = reducer.message!;
+				const block = message.content[0];
+				measureLag =
+					frame.type === "toolcall_delta" && block?.type === "toolCall" && block.arguments === previousArgs;
+				if (measureLag) lagged++;
+				else if (frame.type === "toolcall_delta") caughtUp++;
+				try {
+					await listener!(
+						frame.type === "start"
+							? {
+									type: "message_start",
+									lane: "main",
+									runId: "run",
+									entryId: "response",
+									frameSequence: ++sequence,
+									frame,
+									message,
+								}
+							: {
+									type: "message_update",
+									lane: "main",
+									runId: "run",
+									entryId: "response",
+									frameSequence: ++sequence,
+									frame,
+									message,
+									event: { type: "toolcall_delta", contentIndex: 0, delta: "", partial: message },
+								},
+						BACKGROUND_CONTEXT,
+					);
+					await vi.waitFor(() => expect(transcript.state.value.stream?.sequence).toBe(sequence));
+				} finally {
+					measureLag = false;
+				}
+				expect(transcript.state.value.snapshot?.operation?.streamingMessage).toEqual(message);
+			};
+			await send({ type: "start", partial: fauxAssistantMessage([], { stopReason: "pending" }) });
+			await send({
+				type: "toolcall_start",
+				contentIndex: 0,
+				toolCall: { type: "toolCall", id: "call", name: "write", arguments: {} },
+			});
+			await send({ type: "toolcall_delta", contentIndex: 0, delta: `{"values":[${"0,".repeat(size)}"` });
+			for (let index = 0; index < 512; index++) {
+				await send({ type: "toolcall_delta", contentIndex: 0, delta: "z", rawDelta: "R" });
+			}
+			expect(lagged).toBeGreaterThan(256);
+			expect(caughtUp).toBeGreaterThan(1);
+			expect(laggedArrayVisits).toBeLessThan(size * 2);
+			await send({ type: "toolcall_delta", contentIndex: 0, delta: '"]}' });
+			expect(transcript.state.value.snapshot?.operation?.streamingMessage?.content[0]).toMatchObject({
+				arguments: { values: [...Array.from({ length: size }, () => 0), "z".repeat(512)] },
+				raw: "R".repeat(512),
+			});
+			await send({ type: "toolcall_checkpoint", contentIndex: 0, json: '{"replacement":true}' });
+			await send({ type: "toolcall_end", contentIndex: 0, id: "call", name: "write", arguments: { final: true } });
+			expect(transcript.state.value.snapshot?.operation?.streamingMessage?.content[0]).toMatchObject({
+				arguments: { final: true },
+			});
+		} finally {
+			spy.mockRestore();
+			await host.close();
+		}
+	},
+	120_000,
+);
+
 test("catches up a credit-limited tool preview on the first delta after hydration", async () => {
 	const source = new AssistantMessageFrameReducer();
 	source.apply({ type: "start", partial: fauxAssistantMessage([], { stopReason: "pending" }) });

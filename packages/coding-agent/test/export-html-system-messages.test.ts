@@ -13,7 +13,10 @@ afterEach(() => {
 	while (tempDirs.length) rmSync(tempDirs.pop()!, { recursive: true, force: true });
 });
 
-async function loadExportedRenderer(entries: unknown[]): Promise<(entry: unknown) => string> {
+async function loadExportedRenderer(
+	entries: unknown[],
+	functionName = "renderEntry",
+): Promise<(entry: unknown) => string> {
 	initTheme("dark");
 	const cwd = mkdtempSync(join(tmpdir(), "pi-export-system-"));
 	tempDirs.push(cwd);
@@ -38,7 +41,7 @@ async function loadExportedRenderer(entries: unknown[]): Promise<(entry: unknown
 		window: { location: { search: "" } },
 	});
 	return runInContext(
-		viewer.replace("function renderEntry(entry) {", "return renderEntry; function renderEntry(entry) {"),
+		viewer.replace("function renderEntry(entry) {", `return ${functionName}; function renderEntry(entry) {`),
 		context,
 	) as (entry: unknown) => string;
 }
@@ -117,6 +120,16 @@ describe("export HTML system messages", () => {
 			{ type: "message", id: "s2", parentId: "c1", message: update },
 		];
 		const render = await loadExportedRenderer(compacted);
+		const baseline = render(compacted[0]);
+		expect(baseline).toContain("System Prompt</div>");
+		expect(baseline).toContain("You are a helpful assistant.");
+		expect(baseline).toContain("&lt;rules&gt;\nbe concise\n&lt;/rules&gt;");
+		expect(baseline).toContain("Available Tools</div>");
+		expect(baseline).toContain('class="tool-item-name">read</span>');
+		expect(baseline).toContain("Prior work");
+		const search = await loadExportedRenderer(compacted, "getSearchableText");
+		expect(search(compacted[0])).toContain("you are a helpful assistant.");
+		expect(search(compacted[0])).toContain("read");
 		const html = render(compacted[1]);
 		expect(html).toContain("System Prompt Update:");
 		expect(html).toContain("Extra instructions");

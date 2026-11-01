@@ -65,6 +65,12 @@ class ContextValue<T> extends BaseContext {
 		this.#value = value;
 	}
 
+	override get telemetry(): TelemetrySpan {
+		return this.#key.token === TELEMETRY_CONTEXT_KEY.token
+			? (this.#value as unknown as TelemetrySpan)
+			: this.#parent.telemetry;
+	}
+
 	value<Value>(key: ContextKey<Value>): Value | undefined {
 		if (key.token === this.#key.token) return this.#value as unknown as Value;
 		return this.#parent.value(key);

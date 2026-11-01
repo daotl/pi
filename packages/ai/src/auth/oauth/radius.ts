@@ -9,7 +9,7 @@
  * It is only intended for CLI use, not browser environments.
  */
 
-import { normalizeRadiusGatewayUrl } from "../../providers/radius-config.ts";
+import { getRadiusCatalogId, normalizeRadiusGatewayUrl } from "../../providers/radius-config.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer } from "./callback-server.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
@@ -292,16 +292,20 @@ export function createRadiusOAuth(options: RadiusOAuthOptions): OAuthAuth {
 			});
 
 			if (loginMethod === LOGIN_METHOD_DEVICE_CODE) {
-				return loginWithDeviceCode(gateway, interaction);
+				return { ...(await loginWithDeviceCode(gateway, interaction)), catalogId: crypto.randomUUID() };
 			}
 			if (loginMethod === LOGIN_METHOD_BROWSER) {
 				const discovery = await loadRadiusOAuthDiscovery(gateway, interaction.signal);
-				return loginWithBrowser(gateway, discovery.authorizationEndpoint, interaction);
+				return {
+					...(await loginWithBrowser(gateway, discovery.authorizationEndpoint, interaction)),
+					catalogId: crypto.randomUUID(),
+				};
 			}
 			throw new Error(`Unknown ${options.name} sign-in method: ${loginMethod}`);
 		},
 
 		async refresh(credential, signal): Promise<OAuthCredential> {
+			const catalogId = await getRadiusCatalogId(credential);
 			const refreshed = await requestOAuthToken(
 				gateway,
 				new URLSearchParams({
@@ -311,7 +315,7 @@ export function createRadiusOAuth(options: RadiusOAuthOptions): OAuthAuth {
 				}),
 				signal,
 			);
-			return refreshed;
+			return { ...refreshed, catalogId };
 		},
 
 		async toAuth(credential) {

@@ -399,6 +399,130 @@ describe("Session worker lifecycle failures", () => {
 });
 
 describe("Session worker native channels", () => {
+	test("client native closure cancels worker calls and starts resource cleanup without releasing sibling demand", async () => {
+		const { coordinator, workers, handle, attachment, release } = await createAttachedWorker();
+		const demand = coordinator.sent
+			.map(({ payload }) => asObject(payload))
+			.find(({ type }) => type === "session_demand")!;
+		const scope = { serverConnectionId: "server-generation-1", attachmentId: demand.attachmentId as string };
+		const retained = await handle.attachClient!(BACKGROUND_CONTEXT);
+		const retainedDemand = asObject(coordinator.sent[coordinator.sent.length - 1]!.payload);
+		const retainedScope = { ...scope, attachmentId: retainedDemand.attachmentId as string };
+		const Contract = remote("test.worker-client-close", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("session"),
+			variants: { active: { methods: { wait: method(), echo: method(Type.String(), Type.String()) } } },
+		});
+		let entered = false;
+		let cancelled = false;
+		let cleaning = false;
+		const finishCleanup = Promise.withResolvers<void>();
+		const services = await createSessionWorkerServices({
+			lane: createServiceLane(),
+			modelRuntime: undefined,
+			facetLoader: async () => ({
+				facets: [
+					{
+						name: "client-close-probe",
+						...defineFacet(({ serve }) => {
+							serve(Contract, (_input, principal, self) => {
+								self.resource("client-resource", {
+									version: 1,
+									open: () => ({}),
+									close: async () => {
+										if (principal === `${scope.serverConnectionId}\0${scope.attachmentId}`) {
+											cleaning = true;
+											await finishCleanup.promise;
+										}
+									},
+								});
+								return {
+									variant: "active",
+									echo: (value) => value,
+									wait: async (ctx) => {
+										entered = true;
+										await new Promise<void>((resolve) => {
+											if (ctx.signal.aborted) resolve();
+											else ctx.signal.addEventListener("abort", () => resolve(), { once: true });
+										});
+										cancelled = true;
+									},
+								};
+							});
+						}),
+					},
+				],
+				async dispose() {},
+			}),
+			async publish(publishedScope, frame) {
+				coordinator.emit({
+					type: "message",
+					from: "worker-1",
+					payload: {
+						type: "chord",
+						token: "worker-token",
+						sessionKey: metadata.path,
+						scope: publishedScope,
+						frame,
+					},
+				});
+			},
+		});
+		const acknowledge = coordinator.onSend;
+		coordinator.onSend = (peerId, payload) => {
+			if (payload.type === "chord") services.receive(payload.scope as typeof scope, payload.frame as Frame);
+			else acknowledge?.(peerId, payload);
+		};
+		services.attach(scope);
+		services.attach(retainedScope);
+		const client = createHost({ name: "closing-client", kind: "client", self: null });
+		const retainedClient = createHost({ name: "retained-client", kind: "client", self: null });
+		try {
+			client.connect(attachment.link, { principal: null });
+			retainedClient.connect(retained.link, { principal: null });
+			const ref = await client.get(Contract, {});
+			const retainedRef = await retainedClient.get(Contract, {});
+			const waiting = client.root((ctx) => ref.wait(ctx)).catch((error: unknown) => error);
+			await vi.waitFor(() => expect(entered).toBe(true));
+			attachment.link.close("Native session closed");
+			await vi.waitFor(
+				() => {
+					expect(cancelled).toBe(true);
+					expect(cleaning).toBe(true);
+				},
+				{ timeout: 1_000 },
+			);
+			expect(await waiting).toMatchObject({ code: "unavailable" });
+			await expect(retainedClient.root((ctx) => retainedRef.echo("still connected", ctx))).resolves.toBe(
+				"still connected",
+			);
+			expect(
+				coordinator.sent
+					.map(({ payload }) => asObject(payload))
+					.filter((payload) => payload.type === "session_demand" && payload.attached === false),
+			).toEqual([]);
+			finishCleanup.resolve();
+			await release();
+			await release();
+			expect(
+				coordinator.sent
+					.map(({ payload }) => asObject(payload))
+					.filter((payload) => payload.type === "session_demand" && payload.attached === false),
+			).toHaveLength(1);
+			ref.release();
+			retainedRef.release();
+		} finally {
+			finishCleanup.resolve();
+			await release();
+			await retained.release(BACKGROUND_CONTEXT);
+			await client.close();
+			await retainedClient.close();
+			await services.dispose();
+			workers.detach();
+		}
+	});
+
 	test.each([
 		["malformed frame", { t: "call", id: "not-a-number" }, /malformed frame/],
 		[

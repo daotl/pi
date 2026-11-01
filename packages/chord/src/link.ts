@@ -40,7 +40,10 @@ abstract class BaseLink implements Link {
 
 	receive(handler: (frame: Frame) => void): void {
 		this.#handler = handler;
-		for (const frame of this.#queue.splice(0)) handler(frame);
+		for (const frame of this.#queue.splice(0)) {
+			if (this.#closed) break;
+			this.#deliverNow(frame);
+		}
 	}
 
 	onClose(handler: (reason: string) => void): void {
@@ -326,10 +329,12 @@ export class IpcLink extends BaseLink {
 		this.#channel = channel;
 		channel.on("message", this.#onMessage);
 		channel.on("disconnect", this.#onDisconnect);
+		if (!channel.connected) this.ended("ipc disconnected");
 	}
 
 	protected transmit(frame: Frame): undefined {
-		if (this.#channel.connected) this.#channel.send({ chord2: packObject(frame, true) }, this.#onSent);
+		if (!this.#channel.connected) this.ended("ipc disconnected");
+		else this.#channel.send({ chord2: packObject(frame, true) }, this.#onSent);
 		return undefined;
 	}
 

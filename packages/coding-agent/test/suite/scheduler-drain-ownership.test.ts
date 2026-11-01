@@ -972,70 +972,137 @@ it("stops an outgoing queue batch after its command replaces the runtime", async
 	}
 });
 
-it("cancels scheduled confirmation preflight before shutdown drains terminal input", async () => {
+it.each(["scheduled", "compaction"] as const)(
+	"cancels %s confirmation preflight before shutdown drains terminal input",
+	async (origin) => {
+		const entered = Promise.withResolvers<void>();
+		const resumed = Promise.withResolvers<void>();
+		const draining = Promise.withResolvers<void>();
+		const releaseDrain = Promise.withResolvers<void>();
+		const text = "never admit this shutdown prompt";
+		let confirmation: boolean | undefined;
+		const ui = await createSchedulingMode({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async (event, context) => {
+						if (event.messageType !== "user" || event.prompt !== text) return;
+						// Deliberately omit a signal: shutdown itself resolves this dialog.
+						const answer = context.ui.confirm("Scheduled permission", "Continue?");
+						entered.resolve();
+						confirmation = await answer;
+						resumed.resolve();
+					});
+				},
+			],
+		});
+		let providerRequests = 0;
+		ui.harness.setResponses([
+			() => {
+				providerRequests++;
+				return fauxAssistantMessage("must not run during shutdown");
+			},
+		]);
+		const exitError = new Error("test process exit");
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+			throw exitError;
+		});
+		const drain = vi.spyOn(ui.terminal, "drainInput").mockImplementation(async () => {
+			draining.resolve();
+			await releaseDrain.promise;
+		});
+		// Exercise the real private shutdown path without exiting the test process.
+		const shutdownMode = ui.mode as unknown as { shutdown(): Promise<void> };
+		let shutdown: Promise<void> | undefined;
+		let delivery: Promise<void> | undefined;
+		try {
+			await ui.mode.init();
+			if (origin === "scheduled") await ui.internal.handleScheduleCommand(`\n${text}`);
+			else {
+				ui.internal.queueCompactionMessage(text, "followUp");
+				ui.internal.queueCompactionMessage("reserved shutdown remainder", "followUp");
+				delivery = ui.internal.flushCompactionQueue();
+			}
+			await entered.promise;
+			expect(ui.harness.session.isIdle).toBe(true);
+			shutdown = shutdownMode.shutdown();
+			await draining.promise;
+			await resumed.promise;
+			await setImmediate();
+			await setImmediate();
+			await delivery;
+			expect(confirmation).toBe(false);
+			expect(providerRequests).toBe(0);
+			expect(ui.harness.session.messages.map(getMessageText)).not.toContain(text);
+			expect(ui.harness.session.messages.map(getMessageText)).not.toContain("reserved shutdown remainder");
+			expect(
+				ui.harness.sessionManager
+					.getEntries()
+					.some((entry) => entry.type === "message" && getMessageText(entry.message) === text),
+			).toBe(false);
+			releaseDrain.resolve();
+			await expect(shutdown).rejects.toBe(exitError);
+		} finally {
+			releaseDrain.resolve();
+			await shutdown?.catch(() => {});
+			await delivery?.catch(() => {});
+			drain.mockRestore();
+			exit.mockRestore();
+			await ui.cleanup();
+		}
+	},
+);
+
+it("resumes only the reserved compaction remainder after shutdown fails", async () => {
 	const entered = Promise.withResolvers<void>();
-	const resumed = Promise.withResolvers<void>();
-	const draining = Promise.withResolvers<void>();
-	const releaseDrain = Promise.withResolvers<void>();
-	const text = "never admit this shutdown prompt";
-	let confirmation: boolean | undefined;
+	const canceledText = "cancel queued permission";
+	const retainedText = "retained queued remainder";
 	const ui = await createSchedulingMode({
 		extensionFactories: [
 			(pi) => {
 				pi.on("before_agent_start", async (event, context) => {
-					if (event.messageType !== "user" || event.prompt !== text) return;
-					// Deliberately omit a signal: shutdown itself resolves this dialog.
-					const answer = context.ui.confirm("Scheduled permission", "Continue?");
+					if (event.messageType !== "user" || event.prompt !== canceledText) return;
+					const confirmation = context.ui.confirm("Queued permission", "Continue?");
 					entered.resolve();
-					confirmation = await answer;
-					resumed.resolve();
+					await confirmation;
 				});
 			},
 		],
 	});
-	let providerRequests = 0;
+	const requests: string[] = [];
 	ui.harness.setResponses([
-		() => {
-			providerRequests++;
-			return fauxAssistantMessage("must not run during shutdown");
+		(context) => {
+			requests.push(
+				context.messages
+					.filter((message) => message.role === "user")
+					.map(getMessageText)
+					.at(-1)!,
+			);
+			return fauxAssistantMessage("retained response");
 		},
 	]);
-	const exitError = new Error("test process exit");
-	const exit = vi.spyOn(process, "exit").mockImplementation(() => {
-		throw exitError;
+	const failure = vi.spyOn(ui.harness.session, "flushPendingPersistence").mockImplementationOnce(() => {
+		throw new Error("recoverable persistence failure");
 	});
-	const drain = vi.spyOn(ui.terminal, "drainInput").mockImplementation(async () => {
-		draining.resolve();
-		await releaseDrain.promise;
-	});
-	// Exercise the real private shutdown path without exiting the test process.
 	const shutdownMode = ui.mode as unknown as { shutdown(): Promise<void> };
-	let shutdown: Promise<void> | undefined;
+	let delivery: Promise<void> | undefined;
 	try {
 		await ui.mode.init();
-		await ui.internal.handleScheduleCommand(`\n${text}`);
+		ui.internal.queueCompactionMessage(canceledText, "followUp");
+		ui.internal.queueCompactionMessage(retainedText, "followUp");
+		delivery = ui.internal.flushCompactionQueue();
 		await entered.promise;
-		expect(ui.harness.session.isIdle).toBe(true);
-		shutdown = shutdownMode.shutdown();
-		await draining.promise;
-		await resumed.promise;
-		await setImmediate();
-		await setImmediate();
-		expect(confirmation).toBe(false);
-		expect(providerRequests).toBe(0);
-		expect(ui.harness.session.messages.map(getMessageText)).not.toContain(text);
-		expect(
-			ui.harness.sessionManager
-				.getEntries()
-				.some((entry) => entry.type === "message" && getMessageText(entry.message) === text),
-		).toBe(false);
-		releaseDrain.resolve();
-		await expect(shutdown).rejects.toBe(exitError);
+		await shutdownMode.shutdown();
+		await delivery;
+		await vi.waitFor(() => expect(requests).toEqual([retainedText]));
+		await ui.harness.session.waitForIdle();
+		expect(ui.harness.session.messages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
+			"original context",
+			retainedText,
+		]);
+		expect(ui.internal.getAllQueuedMessages()).toEqual({ steering: [], followUp: [] });
 	} finally {
-		releaseDrain.resolve();
-		await shutdown?.catch(() => {});
-		drain.mockRestore();
-		exit.mockRestore();
+		failure.mockRestore();
+		await delivery?.catch(() => {});
 		await ui.cleanup();
 	}
 });

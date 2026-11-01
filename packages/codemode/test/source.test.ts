@@ -59,6 +59,17 @@ describe("parseCodemodeSource", () => {
 		);
 	});
 
+	it("recognizes Unicode and escaped identifiers before division", () => {
+		for (const identifier of ["数", "π", "𐐀", "á", "a‌", "a‍", "\\u6570", "\\u{10400}", "a\\u0301"]) {
+			const prefix = `const ${identifier} = 4; const ratio = ${identifier} / 2;`;
+			expect(() => parseCodemodeSource(`${prefix}\n// @options: {"timeout_ms": 1}\nwhile (true) {}`)).toThrow(
+				"found one on line 2",
+			);
+			const literal = `const ${identifier} = 4; const ratio = ${identifier} / \`example\n// @options: {}\n\`;`;
+			expect(parseCodemodeSource(literal)).toEqual({ code: literal, options: {} });
+		}
+	});
+
 	it("rejects misplaced deadlines after postfix division and control-statement regexps", () => {
 		for (const prefix of [
 			"let n = 4; const ratio = n++ / 2;",

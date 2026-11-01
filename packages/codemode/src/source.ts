@@ -14,6 +14,10 @@ const SUPPORTED_FIELDS = ["max_output_tokens", "timeout_ms"] as const;
 const SUPPORTED_FIELDS_TEXT = "`max_output_tokens` and `timeout_ms`";
 /** Largest delay `setTimeout` supports, which bounds `timeout_ms`. */
 const MAX_TIMEOUT_MS = 2_147_483_647;
+// Numbers retain the scanner's word treatment; identifiers also include Unicode and escaped characters.
+const SOURCE_WORD =
+	/(?:[$_\p{ID_Start}\d]|\\u(?:[\da-fA-F]{4}|\{[\da-fA-F]+\}))(?:[$\p{ID_Continue}]|\u200C|\u200D|\\u(?:[\da-fA-F]{4}|\{[\da-fA-F]+\}))*/uy;
+const IDENTIFIER_ESCAPE = /\\u(?:([\da-fA-F]{4})|\{([\da-fA-F]+)\})/g;
 
 /**
  * Lark grammar for providers with grammar-constrained tool input. It only fixes the shape of the
@@ -177,12 +181,16 @@ function misplacedOptionsLine(input: string): number | undefined {
 			index++;
 			continue;
 		}
-		let wordEnd = index;
-		let word: string | undefined;
-		if (/[\w$]/.test(char)) {
-			while (wordEnd < input.length && /[\w$]/.test(input[wordEnd])) wordEnd++;
-			word = input.slice(index, wordEnd);
-		}
+		SOURCE_WORD.lastIndex = index;
+		const token = SOURCE_WORD.exec(input)?.[0];
+		const wordEnd = SOURCE_WORD.lastIndex;
+		const word = token?.replace(
+			IDENTIFIER_ESCAPE,
+			(encoded: string, fixed: string | undefined, braced: string | undefined) => {
+				const point = Number.parseInt(fixed ?? braced!, 16);
+				return point <= 0x10ffff ? String.fromCodePoint(point) : encoded;
+			},
+		);
 		const enclosing = braces.at(-1);
 		const classBody =
 			typeof enclosing === "object" &&

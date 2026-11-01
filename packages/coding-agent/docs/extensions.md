@@ -302,11 +302,15 @@ A tool that reaches other tools declares which ones a call may reach with `reach
 
 Register every tool first, keep optional tools inactive, and use `pi.setActiveTools()` from a loader tool to select the desired active tools. Names must already be registered; unknown names are ignored.
 
+A `+name` entry in `--tools` also selects an inactive tool registered later, such as during `session_start`. Pi keeps unresolved selections until registration, a loadout change that deactivates a tool, or the next agent run. Later registrations do not reapply the startup modifiers over an explicit loadout.
+
 Pi records the initial prompt and tool set in the transcript's first system message, then appends tool and prompt changes before the next model request. Providers that cannot represent the transition receive a complete transcript checkpoint, which can invalidate the cached prefix.
 
 ### Tool rendering
 
 A tool's `renderCall` and `renderResult` draw its calls in the interactive transcript and in HTML exports. `pi.registerToolRenderer((toolName, next) => renderers)` chooses renderers for calls to any tool, including tools that are not registered yet, such as MCP tools in a resumed session before their server connected. `next()` returns what the remaining resolvers (in extension load order), then the registered tool, would use, so `next() ?? mine` only fills in.
+
+If a tool renderer resolver throws, pi reports an extension error with its source extension and uses the remaining resolvers or the base renderer. Throwing after `next()` reuses that result instead of running the remaining resolvers again.
 
 ### MCP servers
 

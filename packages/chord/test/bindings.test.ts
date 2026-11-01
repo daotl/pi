@@ -703,7 +703,8 @@ describe("versioned call projections", () => {
 		server.serve(provider, (input) => ({ variant: "main", read: (args) => ({ input, args }) }));
 		try {
 			for (const host of [server, browser]) {
-				const ref = await host.get(consumer, { rows: [{ a: "address" }] });
+				const input = { rows: [{ a: "address", b: "stripped" }] };
+				const ref = await host.get(consumer, input);
 				assert.deepEqual(await ref.read({ rows: [{ a: "argument", b: "stripped" }] } as never), {
 					input: { rows: [{ a: "address" }] },
 					args: { rows: [{ a: "argument" }] },

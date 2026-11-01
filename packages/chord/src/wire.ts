@@ -58,6 +58,7 @@ const WireReloadReportSchema = Type.Object({
 	removed: List(Type.String()),
 	prepared: List(Type.String()),
 	gated: List(Type.String()),
+	moduleNames: Type.Optional(List(Type.Tuple([Type.String(), Type.String()]))),
 });
 export type WireReloadReport = Static<typeof WireReloadReportSchema>;
 

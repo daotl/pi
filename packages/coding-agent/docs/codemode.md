@@ -45,7 +45,7 @@ What a call resolves to depends on the tool:
 - `read` resolves to the file's text, or for an image to an image block `{ type: "image", data, mimeType, note }` that `image()` shows. `data` is the base64 image the model would see and `note` the text that goes with it, such as resize hints.
 - Other tools, such as `edit` and `write`, resolve to their text output.
 
-A call that fails, is blocked, or gets invalid arguments rejects with an `Error` that carries the tool's error text. Use `Promise.allSettled()` to keep the results of the calls that succeed.
+Transport failures, blocked calls, invalid arguments, and tool error results without a structured return reject with an `Error` that carries the tool's error text. A tool with an output schema that returns `structuredContent` resolves to that value even when the tool reports an error. Inspect an MCP result's `isError` and a `bash` result's `exit_code` to detect those failures. `Promise.allSettled()` keeps results when other calls reject, but its `fulfilled` status alone does not mean the tool succeeded.
 
 The `codemode` description lists tools with their TypeScript declarations, grouped by namespace (for example one MCP server). Tools with `deferred` exposure, which includes MCP tools with the default `codemode` exposure, are not listed, so the description stays the same while MCP servers connect. Listed declarations share a budget of 3000 estimated tokens (`codemode.inlineBudget` in [settings](settings.md#tools)). Scripts find the other tools with `searchTools()`, `describeTool()`, `describeNamespace()`, or by filtering `ALL_TOOLS`.
 

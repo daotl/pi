@@ -128,7 +128,7 @@ The callback and recording contract is:
 
 - create a child span and invoke the callback synchronously, exactly once;
 - expose optional metric and propagation capabilities on its contexts, child spans, and extracted parents, including inert fallback spans;
-- preserve the callback's returned value and rejection value, returning a promise rejected with the same value after a synchronous throw;
+- preserve the callback's returned value and rejection value, returning a promise rejected with the same value after a synchronous throw; unreadable rejection properties or prototype inspection must not replace that rejection (automatic status falls back to `error` without details);
 - keep the native span open until a returned promise settles;
 - treat normal completion as `ok` and throws/rejections as errors unless an explicit status was set;
 - make repeated `setStatus()` calls last-write-wins;

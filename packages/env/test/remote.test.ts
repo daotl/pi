@@ -46,6 +46,66 @@ async function expectNativeChange(changes: WatchChange[], path: string, action: 
 }
 
 describe("RemoteExecutionEnv", () => {
+	it("does not create a directory for an already-aborted request, including a session-bound request", async () => {
+		const { env, connection } = environment();
+		const session = await connection.session();
+		const controller = new AbortController();
+		controller.abort();
+		for (const bound of [undefined, session]) {
+			const path = join(env.cwd, `not-dispatched-${bound ?? "unbound"}`);
+			await expect(
+				connection.request("mkdir", { path, recursive: true }, { signal: controller.signal, session: bound }),
+			).rejects.toMatchObject({ code: "aborted" });
+			expect(existsSync(path)).toBe(false);
+		}
+	});
+
+	it("settles an aborted command during startup without cancelling another caller or dispatching the command", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-env-start-abort-"));
+		dirs.push(cwd);
+		const entered = Promise.withResolvers<void>();
+		const startup = Promise.withResolvers<readonly string[]>();
+		const connection = new Connection({
+			command: () => {
+				entered.resolve();
+				return startup.promise;
+			},
+		});
+		connections.push(connection);
+		const env = new RemoteExecutionEnv({ connection, id: "pi-env:startup-abort", cwd });
+		const controller = new AbortController();
+		let settled = false;
+		const cancelled = env
+			.exec(
+				[process.execPath, "-e", 'require("node:fs").writeFileSync("cancelled.txt", "ran")'],
+				undefined,
+				withAbortSignal(controller.signal, context),
+			)
+			.then((result) => {
+				settled = true;
+				return result;
+			});
+		await entered.promise;
+		const survivor = connection.request(
+			"write",
+			{ path: join(cwd, "survivor.txt"), parents: false },
+			{ payload: Buffer.from("shared startup survived") },
+		);
+		try {
+			controller.abort();
+			// Drain cancellation's promise chain while the command factory remains held.
+			await delay(0);
+			expect(settled).toBe(true);
+			expect(await cancelled).toMatchObject({ ok: false, error: { code: "aborted" } });
+		} finally {
+			startup.resolve([daemon]);
+			await survivor;
+			await cancelled;
+		}
+		expect(getOrThrow(await env.readTextFile("survivor.txt", context))).toBe("shared startup survived");
+		expect(existsSync(join(cwd, "cancelled.txt"))).toBe(false);
+	});
+
 	it("rejects a completed scan whose reply arrives after local cancellation", async () => {
 		const { env, connection } = environment();
 		getOrThrow(await env.writeFile("scan.txt", "first\nsecond\n", context));
@@ -356,10 +416,13 @@ describe("RemoteExecutionEnv", () => {
 			mkdirSync(join(env.cwd, `d${dir}`));
 			for (let file = 0; file < 100; file++) writeFileSync(join(env.cwd, `d${dir}`, `f${file}`), "");
 		}
-		// The cancel follows the request at once, bypassing the client's own abort check, so the daemon stops the walk.
+		// Abort at dispatch, rather than before it, so this exercises daemon cancellation.
 		const controller = new AbortController();
-		controller.abort();
-		const cancelled = connection.request("listFiles", { path: env.cwd }, { signal: controller.signal });
+		const cancelled = connection.request(
+			"listFiles",
+			{ path: env.cwd },
+			{ signal: controller.signal, onStart: () => controller.abort() },
+		);
 		await expect(cancelled).rejects.toMatchObject({ code: "aborted" });
 		const listed = getOrThrow(await env.listFiles(".", undefined, context));
 		expect([listed.entries.length, listed.truncated]).toEqual([10_100, false]);

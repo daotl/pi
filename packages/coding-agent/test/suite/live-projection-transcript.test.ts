@@ -92,6 +92,73 @@ async function createTranscriptMode(harness: Harness) {
 	};
 }
 
+it.each(["live", "historical"] as const)(
+	"renders the base tool after a resolver throws during %s rendering",
+	async (surface) => {
+		const failure = new Error("broken tool resolver");
+		const call = fauxAssistantMessage([fauxToolCall("fallback_tool", {}, { id: "fallback-call" })], {
+			stopReason: "toolUse",
+		});
+		const harness = await createHarness({
+			settings: { quietStartup: true, compaction: { enabled: false }, retry: { enabled: false } },
+			extensionFactories: [
+				{
+					path: "<inline:broken-renderer>",
+					factory: (pi) => {
+						pi.registerTool({
+							name: "fallback_tool",
+							label: "Fallback tool",
+							description: "Tool whose base renderer survives resolver failures",
+							parameters: Type.Object({}),
+							execute: async () => ({ content: [{ type: "text", text: "base tool result" }], details: {} }),
+						});
+						pi.registerToolRenderer((toolName, next) => {
+							if (toolName === "fallback_tool") throw failure;
+							return next();
+						});
+					},
+				},
+			],
+		});
+		if (surface === "historical") {
+			harness.sessionManager.appendMessage({ role: "user", content: "saved request", timestamp: 1 });
+			harness.sessionManager.appendMessage(call);
+			harness.sessionManager.appendMessage({
+				role: "toolResult",
+				toolCallId: "fallback-call",
+				toolName: "fallback_tool",
+				content: [{ type: "text", text: "base tool result" }],
+				isError: false,
+				timestamp: 2,
+			});
+			harness.session.refreshContext();
+		} else harness.setResponses([call, fauxAssistantMessage("finished tool request")]);
+		const ui = await createTranscriptMode(harness);
+		const errors: Array<{ extensionPath: string; event: string; error: string }> = [];
+		const unsubscribe = harness.session.extensionRunner.onError((error) => errors.push(error));
+		try {
+			await ui.mode.init();
+			if (surface === "live") await harness.session.prompt("run fallback tool");
+			const tools = ui.internal.chatContainer.children.filter((child) => child instanceof ToolExecutionComponent);
+			expect(tools).toHaveLength(1);
+			expect(stripAnsi(tools[0].render(120).join("\n"))).toContain("base tool result");
+			expect(errors).toEqual([
+				expect.objectContaining({
+					extensionPath: "<inline:broken-renderer>",
+					event: "tool_renderer",
+					error: failure.message,
+				}),
+			]);
+			await ui.terminal.waitForRender();
+			expect(ui.terminal.getScrollBuffer().join("\n")).toContain("base tool result");
+		} finally {
+			unsubscribe();
+			await ui.stop();
+			harness.cleanup();
+		}
+	},
+);
+
 it("renders edited and omitted contributions while retaining source cache-miss billing", async () => {
 	const harness = await createHarness({
 		settings: { quietStartup: true, showCacheMissNotices: true, compaction: { enabled: false } },

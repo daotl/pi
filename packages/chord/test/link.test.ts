@@ -19,6 +19,7 @@ import {
 	type StateEvent,
 } from "../src/index.ts";
 import { Packed, unpack } from "../src/link.ts";
+import { isFrame } from "../src/wire.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -602,6 +603,79 @@ describe("links: packed payloads", () => {
 });
 
 describe("links: IPC", () => {
+	it("validates resolved facet identity pairs on reload votes", () => {
+		const report = {
+			codeVersion: 2,
+			previous: 1,
+			changed: [],
+			removed: [],
+			prepared: [],
+			gated: [],
+			moduleNames: [["./facet.ts", "file:///facet.ts"]],
+		};
+		assert.equal(isFrame({ t: "vote", reload: 1, report }), true);
+		assert.equal(isFrame({ t: "vote", reload: 1, report: { ...report, moduleNames: [["./facet.ts", 42]] } }), false);
+	});
+	it("ends an already disconnected channel and retries a dead route immediately", async () => {
+		const channel: IpcChannel = {
+			connected: false,
+			send: () => {
+				assert.fail("dead channel send");
+			},
+			on: () => undefined,
+			off: () => undefined,
+		};
+		const dead = ipcLink(channel);
+		const reasons: string[] = [];
+		dead.onClose((reason) => {
+			reasons.push(reason);
+		});
+		assert.equal(dead.closed, true);
+		assert.deepEqual(reasons, ["closed"]);
+		const server = createHost({ self: "host", name: "server", onError: () => {} });
+		let attempts = 0;
+		let worker: Host | undefined;
+		server.route("session:", {
+			principal: () => "worker",
+			authorize: () => true,
+			resolve: async (name) => {
+				if (++attempts === 1) return dead;
+				const [down, up] = memoryLinkPair();
+				worker = createHost({
+					self: "worker",
+					name,
+					upstream: { link: up, principal: "server" },
+					onError: () => {},
+				});
+				serveCounter(worker);
+				return down;
+			},
+		});
+		try {
+			await assert.rejects(server.hold(SessionCounter, { session: "S1", name: "a" }).ready, /closed/);
+			assert.equal(await server.hold(SessionCounter, { session: "S1", name: "a" }).add(2), 2);
+			assert.equal(attempts, 2);
+		} finally {
+			await worker?.close();
+			await server.close();
+		}
+	});
+
+	it("does not execute queued holds or calls after a queued protocol violation closes admission", async () => {
+		const server = createHost({ self: "host", name: "server", onError: () => {} });
+		const principals: unknown[] = [];
+		serveCounter(server, principals);
+		const [down, raw] = memoryLinkPair();
+		raw.send({ t: "call", hold: 1 } as Frame);
+		raw.send({ t: "hold", id: 1, at: "server", token: Counter.description, input: { name: "queued" } });
+		raw.send({ t: "call", id: 2, hold: 1, member: "add", args: 1 });
+		await tick();
+		server.accept(down, { principal: "guest" });
+		await tick();
+		assert.equal(down.closed, true);
+		assert.deepEqual(principals, []);
+		await server.close();
+	});
 	it("a write that fails after the peer process exited (EPIPE) ends the link instead of raising an unhandled error", async () => {
 		// Node reports such a failure asynchronously: to the send callback, or else as an `error` event nobody handles.
 		const sent: unknown[] = [];

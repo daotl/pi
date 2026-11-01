@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseDocument } from "yaml";
@@ -15,6 +16,40 @@ export const cloudflareRuntimeExports = new Set([
 	"@earendil-works/pi-durable/images/cloudflare",
 	"@earendil-works/pi-durable/storage/sqlite/cloudflare",
 ]);
+
+// This public subpath launches a CLI at import time, not a library module.
+const executableRuntimeExports = new Set(["@earendil-works/pi-coding-agent/rpc-entry"]);
+
+function smokeTestExecutableExport(directory, path, version) {
+	const home = mkdtempSync(join(tmpdir(), "pi-executable-smoke-home-"));
+	const env = {
+		PATH: process.env.PATH,
+		HOME: home,
+		USERPROFILE: home,
+		APPDATA: home,
+		LOCALAPPDATA: home,
+		XDG_CONFIG_HOME: home,
+		XDG_CACHE_HOME: home,
+		PI_CODING_AGENT_DIR: join(home, ".pi", "agent"),
+		PI_OFFLINE: "1",
+		PI_TELEMETRY: "0",
+	};
+	for (const name of ["SystemRoot", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"]) {
+		if (process.env[name]) env[name] = process.env[name];
+	}
+	try {
+		const output = execFileSync(process.execPath, [path, "--version"], {
+			cwd: directory,
+			env,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+			timeout: 30_000,
+		});
+		if (output.trim() !== version) throw new Error(`Unexpected version from ${path}: ${output}`);
+	} finally {
+		rmSync(home, { recursive: true, force: true });
+	}
+}
 
 function createFileSpecifier(fromDirectory, path) {
 	const relativePath = relative(fromDirectory, path);
@@ -181,13 +216,15 @@ export function smokeTestNpmConsumer({ directory, artifactSet, packageName }) {
 	assertPackageFile(installedDirectory, manifest.types, `${packageName} types`);
 
 	const runtimeImports = new Map([[packageName, false]]);
+	const executablePaths = [];
 	for (const [subpath, value] of literalExports(manifest)) {
 		const runtime = runtimeTarget(value);
 		const types = typesTarget(value);
 		if (runtime) {
 			assertPackageFile(installedDirectory, runtime, `${packageName} export ${subpath}`);
 			const specifier = subpath === "." ? packageName : `${packageName}${subpath.slice(1)}`;
-			if (!cloudflareRuntimeExports.has(specifier)) runtimeImports.set(specifier, runtime.endsWith(".json"));
+			if (executableRuntimeExports.has(specifier)) executablePaths.push(resolve(installedDirectory, runtime));
+			else if (!cloudflareRuntimeExports.has(specifier)) runtimeImports.set(specifier, runtime.endsWith(".json"));
 		}
 		if (types) assertPackageFile(installedDirectory, types, `${packageName} types export ${subpath}`);
 	}
@@ -207,6 +244,7 @@ export function smokeTestNpmConsumer({ directory, artifactSet, packageName }) {
 	} finally {
 		rmSync(smokePath, { force: true });
 	}
+	for (const path of executablePaths) smokeTestExecutableExport(directory, path, manifest.version);
 }
 
 export function packageConsumerDirectoryName(packageName) {

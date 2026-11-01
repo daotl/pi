@@ -795,9 +795,31 @@ export class ExtensionRunner {
 
 	/** Renderers of calls to `toolName`: extension resolvers in load order, then `base`. */
 	resolveToolRenderers(toolName: string, base: () => ToolRenderers | undefined): ToolRenderers | undefined {
-		const resolvers = this.extensions.flatMap((ext) => ext.toolRenderers ?? []);
-		const resolve = (index: number): ToolRenderers | undefined =>
-			index < resolvers.length ? resolvers[index](toolName, () => resolve(index + 1)) : base();
+		const resolvers = this.extensions.flatMap((ext) =>
+			(ext.toolRenderers ?? []).map((resolver) => ({ ext, resolver })),
+		);
+		const resolve = (index: number): ToolRenderers | undefined => {
+			if (index === resolvers.length) return base();
+			const { ext, resolver } = resolvers[index];
+			let calledNext = false;
+			let nextResult: ToolRenderers | undefined;
+			const next = () => {
+				calledNext = true;
+				nextResult = resolve(index + 1);
+				return nextResult;
+			};
+			try {
+				return resolver(toolName, next);
+			} catch (error) {
+				this.emitError({
+					extensionPath: ext.path,
+					event: "tool_renderer",
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined,
+				});
+				return calledNext ? nextResult : next();
+			}
+		};
 		return resolve(0);
 	}
 

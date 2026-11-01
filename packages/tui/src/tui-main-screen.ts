@@ -592,7 +592,25 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			terminalLineRows(line.slice(0, cursor.index), this.terminal.columns, cursor);
 			let restore = partial
 				? getKittyImagePlacement(cropKittyImageLine(line, hiddenRows, visibleRows))?.sequence
-				: `\x1b_Ga=p,i=${id},c=${header.columns ?? this.terminal.columns},r=${header.rows},C=1,q=2\x1b\\`;
+				: undefined;
+			if (!partial) {
+				const start = line.indexOf(KITTY_SEQUENCE_PREFIX);
+				const controlsEnd = line.indexOf(";", start);
+				const placement = line
+					.slice(start + KITTY_SEQUENCE_PREFIX.length, controlsEnd)
+					.split(",")
+					.filter((control) => /^(?:p|x|y|w|h|X|Y|U|z|P|Q|H|V)=/.test(control));
+				const controls = [
+					"a=p",
+					`i=${id}`,
+					`c=${header.columns ?? this.terminal.columns}`,
+					`r=${header.rows}`,
+					...placement,
+					"C=1",
+					"q=2",
+				];
+				restore = `\x1b_G${controls.join(",")}\x1b\\`;
+			}
 			if (partial && !restore) {
 				const start = line.indexOf(KITTY_SEQUENCE_PREFIX);
 				const controlsEnd = line.indexOf(";", start);
@@ -688,7 +706,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		rows: number[],
 		restoring = false,
 		images = this.kittyViewportCoverage(),
-		overlayImages: Array<{ row: number; col: number; line: string }> = [],
+		overlayImages: Array<{ anchorRow: number; col: number; line: string }> = [],
 	): void {
 		if (rows.length === 0) return;
 		const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
@@ -733,8 +751,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		}
 		// Overlay graphics have not been emitted by renderTranscript. Place them only
 		// after clearing every covered text row, otherwise later clears erase the image.
-		for (const { row, col, line } of overlayImages) {
-			const targetRow = this.previousViewportTop + row;
+		for (const { anchorRow, col, line } of overlayImages) {
+			const targetRow = this.previousViewportTop + anchorRow;
 			const delta = targetRow - this.hardwareCursorRow;
 			if (delta > 0) output.append(`\x1b[${delta}B`);
 			else if (delta < 0) output.append(`\x1b[${-delta}A`);

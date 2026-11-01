@@ -232,11 +232,16 @@ async function startInMemorySpan<T>(
 	try {
 		return await callback(span);
 	} catch (error) {
-		if (!recordedSpan.explicitStatus)
-			recordedSpan.status =
-				error instanceof Error
-					? { status: "error", error: { name: error.name, message: error.message } }
-					: { status: "error" };
+		if (!recordedSpan.explicitStatus) {
+			recordedSpan.status = { status: "error" };
+			try {
+				if (error instanceof Error) {
+					recordedSpan.status = { status: "error", error: { name: error.name, message: error.message } };
+				}
+			} catch {
+				// Rejection inspection must never replace the callback's original failure.
+			}
+		}
 		throw error;
 	} finally {
 		recordedSpan.settled = true;

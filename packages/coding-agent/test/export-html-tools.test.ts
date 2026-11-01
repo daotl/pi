@@ -39,6 +39,57 @@ function renderExportedCall(html: string, ownerId: string, leafId = ownerId): st
 }
 
 describe("export HTML historical tool content", () => {
+	it.each(["absent", "throws"] as const)(
+		"retains built-in and generic arguments when the custom call renderer is %s",
+		async (callRenderer) => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-export-result-only-"));
+			try {
+				initTheme("dark", false);
+				const manager = SessionManager.create(cwd, cwd);
+				const calls: ToolCall[] = [
+					{ type: "toolCall", id: "read", name: "read", arguments: { path: "README.md", offset: 7, limit: 4 } },
+					{ type: "toolCall", id: "custom", name: "lookup", arguments: { query: "needle <value>" } },
+				];
+				const ownerId = manager.appendMessage({ ...fauxAssistantMessage(""), content: calls });
+				for (const call of calls) {
+					manager.appendMessage({
+						role: "toolResult",
+						toolCallId: call.id,
+						toolName: call.name,
+						content: [{ type: "text", text: "recorded output" }],
+						isError: false,
+						timestamp: 2,
+					});
+				}
+				const renderers: ToolRenderers = {
+					...(callRenderer === "throws"
+						? {
+								renderCall: () => {
+									throw new Error("Cannot render call");
+								},
+							}
+						: {}),
+					renderResult: () => new Text("customized result", 0, 0),
+				};
+				const html = readFileSync(
+					await exportSessionToHtml(manager, undefined, {
+						outputPath: join(cwd, "out.html"),
+						toolRenderer: createToolHtmlRenderer({ getToolRenderers: () => renderers, theme, cwd }),
+					}),
+					"utf8",
+				);
+				const rendered = renderExportedCall(html, ownerId, manager.getLeafId()!);
+				expect(rendered).toContain("README.md");
+				expect(rendered).toContain(":7-10</span>");
+				expect(rendered).toContain("&quot;query&quot;: &quot;needle &lt;value&gt;&quot;");
+				expect(rendered).toContain("customized result");
+				expect(rendered).not.toContain("recorded output");
+			} finally {
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("keeps successful read output collapsed and supports local and global expansion", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "pi-export-read-"));
 		try {

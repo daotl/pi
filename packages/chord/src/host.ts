@@ -279,10 +279,12 @@ export class HostImpl implements Host, HostCore {
 	#originSeq = 0;
 	readonly #routes = new Map<string, Route>();
 	readonly #childReloads = new ChildReloads(this);
-	/** Child facet modules by host-name prefix, from every committed cluster reload (for reconciling children). */
-	remoteModules: Record<string, string[]> = {};
-	/** Removal tombstones also reconcile children that connected during a transaction. */
-	remoteRemoved: Record<string, string[]> = {};
+	/** Committed prefix selections, replayed independently for each child's name. */
+	readonly remoteHistory: {
+		remote: Readonly<Record<string, readonly string[]>>;
+		remove: Readonly<Record<string, readonly string[]>>;
+	}[] = [];
+	readonly moduleNames = new Map<string, string>();
 	/** Highest code version the parent has retired. */
 	#retireAllowed = 0;
 	/** Roots that came over a link, by the link they came from. */
@@ -571,15 +573,15 @@ export class HostImpl implements Host, HostCore {
 
 	addressOf(type: AnyContract, input: unknown, principal: unknown, candidate = false): string {
 		const elsewhere = this.#elsewhere(type, input);
-		if (elsewhere !== undefined) return this.#remoteKey(type, elsewhere.input, principal);
+		if (elsewhere !== undefined && elsewhere.at !== this.name)
+			return this.#remoteKey(type, elsewhere.input, principal);
 		const service = this.#bindingService(type.name, candidate);
 		if (service === undefined) throw unknownType(type.name, this.name);
-		return this.#locate(service, input, principal).address;
+		return this.#locate(service, elsewhere === undefined ? input : elsewhere.input, principal).address;
 	}
 
 	/**
-	 * Where an object of a remote type lives when that is another host: its name and the input normalized with the
-	 * caller's contract (the placement is read from it). `undefined`: here (and every local type).
+	 * Placement and caller-projected input, including same-host placement. `undefined`: a local type.
 	 */
 	#elsewhere(type: AnyContract, input: unknown): { readonly at: string; readonly input: unknown } | undefined {
 		const placement = type.description.host;
@@ -587,7 +589,7 @@ export class HostImpl implements Host, HostCore {
 		// A received token is declarative routing metadata. Never execute its defaults or validators.
 		const normalized = isReceivedContract(type) ? input : normalize(type.input, input, `${type.name} input`);
 		const at = resolveHost(type.name, placement, normalized);
-		return at === this.name ? undefined : { at, input: normalized };
+		return { at, input: normalized };
 	}
 
 	/**
@@ -633,8 +635,11 @@ export class HostImpl implements Host, HostCore {
 		// holds addressed here must first bind the registered provider, then normalize only with its trusted schema.
 		if (!isReceivedContract(type)) {
 			const elsewhere = this.#elsewhere(type, input);
-			if (elsewhere !== undefined)
-				return this.#acquireRemote(type, elsewhere.at, elsewhere.input, options, owner, candidate);
+			if (elsewhere !== undefined) {
+				input = elsewhere.input;
+				if (elsewhere.at !== this.name)
+					return this.#acquireRemote(type, elsewhere.at, input, options, owner, candidate);
+			}
 		}
 		if (service === undefined) throw unknownType(type.name, this.name);
 		bind(service.contract, service.options.accepts, type);
@@ -1473,17 +1478,15 @@ export class HostImpl implements Host, HostCore {
 	rememberRemoteModules(
 		remote: Readonly<Record<string, readonly string[]>> | undefined,
 		remove: Readonly<Record<string, readonly string[]>> | undefined,
+		reports: readonly ReloadReport[],
 	): void {
-		for (const prefix of new Set([...Object.keys(remote ?? {}), ...Object.keys(remove ?? {})])) {
-			const modules = remote?.[prefix] ?? [];
-			const removed = remove?.[prefix] ?? [];
-			this.remoteModules[prefix] = [...new Set([...(this.remoteModules[prefix] ?? []), ...modules])].filter(
-				(module) => !removed.includes(module),
-			);
-			this.remoteRemoved[prefix] = [...new Set([...(this.remoteRemoved[prefix] ?? []), ...removed])].filter(
-				(module) => !modules.includes(module),
-			);
-		}
+		for (const report of reports)
+			for (const [module, name] of report.moduleNames ?? []) this.moduleNames.set(module, name);
+		if (Object.keys(remote ?? {}).length === 0 && Object.keys(remove ?? {}).length === 0) return;
+		this.remoteHistory.push({
+			remote: Object.fromEntries(Object.entries(remote ?? {}).map(([prefix, modules]) => [prefix, [...modules]])),
+			remove: Object.fromEntries(Object.entries(remove ?? {}).map(([prefix, names]) => [prefix, [...names]])),
+		});
 	}
 
 	/** The code version id the next reload would commit. */

@@ -3,9 +3,11 @@ import { envApiKeyAuth, lazyOAuth } from "../auth/helpers.ts";
 import { loadRadiusOAuth } from "../auth/oauth/load.ts";
 import type { Provider } from "../models.ts";
 import type { Model } from "../types.ts";
+import { providerHeadersToRecord } from "../utils/headers.ts";
 import { RADIUS_MODELS } from "./radius.models.ts";
 import {
 	DEFAULT_RADIUS_GATEWAY,
+	getRadiusCatalogId,
 	getRadiusModels,
 	getRadiusModelsFromConfig,
 	loadRadiusGatewayConfig,
@@ -47,8 +49,20 @@ export function radiusProvider(options: RadiusProviderOptions = {}): Provider<"p
 		getModels: () => dynamicModels ?? baselineModels,
 		refreshModels: async (context) => {
 			// Only side-effect-free, proven auth can identify a stored account catalog.
-			const identityText = context.auth?.apiKey
-				? JSON.stringify({
+			const oauthCredential = context.credential?.type === "oauth" ? context.credential : undefined;
+			const authIdentity = oauthCredential ? await getRadiusCatalogId(oauthCredential) : context.auth?.apiKey;
+			const identityHeaders = oauthCredential
+				? Object.fromEntries(
+						Object.entries(context.auth?.headers ?? {}).map(([key, value]) => [
+							key,
+							key.toLowerCase() === "authorization" && value === `Bearer ${context.auth?.apiKey}`
+								? `Bearer ${authIdentity}`
+								: value,
+						]),
+					)
+				: context.auth?.headers;
+			const fields = context.auth?.apiKey
+				? {
 						gateway,
 						baseUrl: (context.auth.baseUrl ?? context.baseUrl ?? "").replace(/\/+$/, ""),
 						credential: context.credential?.type ?? "api_key",
@@ -56,6 +70,22 @@ export function radiusProvider(options: RadiusProviderOptions = {}): Provider<"p
 						headers: Object.entries(context.auth.headers ?? {})
 							.map(([key, value]) => [key.toLowerCase(), value] as const)
 							.sort(([left], [right]) => left.localeCompare(right)),
+					}
+				: undefined;
+			const identityText = fields
+				? JSON.stringify({
+						...fields,
+						apiKey: authIdentity,
+						headers: oauthCredential
+							? Object.entries(
+									providerHeadersToRecord(
+										{ accept: "application/json", authorization: `Bearer ${authIdentity}` },
+										identityHeaders,
+									) ?? {},
+								)
+									.map(([key, value]) => [key.toLowerCase(), value] as const)
+									.sort(([left], [right]) => left.localeCompare(right))
+							: fields.headers,
 					})
 				: undefined;
 			const identity =
@@ -66,12 +96,29 @@ export function radiusProvider(options: RadiusProviderOptions = {}): Provider<"p
 							(byte) => byte.toString(16).padStart(2, "0"),
 						).join("");
 			const stored = context.stored;
-			const matching = identity !== undefined && stored?.personalizationKey === identity;
+			// Migrate a token-bound entry only while its original credential can still prove ownership.
+			const legacyIdentity =
+				fields && oauthCredential && !oauthCredential.catalogId
+					? Array.from(
+							new Uint8Array(
+								await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(fields))),
+							),
+							(byte) => byte.toString(16).padStart(2, "0"),
+						).join("")
+					: undefined;
+			const matching =
+				identity !== undefined &&
+				stored !== undefined &&
+				(stored.personalizationKey === identity ||
+					(legacyIdentity !== undefined && stored.personalizationKey === legacyIdentity));
 			const restored = matching
 				? ((stored?.models ?? []).filter((model) => model.provider === id) as Model<"pi-messages">[])
 				: undefined;
 			if (
 				!(await context.publish({
+					...(matching && stored.personalizationKey !== identity
+						? { persist: { ...stored, personalizationKey: identity } }
+						: {}),
 					update: () => {
 						dynamicModels = restored;
 					},
@@ -98,7 +145,7 @@ export function radiusProvider(options: RadiusProviderOptions = {}): Provider<"p
 
 			if (!context.allowNetwork || context.signal.aborted) return;
 			const apiKey = context.auth?.apiKey;
-			const config = await loadRadiusGatewayConfig(gateway, apiKey, context.signal);
+			const config = await loadRadiusGatewayConfig(gateway, apiKey, context.signal, context.auth?.headers);
 			if (context.signal.aborted) return;
 			const refreshed = getRadiusModelsFromConfig(id, config);
 			await context.publish({

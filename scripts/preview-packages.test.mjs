@@ -103,8 +103,11 @@ test("publish uploads each tarball, moves refs and prints install commands", asy
 		},
 	);
 	assert.deepEqual(JSON.parse(refs.body), { sha, refs: ["pr-1"], run: 7 });
-	assert.match(stdout, new RegExp(`npm i ${server.url}/@scope/a@pr-1`));
-	assert.match(stdout, new RegExp(`npm i ${server.url}/@scope/a@${sha}`));
+	const commands = stdout.split("\n").filter((line) => line.startsWith("npm i ")).map((line) => line.split(" "));
+	assert.deepEqual(commands, [
+		["npm", "i", "--ignore-scripts", `${server.url}/@scope/a@pr-1`],
+		["npm", "i", "--ignore-scripts", `${server.url}/@scope/a@${sha}`],
+	]);
 });
 
 test("publish leaves the summary to a newer run that already owns the ref", async (t) => {

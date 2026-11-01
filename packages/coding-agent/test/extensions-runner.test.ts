@@ -915,6 +915,54 @@ describe("ExtensionRunner", () => {
 		expect(runner.resolveToolRenderers("b", () => ({ renderCall }))).toEqual({ renderCall });
 	});
 
+	it.each(["before next", "after next"] as const)(
+		"falls through a resolver throwing %s without repeating downstream work",
+		async (timing) => {
+			const runtime = createExtensionRuntime();
+			const eventBus = createEventBus();
+			const failure = new Error("renderer selection failed");
+			const broken = await loadExtensionFromFactory(
+				(pi) =>
+					pi.registerToolRenderer((_toolName, next) => {
+						if (timing === "after next") next();
+						throw failure;
+					}),
+				tempDir,
+				eventBus,
+				runtime,
+				"<inline:broken-renderer>",
+			);
+			const visited: string[] = [];
+			const renderCall = () => ({ render: () => ["base tool call"], invalidate: () => {} });
+			const fallback = await loadExtensionFromFactory(
+				(pi) =>
+					pi.registerToolRenderer((toolName, next) => {
+						visited.push(toolName);
+						return toolName === "custom" ? { renderShell: "self" } : next();
+					}),
+				tempDir,
+				eventBus,
+				runtime,
+				"<inline:fallback-renderer>",
+			);
+			const runner = new ExtensionRunner([broken, fallback], runtime, tempDir, sessionManager, modelRegistry);
+			const errors: Array<{ extensionPath: string; event: string; error: string; stack?: string }> = [];
+			runner.onError((error) => errors.push(error));
+			expect(runner.resolveToolRenderers("custom", () => ({ renderCall }))).toEqual({ renderShell: "self" });
+			expect(runner.resolveToolRenderers("builtin", () => ({ renderCall }))).toEqual({ renderCall });
+			expect(visited).toEqual(["custom", "builtin"]);
+			expect(errors).toHaveLength(2);
+			for (const error of errors) {
+				expect(error).toEqual({
+					extensionPath: "<inline:broken-renderer>",
+					event: "tool_renderer",
+					error: failure.message,
+					stack: failure.stack,
+				});
+			}
+		},
+	);
+
 	describe("boundary chaining", () => {
 		it("chains shared draft proposals and preserves omitted result fields", async () => {
 			const runtime = createExtensionRuntime();

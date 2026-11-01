@@ -234,8 +234,20 @@ export class SessionWorkerManager {
 		const [tunnel, control] = createRoutedLinkPair();
 		const key = scopeKey(scope);
 		this.#links.set(key, { worker, scope, link: control });
-		control.onClose(() => {
-			if (this.#links.get(key)?.link === control) this.#links.delete(key);
+		control.onClose((reason) => {
+			if (this.#links.get(key)?.link !== control) return;
+			// Routed links consume bye frames, so receive() cannot forward this terminal event.
+			if (
+				!this.#detached &&
+				!this.#coordinator.wasReplaced &&
+				this.#workersByPeer.get(worker.peerId) === worker &&
+				worker.attachmentIds.has(attachmentId)
+			) {
+				void this.#coordinator
+					.send(worker.peerId, { type: "chord", scope, frame: { t: "bye", reason } })
+					.catch(() => {});
+			}
+			this.#links.delete(key);
 		});
 		control.receive((frame) => {
 			if (this.#detached || !worker.attachmentIds.has(attachmentId) || this.#links.get(key)?.link !== control)
@@ -517,8 +529,10 @@ export class SessionWorkerManager {
 				entry.worker.token === message.token &&
 				entry.worker.metadata.path === message.sessionKey
 			) {
-				if (message.frame.t === "bye") entry.link.close(message.frame.reason);
-				else entry.link.send(message.frame);
+				if (message.frame.t === "bye") {
+					this.#links.delete(scopeKey(message.scope));
+					entry.link.close(message.frame.reason);
+				} else entry.link.send(message.frame);
 			}
 			return;
 		}

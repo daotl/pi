@@ -1298,6 +1298,14 @@ export class ObjectImpl {
 
 	/** Opens resources after bounded, cancellable reference dependencies; joins started opens before failing. */
 	async open(resources: readonly ResourceImpl[], refs: readonly RefCore[], signal: AbortSignal): Promise<void> {
+		const batch = new AbortController();
+		signal = AbortSignal.any([signal, batch.signal]);
+		const outcome: { failure?: { reason: unknown } } = {};
+		const failed = (reason: unknown): void => {
+			if (outcome.failure !== undefined) return;
+			outcome.failure = { reason };
+			batch.abort(reason);
+		};
 		const opening = new Map<ResourceImpl, Promise<void>>();
 		const dependencies = new Map<RefCore, Promise<void>>();
 		for (const ref of new Set([
@@ -1331,9 +1339,8 @@ export class ObjectImpl {
 			}
 			return promise;
 		};
-		const results = await Promise.allSettled([...resources.map(openOne), ...dependencies.values()]);
-		const failure = results.find((result) => result.status === "rejected");
-		if (failure !== undefined) throw failure.reason;
+		await Promise.allSettled([...resources.map(openOne), ...dependencies.values()].map((work) => work.catch(failed)));
+		if (outcome.failure !== undefined) throw outcome.failure.reason;
 	}
 
 	/**
@@ -1386,36 +1393,48 @@ export class ObjectImpl {
 	 */
 	async initCells(run: Run, signal: AbortSignal, preparationCodeVersion?: number): Promise<void> {
 		if (run.created.inits.length === 0) return;
-		const results = await Promise.allSettled(
-			run.created.inits.map(async ([cell, init]) => {
-				const value = await this.host.root(
-					async (root) => {
-						const lifetime = new AbortController();
-						const invocations = new Set<Promise<unknown>>();
-						const ctx = new CtxImpl(this.host, {
-							signals: [root.signal, lifetime.signal],
-							rootId: root.rootId,
-							codeVersion: root.codeVersion,
-							principal: root.principal,
-							preparationCodeVersion,
-							preparationInvocations: invocations,
-							preparationSignal: lifetime.signal,
-						});
-						try {
-							return await init(ctx);
-						} finally {
-							lifetime.abort(new ChordError("aborted", "initializer settled"));
-							ctx.close();
-							while (invocations.size > 0) await Promise.allSettled([...invocations]);
-						}
-					},
-					{ signal },
-				);
-				if (!signal.aborted) cell.initialize(value);
-			}),
+		const batch = new AbortController();
+		signal = AbortSignal.any([signal, batch.signal]);
+		const outcome: { failure?: { reason: unknown } } = {};
+		const failed = (reason: unknown): void => {
+			if (outcome.failure !== undefined) return;
+			outcome.failure = { reason };
+			batch.abort(reason);
+		};
+		await Promise.allSettled(
+			run.created.inits
+				.map(async ([cell, init]) => {
+					const value = await this.host.root(
+						async (root) => {
+							const lifetime = new AbortController();
+							const invocations = new Set<Promise<unknown>>();
+							const ctx = new CtxImpl(this.host, {
+								signals: [root.signal, lifetime.signal],
+								rootId: root.rootId,
+								codeVersion: root.codeVersion,
+								principal: root.principal,
+								preparationCodeVersion,
+								preparationInvocations: invocations,
+								preparationSignal: lifetime.signal,
+							});
+							try {
+								return await init(ctx);
+							} catch (error) {
+								failed(error);
+								throw error;
+							} finally {
+								lifetime.abort(new ChordError("aborted", "initializer settled"));
+								ctx.close();
+								while (invocations.size > 0) await Promise.allSettled([...invocations]);
+							}
+						},
+						{ signal },
+					);
+					if (!signal.aborted) cell.initialize(value);
+				})
+				.map((work) => work.catch(failed)),
 		);
-		const failure = results.find((result) => result.status === "rejected");
-		if (failure !== undefined) throw failure.reason;
+		if (outcome.failure !== undefined) throw outcome.failure.reason;
 	}
 
 	/** Undoes the objects a run created: closes its resources (reverse order) and releases its references. */

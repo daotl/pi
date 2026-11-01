@@ -158,3 +158,56 @@ test("runner preserves npm failure status when Node cancellations are reported",
 	assert.equal(result.status, 7, result.stdout + result.stderr);
 	assert.match(result.stdout, /=== TOTAL: 9 passed, 2 failed, 4 skipped ===/);
 });
+
+function runDurableRunner(t, args = [], failedPhase = "") {
+	const root = mkdtempSync(join(tmpdir(), "pi-durable-runner-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const scriptDirectory = join(root, "scripts");
+	const vitestDirectory = join(root, "node_modules", "vitest");
+	mkdirSync(scriptDirectory, { recursive: true });
+	mkdirSync(vitestDirectory, { recursive: true });
+	const runner = join(scriptDirectory, "test.mjs");
+	const record = join(root, "invocations.jsonl");
+	writeFileSync(runner, readFileSync(join(repoRoot, "packages/durable/scripts/test.mjs"), "utf8"));
+	writeFileSync(join(vitestDirectory, "package.json"), '{"name":"vitest"}');
+	const executable = (phase) => `import { appendFileSync } from "node:fs";
+const phase = ${JSON.stringify(phase)};
+appendFileSync(${JSON.stringify(record)}, JSON.stringify({ phase, args: process.argv.slice(2), retention: process.env.PI_DURABLE_DOCUMENT_RETENTION_MS }) + "\\n");
+if (phase === ${JSON.stringify(failedPhase)}) process.exit(7);
+`;
+	writeFileSync(join(vitestDirectory, "vitest.mjs"), executable("vitest"));
+	const npm = join(root, "npm.mjs");
+	writeFileSync(npm, executable("npm"));
+	const env = { ...process.env, npm_execpath: npm };
+	delete env.PI_DURABLE_DOCUMENT_RETENTION_MS;
+	const result = spawnSync(process.execPath, [runner, ...args], { cwd: root, env, encoding: "utf8", timeout: 10_000 });
+	assert.ifError(result.error);
+	return { ...result, calls: readFileSync(record, "utf8").trim().split("\n").map((line) => JSON.parse(line)) };
+}
+
+test("Durable default run retains both retention modes and the separate Workers suite", (t) => {
+	const result = runDurableRunner(t);
+	assert.equal(result.status, 0, result.stderr);
+	assert.deepEqual(result.calls, [
+		{ phase: "vitest", args: ["--run"] },
+		{ phase: "vitest", args: ["--run"], retention: "0" },
+		{ phase: "npm", args: ["run", "test:workers"] },
+	]);
+});
+
+for (const args of [["test/session-documents.test.ts"], ["-t", "specific case"], ["--help"], ["test/session-documents.test.ts", "-t", "specific case", "--reporter=verbose"]]) {
+	test(`Durable focused arguments ${JSON.stringify(args)} reach both Node runs without starting Workers`, (t) => {
+		const result = runDurableRunner(t, args);
+		assert.equal(result.status, 0, result.stderr);
+		assert.deepEqual(result.calls, [
+			{ phase: "vitest", args: ["--run", ...args] },
+			{ phase: "vitest", args: ["--run", ...args], retention: "0" },
+		]);
+	});
+}
+
+test("Durable focused failure exits with its test status without launching more phases", (t) => {
+	const result = runDurableRunner(t, ["-t", "failing case"], "vitest");
+	assert.equal(result.status, 7);
+	assert.deepEqual(result.calls, [{ phase: "vitest", args: ["--run", "-t", "failing case"] }]);
+});

@@ -12,16 +12,60 @@ const snapshot = (items) => ({ repo: "owner/repo", items, categories: [{ name: "
 
 function harness() {
 	const listeners = {}, requests = [], nodes = Object.fromEntries(["main", "cat", "status", "sync"].map((id) => [id, { innerHTML: "", value: "" }]));
-	let poll;
+	let poll, focusedSelect = null;
 	const tabs = ["inbox", "decided", "all"].map((view) => ({ dataset: { view }, classList: { toggle() {} } }));
-	const document = { hidden: false, getElementById: (id) => nodes[id], addEventListener: (name, fn) => { listeners[name] = fn; }, querySelectorAll: (selector) => selector === ".tab" ? tabs : [], querySelector: () => null };
-	runInNewContext(script, { document, window: { open() {} }, confirm: () => true, setInterval: (fn) => { poll = fn; }, fetch: (path, options) => new Promise((resolve) => { requests.push({ path, body: options && JSON.parse(options.body), resolve }); }) });
+	const document = { hidden: false, getElementById: (id) => nodes[id], addEventListener: (name, fn) => { listeners[name] = fn; }, querySelectorAll: (selector) => selector === ".tab" ? tabs : [], querySelector: (selector) => selector === "select:focus" ? focusedSelect : null };
+	runInNewContext(script, { document, queueMicrotask, window: { open() {} }, confirm: () => true, setInterval: (fn) => { poll = fn; }, fetch: (path, options) => new Promise((resolve) => { requests.push({ path, body: options && JSON.parse(options.body), resolve }); }) });
 	const respond = async (request, value) => { request.resolve({ ok: true, json: async () => value }); await tick(); };
 	const key = (key, repeat = false) => listeners.keydown({ key, repeat, target: { tagName: "BODY" } });
 	const click = (dataset) => listeners.click({ target: { closest: (selector) => selector === "[data-act]" ? { dataset } : null } });
 	Object.assign(nodes.sync, { retry: () => nodes.sync.onclick() });
-	return { nodes, requests, respond, key, click, poll: () => poll(), tab: (view) => tabs.find((tab) => tab.dataset.view === view).onclick(), category: (value) => { nodes.cat.value = value; listeners.change({ target: { id: "cat", value, dataset: {} } }); } };
+	const focusCategory = (number) => { focusedSelect = { tagName: "SELECT", dataset: { act: "cat", n: String(number) }, value: "bugs" }; };
+	const blurCategory = async () => { const target = focusedSelect; focusedSelect = null; listeners.focusout?.({ target }); await tick(); };
+	const changeCategory = (value) => { focusedSelect.value = value; listeners.change({ target: focusedSelect }); };
+	return { nodes, requests, respond, key, click, focusCategory, blurCategory, changeCategory, poll: () => poll(), tab: (view) => tabs.find((tab) => tab.dataset.view === view).onclick(), category: (value) => { nodes.cat.value = value; listeners.change({ target: { id: "cat", value, dataset: {} } }); } };
 }
+
+test("a delayed poll preserves a category selection and installs its snapshot after blur", async () => {
+	const ui = harness();
+	await ui.respond(ui.requests[0], snapshot([issue(10)]));
+	ui.poll();
+	ui.focusCategory(10);
+	await ui.respond(ui.requests[1], snapshot([issue(20)]));
+	assert.match(ui.nodes.main.innerHTML, /Issue 10/);
+	assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 20/);
+	await ui.blurCategory();
+	assert.match(ui.nodes.main.innerHTML, /Issue 20/);
+});
+
+test("changing a category invalidates a deferred poll before it can replace the decision refresh", async () => {
+	const ui = harness();
+	await ui.respond(ui.requests[0], snapshot([issue(10)]));
+	ui.poll();
+	ui.focusCategory(10);
+	await ui.respond(ui.requests[1], snapshot([issue(99)]));
+	ui.changeCategory("features");
+	assert.deepEqual(ui.requests[2].body, { number: 10, category: "features" });
+	await ui.blurCategory();
+	assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 99/);
+	await ui.respond(ui.requests[2]);
+	const updated = issue(10); updated.decision = { category: "features" };
+	await ui.respond(ui.requests[3], snapshot([updated]));
+	assert.match(ui.nodes.main.innerHTML, /features ✎/);
+	assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 99/);
+});
+
+test("only the newest deferred snapshot can install after focus leaves a select", async () => {
+	const ui = harness();
+	await ui.respond(ui.requests[0], snapshot([issue(10)]));
+	ui.poll(); ui.poll();
+	ui.focusCategory(10);
+	await ui.respond(ui.requests[2], snapshot([issue(20)]));
+	await ui.respond(ui.requests[1], snapshot([issue(30)]));
+	await ui.blurCategory();
+	assert.match(ui.nodes.main.innerHTML, /Issue 20/);
+	assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 30/);
+});
 
 test("bulk none decides only done suggestions in the displayed category", async () => {
 	const ui = harness();

@@ -72,7 +72,7 @@ describe("Radius OAuth", () => {
 		);
 
 		const oauth = createRadiusOAuth({ name: "Radius", gateway: GATEWAY });
-		await expect(oauth.login(interaction("device-code", events))).resolves.toEqual({
+		await expect(oauth.login(interaction("device-code", events))).resolves.toMatchObject({
 			type: "oauth",
 			access: "access-token",
 			refresh: "refresh-token",
@@ -114,6 +114,24 @@ describe("Radius OAuth", () => {
 			),
 		).resolves.toMatchObject({ access: "new-access", refresh: "new-refresh" });
 		expect(fetchMock).toHaveBeenCalledOnce();
+	});
+
+	it("preserves catalog identity on refresh but replaces it on a new login", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: unknown) =>
+				requestUrl(input).endsWith("/device")
+					? jsonResponse({ device_code: "device", user_code: "code", verification_uri: GATEWAY, expires_in: 600 })
+					: jsonResponse({ access_token: "access", refresh_token: "refresh", expires_in: 3600 }),
+			),
+		);
+		const oauth = createRadiusOAuth({ name: "Radius", gateway: GATEWAY });
+		const first = await oauth.login(interaction("device-code"));
+		const refreshed = await oauth.refresh(first, new AbortController().signal);
+		const second = await oauth.login(interaction("device-code"));
+		expect(typeof first.catalogId).toBe("string");
+		expect(refreshed.catalogId).toBe(first.catalogId);
+		expect(second.catalogId).not.toBe(first.catalogId);
 	});
 
 	it("discovers only the interactive browser authorization endpoint", async () => {

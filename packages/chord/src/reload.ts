@@ -55,6 +55,8 @@ export interface ReloadReport {
 	readonly prepared: readonly string[];
 	/** Addresses of objects that went through the gate. */
 	readonly gated: readonly string[];
+	/** Module specifiers paired with participant-resolved facet identities. */
+	readonly moduleNames?: readonly (readonly [string, string])[];
 	/**
 	 * Cluster reloads: what each participating child host prepared, by host name (its vote; the child commits it after
 	 * the server). Absent for local reloads.
