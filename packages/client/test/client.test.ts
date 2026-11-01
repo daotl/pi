@@ -63,9 +63,8 @@ describe("native routed Chord links", () => {
 				expect(client.connected).toBe(true);
 				expect(client.hello).toBe(hello);
 				link.close();
-				const replacement = createClientChordLink(client, () => target);
-				replacement.send({ t: "ping", n: 9 });
-				expect(server.messages.at(-1)).toEqual({ type: "chord", target, frame: { t: "ping", n: 9 } });
+				expect(client.connected).toBe(false);
+				expect(() => createClientChordLink(client, () => target)).toThrow(DisconnectedError);
 			} finally {
 				await client.dispose();
 			}

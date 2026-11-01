@@ -85,11 +85,15 @@ To enforce an admission limit, pass `acquireWorker()`. It runs synchronously aft
 const result = await sandbox.execute(`store("runs", (load("runs") ?? 0) + 1)`, { store: saved });
 if (result.ok) {
 	for (const key of result.storeWrites.delete) delete saved[key];
-	Object.assign(saved, result.storeWrites.set);
+	for (const [key, value] of Object.entries(result.storeWrites.set)) {
+		Object.defineProperty(saved, key, { value, enumerable: true, configurable: true, writable: true });
+	}
 }
 ```
 
 `load` returns a copy, so mutating it does not change the store. Storing `undefined` deletes the key. A value may be at most `MAX_STORE_VALUE_CHARS` (256 Ki) characters of JSON and all values together at most `MAX_STORE_TOTAL_CHARS` (1 Mi); larger writes throw a `RangeError` inside the script.
+
+Every string key, including `__proto__`, is preserved as an own data property across the sandbox bridge. Host persistence must also insert own properties rather than invoke inherited setters.
 
 ## Source format
 
@@ -103,7 +107,7 @@ text(JSON.parse(source).name);
 
 Supported fields are `max_output_tokens`, a token budget for the output, and `timeout_ms`, a hard deadline. The sandbox does not act on them; the caller decides. The options line is replaced by an empty line, so line numbers in stack traces still match the input. Empty input, invalid JSON, unknown fields, an options line without code, or an options line on any line but the first throw `CodemodeSourceError`. `CODEMODE_SOURCE_GRAMMAR` is a Lark grammar for providers that support grammar-constrained tool input. Both are also available from the lightweight `@earendil-works/pi-codemode/source` entry.
 
-Options-looking text inside literals is ordinary source text, but a real options comment after a statement is rejected, including after a `for await` loop.
+Options-looking text inside literals is ordinary source text, including after ASI-terminated `debugger`, `break`, and `continue` statements. A real options comment after a statement is rejected, including after a `for await` loop.
 
 ## Bundled Node and Bun hosts
 

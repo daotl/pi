@@ -201,7 +201,11 @@ function searchAndLoad(
 	const candidates = tools.getAllTools().filter((tool) => isSearchable(tool.exposure) && !active.includes(tool.name));
 	const documents = candidates.map((tool) => createToolSearchDocument(tool, tool.namespace));
 	const matches = new Bm25Ranker().rank(query, documents, limit);
-	if (matches.length > 0) tools.setActiveTools([...active, ...matches.map((match) => match.name)]);
+	if (matches.length > 0)
+		tools.setActiveTools(
+			matches.map((match) => match.name),
+			{ mode: "add" },
+		);
 	return matches.map((match) => ({
 		name: match.name,
 		description: candidates.find((tool) => tool.name === match.name)?.description ?? "",

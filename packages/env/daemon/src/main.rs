@@ -429,9 +429,36 @@ fn start_workers() -> Sender<Job> {
 
 fn respond(server: &Server, id: u32, request: Frame, control: Arc<Control>) {
     #[cfg(unix)]
+    let mut request = request;
+    #[cfg(unix)]
     {
         let prepared = (|| -> Result<Option<special::Operation>, Failure> {
             match request.json["op"].as_str() {
+                Some("write") => {
+                    let path = field(&request.json, "path")?;
+                    if std::fs::metadata(path)
+                        .is_ok_and(|metadata| !metadata.is_file() && !metadata.is_dir())
+                    {
+                        return Ok(Some(special::Operation::WriteOpen {
+                            path: path.to_string(),
+                            append: flag(&request.json, "append"),
+                            content: std::mem::take(&mut request.payload),
+                            keep: flag(&request.json, "keep"),
+                        }));
+                    }
+                }
+                Some("writeChunk") => {
+                    let handle = server.file(&request.json)?;
+                    if handle.stream {
+                        return Ok(Some(special::Operation::Write {
+                            handle,
+                            content: std::mem::take(&mut request.payload),
+                            written: 0,
+                            keep: false,
+                            initial: false,
+                        }));
+                    }
+                }
                 Some("open") if request.json["mode"].as_str() == Some("read") => {
                     if control.aborted.load(Ordering::SeqCst) {
                         return Err(Failure::new("aborted", "aborted"));

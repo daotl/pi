@@ -36,6 +36,8 @@ On disconnect or disposal, pending requests reject locally, but accepted work ma
 
 `connect()` and `reconnect()` reject while already connecting or connected. These rejected attempts leave the current handshake, server identity and routed Chord links intact; disconnect first to start a new connection.
 
+Closing the server-scoped Chord link (locally or by its provider) disconnects the physical client and invalidates all routes. Call `reconnect()` before creating a replacement server link; that handshake acquires a fresh native server attachment. Closing only a Session link does not disconnect the server route.
+
 The experimental local coordinator only provides a stable endpoint and relays traffic. Replaceable server processes own Session and worker lifecycle outside the public client protocol.
 
 Call transport handlers as follows:

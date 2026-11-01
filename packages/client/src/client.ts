@@ -121,7 +121,10 @@ export class Client {
 				this.#connection.send(encoded);
 				return encoded.byteLength;
 			},
-			() => this.#links.delete(link),
+			() => {
+				this.#links.delete(link);
+				if (!("sessionId" in captured) && this.connected) this.disconnect("Server Chord link closed");
+			},
 		);
 		this.#links.add(link);
 		const key = targetKey(captured);

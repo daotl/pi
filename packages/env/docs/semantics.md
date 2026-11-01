@@ -36,6 +36,11 @@ env conformance suite and `test/differential.test.ts` check each rule below.
   file is read up to its size at open; other files to their end. `readBinaryFile` and `readTextFile` check for
   cancellation after each reply, including a single-chunk binary read and unknown-size EOF, and close the file
   before returning an abort.
+- Unix FIFO writer opens use a separate bounded, interruptible helper pool; connected special-file writes are
+  nonblocking and cancellable. Waiting writers do not occupy ordinary file workers or reader-open helpers.
+  The original descriptor preserves reader/writer rendezvous and append behavior; chunks stay ordered per handle.
+- The remote line reader scans decoded fragments once and joins only when returning a line, including a final
+  unterminated line. UTF-8 decoding and cancellation checkpoints remain streaming.
 - `listFiles` has no `NodeExecutionEnv` counterpart: the daemon implements it for remote and local environments
   alike (`LocalExecutionEnv` runs a daemon on the same machine), so both list with the same code. Unlike `fd`,
   symbolic links are not followed; unlike `git ls-files`, a tracked file that matches an ignore rule is left out.

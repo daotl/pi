@@ -523,7 +523,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			if (needsToolSearch && hasToolSearch && !active.includes(TOOL_SEARCH_TOOL_NAME)) {
 				activate.push(TOOL_SEARCH_TOOL_NAME);
 			}
-			if (activate.length > 0) pi.setActiveTools([...active, ...activate]);
+			if (activate.length > 0) pi.setActiveTools(activate, { mode: "add" });
 			const reachable = [...active, ...activate];
 			if (hasCodemode && reachable.includes(CODEMODE_TOOL_NAME)) return;
 			if (hasToolSearch && reachable.includes(TOOL_SEARCH_TOOL_NAME)) return;

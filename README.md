@@ -109,6 +109,8 @@ npm run pack:packages -- --out .artifacts/pi-packages
 This refreshes model data before building `pi-ai`. To avoid network access when
 model data is already hydrated, pass `--offline-model-data`.
 
+The direct `node scripts/pack-packages.mjs --out <dir>` and `node scripts/local-release.mjs` entrypoints also work without an npm parent. On Windows they resolve `npm-cli.js` from `npm_execpath`, beside Node, or from an npm installation on `PATH`, and invoke it with Node without a command shell.
+
 Local packing skips the release-daemon completeness check and announces that
 limitation. It supports installation and import testing without preparing the
 eight-platform `pi-env` daemon matrix, but does not certify a deployable

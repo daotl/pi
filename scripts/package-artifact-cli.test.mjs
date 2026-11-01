@@ -21,6 +21,28 @@ function assertFailsBeforeWork(result, message) {
 	assert.doesNotMatch(result.stdout, /generate:models|npm run clean/);
 }
 
+test("standalone Windows npm resolves a CLI on PATH without invoking a command shell", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "pi-npm-path-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const bin = join(root, "npm & tools");
+	const cli = join(bin, "node_modules/npm/bin/npm-cli.js");
+	mkdirSync(dirname(cli), { recursive: true });
+	writeFileSync(cli, 'console.log(JSON.stringify(process.argv.slice(2)));\n');
+	const preload = join(root, "windows.cjs");
+	writeFileSync(preload, 'Object.defineProperty(process, "platform", { value: "win32" });\n');
+	const runner = join(root, "run.mjs");
+	writeFileSync(runner, `import { execNpmSync } from ${JSON.stringify(new URL("./npm-command.mjs", import.meta.url).href)};\nconsole.log(execNpmSync(process.argv.slice(2), { encoding: "utf8" }).trim());\n`);
+	for (const npmExecpath of [undefined, cli]) {
+		const env = { ...process.env, PATH: bin };
+		delete env.npm_execpath;
+		if (npmExecpath) env.npm_execpath = npmExecpath;
+		const args = ["pack", "space and & shell | text", 'quote"value'];
+		const result = spawnSync(process.execPath, ["--require", preload, runner, ...args], { env, encoding: "utf8" });
+		assert.equal(result.status, 0, result.stderr);
+		assert.deepEqual(JSON.parse(result.stdout), args);
+	}
+});
+
 test("rejects missing option values before doing work", () => {
 	assertFailsBeforeWork(runScript("local-release.mjs", ["--out"]), /--out/);
 	assertFailsBeforeWork(runScript("pack-packages.mjs", ["--out", "--force"]), /--out/);
@@ -70,9 +92,12 @@ for (const command of ["pack-packages.mjs", "local-release.mjs"]) {
 			command === "local-release.mjs"
 				? ["--skip-check", "--skip-test", "--skip-install"]
 				: ["--offline-model-data"];
+		const env = { ...process.env };
+		delete env.npm_execpath;
 		const result = spawnSync(process.execPath, [join(scriptsDirectory, command), "--out", out, ...args], {
 			cwd: repo,
 			encoding: "utf8",
+			env,
 		});
 		assert.equal(result.status, 0, result.stdout + result.stderr);
 		assert.match(result.stdout + result.stderr, /(?:skipping|not checking).*release.daemon/i);

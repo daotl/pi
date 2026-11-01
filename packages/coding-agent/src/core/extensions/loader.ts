@@ -431,9 +431,9 @@ function createExtensionAPI(
 			return runtime.getSettings();
 		},
 
-		setActiveTools(toolNames: string[]): void {
+		setActiveTools(toolNames: string[], options?: { mode: "add" }): void {
 			assertActive();
-			runtime.setActiveTools(toolNames);
+			runtime.setActiveTools(toolNames, options);
 		},
 
 		getCommands() {

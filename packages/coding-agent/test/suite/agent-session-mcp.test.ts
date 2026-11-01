@@ -1415,7 +1415,10 @@ describe("AgentSession MCP tools after resume and reload", () => {
 
 			// Like plan mode restoring its tools, or an extension adding one to the current loadout.
 			const setLoadout: ExtensionFactory = (pi) => {
-				pi.on("session_start", () => pi.setActiveTools(loadout ? [...loadout] : [...pi.getActiveTools(), "read"]));
+				pi.on("session_start", () => {
+					if (loadout) pi.setActiveTools([...loadout]);
+					else pi.setActiveTools(["read"], { mode: "add" });
+				});
 			};
 			const second = await setup(first.harness.sessionManager, [setLoadout]);
 			await vi.waitFor(() =>

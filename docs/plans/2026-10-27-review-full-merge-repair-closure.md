@@ -2825,3 +2825,59 @@ No unimplemented accepted finding remains in this round. Native Windows acceptan
 ### Verdict
 
 **Eight findings independently validated in one batch, repaired and locally verified. Whole merge remains NOT READY for unconditional native-platform acceptance.** The current review and repair result supersedes its in-progress checkpoints, without rewriting historical review records.
+
+## Complete merge review and repair - d51fe70e9
+
+Scope: `98dfe28cbeec4e1f2f61516e227420b2407dcdf9` through `d51fe70e9b4e1a98017e7bcd194220b321309582`, including merge `8322aa1d` and every follow-up. The pre-review worktree was clean; no empty checkpoint commit was needed. Run artifacts: `/tmp/compound-engineering-501/ce-code-review/20261101-complete-d51fe70e9-974bc22d`.
+
+### Applied
+
+| # | File | Repair | Reviewer |
+|---|---|---|---|
+| 1 | `packages/chord/src/host.ts` (+test) | Fail closed on throwing principal restamps, continue remaining connection revocation and child propagation, join local holder disposal, then return accumulated failures. | security |
+| 2 | `packages/codemode/src/source.ts` (+test/docs) | Track restricted-statement ASI for debugger and optionally labelled break/continue before regexp scanning; preserve member-name division and misplaced-directive rejection. | maintainability |
+| 3 | `packages/codemode/src/runtime/execution.ts` (+Durable test/docs) | Insert store keys as own enumerable data properties at both bridge boundaries. Actual Durable calls and SQLite reopen retain `__proto__` beside ordinary keys. Coding-agent replay already uses Map/Object.fromEntries and needs no alternate convention. | correctness |
+| 4 | `packages/env/daemon/src/{main,special}.rs` (+test/docs) | Add a bounded interruptible writer-open pool separate from read-open and ordinary workers; preserve the successful rendezvous descriptor; use nonblocking cancellable writes, ordered per handle, with existing failure poisoning. | adversarial-reviewer |
+| 5 | `scripts/npm-command.mjs` (+test/docs) | Resolve npm's JS CLI without an npm parent using npm_execpath, Node's installation or PATH; invoke with Node without shell interpolation. | adversarial-reviewer |
+| 7 | `packages/coding-agent/src/core/agent-session.ts` (+types/loader/callers/tests/docs) | Public replacements retire omitted pending selections even when active registered names do not change. Explicit additive mode preserves pending selections; real MCP discovery and tool_search callers migrated. | agent-native-reviewer |
+| 9 | `packages/env/src/remote-env.ts` (+test/docs) | Scan decoded fragments once and join only at a returned line, preserving split UTF-8, terminated/unterminated EOF and cancellation. | performance |
+| 10 | `packages/server/src/server.ts`, `packages/client/src/client.ts` (+tests/docs) | Server-channel closure terminates the physical route. Reconnect runs a fresh handshake and acquires a new native attachment before calls resume. Session-only channel closure remains scoped. | api-contract |
+
+Auth, contract and concurrency changes remain review-sensitive despite green local tests. No universal safety or native Windows certification is implied.
+
+### Stage 5c policy disagreements
+
+The single validator confirmed all ten code-permitted states. Its `validation_status: confirmed` and exact unmeasured-incidence reasons remain intact. Confirmation does not establish the proposed policy or authorize changing it blindly.
+
+- **#6, classifier default deadline:** not applied. `ProviderRequestOptions` at `packages/ai/src/types.ts:200-204` makes timeout optional/provider-specific; classifier-shared and llama-cpp classification apply caller-provided deadlines. No inspected classifier contract requires a 60-second default, and Mistral's own default does not establish one for Decisions/System One. Actual stalled loopback-body cancellation returned `stopReason: aborted` with an explicit caller signal. A finite default remains an explicit policy choice, not an established contract violation.
+- **#8, Durable E2E opt-in:** not applied. `AGENTS.md:34` explicitly documents credential-dependent direct full suites and requires root `./test.sh` for isolation; the supported direct alternative is a selected test, not an ambient-safe full package suite. The cache test and OAuth helper explicitly document live credentials and refresh/save. Adding a mandatory PI_E2E_TESTS gate would change that policy. Synthetic-HOME collection of the two live files skipped both tests with unchanged synthetic auth bytes and network denied. No real user credential or paid provider call was used.
+
+### Verification
+
+- Every applied defect had a test-only failing run before product repair. Examples: #1 left the first connection open; #2 rejected literal text on line 4; #3 returned `[null,2]`; #4 saturated sixteen workers until the existing ten-second test guard; #5 rejected absent npm_execpath in the controlled Windows branch; #7 activated the omitted late tool; #9 examined 83,492,773 LF-search characters for roughly 3 MiB; #10 left the client connected after channel closure.
+- Focused green runs: Chord link/principals **42 passed**; codemode source **21 passed**; Durable codemode **49 passed**; four coding-agent files **150 passed**; server conformance **21 passed**; client **12 passed**; Env differential **7 passed / 2 platform skips** plus the long-line regression; packaging CLI **5 passed**. Counts overlap with the root suite and are not summed.
+- Actual non-test runtime smoke exercised two live relayed capabilities after failed restamping; parser plus QuickJS execution; Durable Harness/SQLite calls and reopen; sixteen waiting FIFO writers with ordinary reads/writes and later reader rendezvous; multi-chunk FIFO append; connected-idle-reader 2-MiB writer cancellation followed by a usable ordinary write; an 8-MiB UTF-8 line and EOF; SDK pending-loadout replacement; and a real Client/Server/Chord echo before closure and after physical reconnect with exactly two native attachments. Owned temporary smoke programs were removed after proof.
+- Rust **1.98** external build and **39 tests passed**. Rust **1.96** clippy with `--all-targets -- -D warnings` passed using a distinct external target. Owned reactor production formatting matches rustfmt; untouched historical test formatting was not rewritten. No output was written to the protected in-repository Cargo target.
+- Final `npm run check`: **1985 files, No fixes applied**, all dependency/import/entry-graph/install-lock/TypeScript/browser-smoke gates passed with zero errors, warnings or infos. The initial check formatted eight owned files and identified one obsolete import; that was corrected before this final clean check.
+- Authoritative root **bg_1323**: `rtk proxy env PATH="/tmp/pi-fixall-6a243f805/suite-bin:$PATH" PI_ENV_DAEMON=<this-run>/cargo-target/debug/pi-env ./test.sh`, repository root, timeout 1800. **13532 passed, 0 failed, 949 skipped**, exit 0, 1075.97 seconds. Full output: `artifact://17458`. Test assertions, exclusions and timeouts were not weakened.
+- Controlled Windows contract tests preserve literal spaces, quotes and shell metacharacters; both advertised pack/local-release fixtures actually ran with npm_execpath deleted. This is not native Windows runtime proof.
+
+### Coverage and integrity
+
+All thirteen persona returns were collected. The full 1296-path manifest and canonical diff were review inventory, not exhaustive all-hunk approval. One independent validator inspected all ten selected findings in **8m49s** and confirmed each on source with incidence unmeasured. No shortcut skip or second validator ran. Its stage-log end was recorded after a long user interruption and must not be interpreted as validator runtime. Protected subjects were independently classified as authorization-authentication (#1/#7/#8), public-contract (#2/#5/#10), data-loss (#3), concurrency (#4), and null (#6/#9).
+
+Cross-model pass skipped: host serving family unattested; no external code egress. Local adversarial supplied that lens. Graph lookup failed with WeakMap errors and no LSP device was mounted in this leaf; exact source/caller/history fallback was used, with no exhaustive dynamic/external caller claim. First-evidence backfilled count remains **9** from merge. No malformed findings/returns, confidence suppressions, missing-quote demotions or semantic duplicates were manufactured. Policy/context discovery limits from the supplied review handoff remain disclosed.
+
+The original **571228-byte** ledger prefix remains byte-identical (SHA-256 `ae04e8dee087c43e4ed3121b04a5fb25ce5d58ea672cfa5ec4cceef5ac2e9822`). All **749** protected target hashes remain unchanged. Preserve `my-merge=cb3bee033ba853041609b874303dc625d5d30479` and `crystal=8322aa1d6808711a6e46bfbe67d8a788ca8cbd1e`. This repair owns 31 paths including this append-only ledger; no intentional dependency manifests, lockfiles or changelog edits. No push or PR.
+
+### Deployment Notes
+
+Native Windows/Android, external SSH hosts, production Cloudflare, actual browser IndexedDB transactions, Nix and public artifact publication remain unexecuted certification gates. Local synthetic providers and macOS daemon proof do not replace them. SQLite schema 2 rollout still requires stopped/exclusive ownership, a WAL-consistent backup, unchanged prefix, task-byte/index/allocator comparisons and restore rehearsal; an older schema-1 executable cannot safely roll back an upgraded database without its backup. Local packaging does not certify all eight release-daemon assets.
+
+### Actionable Findings
+
+Eight fixes are applied and verified. #6 and #8 remain explicitly disputed policy proposals with their confirmed source-validation records preserved, not silently removed or claimed implemented.
+
+### Verdict
+
+**Ready with fixes applied, subject to the two documented policy disagreements and deployment gates.** The accepted source-repair queue is closed by exercised local proof; this is not unconditional whole-merge or native-platform acceptance.

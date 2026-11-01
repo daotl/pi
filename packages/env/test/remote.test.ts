@@ -449,6 +449,46 @@ describe("RemoteExecutionEnv", () => {
 		}
 	});
 
+	it("scans long UTF-8 lines once and preserves EOF and cancellation", async () => {
+		const { env, connection } = environment();
+		const text = `${"a".repeat(64 * 1024 - 1)}€${"b".repeat(3 * 1024 * 1024)}`;
+		writeFileSync(join(env.cwd, "lines"), `${text}\nlast€`);
+		const reader = getOrThrow(await env.openTextLineReader("lines", context));
+		const indexOf = String.prototype.indexOf;
+		let scanned = 0;
+		const scan = vi.spyOn(String.prototype, "indexOf").mockImplementation(function (this: string, search, position) {
+			if (search === "\n") scanned += this.length - (position ?? 0);
+			return indexOf.call(this, search, position);
+		});
+		try {
+			expect(getOrThrow(await reader.readLine(context))).toEqual({ text, terminated: true });
+			expect(scanned).toBeLessThan(text.length * 3);
+			scan.mockRestore();
+			expect(getOrThrow(await reader.readLine(context))).toEqual({ text: "last€", terminated: false });
+			expect(getOrThrow(await reader.readLine(context))).toBeUndefined();
+		} finally {
+			scan.mockRestore();
+			await reader.close(context);
+		}
+		const cancelled = getOrThrow(await env.openTextLineReader("lines", context));
+		const controller = new AbortController();
+		const request = connection.request.bind(connection);
+		const gate = vi.spyOn(connection, "request").mockImplementation(async (op, json, options) => {
+			const reply = await request(op, json, options);
+			if (op === "pread") controller.abort();
+			return reply;
+		});
+		try {
+			expect(await cancelled.readLine(withAbortSignal(controller.signal, context))).toMatchObject({
+				ok: false,
+				error: { code: "aborted" },
+			});
+		} finally {
+			gate.mockRestore();
+			await cancelled.close(context);
+		}
+	});
+
 	it.each([1, 512 * 1024])(
 		"rejects a completed %i-byte binary read after cancellation and closes its handle",
 		async (size) => {

@@ -1776,10 +1776,11 @@ export interface ExtensionAPI {
 	getSettings(): Settings;
 
 	/**
-	 * Set the active tools by name. Unknown and `hidden` tools are ignored. Tools with `codemode` or
-	 * `deferred` exposure stay callable from codemode scripts whether active or not.
+	 * Replace the active tools by name. Unknown and `hidden` tools are ignored. Pending startup
+	 * selections omitted from the replacement are retired. `mode: "add"` preserves those selections
+	 * and adds names without removing current tools. `codemode` and `deferred` tools stay callable.
 	 */
-	setActiveTools(toolNames: string[]): void;
+	setActiveTools(toolNames: string[], options?: { mode: "add" }): void;
 
 	/** Get available slash commands in the current session. */
 	getCommands(): SlashCommandInfo[];
@@ -2139,7 +2140,7 @@ export type GetSettingsHandler = () => Settings;
 
 export type GetCommandsHandler = () => SlashCommandInfo[];
 
-export type SetActiveToolsHandler = (toolNames: string[]) => void;
+export type SetActiveToolsHandler = ExtensionAPI["setActiveTools"];
 
 export type RefreshToolsHandler = () => void;
 

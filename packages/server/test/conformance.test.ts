@@ -14,7 +14,6 @@ import { encodeClientMessage } from "@earendil-works/pi-protocol";
 import { Type } from "typebox";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { Client, createClientChordLink } from "../../client/src/index.ts";
-import type { ByteConnectionHandler } from "../src/connection.ts";
 import { createRoutedLinkPair } from "../src/link.ts";
 import { Server } from "../src/server.ts";
 import { SessionRouter } from "../src/session-router.ts";
@@ -33,12 +32,11 @@ const clients = new Set<Client>();
 const hosts = new Set<Host>();
 
 async function connectClient(server: Server): Promise<Client> {
-	let handler: ByteConnectionHandler;
-	let closed = false;
 	const client = new Client({
 		serverId,
 		transportFactory: (handlers) => {
-			handler = server.accept({
+			let closed = false;
+			const handler = server.accept({
 				get closed() {
 					return closed;
 				},
@@ -111,6 +109,39 @@ afterEach(async () => {
 });
 
 describe("native routed Chord sessions", () => {
+	test("reconnects with a fresh native server attachment after closing its Chord link", async () => {
+		const backing = new TestServerHost();
+		await backing.seed("one");
+		let attachments = 0;
+		const attach = backing.serverServices.attachClient.bind(backing.serverServices);
+		vi.spyOn(backing.serverServices, "attachClient").mockImplementation((...args) => {
+			attachments++;
+			return attach(...args);
+		});
+		const server = createServer(backing);
+		const client = await connectClient(server);
+		const presentation = createHost({ name: "reconnect-presentation", self: null, kind: "client" });
+		hosts.add(presentation);
+		const first = createClientChordLink(client, () => ({ serverId }));
+		presentation.connect(first, { principal: null });
+		const management = await presentation.get(TestSessionManagement, {});
+		await presentation.root((ctx) => management.attach("one", ctx));
+		first.close("replace presentation");
+		expect(client.connected).toBe(false);
+		expect(() => createClientChordLink(client, () => ({ serverId }))).toThrow();
+		await client.reconnect();
+		presentation.connect(
+			createClientChordLink(client, () => ({ serverId })),
+			{ principal: null },
+		);
+		const fresh = await presentation.get(TestSessionManagement, {});
+		await presentation.root((ctx) => fresh.attach("one", ctx));
+		expect(client.attachment?.sessionId).toBe("one");
+		expect(attachments).toBe(2);
+		await presentation.root((ctx) => fresh.detach(ctx));
+		expect(client.attachment).toBeUndefined();
+	});
+
 	test("shares a hosted Session across independent presentation attachments", async () => {
 		const backing = new TestServerHost();
 		await backing.seed("one");

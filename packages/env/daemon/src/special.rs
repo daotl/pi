@@ -1,11 +1,11 @@
-//! Unix stream reads must not retain ordinary file workers while waiting for a writer or bytes.
+//! Unix stream I/O must not retain ordinary file workers while waiting for rendezvous or bytes.
 
 use crate::{Control, Failure, FileHandle, Server, finish_response, sys};
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +28,19 @@ pub enum Operation {
         handle: Arc<FileHandle>,
         offset: Option<u64>,
         length: usize,
+    },
+    WriteOpen {
+        path: String,
+        append: bool,
+        content: Vec<u8>,
+        keep: bool,
+    },
+    Write {
+        handle: Arc<FileHandle>,
+        content: Vec<u8>,
+        written: usize,
+        keep: bool,
+        initial: bool,
     },
 }
 
@@ -107,7 +120,12 @@ impl Sender {
     }
 }
 
-fn blocking_open(path: &str, control: &Control, defer: &AtomicBool) -> io::Result<Option<File>> {
+fn open_mode(
+    path: &str,
+    flags: libc::c_int,
+    control: &Control,
+    defer: &AtomicBool,
+) -> io::Result<Option<File>> {
     let path = CString::new(std::path::Path::new(path).as_os_str().as_bytes())
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
     let mut interrupted = false;
@@ -121,7 +139,13 @@ fn blocking_open(path: &str, control: &Control, defer: &AtomicBool) -> io::Resul
             return Ok(None);
         }
         // SAFETY: NUL-terminated path; unlike std OpenOptions, do not retry EINTR internally.
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                flags | libc::O_CLOEXEC,
+                0o666 as libc::c_uint,
+            )
+        };
         if fd >= 0 {
             // SAFETY: open returned a new descriptor now exclusively owned by this File. Retain it even if the
             // reactor concurrently deferred this job: its successful open already owns the writer rendezvous.
@@ -164,8 +188,19 @@ impl Openers {
                         Ok(job) => job,
                         Err(_) => return,
                     };
-                    let Operation::Open { path, .. } = &job.request.operation else {
-                        unreachable!()
+                    let (path, flags) = match &job.request.operation {
+                        Operation::Open { path, .. } => (path, libc::O_RDONLY),
+                        Operation::WriteOpen { path, append, .. } => (
+                            path,
+                            libc::O_WRONLY
+                                | libc::O_CREAT
+                                | if *append {
+                                    libc::O_APPEND
+                                } else {
+                                    libc::O_TRUNC
+                                },
+                        ),
+                        _ => unreachable!(),
                     };
                     // SAFETY: pthread_self identifies this live, exclusively owned helper thread.
                     *slot.lock().unwrap() = Some(Active {
@@ -175,7 +210,7 @@ impl Openers {
                     });
                     let registered = Registered(slot.clone());
                     let result = if mask_error == 0 {
-                        blocking_open(path, &job.request.control, &job.defer)
+                        open_mode(path, flags, &job.request.control, &job.defer)
                     } else {
                         Err(io::Error::from_raw_os_error(mask_error))
                     };
@@ -231,6 +266,58 @@ impl Openers {
 }
 
 impl Request {
+    fn attempt_write(&mut self) -> Option<Result<(serde_json::Value, Vec<u8>), Failure>> {
+        let Operation::Write {
+            handle,
+            content,
+            written,
+            ..
+        } = &mut self.operation
+        else {
+            return None;
+        };
+        let result = (|| {
+            if self.control.aborted.load(Ordering::SeqCst) {
+                return Err(Failure::new("aborted", "aborted"));
+            }
+            if handle.failed.load(Ordering::SeqCst) {
+                return Err(Failure::new("EBADF", "an earlier write failed"));
+            }
+            while *written < content.len() {
+                if self.control.aborted.load(Ordering::SeqCst) {
+                    return Err(Failure::new("aborted", "aborted"));
+                }
+                match (&handle.file).write(&content[*written..]) {
+                    Ok(0) => {
+                        return Err(Failure::io(
+                            &io::Error::from(io::ErrorKind::WriteZero),
+                            "write",
+                            &handle.path,
+                        ));
+                    }
+                    Ok(count) => *written += count,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(Failure::io(&error, "write", &handle.path)),
+                }
+            }
+            Ok(Some((json!({}), Vec::new())))
+        })();
+        match result {
+            Ok(None) => None,
+            Ok(Some(value)) => Some(Ok(value)),
+            Err(error) => {
+                handle.failed.store(true, Ordering::SeqCst);
+                Some(Err(error))
+            }
+        }
+    }
     fn attempt_read(
         &mut self,
         buffer: &mut Vec<u8>,
@@ -275,22 +362,25 @@ impl Request {
 }
 
 fn complete_open(server: &Server, opened: Opened) -> Option<Request> {
-    if matches!(&opened.result, Ok(None)) && !opened.request.control.aborted.load(Ordering::SeqCst)
-    {
-        return Some(opened.request);
+    let Opened {
+        mut request,
+        result,
+    } = opened;
+    if matches!(&result, Ok(None)) && !request.control.aborted.load(Ordering::SeqCst) {
+        return Some(request);
     }
-    let result = (|| {
-        if opened.request.control.aborted.load(Ordering::SeqCst) {
+    let file = (|| {
+        if request.control.aborted.load(Ordering::SeqCst) {
             return Err(Failure::new("aborted", "aborted"));
         }
-        let Operation::Open { path, .. } = &opened.request.operation else {
-            unreachable!()
+        let path = match &request.operation {
+            Operation::Open { path, .. } | Operation::WriteOpen { path, .. } => path,
+            _ => unreachable!(),
         };
-        let file = opened
-            .result
+        let file = result
             .map_err(|error| Failure::io(&error, "open", path))?
             .expect("nondeferred open owns a descriptor");
-        // SAFETY: the completed helper transferred exclusive ownership of this live descriptor.
+        // SAFETY: the helper transferred exclusive ownership of this live descriptor.
         unsafe {
             let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
             if flags < 0
@@ -299,9 +389,40 @@ fn complete_open(server: &Server, opened: Opened) -> Option<Request> {
                 return Err(Failure::io(&io::Error::last_os_error(), "open", path));
             }
         }
-        server.open_read(file, path).map(|json| (json, Vec::new()))
+        Ok(file)
     })();
-    finish_response(server, opened.request.id, false, result);
+    let result = match file {
+        Err(error) => Err(error),
+        Ok(file) => match request.operation {
+            Operation::Open { path, .. } => {
+                server.open_read(file, &path).map(|json| (json, Vec::new()))
+            }
+            Operation::WriteOpen {
+                path,
+                content,
+                keep,
+                ..
+            } => {
+                let handle = Arc::new(FileHandle {
+                    file,
+                    path,
+                    stream: true,
+                    failed: AtomicBool::new(false),
+                    serial: Mutex::default(),
+                });
+                request.operation = Operation::Write {
+                    handle,
+                    content,
+                    written: 0,
+                    keep,
+                    initial: true,
+                };
+                return Some(request);
+            }
+            _ => unreachable!(),
+        },
+    };
+    finish_response(server, request.id, false, result);
     None
 }
 
@@ -315,17 +436,22 @@ pub fn start(server: Weak<Server>) -> Sender {
     let sender = Sender(events.clone());
     std::thread::spawn(move || {
         let mut quick = Openers::start(events.clone(), false);
-        let mut slow = Openers::start(events, true);
+        let mut slow = Openers::start(events.clone(), true);
+        // Writer rendezvous never occupies a read-open helper: a later reader must be able to release it.
+        let mut writers = Openers::start(events, true);
         let mut pending = Vec::<Request>::new();
         let mut quick_queue = VecDeque::<Request>::new();
         let mut slow_queue = VecDeque::<Request>::new();
+        let mut write_queue = VecDeque::<Request>::new();
         let mut scratch = Vec::new();
         loop {
             let next = if pending.is_empty()
                 && quick_queue.is_empty()
                 && slow_queue.is_empty()
+                && write_queue.is_empty()
                 && quick.active == 0
                 && slow.active == 0
+                && writers.active == 0
             {
                 receiver
                     .recv()
@@ -348,6 +474,7 @@ pub fn start(server: Weak<Server>) -> Sender {
             // it: preserve that exact descriptor, including an empty writer's completed rendezvous.
             quick.interrupt(true);
             slow.interrupt(false);
+            writers.interrupt(false);
             for event in event
                 .into_iter()
                 .chain(receiver.try_iter().take(crate::MAX_HANDLES))
@@ -358,16 +485,34 @@ pub fn start(server: Weak<Server>) -> Sender {
                         opened,
                         slow: is_slow,
                     } => {
-                        let pool = if is_slow { &mut slow } else { &mut quick };
+                        let writing =
+                            matches!(opened.request.operation, Operation::WriteOpen { .. });
+                        let pool = if writing {
+                            &mut writers
+                        } else if is_slow {
+                            &mut slow
+                        } else {
+                            &mut quick
+                        };
                         pool.active -= 1;
                         if let Some(request) = complete_open(&server, opened) {
-                            slow_queue.push_back(request);
+                            match request.operation {
+                                Operation::Write { .. } => pending.push(request),
+                                Operation::WriteOpen { .. } => write_queue.push_back(request),
+                                _ => slow_queue.push_back(request),
+                            }
                         }
                     }
                 }
             }
             for request in arrivals {
-                if pending.len() + quick_queue.len() + slow_queue.len() + quick.active + slow.active
+                if pending.len()
+                    + quick_queue.len()
+                    + slow_queue.len()
+                    + write_queue.len()
+                    + quick.active
+                    + slow.active
+                    + writers.active
                     >= crate::MAX_HANDLES
                 {
                     finish_response(
@@ -381,10 +526,15 @@ pub fn start(server: Weak<Server>) -> Sender {
                 match &request.operation {
                     Operation::Open { slow: true, .. } => slow_queue.push_back(request),
                     Operation::Open { slow: false, .. } => quick_queue.push_back(request),
-                    Operation::Read { .. } => pending.push(request),
+                    Operation::WriteOpen { .. } => write_queue.push_back(request),
+                    Operation::Read { .. } | Operation::Write { .. } => pending.push(request),
                 }
             }
-            for (queue, pool) in [(&mut quick_queue, &mut quick), (&mut slow_queue, &mut slow)] {
+            for (queue, pool) in [
+                (&mut quick_queue, &mut quick),
+                (&mut slow_queue, &mut slow),
+                (&mut write_queue, &mut writers),
+            ] {
                 let count = queue.len();
                 for _ in 0..count {
                     let request = queue.pop_front().unwrap();
@@ -403,9 +553,33 @@ pub fn start(server: Weak<Server>) -> Sender {
                 }
             }
             let mut index = 0;
+            let mut writing = HashSet::new();
             while index < pending.len() {
-                if let Some(result) = pending[index].attempt_read(&mut scratch) {
-                    let request = pending.swap_remove(index);
+                if let Operation::Write { handle, .. } = &pending[index].operation
+                    && !writing.insert(Arc::as_ptr(handle))
+                {
+                    index += 1;
+                    continue;
+                }
+                let result = if matches!(pending[index].operation, Operation::Write { .. }) {
+                    pending[index].attempt_write()
+                } else {
+                    pending[index].attempt_read(&mut scratch)
+                };
+                if let Some(mut result) = result {
+                    let request = pending.remove(index);
+                    if let Operation::Write {
+                        handle,
+                        keep: true,
+                        initial: true,
+                        ..
+                    } = request.operation
+                        && result.is_ok()
+                    {
+                        result = server
+                            .insert(crate::Handle::File(handle))
+                            .map(|id| (json!({ "handle": id }), Vec::new()));
+                    }
                     finish_response(&server, request.id, false, result);
                 } else {
                     index += 1;
@@ -523,7 +697,7 @@ mod tests {
         std::fs::write(&path, b"ordinary").unwrap();
         let control = Control::default();
         let defer = AtomicBool::new(true);
-        let mut file = blocking_open(&path.to_string_lossy(), &control, &defer)
+        let mut file = open_mode(&path.to_string_lossy(), libc::O_RDONLY, &control, &defer)
             .unwrap()
             .expect(
                 "initial deferral cannot send an unattempted regular open behind stalled FIFOs",
@@ -532,7 +706,7 @@ mod tests {
         file.read_to_string(&mut content).unwrap();
         assert_eq!(content, "ordinary");
         control.cancel(false);
-        let cancelled = blocking_open(&path.to_string_lossy(), &control, &defer).unwrap_err();
+        let cancelled = open_mode(&path.to_string_lossy(), libc::O_RDONLY, &control, &defer).unwrap_err();
         assert_eq!(sys::error_name(&cancelled), "aborted");
         drop(file);
         std::fs::remove_dir_all(root).unwrap();

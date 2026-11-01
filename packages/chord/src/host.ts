@@ -222,6 +222,7 @@ export interface Host<P = unknown> {
 	/**
 	 * Force-disposes every object whose principal matches (never the host's own principal), awaits matching cleanup
 	 * already in progress, re-stamps or closes matching links, and propagates pattern matches to child hosts.
+	 * A failed restamp closes that link. Revocation, propagation and cleanup continue before errors are returned.
 	 */
 	invalidatePrincipal(match: PrincipalMatch<P>): Promise<void>;
 	/** Accepts a child link (a worker or a browser); requests on it act as `options.principal`. */
@@ -1135,6 +1136,7 @@ export class HostImpl implements Host, HostCore {
 			(object) => !this.isSelf(object.principal) && matches(object.principal),
 		);
 		const revocation = { matches, reason };
+		const errors: unknown[] = [];
 		this.#revocations.push(revocation);
 		try {
 			// Revoke every authority before any holder's asynchronous cleanup can stall the rest.
@@ -1149,14 +1151,33 @@ export class HostImpl implements Host, HostCore {
 			// Links acting as a matching principal are re-stamped (if the acceptor can) or closed.
 			for (const connection of [...this.connections]) {
 				if (connection.role !== "downstream" || !matches(connection.principal)) continue;
-				// Relays under the old principal close at once, including those still resolving their route.
-				connection.revoke(connection.restamp?.(connection.principal));
+				let principal: unknown;
+				try {
+					principal = connection.restamp?.(connection.principal);
+				} catch (error) {
+					errors.push(error);
+				}
+				// Failed replacement authentication closes the link instead of retaining its old authority.
+				try {
+					connection.revoke(principal);
+				} catch (error) {
+					errors.push(error);
+					try {
+						connection.link.close("principal invalidated");
+					} catch (error) {
+						errors.push(error);
+					}
+				}
 			}
 			// Patterns propagate to child hosts, which dispose their own matching objects (e.g. relayed guests).
 			if (typeof match !== "function") {
 				for (const connection of this.connections) {
 					if (connection.role === "downstream" && connection.peer.kind === "host") {
-						connection.send({ t: "invalidate", pattern: match });
+						try {
+							connection.send({ t: "invalidate", pattern: match });
+						} catch (error) {
+							errors.push(error);
+						}
 					}
 				}
 			}
@@ -1164,7 +1185,13 @@ export class HostImpl implements Host, HostCore {
 			this.#revocations.splice(this.#revocations.indexOf(revocation), 1);
 		}
 		// Revoking links may release their last holds and start disposal; join the objects captured before that.
-		await disposeHoldersFirst(matching, reason, "invalidatePrincipal: disposal failed");
+		try {
+			await disposeHoldersFirst(matching, reason, "invalidatePrincipal: disposal failed");
+		} catch (error) {
+			errors.push(error);
+		}
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) throw new AggregateError(errors, "invalidatePrincipal: revocation failed");
 	}
 
 	// ─── links ───

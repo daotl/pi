@@ -303,6 +303,74 @@ describe("RemoteExecutionEnv against NodeExecutionEnv", () => {
 	}, 120_000);
 
 	it.skipIf(process.platform === "win32")(
+		"keeps file workers and FIFO readers live behind waiting writers",
+		async () => {
+			const isolated = new Connection({ command: [daemon] });
+			const root = mkdtempSync(join(tmpdir(), "pi-env-fifo-writers-"));
+			dirs.push(root);
+			const env = new RemoteExecutionEnv({ connection: isolated, id: "pi-env:writers", cwd: root });
+			const controllers = Array.from({ length: 16 }, () => new AbortController());
+			try {
+				expect(await env.exec(["mkfifo", join(root, "fifo")], undefined, context)).toEqual({
+					ok: true,
+					value: { exitCode: 0 },
+				});
+				writeFileSync(join(root, "ordinary"), "available");
+				const started = Promise.withResolvers<void>();
+				let admitted = 0;
+				const writers = controllers.map((controller, index) =>
+					isolated.request(
+						"write",
+						{ path: join(root, "fifo") },
+						{
+							signal: controller.signal,
+							payload: Buffer.from(String(index)),
+							onStart: () => {
+								if (++admitted === controllers.length) started.resolve();
+							},
+						},
+					),
+				);
+				await started.promise;
+				expect(await env.readTextFile("ordinary", context)).toEqual({ ok: true, value: "available" });
+				const reader = env.readTextFile("fifo", context);
+				expect((await reader).ok).toBe(true);
+				await Promise.all(writers);
+				const cancelling = Promise.withResolvers<void>();
+				const pending = isolated
+					.request(
+						"write",
+						{ path: join(root, "fifo") },
+						{
+							signal: controllers[0]!.signal,
+							payload: Buffer.from("cancel"),
+							onStart: () => cancelling.resolve(),
+						},
+					)
+					.then(
+						() => "unexpected success",
+						(error: unknown) => {
+							if (error !== null && typeof error === "object" && "code" in error) return error.code;
+							throw error;
+						},
+					);
+				await cancelling.promise;
+				controllers[0]!.abort();
+				const cancelled = await pending;
+				expect(cancelled).toBe("aborted");
+				const payload = "a".repeat(700_000) + "b".repeat(700_000);
+				const writing = env.appendFile("fifo", payload, context);
+				expect(await env.readTextFile("fifo", context)).toEqual({ ok: true, value: payload });
+				expect(await writing).toEqual({ ok: true, value: undefined });
+			} finally {
+				for (const controller of controllers) controller.abort();
+				isolated.close();
+			}
+		},
+		10_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
 		"keeps ordinary operations live while FIFO opens wait and cancels every pending open",
 		async () => {
 			const isolated = new Connection({ command: [daemon] });

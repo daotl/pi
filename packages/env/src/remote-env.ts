@@ -303,6 +303,7 @@ class RemoteTextLineReader implements TextLineReader {
 	readonly #decoder = new StreamDecoder();
 	#offset = 0;
 	#buffered = "";
+	readonly #fragments: string[] = [];
 	#ended = false;
 	#closed = false;
 
@@ -319,25 +320,31 @@ class RemoteTextLineReader implements TextLineReader {
 			while (true) {
 				const newline = this.#buffered.indexOf("\n");
 				if (newline !== -1) {
-					const text = this.#buffered.slice(0, newline);
+					this.#fragments.push(this.#buffered.slice(0, newline));
+					const text = this.#fragments.join("");
+					this.#fragments.length = 0;
 					this.#buffered = this.#buffered.slice(newline + 1);
 					return ok({ text, terminated: true });
 				}
 				if (this.#ended) {
-					if (this.#buffered.length === 0) return ok(undefined);
-					const text = this.#buffered;
+					if (this.#buffered.length === 0 && this.#fragments.length === 0) return ok(undefined);
+					this.#fragments.push(this.#buffered);
+					const text = this.#fragments.join("");
+					this.#fragments.length = 0;
 					this.#buffered = "";
 					return ok({ text, terminated: false });
 				}
+				if (this.#buffered.length > 0) this.#fragments.push(this.#buffered);
+				this.#buffered = "";
 				const bytes = await this.#handle.pread(this.#offset, LINE_CHUNK, context.abortSignal);
 				const afterReadAbort = abortResult<TextLine | undefined>(context.abortSignal, path);
 				if (afterReadAbort) return afterReadAbort;
 				this.#offset += bytes.length;
 				if (bytes.length === 0) {
-					this.#buffered += this.#decoder.decode();
+					this.#buffered = this.#decoder.decode();
 					this.#ended = true;
 				} else {
-					this.#buffered += this.#decoder.decode(bytes);
+					this.#buffered = this.#decoder.decode(bytes);
 				}
 			}
 		} catch (error) {
@@ -349,6 +356,7 @@ class RemoteTextLineReader implements TextLineReader {
 		if (this.#closed) return;
 		this.#closed = true;
 		this.#buffered = "";
+		this.#fragments.length = 0;
 		await this.#handle.close();
 	}
 }

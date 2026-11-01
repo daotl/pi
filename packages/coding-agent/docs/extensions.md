@@ -302,7 +302,7 @@ A tool that reaches other tools declares which ones a call may reach with `reach
 
 Register every tool first, keep optional tools inactive, and use `pi.setActiveTools()` from a loader tool to select the desired active tools. Names must already be registered; unknown names are ignored.
 
-A `+name` entry in `--tools` also selects an inactive tool registered later, such as during `session_start`. Pi keeps unresolved selections until registration, a loadout change that deactivates a tool, or the next agent run. Later registrations do not reapply the startup modifiers over an explicit loadout.
+A `+name` entry in `--tools` also selects an inactive tool registered later, such as during `session_start`. Pi keeps unresolved selections until registration, a replacement that omits them, or the next agent run. `pi.setActiveTools(names)` is a replacement even if the registered active names do not change; requested pending names stay pending. Use `pi.setActiveTools(names, { mode: "add" })` for discovery that adds registered tools without retiring pending selections. Later registrations do not reapply startup modifiers over an explicit loadout.
 
 Pi records the initial prompt and tool set in the transcript's first system message, then appends tool and prompt changes before the next model request. Providers that cannot represent the transition receive a complete transcript checkpoint, which can invalidate the cached prefix.
 

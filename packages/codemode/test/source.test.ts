@@ -402,6 +402,25 @@ describe("parseCodemodeSource", () => {
 			expect(parseCodemodeSource(input)).toEqual({ code: input, options: {} });
 	});
 
+	it("recognizes regexps after ASI-terminated debugger, break and continue", () => {
+		for (const statement of ["debugger", "break", "break outer", "continue", "continue outer"]) {
+			const prefix = statement === "debugger" ? "" : "outer: while (false) { ";
+			const suffix = statement === "debugger" ? "" : " }";
+			for (const newline of ["\n", " /* newline\n */ ", "\r\n"]) {
+				const start = `${prefix}${statement}${newline}/\`/.test('x');`;
+				const input = `${start}\nconst sample = \`example\n// @options: {}\n\`;${suffix}`;
+				expect(parseCodemodeSource(input)).toEqual({ code: input, options: {} });
+				expect(() => parseCodemodeSource(`${start}\n// @options: {}\nreturn 1;${suffix}`)).toThrow(
+					`found one on line ${start.split("\n").length + 1}`,
+				);
+			}
+		}
+		for (const name of ["debugger", "break", "continue"]) {
+			const input = `obj.${name}\n/ \`example\n// @options: {}\n\`;`;
+			expect(parseCodemodeSource(input)).toEqual({ code: input, options: {} });
+		}
+	});
+
 	// #10631: an options line after the first line used to be ignored, so its timeout never applied.
 	it("rejects an options line that is not the first line", () => {
 		const cases: [string, number][] = [

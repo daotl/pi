@@ -89,7 +89,9 @@ function serializeStore(store: Readonly<Record<string, unknown>> | undefined): R
 	const serialized: Record<string, string> = {};
 	for (const [key, value] of Object.entries(store ?? {})) {
 		const json = JSON.stringify(value);
-		if (json !== undefined) serialized[key] = json;
+		if (json !== undefined) {
+			Object.defineProperty(serialized, key, { value: json, enumerable: true, configurable: true, writable: true });
+		}
 	}
 	return serialized;
 }
@@ -123,7 +125,14 @@ function parseStoreWrites(json: string): CodemodeStoreWrites {
 		}
 		const [key, value] = entry as [string, string?];
 		if (value === undefined) writes.delete.push(key);
-		else writes.set[key] = parseBridgeJson(value, `store value for ${JSON.stringify(key)}`);
+		else {
+			Object.defineProperty(writes.set, key, {
+				value: parseBridgeJson(value, `store value for ${JSON.stringify(key)}`),
+				enumerable: true,
+				configurable: true,
+				writable: true,
+			});
+		}
 	}
 	return writes;
 }

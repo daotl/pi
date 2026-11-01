@@ -1054,6 +1054,37 @@ describe("durable code mode", () => {
 		await opened.harness.close(context);
 	});
 
+	it("preserves reserved store keys across calls and a SQLite reopen", async () => {
+		const chat = codemodeChat();
+		const path = await sqlitePath();
+		chat.setup.faux.setResponses([
+			script('store("__proto__", { saved: 1 }); store("normal", 2); return load("__proto__");'),
+			DONE,
+			script('return [load("__proto__"), load("normal")];'),
+			DONE,
+		]);
+		let opened = await openChat(await openNodeSqliteStorage(path), chat.setup);
+		try {
+			await (await opened.root.submit({ type: "input", content: "save" }, context)).wait(context);
+			await (await opened.root.submit({ type: "input", content: "load" }, context)).wait(context);
+			const results = (await allEntries(opened.root)).filter((entry) => ToolResultEntry.is(entry));
+			const message = results.at(-1)!.model![0]!;
+			if (message.role !== "toolResult") throw new Error("Expected tool result");
+			expect(message.content.filter((item) => item.type === "text").at(-1)?.text).toBe('[{"saved":1},2]');
+			await opened.harness.close(context);
+			chat.setup.faux.setResponses([script('return [load("__proto__"), load("normal")];'), DONE]);
+			opened = await openChat(await openNodeSqliteStorage(path), chat.setup);
+			await (await opened.root.submit({ type: "input", content: "reopen" }, context)).wait(context);
+			const reopened = (await allEntries(opened.root)).filter((entry) => ToolResultEntry.is(entry)).at(-1)!;
+			const reopenedMessage = reopened.model![0]!;
+			if (reopenedMessage.role !== "toolResult") throw new Error("Expected reopened tool result");
+			expect(reopenedMessage.content.filter((item) => item.type === "text").at(-1)?.text).toBe('[{"saved":1},2]');
+		} finally {
+			await opened.harness.close(context);
+			await chat.sandbox.close();
+		}
+	});
+
 	it("keeps store() values per conversation, as of a fork's entry", async () => {
 		const chat = codemodeChat();
 		chat.holds.block = false;

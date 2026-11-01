@@ -287,8 +287,11 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 			services.link.receive((frame) => {
 				void this.sendMessage(state, { type: "chord", target, frame });
 			});
-			services.link.onClose((reason) => {
-				void this.sendMessage(state, { type: "chord", target, frame: { t: "bye", reason } });
+			services.link.onClose(() => {
+				if (state.disconnected) return;
+				state.stage = "closing";
+				// A server endpoint belongs to this handshake. Reopening requires a fresh attachment.
+				void this.closeConnection(state.connection).then(() => this.disconnect(state));
 			});
 		}
 	}

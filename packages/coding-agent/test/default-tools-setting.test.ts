@@ -219,6 +219,31 @@ describe("defaultTools setting", () => {
 		},
 	);
 
+	it.each([false, true])("replacement retains only explicitly requested pending tools (keep=%s)", async (keep) => {
+		const session = await createSession(["read", "late_tool"], {}, [
+			(pi) => {
+				pi.on("session_start", () => {
+					pi.registerTool({
+						name: "late_tool",
+						label: "Late",
+						description: "Late tool",
+						parameters: Type.Object({}),
+						defaultActive: false,
+						execute: async () => ({ content: [{ type: "text", text: "late" }], details: {} }),
+					});
+				});
+			},
+		]);
+		try {
+			session.setActiveToolsByName(keep ? ["read", "late_tool"] : ["read"]);
+			await session.bindExtensions({});
+			expect(session.getActiveToolNames()).toEqual(keep ? ["read", "late_tool"] : ["read"]);
+			expect(session.getCallableToolNames()).toEqual(keep ? ["read", "late_tool"] : ["read"]);
+		} finally {
+			session.dispose();
+		}
+	});
+
 	it.each(["replacement", "negative modifier", "excluded", "allowlist", "all", "builtin"] as const)(
 		"does not retain configured late tools after %s overrides the selection",
 		async (selection) => {

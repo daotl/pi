@@ -639,7 +639,7 @@ export class AgentSession {
 	/**
 	 * Tools of the initial, restored or reloaded loadout that are not registered yet, such as tools of MCP
 	 * servers that are still connecting. They are activated when they are registered, and dropped when
-	 * `setActiveToolsByName()` deactivates a tool or the next agent run starts.
+	 * a replacement omits them or the next agent run starts. Additive discovery keeps them.
 	 */
 	private _pendingToolNames = new Set<string>();
 	/** Names the restored branch added or removed, so late registration does not undo its loadout. */
@@ -1944,20 +1944,22 @@ export class AgentSession {
 	}
 
 	/**
-	 * Set active tools by name.
+	 * Replace active tools by name, or add them with `mode: "add"`. Replacement retires omitted pending selections.
 	 * Only tools in the registry can be enabled. Unknown and hidden tool names are ignored.
 	 * Also rebuilds the system prompt to reflect the new tool set.
 	 * Changes take effect on the next agent turn.
 	 */
-	setActiveToolsByName(toolNames: string[]): void {
-		const previous = this.getActiveToolNames();
-		this._setActiveTools(toolNames);
-		// A loadout that deactivates a tool replaces the restored one; additions keep pending selections.
-		const active = new Set(this.getActiveToolNames());
-		if (previous.some((name) => !active.has(name))) {
-			this._pendingToolNames.clear();
-			this._restoredToolNames.clear();
+	setActiveToolsByName(toolNames: string[], options?: { mode: "add" }): void {
+		if (options?.mode === "add") {
+			this._setActiveTools([...this.getActiveToolNames(), ...toolNames]);
+			return;
 		}
+		const requested = new Set(toolNames);
+		for (const name of this._pendingToolNames) {
+			if (!requested.has(name)) this._pendingToolNames.delete(name);
+		}
+		this._restoredToolNames.clear();
+		this._setActiveTools(toolNames);
 	}
 
 	private _setActiveTools(toolNames: string[]): void {
@@ -6205,7 +6207,7 @@ export class AgentSession {
 				getActiveTools: () => this.getActiveToolNames(),
 				getAllTools: () => this.getAllTools(),
 				getSettings: () => this.settingsManager.getSettings(),
-				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
+				setActiveTools: (toolNames, options) => this.setActiveToolsByName(toolNames, options),
 				refreshTools: () => this._refreshToolRegistry(),
 				getCommands,
 				setModel: async (model) => {

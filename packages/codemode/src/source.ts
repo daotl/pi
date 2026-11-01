@@ -137,6 +137,7 @@ function misplacedOptionsLine(input: string): number | undefined {
 	let control: false | "control" | "switch" | "for" = false;
 	let pendingFor = false;
 	let member = false;
+	let restrictedStatement: "label" | "end" | undefined;
 	let label = false;
 	while (index < input.length) {
 		const char = input[index];
@@ -189,6 +190,11 @@ function misplacedOptionsLine(input: string): number | undefined {
 			if (/[\r\n\u2028\u2029]/.test(char)) lineBreak = true;
 			index++;
 			continue;
+		}
+		if (restrictedStatement !== undefined && lineBreak) {
+			expressionStart = true;
+			statementStart = true;
+			restrictedStatement = undefined;
 		}
 		SOURCE_WORD.lastIndex = index;
 		const token = SOURCE_WORD.exec(input)?.[0];
@@ -332,6 +338,15 @@ function misplacedOptionsLine(input: string): number | undefined {
 				member = false;
 				continue;
 			}
+			const restrictedLabel = restrictedStatement === "label";
+			restrictedStatement =
+				!member && statementStart && /^(?:debugger|break|continue)$/.test(word)
+					? word === "debugger"
+						? "end"
+						: "label"
+					: restrictedLabel
+						? "end"
+						: undefined;
 			label = statementStart && !member;
 			if (directSwitch && !member && (word === "case" || word === "default")) {
 				directSwitch.label = true;

@@ -385,6 +385,43 @@ describe("links: relay, stamping, lifetime", () => {
 		assert.deepEqual(await again.who(), { guest: "g1", revision: 2 });
 	});
 
+	it("revokes every live relay and disposes local holders when restamping fails", async () => {
+		const c = cluster();
+		const failure = new Error("authentication lookup failed");
+		const first = c.browser(
+			{ guest: "g1" },
+			{
+				restamp: () => {
+					throw failure;
+				},
+			},
+		);
+		const second = c.browser({ guest: "g1" });
+		serveCounter(c.server);
+		const local = c.server.hold(Counter, { name: "local" }, { principal: { guest: "g1" } });
+		const one = first.host.hold(SessionCounter, { session: "S1", name: "one" });
+		const two = second.host.hold(SessionCounter, { session: "S1", name: "two" });
+		try {
+			await local.ready;
+			assert.equal(await one.add(1), 1);
+			assert.equal(await two.add(1), 1);
+			await assert.rejects(c.server.invalidatePrincipal({ guest: "g1" }), (error) => error === failure);
+			assert.equal(first.up.closed, true);
+			assert.equal(second.up.closed, true);
+			assert.equal(local.status, "gone");
+			await assert.rejects(one.add(1));
+			await assert.rejects(two.add(1));
+			for (let i = 0; i < 20 && (!c.log.includes("close one") || !c.log.includes("close two")); i++) await tick();
+			assert.ok(c.log.includes("close one"));
+			assert.ok(c.log.includes("close two"));
+		} finally {
+			await first.host.close();
+			await second.host.close();
+			await c.server.close();
+			for (const worker of c.workers.values()) await worker.close();
+		}
+	});
+
 	it("after a reconnect, state subscribers get a reset and calls work again", async () => {
 		const c = cluster();
 		const browser = c.browser({ guest: "g1" });
