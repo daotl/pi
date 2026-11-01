@@ -114,7 +114,7 @@ import type {
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
-import type { McpHttpServerConfig } from "../../core/mcp-servers.ts";
+import { type McpHttpServerConfig, mcpNamespace } from "../../core/mcp-servers.ts";
 import {
 	formatMessageContent,
 	formatMessageForEdit,
@@ -8844,8 +8844,10 @@ export class InteractiveMode {
 
 		let name = existing?.name ?? "radius";
 		if (!existing) {
-			const names = new Set(servers.map((server) => server.name));
-			for (let suffix = 1; names.has(name); suffix++) name = suffix === 1 ? "radius-mcp" : `radius-mcp-${suffix}`;
+			const namespaces = new Set(servers.map((server) => mcpNamespace(server.name)));
+			for (let suffix = 1; namespaces.has(mcpNamespace(name)); suffix++) {
+				name = suffix === 1 ? "radius-mcp" : `radius-mcp-${suffix}`;
+			}
 		}
 		const config: McpHttpServerConfig =
 			existing && "url" in existing.config

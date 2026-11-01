@@ -109,6 +109,13 @@ npm run pack:packages -- --out .artifacts/pi-packages
 This refreshes model data before building `pi-ai`. To avoid network access when
 model data is already hydrated, pass `--offline-model-data`.
 
+Local packing skips the release-daemon completeness check and announces that
+limitation. It supports installation and import testing without preparing the
+eight-platform `pi-env` daemon matrix, but does not certify a deployable
+`pi-env` release. Environment startup still needs the matching daemon assets
+under `packages/env/bin/`; see [pi-env development](packages/env/README.md#development).
+Publication retains the strict complete-asset check.
+
 Then configure an external project to consume one package and resolve all of
 its Pi dependencies from the same artifact set. npm is the default:
 

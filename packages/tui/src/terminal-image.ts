@@ -471,15 +471,45 @@ export function getKittyImagePlacement(line: string): KittyImagePlacement | unde
 export function cropKittyImageLine(line: string, hiddenRows: number, visibleRows: number): string {
 	const metadata = getKittyImageMetadata(line);
 	const match = /\x1b_G([^;]*);/.exec(line);
-	if (!metadata || !match || hiddenRows < 0 || hiddenRows >= metadata.rows || visibleRows <= 0) return line;
-	const croppedRows = Math.min(visibleRows, metadata.rows - hiddenRows);
-	if (hiddenRows === 0 && croppedRows === metadata.rows) return line;
-	const sourceY = Math.floor((metadata.heightPx * hiddenRows) / metadata.rows);
-	const sourceEnd = Math.ceil((metadata.heightPx * (hiddenRows + croppedRows)) / metadata.rows);
-	const sourceHeight = Math.max(1, Math.min(metadata.heightPx, sourceEnd) - sourceY);
-	const controls = match[1].split(",").filter((control) => !/^[yhr]=/.test(control));
-	controls.push(`y=${sourceY}`, `h=${sourceHeight}`, `r=${croppedRows}`);
-	return `${line.slice(0, match.index)}\x1b_G${controls.join(",")};${line.slice(match.index + match[0].length)}`;
+	if (!match) return line;
+	const controls = match[1].split(",");
+	const values: Record<string, string> = {};
+	for (const control of controls) {
+		const [key, value] = control.split("=", 2);
+		if (value !== undefined) values[key] = value;
+	}
+	const rows = getExplicitKittyImageRows(match[1]) ?? metadata?.rows;
+	if (rows === undefined || hiddenRows < 0 || hiddenRows >= rows || visibleRows <= 0) return line;
+	const croppedRows = Math.min(visibleRows, rows - hiddenRows);
+	if (hiddenRows === 0 && croppedRows === rows) return line;
+	const format = Number(values.f ?? 32);
+	const direct = values.t === undefined || values.t === "d";
+	// Only inspect the PNG header, never decode the complete (possibly chunked) payload.
+	const dimensions =
+		!metadata && direct && format === 100
+			? getPngDimensions(line.slice(match.index + match[0].length, match.index + match[0].length + 32))
+			: undefined;
+	const heightPx =
+		metadata?.heightPx ?? dimensions?.heightPx ?? (direct && (format === 24 || format === 32) ? Number(values.v) : 0);
+	const sourceY = Number(values.y ?? 0);
+	const sourceHeight = Number(values.h ?? heightPx);
+	if (
+		!Number.isFinite(heightPx) ||
+		heightPx <= 0 ||
+		!Number.isFinite(sourceY) ||
+		sourceY < 0 ||
+		sourceY >= heightPx ||
+		!Number.isFinite(sourceHeight) ||
+		sourceHeight <= 0 ||
+		sourceY + sourceHeight > heightPx
+	) {
+		return line;
+	}
+	const cropY = Math.floor((sourceHeight * hiddenRows) / rows);
+	const cropEnd = Math.ceil((sourceHeight * (hiddenRows + croppedRows)) / rows);
+	const croppedControls = controls.filter((control) => !/^[yhr]=/.test(control));
+	croppedControls.push(`y=${sourceY + cropY}`, `h=${cropEnd - cropY}`, `r=${croppedRows}`);
+	return `${line.slice(0, match.index)}\x1b_G${croppedControls.join(",")};${line.slice(match.index + match[0].length)}`;
 }
 
 function chooseLessDistortedCellCount(upperCount: number, idealCount: number): number {

@@ -192,8 +192,13 @@ abstract class WatchLifecycle<T, L, D extends Delivery<T>> {
 					await this.invoke(listener, delivery, withoutAbortSignal(delivery.context));
 				} catch (error) {
 					if (this.#end === undefined) {
-						this.#report?.(error);
-						this.#terminate({ reason: "listener_error", error: toError(error) });
+						try {
+							this.#report?.(error);
+						} catch {
+							// Reporting must not prevent the original listener failure from ending the watch.
+						} finally {
+							this.#terminate({ reason: "listener_error", error: toError(error) });
+						}
 					}
 					break;
 				}
@@ -215,6 +220,7 @@ abstract class WatchLifecycle<T, L, D extends Delivery<T>> {
 		if (this.#end !== undefined) return;
 		this.#end = end;
 		const detach = this.#detach;
+		const report = this.#report;
 		this.#detach = undefined;
 		this.#report = undefined;
 		this.#listener = undefined;
@@ -224,8 +230,17 @@ abstract class WatchLifecycle<T, L, D extends Delivery<T>> {
 		}
 		this.#cancellationSignal = undefined;
 		this.#cancellationListener = undefined;
-		detach?.();
-		this.#closed.resolve(end);
+		try {
+			detach?.();
+		} catch (error) {
+			try {
+				report?.(error);
+			} catch {
+				// Cleanup and reporting failures cannot change the terminal reason or strand closed.
+			}
+		} finally {
+			this.#closed.resolve(end);
+		}
 	}
 }
 

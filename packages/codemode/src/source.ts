@@ -106,6 +106,7 @@ function misplacedOptionsLine(input: string): number | undefined {
 	// A block ends a statement; an object or function expression still permits division.
 	type Brace =
 		| "block"
+		| "switch"
 		| "object"
 		| "function"
 		| "template"
@@ -117,16 +118,23 @@ function misplacedOptionsLine(input: string): number | undefined {
 				brackets: number;
 		  };
 	const braces: Brace[] = [];
-	const parentheses: ("control" | "expression" | "declaration" | "function" | "method")[] = [];
+	const parentheses: ("control" | "switch" | "expression" | "declaration" | "function" | "method")[] = [];
 	let brackets = 0;
 	let lineBreak = false;
 	let statementStart = true;
 	let functionParameters: "declaration" | "function" | undefined;
-	let nextBrace: "block" | "function" | "class-member" | undefined;
+	let nextBrace: "block" | "switch" | "function" | "class-member" | undefined;
 	const classBodies: { braces: number; parentheses: number; declaration: boolean }[] = [];
 	const objectBodies: { braces: number; parentheses: number; brackets: number; property: boolean }[] = [];
 	const statementScopes = [{ braces: 0, parentheses: 0, brackets: 0 }];
-	let control = false;
+	const switchScopes: {
+		braces: number;
+		parentheses: number;
+		brackets: number;
+		label: boolean;
+		conditionals: number;
+	}[] = [];
+	let control: false | "control" | "switch" = false;
 	let member = false;
 	let label = false;
 	while (index < input.length) {
@@ -245,6 +253,13 @@ function misplacedOptionsLine(input: string): number | undefined {
 		const body = nextBrace;
 		nextBrace = undefined;
 		const labelColon = label && char === ":";
+		const switchScope = switchScopes.at(-1);
+		const directSwitch =
+			switchScope?.braces === braces.length &&
+			switchScope.parentheses === parentheses.length &&
+			switchScope.brackets === brackets
+				? switchScope
+				: undefined;
 		label = false;
 		if (char === '"' || char === "'" || (char === "/" && expressionStart)) {
 			const delimiter = char;
@@ -278,11 +293,7 @@ function misplacedOptionsLine(input: string): number | undefined {
 		if (char === "(") {
 			parentheses.push(
 				functionParameters ??
-					(classBody?.phase === "member" || directObject?.property
-						? "method"
-						: control
-							? "control"
-							: "expression"),
+					(classBody?.phase === "member" || directObject?.property ? "method" : control ? control : "expression"),
 			);
 			functionParameters = undefined;
 			control = false;
@@ -293,9 +304,10 @@ function misplacedOptionsLine(input: string): number | undefined {
 		}
 		if (char === ")") {
 			const context = parentheses.pop();
-			expressionStart = context === "control";
+			expressionStart = context === "control" || context === "switch";
 			statementStart = expressionStart;
 			if (context === "control" || context === "declaration") nextBrace = "block";
+			else if (context === "switch") nextBrace = "switch";
 			else if (context === "function") nextBrace = "function";
 			else if (context === "method") nextBrace = "class-member";
 			index++;
@@ -314,6 +326,11 @@ function misplacedOptionsLine(input: string): number | undefined {
 				continue;
 			}
 			label = statementStart && !member;
+			if (directSwitch && !member && (word === "case" || word === "default")) {
+				directSwitch.label = true;
+				directSwitch.conditionals = 0;
+				label = false;
+			}
 			if (!member && word === "function") {
 				functionParameters = statementStart ? "declaration" : "function";
 			}
@@ -324,7 +341,12 @@ function misplacedOptionsLine(input: string): number | undefined {
 			expressionStart =
 				statementKeyword ||
 				(!member && /^(?:return|throw|case|delete|void|typeof|new|in|of|yield|await|instanceof)$/.test(word));
-			control = !member && /^(?:if|while|for|with|switch|catch)$/.test(word);
+			control =
+				!member && word === "switch"
+					? "switch"
+					: !member && /^(?:if|while|for|with|catch)$/.test(word)
+						? "control"
+						: false;
 			// async can precede a function declaration without changing its statement context.
 			statementStart = statementKeyword || (!member && /^(?:async|export|default)$/.test(word) && statementStart);
 			member = false;
@@ -347,16 +369,27 @@ function misplacedOptionsLine(input: string): number | undefined {
 			if (context === "object") {
 				objectBodies.push({ braces: braces.length, parentheses: parentheses.length, brackets, property: true });
 			}
+			if (context === "switch") {
+				switchScopes.push({
+					braces: braces.length,
+					parentheses: parentheses.length,
+					brackets,
+					label: false,
+					conditionals: 0,
+				});
+			}
 			expressionStart = true;
-			statementStart = context === "block" || context === "function" || context === "class-member";
+			statementStart =
+				context === "block" || context === "switch" || context === "function" || context === "class-member";
 			if (statementStart) statementScopes.push({ braces: braces.length, parentheses: parentheses.length, brackets });
 		} else if (char === "}") {
 			if (statementScopes.at(-1)?.braces === braces.length) statementScopes.pop();
 			if (objectBodies.at(-1)?.braces === braces.length) objectBodies.pop();
+			if (switchScopes.at(-1)?.braces === braces.length) switchScopes.pop();
 			const brace = braces.pop();
 			const context = typeof brace === "object" ? brace.kind : brace;
 			template = context === "template";
-			expressionStart = context === "block" || context === "class-declaration";
+			expressionStart = context === "block" || context === "switch" || context === "class-declaration";
 			statementStart = expressionStart;
 			if (context === "class-member") {
 				const owner = braces.at(-1);
@@ -364,6 +397,26 @@ function misplacedOptionsLine(input: string): number | undefined {
 				statementStart = false;
 			}
 		} else {
+			// Only a case/default label's final colon opens a statement list. Object
+			// properties and nested expressions have their own depth; ternaries at
+			// switch depth consume their colons before the label can finish.
+			let switchLabelColon = false;
+			if (directSwitch?.label) {
+				if (
+					char === "?" &&
+					input[index - 1] !== "?" &&
+					input[index + 1] !== "?" &&
+					(input[index + 1] !== "." || /\d/.test(input[index + 2] ?? ""))
+				) {
+					directSwitch.conditionals++;
+				} else if (char === ":") {
+					if (directSwitch.conditionals > 0) directSwitch.conditionals--;
+					else {
+						directSwitch.label = false;
+						switchLabelColon = true;
+					}
+				}
+			}
 			if (directObject) {
 				if (char === ",") directObject.property = true;
 				else if (char === ":" || (char === "." && input[index + 1] === ".")) directObject.property = false;
@@ -373,7 +426,7 @@ function misplacedOptionsLine(input: string): number | undefined {
 			if (classBody && char === ";") classBody.phase = "member";
 			else if (classBody?.phase === "member" && char === "=") classBody.phase = "initializer";
 			expressionStart = char !== "]" && char !== "." && char !== "#";
-			statementStart = (char === ";" && !classBody) || labelColon;
+			statementStart = (char === ";" && !classBody) || labelColon || switchLabelColon;
 		}
 		control = false;
 		member = char === "." || char === "#";

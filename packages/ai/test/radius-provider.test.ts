@@ -188,6 +188,62 @@ describe("Radius provider catalogs", () => {
 		expect(fetch).toHaveBeenCalledOnce();
 	});
 
+	it.each(["auth", "provider"] as const)(
+		"loads and publishes the %s endpoint catalog without sending credentials to the original gateway",
+		async (endpointSource) => {
+			const credentials = new InMemoryCredentialStore();
+			await credentials.modify("radius", async () => ({ type: "api_key", key: "stored-secret" }));
+			const store = new InMemoryModelsStore();
+			const models = createModels({ credentials, modelsStore: store });
+			const endpoint = "https://account-radius.example/v1/";
+			const config: RadiusGatewayConfig = {
+				baseUrl: endpoint,
+				models: [{ ...radiusConfig().models[1], id: "account-only", name: "Account Only" }],
+			};
+			models.setProvider({
+				...radiusProvider(),
+				baseUrl: endpointSource === "provider" ? endpoint : "https://configured-radius.example/v1",
+				auth: {
+					apiKey: {
+						name: "Account gateway",
+						resolve: async () => ({
+							auth: {
+								apiKey: "resolved-secret",
+								headers: { "X-Organization": "account-org" },
+								...(endpointSource === "auth" ? { baseUrl: endpoint } : {}),
+							},
+						}),
+					},
+				},
+			});
+			const requests: { url: string; authorization: string | null; organization: string | null }[] = [];
+			vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+				const url = String(input);
+				const headers = new Headers(init?.headers);
+				requests.push({
+					url,
+					authorization: headers.get("authorization"),
+					organization: headers.get("x-organization"),
+				});
+				return Response.json(url === "https://account-radius.example/v1/config" ? config : radiusConfig());
+			});
+
+			const result = await models.refresh({ providers: ["radius"] });
+
+			expect(result.errors).toEqual(new Map());
+			expect(requests).toEqual([
+				{
+					url: "https://account-radius.example/v1/config",
+					authorization: "Bearer resolved-secret",
+					organization: "account-org",
+				},
+			]);
+			const accountModels = getRadiusModelsFromConfig("radius", config);
+			expect(models.getModels("radius")).toEqual(accountModels);
+			expect((await store.read("radius"))?.models).toEqual(accountModels);
+		},
+	);
+
 	it.each([
 		{ network: false, bearerHeader: false },
 		{ network: true, bearerHeader: false },

@@ -600,7 +600,11 @@ export class Reload {
 		}
 		const deferred = new Set<ResourceImpl>();
 		for (const resource of run.created.resources) {
-			if (resource.exclusive || resource.deps.some((dep) => deferred.has(dep as ResourceImpl)))
+			if (
+				resource.exclusive ||
+				object.decls.resources.get(resource.key)?.exclusive ||
+				resource.deps.some((dep) => deferred.has(dep as ResourceImpl))
+			)
 				deferred.add(resource);
 		}
 		for (const resource of deferred) {

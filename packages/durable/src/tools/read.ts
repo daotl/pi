@@ -162,9 +162,14 @@ async function readImage(
 			notes.push(`Converted from ${prepared.convertedFrom} to ${prepared.mimeType}.`);
 		if (prepared.resized !== undefined) {
 			const { from, to } = prepared.resized;
-			const scale = (from.width / to.width).toFixed(2);
+			const scaleX = from.width / to.width;
+			const scaleY = from.height / to.height;
+			const mapping =
+				scaleX === scaleY
+					? `Multiply coordinates by ${scaleX.toFixed(2)}`
+					: `Multiply x coordinates by ${scaleX.toFixed(2)} and y coordinates by ${scaleY.toFixed(2)}`;
 			notes.push(
-				`Resized from ${from.width}x${from.height} to ${to.width}x${to.height}. Multiply coordinates by ${scale} to map them to the original.`,
+				`Resized from ${from.width}x${from.height} to ${to.width}x${to.height}. ${mapping} to map them to the original.`,
 			);
 		}
 	} else {

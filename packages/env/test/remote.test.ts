@@ -10,11 +10,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
+import { setTimeout as delay, setImmediate as nextTurn } from "node:timers/promises";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import { getOrThrow, type ShellOutputInfo, type WatchChange, type WatchTarget } from "@earendil-works/pi-durable/env";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { Connection, type Json, nodePlatform, RemoteError } from "../src/connection.ts";
+import { LocalExecutionEnv } from "../src/list-files.ts";
 import { RemoteExecutionEnv } from "../src/remote-env.ts";
 import { daemon } from "./daemon.ts";
 
@@ -46,6 +47,255 @@ async function expectNativeChange(changes: WatchChange[], path: string, action: 
 }
 
 describe("RemoteExecutionEnv", () => {
+	it("rejects oversized JSON and payload requests without interrupting a running command", async () => {
+		const { env, connection } = environment();
+		const ready = Promise.withResolvers<void>();
+		let output = "";
+		const controller = new AbortController();
+		const running = env.exec(
+			[
+				process.execPath,
+				"-e",
+				'process.stdout.write("ready", () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0))',
+			],
+			{
+				onOutput: (text) => {
+					output += text;
+					ready.resolve();
+				},
+			},
+			withAbortSignal(controller.signal, context),
+		);
+		try {
+			await ready.promise;
+			const session = await connection.session();
+			let starts = 0;
+			for (const options of [
+				{
+					json: { path: join(env.cwd, "oversized.bin"), parents: false },
+					payload: new Uint8Array(16 * 1024 * 1024),
+				},
+				{
+					json: { path: join(env.cwd, "oversized-json.bin"), extra: "é".repeat(8 * 1024 * 1024) },
+					payload: undefined,
+				},
+			]) {
+				await expect(
+					connection.request("write", options.json, {
+						payload: options.payload,
+						onStart: () => starts++,
+					}),
+				).rejects.toMatchObject({ code: "E2BIG" });
+			}
+			expect(starts).toBe(0);
+			expect(await connection.session()).toBe(session);
+			getOrThrow(await env.writeFile("after-size-error.txt", "still connected", context));
+			expect(getOrThrow(await env.readTextFile("after-size-error.txt", context))).toBe("still connected");
+			expect(existsSync(join(env.cwd, "oversized.bin"))).toBe(false);
+			expect(existsSync(join(env.cwd, "oversized-json.bin"))).toBe(false);
+		} finally {
+			controller.abort();
+			const result = await running;
+			expect(result).toMatchObject({ ok: false, error: { code: "aborted" } });
+		}
+		expect(output).toBe("ready");
+	});
+
+	it("accepts the exact encoded frame limit and rejects one extra payload byte", async () => {
+		const { env, connection } = environment();
+		const path = join(env.cwd, "frame-limit.bin");
+		const json = { path, parents: false };
+		const size = 16 * 1024 * 1024 - 9 - Buffer.byteLength(JSON.stringify({ ...json, op: "write" }));
+		const payload = new Uint8Array(size).fill(0x61);
+		await connection.request("write", json, { payload });
+		await expect(connection.request("write", json, { payload: new Uint8Array(size + 1) })).rejects.toMatchObject({
+			code: "E2BIG",
+		});
+		expect(
+			Buffer.compare(Buffer.from(getOrThrow(await env.readBinaryFile(path, context))), Buffer.from(payload)),
+		).toBe(0);
+	});
+
+	it.each([
+		{ timeoutMs: -1 },
+		{ timeoutMs: 1e300 },
+		{ window: { maxBytes: 1000, maxLines: 20, minIntervalMs: -1, bytesPerSecond: 1000 } },
+		{ window: { maxBytes: 1000, maxLines: 20, minIntervalMs: 1e300, bytesPerSecond: 1000 } },
+	])("settles invalid wire durations with EINVAL and keeps the daemon usable: %j", async (fields) => {
+		const { env, connection } = environment();
+		const session = await connection.session();
+		// A hung native request needs a real guard: fake timers cannot drive the child process's I/O.
+		let guard: NodeJS.Timeout | undefined;
+		const deadline = new Promise<never>((_resolve, reject) => {
+			guard = setTimeout(() => reject(new Error("invalid duration request did not settle")), 2000);
+		});
+		try {
+			await expect(
+				Promise.race([
+					connection.request("exec", {
+						argv: [process.execPath, "-e", 'require("node:fs").writeFileSync("invalid-ran", "ran")'],
+						cwd: env.cwd,
+						...fields,
+					}),
+					deadline,
+				]),
+			).rejects.toMatchObject({ code: "EINVAL" });
+			expect(existsSync(join(env.cwd, "invalid-ran"))).toBe(false);
+			let output = "";
+			const result = await connection.request(
+				"exec",
+				{
+					argv: [process.execPath, "-e", "process.stdout.write('valid')"],
+					cwd: env.cwd,
+					timeoutMs: 10_000.5,
+					window: { maxBytes: 1000, maxLines: 20, minIntervalMs: 0.5, bytesPerSecond: 1000 },
+				},
+				{
+					onEvent: (_event, payload) => {
+						output += Buffer.from(payload).toString("utf8");
+					},
+				},
+			);
+			expect(result.json.exitCode).toBe(0);
+			expect(result.session).toBe(session);
+			expect(output).toBe("valid");
+		} finally {
+			clearTimeout(guard);
+		}
+	});
+
+	it.each([
+		"exec cwd",
+		"read",
+		"write",
+		"rename",
+		"listFiles",
+		"local listFiles",
+		"absolutePath",
+		"joinPath",
+		"temp",
+		"watch",
+	])("cancels %s while shared startup is pending without dispatching it", async (operation) => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-env-path-startup-"));
+		dirs.push(cwd);
+		const entered = Promise.withResolvers<void>();
+		const startup = Promise.withResolvers<readonly string[]>();
+		const connection = new Connection({
+			command: () => {
+				entered.resolve();
+				return startup.promise;
+			},
+		});
+		connections.push(connection);
+		const env = new RemoteExecutionEnv({ connection, id: "path-startup", cwd });
+		const controller = new AbortController();
+		const cancelledContext = withAbortSignal(controller.signal, context);
+		const invoke = () => {
+			switch (operation) {
+				case "exec cwd":
+					return env.exec(
+						[process.execPath, "-e", 'require("node:fs").writeFileSync("cancelled", "ran")'],
+						{ cwd },
+						cancelledContext,
+					);
+				case "read":
+					return env.readTextFile("missing", cancelledContext);
+				case "write":
+					return env.writeFile("cancelled", "ran", cancelledContext);
+				case "rename":
+					return env.renameFile("missing", "cancelled", cancelledContext);
+				case "listFiles":
+					return env.listFiles(".", undefined, cancelledContext);
+				case "local listFiles":
+					return new LocalExecutionEnv({ connection, cwd }).listFiles(".", undefined, cancelledContext);
+				case "absolutePath":
+					return env.absolutePath(".", cancelledContext);
+				case "joinPath":
+					return env.joinPath(["a", "b"], cancelledContext);
+				case "temp":
+					return env.createTempDir("cancelled-", cancelledContext);
+				default:
+					return env.watch([{ path: "." }], () => {}, cancelledContext);
+			}
+		};
+		let settled = false;
+		const cancelled = invoke().then((result) => {
+			settled = true;
+			return result;
+		});
+		await entered.promise;
+		const survivor = connection.info();
+		try {
+			controller.abort();
+			await nextTurn();
+			expect(settled).toBe(true);
+			expect(await cancelled).toMatchObject({ ok: false, error: { code: "aborted" } });
+		} finally {
+			startup.resolve([daemon]);
+			await survivor;
+			const result = await cancelled;
+			if (
+				result.ok &&
+				typeof result.value === "object" &&
+				result.value !== null &&
+				"close" in result.value &&
+				typeof result.value.close === "function"
+			)
+				await result.value.close(context);
+		}
+		getOrThrow(await env.writeFile("survivor", "shared startup", context));
+		expect(getOrThrow(await env.readTextFile("survivor", context))).toBe("shared startup");
+		expect(existsSync(join(cwd, "cancelled"))).toBe(false);
+	});
+
+	it("does not start a connection for already-aborted file and metadata operations", async () => {
+		let starts = 0;
+		const connection = new Connection({
+			command: async () => {
+				starts++;
+				throw new Error("unexpected startup");
+			},
+		});
+		connections.push(connection);
+		const env = new RemoteExecutionEnv({ connection, id: "already-aborted", cwd: tmpdir() });
+		const controller = new AbortController();
+		controller.abort();
+		const aborted = withAbortSignal(controller.signal, context);
+		for (const result of await Promise.all([
+			env.readTextFile("missing", aborted),
+			env.writeFile("cancelled", "ran", aborted),
+			env.renameFile("missing", "cancelled", aborted),
+			env.listFiles(".", undefined, aborted),
+			env.absolutePath(".", aborted),
+			env.joinPath(["a", "b"], aborted),
+		]))
+			expect(result).toMatchObject({ ok: false, error: { code: "aborted" } });
+		expect(starts).toBe(0);
+	});
+
+	it("keeps abort precedence when the shared command factory subsequently rejects", async () => {
+		const entered = Promise.withResolvers<void>();
+		const startup = Promise.withResolvers<readonly string[]>();
+		const connection = new Connection({
+			command: () => {
+				entered.resolve();
+				return startup.promise;
+			},
+		});
+		connections.push(connection);
+		const env = new RemoteExecutionEnv({ connection, id: "failed-startup-abort", cwd: tmpdir() });
+		const controller = new AbortController();
+		const aborted = withAbortSignal(controller.signal, context);
+		const command = env.exec([process.execPath, "-e", "process.exit(0)"], { cwd: "." }, aborted);
+		const file = env.readTextFile("missing", aborted);
+		await entered.promise;
+		controller.abort();
+		await nextTurn();
+		startup.reject(new Error("startup failed after cancellation"));
+		for (const result of await Promise.all([command, file])) {
+			expect(result).toMatchObject({ ok: false, error: { code: "aborted" } });
+		}
+	});
 	it("does not create a directory for an already-aborted request, including a session-bound request", async () => {
 		const { env, connection } = environment();
 		const session = await connection.session();

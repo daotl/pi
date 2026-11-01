@@ -15,6 +15,8 @@ function printUsage() {
 
 Builds and packs the publishable packages, then installs the tarballs into
 isolated directories outside the repository for local release testing.
+This local check skips release-daemon completeness and does not certify a
+deployable pi-env release. Publication still requires all daemon assets.
 
 Options:
   --out <dir>          Output directory. Defaults to a new directory under ${tmpdir()}
@@ -97,12 +99,14 @@ if (rootPackageJson.name !== "pi-monorepo") throw new Error("Run this script fro
 execNpmSync(["run", "generate:models"], { cwd: repoRoot, stdio: "inherit" });
 if (!options.skipCheck) execNpmSync(["run", "check"], { cwd: repoRoot, stdio: "inherit" });
 
+console.warn("Local artifacts: skipping release-daemon completeness; this does not certify a deployable pi-env release. Publication still requires all daemon assets.");
 const artifactSet = produceArtifactSet({
 	build: true,
 	force: options.force,
 	offlineModelData: true,
 	outDir: options.outDir,
 	repoRoot,
+	requireEnvReleaseAssets: false,
 });
 const outDir = artifactSet.artifactDirectory;
 const binaryDirectory = join(outDir, "bun");

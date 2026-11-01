@@ -763,7 +763,7 @@ const sessions = self.get(Sessions, {});  // `hostNamed("server")`: worker → s
   side that has to load new code. A browser reloads its page instead of reconnecting:
 
   ```ts
-  host.connect(webSocketLink(socket), { onProtocolMismatch: () => location.reload() });
+  host.connect(webSocketLink(socket), { principal: { kind: "server" }, onProtocolMismatch: () => location.reload() });
   ```
 - **Browsers** don't take part in commits. They learn about new code through shape and `reset` messages, and an incompatible contract makes their calls fail with `upgrade_required`.
 

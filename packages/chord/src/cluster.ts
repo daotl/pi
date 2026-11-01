@@ -68,6 +68,31 @@ function awaitPhase(
 	return settled;
 }
 
+/** Keep the child in the transaction until rollback finishes, or fence it by disconnecting on a missed receipt. */
+async function abortChild(connection: Connection, id: number, deadline: number): Promise<void> {
+	if (!connection.open) return;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const aborted = new Promise<unknown>((resolve, reject) => {
+		connection.abortions.set(id, { resolve, reject });
+		timer = setTimeout(() => {
+			// Settle the deadline failure before close rejects outstanding receipts as unavailable.
+			reject(new ChordError("aborted", `rollback missing after ${deadline} ms`, { reason: "vote_deadline" }));
+			connection.link.close("reload rollback deadline");
+		}, deadline);
+	});
+	aborted.catch(() => {});
+	try {
+		connection.send({ t: "abort", reload: id });
+		await aborted;
+	} catch (error) {
+		if (connection.open) connection.link.close("reload rollback failed");
+		throw error;
+	} finally {
+		clearTimeout(timer);
+		connection.abortions.delete(id);
+	}
+}
+
 export async function runClusterReload(
 	host: HostImpl,
 	plugins: readonly PluginRef[],
@@ -95,6 +120,11 @@ export async function runClusterReload(
 	};
 	const reload = await beginReload(host, plugins, options, codeVersion, transaction);
 	for (const connection of participants) connection.transaction = transaction.id;
+	let aborting: Promise<PromiseSettledResult<void>[]> | undefined;
+	const abortParticipants = (): Promise<PromiseSettledResult<void>[]> => {
+		aborting ??= Promise.allSettled(participants.map((connection) => abortChild(connection, id, deadline)));
+		return aborting;
+	};
 	try {
 		// Retire first: its `retire` frames reach every child before `prepare` (FIFO), so a child never retires a code
 		// version this host still runs roots of.
@@ -144,10 +174,9 @@ export async function runClusterReload(
 					connection.preparations.delete(`${id}:${phase}`);
 				}
 				connection.votes.delete(id);
-				connection.send({ t: "abort", reload: id });
 			}
 			// Rollback aborts immediately, then waits for in-flight preparation before restoring the old runtime.
-			await Promise.allSettled([...preparing, rollback]);
+			await Promise.allSettled([...preparing, rollback, abortParticipants()]);
 			throw error;
 		}
 		let report: ReloadReport;
@@ -160,8 +189,7 @@ export async function runClusterReload(
 			});
 		} catch (error) {
 			if (host.failed === undefined) {
-				await reload.rollback();
-				for (const connection of participants) connection.send({ t: "abort", reload: id });
+				await Promise.allSettled([reload.rollback(), abortParticipants()]);
 			}
 			throw error;
 		}
@@ -172,9 +200,8 @@ export async function runClusterReload(
 		host.rememberRemoteModules(options.remote, options.remoteRemove, Object.values(children));
 		return { ...report, children };
 	} catch (error) {
-		if (host.failed === undefined && !reload.rolledBack) {
-			await reload.rollback();
-			for (const connection of participants) connection.send({ t: "abort", reload: id });
+		if (host.failed === undefined) {
+			await Promise.allSettled([reload.rollback(), abortParticipants()]);
 		}
 		throw error;
 	} finally {
@@ -255,21 +282,7 @@ export async function reconcileChild(host: HostImpl, connection: Connection): Pr
 			}
 		}
 		if (host.current.id !== codeVersion) {
-			// The child owns its reload slot until rollback finishes, not merely until it receives abort.
-			let timer: ReturnType<typeof setTimeout> | undefined;
-			const aborted = new Promise<unknown>((resolve, reject) => {
-				connection.abortions.set(id, { resolve, reject });
-				timer = setTimeout(() => {
-					connection.abortions.delete(id);
-					reject(
-						new ChordError("aborted", `rollback missing after ${RECONCILE_DEADLINE} ms`, {
-							reason: "vote_deadline",
-						}),
-					);
-				}, RECONCILE_DEADLINE);
-			});
-			connection.send({ t: "abort", reload: id });
-			await aborted.finally(() => clearTimeout(timer));
+			await abortChild(connection, id, RECONCILE_DEADLINE);
 			connection.transaction = undefined;
 			continue;
 		}

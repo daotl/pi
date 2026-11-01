@@ -1057,12 +1057,14 @@ export interface DocumentObserver {
 export type SessionEnd = { readonly reason: "closed" } | { readonly reason: "failed"; readonly error: unknown };
 
 /**
- * When a commit reaches Storage. `immediate`, the default: before `commit()` resolves. `deferred`: when every write of
- * the commit changes an existing conversation document with `history: "latest"` and `fork: "initial"` (no creation,
- * migration, or retirement), the Session adopts it in memory, shows it to watches and views, and resolves, but stores it
+ * When a commit reaches Storage. `immediate`, the default: before `commit()` resolves. `deferred`: when the commit
+ * accesses only one document and writes only changes to that existing conversation document with `history: "latest"`
+ * and `fork: "initial"` (no creation, migration, or retirement), the Session adopts it in memory and shows it to watches
+ * and views, and resolves, but stores it
  * later: with the next commit that reads (`tx.doc()`) or writes that document, before the document leaves memory or
  * retires, at `close()`, and at the latest about `withinMs` after the commit (default `settings.progress.persistWithinMs`,
- * 1,000 ms; `Infinity` waits for one of the others). A commit that writes anything else is immediate. A crash loses what
+ * 1,000 ms; `Infinity` waits for one of the others). Accessing another document or writing anything else makes the whole
+ * commit immediate, preserving its atomic writes and read dependencies. A crash loses what
  * is held, so only state whose loss is acceptable, such as streamed progress, should be deferred, and nothing durable may
  * depend on it without reading it in a commit.
  */

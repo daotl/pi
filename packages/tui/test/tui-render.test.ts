@@ -13,6 +13,7 @@ import type { Terminal } from "../src/terminal.ts";
 import {
 	deleteKittyImage,
 	encodeKitty,
+	renderImage,
 	resetCapabilitiesCache,
 	setCapabilities,
 	setCellDimensions,
@@ -1133,6 +1134,142 @@ describe("TUI overlays over native-reflow content", () => {
 			}
 		});
 	}
+
+	it("anchors offset image overlays after cursor-forward prefixes and preserves adjacent text", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 10, heightPx: 20 });
+		const terminal = new LoggingVirtualTerminal(30, 5);
+		const tui = new TuiMainScreen(terminal);
+		tui.addChild(new Text("base zero\nbase one\nbase two\nbase three", 0, 0));
+		const image = new Image(
+			"AAAA",
+			"image/png",
+			{ fallbackColor: (text) => text },
+			{ maxWidthCells: 3, maxHeightCells: 2, imageId: 6110 },
+			{ widthPx: 30, heightPx: 40 },
+		);
+		const imageLines = image.render(12);
+		const component = new TestComponent();
+		component.lines = [`\x1b[3mab\x1b[23m\x1b[2C${imageLines[0]}\x1b[3Ctail`, ...imageLines.slice(1)];
+		const hasPlacement = () => /\x1b_Ga=(?:T|p),[^;]*\bi=6110(?:,|;)/.test(terminal.getWrites());
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			const before = terminal.getViewport();
+			terminal.clearWrites();
+			const overlay = tui.showOverlay(component, { width: 12, row: 1, col: 4 });
+			await terminal.waitForRender();
+			assert.ok(terminal.getWrites().includes("\x1b[9G\x1b7\x1b_G"), "image starts at overlay column plus four");
+			assert.strictEqual(terminal.getViewport()[1].slice(4, 15), "ab     tail");
+			assert.notStrictEqual(getCellItalic(terminal, 1, 4), 0);
+			terminal.clearWrites();
+			const beside = tui.showOverlay(new Text("BY", 0, 0), { width: 2, row: 1, col: 6 });
+			await terminal.waitForRender();
+			assert.ok(hasPlacement(), "a dialog in the cursor gap is disjoint from the actual image");
+			assert.strictEqual(terminal.getViewport()[1].slice(4, 8), "abBY");
+			terminal.clearWrites();
+			const covering = tui.showOverlay(new Text("X", 0, 0), { width: 1, row: 2, col: 10 });
+			await terminal.waitForRender();
+			assert.ok(!hasPlacement(), "a dialog at the image's actual right edge suppresses it");
+			assert.strictEqual(terminal.getViewport()[2][10], "X");
+			terminal.clearWrites();
+			covering.hide();
+			await terminal.waitForRender();
+			assert.ok(hasPlacement());
+			assert.strictEqual(terminal.getViewport()[1].slice(11, 15), "tail");
+			beside.hide();
+			overlay.hide();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(terminal.getViewport(), before);
+		} finally {
+			tui.stop();
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
+	for (const api of ["encodeKitty", "renderImage"] as const) {
+		for (const limit of ["maxHeight", "viewport"] as const) {
+			it(`crops unregistered ${api} overlay placements to ${limit} without mutating cached lines`, async () => {
+				setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+				setCellDimensions({ widthPx: 10, heightPx: 20 });
+				const png =
+					"iVBORw0KGgoAAAANSUhEUgAAAAMAAABaCAYAAAB9qeyAAAAAGUlEQVR4nGP4z8DwH4YZRjmjnFHOKGcgOQB2mRoDbjkRtQAAAABJRU5ErkJggg==";
+				const sequence =
+					api === "encodeKitty"
+						? encodeKitty(png, { columns: 3, rows: 3, moveCursor: false })
+						: renderImage(
+								png,
+								{ widthPx: 3, heightPx: 90 },
+								{ maxWidthCells: 3, maxHeightCells: 3, moveCursor: false },
+							)?.sequence;
+				assert.ok(sequence);
+				const terminal = new LoggingVirtualTerminal(20, limit === "viewport" ? 1 : 4);
+				const tui = new TuiMainScreen(terminal);
+				tui.addChild(new Text("base row", 0, 0));
+				const component = new TestComponent();
+				component.lines = [sequence, "", ""];
+				try {
+					tui.start();
+					await terminal.waitForRender();
+					terminal.clearWrites();
+					const overlay = tui.showOverlay(component, {
+						width: 5,
+						row: 0,
+						col: 4,
+						...(limit === "maxHeight" ? { maxHeight: 1 } : {}),
+					});
+					await terminal.waitForRender();
+					const clipped = [...terminal.getWrites().matchAll(/\x1b_G([^;]*);[^\x1b]*\x1b\\/g)]
+						.map((match) => Object.fromEntries(match[1].split(",").map((control) => control.split("="))))
+						.filter((controls) => controls.a === "T" || controls.a === "p");
+					assert.deepStrictEqual(
+						clipped.map(({ r, y, h }) => ({ r, y, h })),
+						[{ r: "1", y: "0", h: "30" }],
+					);
+					assert.strictEqual(component.lines[0], sequence);
+					overlay.hide();
+					await terminal.waitForRender();
+					terminal.resize(20, 4);
+					await terminal.waitForRender();
+					terminal.clearWrites();
+					tui.showOverlay(component, { width: 5, row: 0, col: 4 });
+					await terminal.waitForRender();
+					const full = [...terminal.getWrites().matchAll(/\x1b_G([^;]*);[^\x1b]*\x1b\\/g)]
+						.map((match) => Object.fromEntries(match[1].split(",").map((control) => control.split("="))))
+						.filter((controls) => controls.a === "T" || controls.a === "p");
+					assert.deepStrictEqual(
+						full.map(({ r, y, h }) => ({ r, y, h })),
+						[{ r: "3", y: undefined, h: undefined }],
+					);
+				} finally {
+					tui.stop();
+					resetCapabilitiesCache();
+					setCellDimensions({ widthPx: 9, heightPx: 18 });
+				}
+			});
+		}
+	}
+
+	it("does not replay a clipped custom overlay image when source geometry is unknown", async () => {
+		const terminal = new LoggingVirtualTerminal(20, 4);
+		const tui = new TuiMainScreen(terminal);
+		tui.addChild(new Text("base zero\nbase one\nbase two", 0, 0));
+		const component = new TestComponent();
+		component.lines = ["label\x1b_Ga=T,f=100,t=f,c=3,r=3;L3RtcC9jdXN0b20ucG5n\x1b\\", "", ""];
+		try {
+			tui.start();
+			await terminal.waitForRender();
+			terminal.clearWrites();
+			tui.showOverlay(component, { width: 8, row: 0, col: 2, maxHeight: 1 });
+			await terminal.waitForRender();
+			assert.ok(!terminal.getWrites().includes("\x1b_Ga=T"), "an uncroppable placement must not escape its overlay");
+			assert.strictEqual(terminal.getViewport()[0].slice(2, 7), "label");
+			assert.strictEqual(terminal.getViewport()[1], "base one");
+		} finally {
+			tui.stop();
+		}
+	});
 
 	for (const [protocol, dialogRow] of [
 		["kitty", 0],

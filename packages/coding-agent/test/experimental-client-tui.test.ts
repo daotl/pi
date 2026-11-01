@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
-import { createHost, type MutableReplicatedState, type Readable, replicatedState } from "@earendil-works/chord";
+import {
+	createHost,
+	defineFacet,
+	local,
+	type MutableReplicatedState,
+	type Readable,
+	replicatedState,
+} from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
 	type AgentLane,
@@ -11,6 +18,7 @@ import {
 } from "@earendil-works/pi-agent-core";
 import { createRoutedLinkPair } from "@earendil-works/pi-server";
 import { ProcessTerminal, TuiMainScreen } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import { type ClientTuiServer, ExperimentalClientTui } from "../src/experimental/client-tui.ts";
 import { ExperimentalChatView } from "../src/experimental/client-tui-chat.ts";
@@ -155,8 +163,16 @@ describe("experimental client TUI", () => {
 		["new", { command: "client" as const }, "two", 1],
 		["continued", { command: "client" as const, continue: true }, "one", 0],
 		["plugin-selected", { command: "client" as const, pluginPackages: ["./example-plugin"] }, "two", 1],
+		["reattachment-race", { command: "client" as const }, "two", 1],
+		["close-during-recovery", { command: "client" as const }, "two", 1],
+		["close-before-recovery-load", { command: "client" as const }, "two", 1],
+		["recovery-failure-during-close", { command: "client" as const }, "two", 1],
+		["connected-detached", { command: "client" as const }, "two", 1],
+		["connected-attaching", { command: "client" as const }, "two", 1],
+		["connected-degraded", { command: "client" as const }, "two", 1],
+		["connected-other-session", { command: "client" as const }, "two", 1],
 	] as const)(
-		"opens a %s Session directly and exercises the full lifecycle only for a new Session",
+		"opens a %s Session and preserves its presentation lifecycle",
 		async (kind, command, sessionId, creates) => {
 			const directoryState = replicatedState<SessionDirectoryState>({ revision: 1, sessions: [session("one", 1)] });
 			const attachment = replicatedState<SessionAttachmentState>({ status: "detached" });
@@ -357,11 +373,56 @@ describe("experimental client TUI", () => {
 			let finished = false;
 			const requestRender = vi.fn();
 			const ui = new TuiMainScreen(new ProcessTerminal());
+			const recoveryEntered = Promise.withResolvers<void>();
+			const releaseRecovery = Promise.withResolvers<void>();
+			let recoveryCancelled = false;
+			let recovering = false;
+			const recoveryFailure = new Error("Presentation activation failed during quit");
+			const RecoveryProbe = local("test.tui-recovery", { version: 1, input: Type.Object({}) });
 			const component = await ExperimentalClientTui.create({
 				command,
 				ui,
 				servers: [server],
 				requestRender,
+				facetLoader: async () => ({
+					facets:
+						kind === "close-during-recovery"
+							? [
+									{
+										name: "test-recovery-lifetime",
+										...defineFacet(({ serve }) => {
+											serve(
+												RecoveryProbe,
+												(_input, _principal, self) => {
+													self.resource("activation", {
+														version: 1,
+														async open({ signal }) {
+															if (!recovering) return;
+															recoveryEntered.resolve();
+															await Promise.race([
+																releaseRecovery.promise,
+																new Promise<void>((resolve) => {
+																	const cancel = () => {
+																		recoveryCancelled = true;
+																		resolve();
+																	};
+																	if (signal.aborted) cancel();
+																	else signal.addEventListener("abort", cancel, { once: true });
+																}),
+															]);
+															await releaseRecovery.promise;
+														},
+													});
+													return {};
+												},
+												{ lifetime: "host" },
+											);
+										}),
+									},
+								]
+							: [],
+					async dispose() {},
+				}),
 				finish() {
 					finished = true;
 				},
@@ -386,6 +447,144 @@ describe("experimental client TUI", () => {
 				expect(component.render(80).join("\n")).not.toContain("Experimental Sessions");
 				expect(component.render(80).join("\n")).not.toContain("Experimental Models");
 
+				if (kind.startsWith("connected-")) {
+					// Match Client ordering: the Session link ends before attachment notification.
+					sessionRemote.close("attachment replaced while connected");
+					const next: SessionAttachmentState =
+						kind === "connected-detached"
+							? { status: "detached" }
+							: kind === "connected-other-session"
+								? { status: "attached", sessionId: "another-session" }
+								: { status: kind === "connected-degraded" ? "degraded" : "attaching", sessionId };
+					publishReplacement(attachment, next);
+					await vi.waitFor(() => {
+						component.refreshTheme();
+						const output = component.render(80).join("\n");
+						expect(output).not.toContain("test/one");
+						expect(output).toContain(
+							kind === "connected-attaching" || kind === "connected-degraded"
+								? "Reattaching Session"
+								: "Session detached",
+						);
+					});
+					expect(connectionState.value.status).toBe("connected");
+					component.handleInput("must not reach the old Session");
+					component.handleInput("\r");
+					expect(prompt).not.toHaveBeenCalled();
+					return;
+				}
+
+				if (
+					kind === "reattachment-race" ||
+					kind === "close-before-recovery-load" ||
+					kind === "recovery-failure-during-close"
+				) {
+					const loading = Promise.withResolvers<void>();
+					const release = Promise.withResolvers<void>();
+					const load = host.load.bind(host);
+					const paused = vi.spyOn(host, "load").mockImplementationOnce(async (...args) => {
+						loading.resolve();
+						await release.promise;
+						if (kind === "recovery-failure-during-close") throw recoveryFailure;
+						await load(...args);
+					});
+					publishReplacement(attachment, { status: "attaching", sessionId });
+					publishReplacement(attachment, { status: "attached", sessionId });
+					try {
+						await loading.promise;
+						if (kind === "recovery-failure-during-close") {
+							const closing = component.close();
+							const closed = Promise.allSettled([closing]);
+							release.resolve();
+							const [result] = await closed;
+							expect(result.status).toBe("rejected");
+							if (result.status === "rejected") expect(result.reason).toBe(recoveryFailure);
+							return;
+						}
+						await vi.waitFor(() => {
+							component.refreshTheme();
+							expect(component.render(80).join("\n")).not.toContain("test/one");
+						});
+						if (kind === "close-before-recovery-load") {
+							const snapshot = laneSnapshot();
+							snapshot.transcript.push({
+								id: "during-close",
+								parentId: null,
+								seq: 1,
+								timestamp: 1,
+								type: "message",
+								message: { role: "user", content: "must not remount after quit", timestamp: 1 },
+							});
+							publishReplacement(transcriptState, {
+								snapshot: snapshot as LaneTranscriptSnapshot,
+								sequence: 1,
+								stream: null,
+								events: [],
+							});
+							const frames: string[] = [];
+							requestRender.mockImplementation(() => {
+								frames.push(component.render(80).join("\n"));
+							});
+							const closing = component.close();
+							release.resolve();
+							await closing;
+							const renders = requestRender.mock.calls.length;
+							publishReplacement(attachment, { status: "attached", sessionId });
+							expect(frames.join("\n")).not.toContain("must not remount after quit");
+							expect(requestRender).toHaveBeenCalledTimes(renders);
+							return;
+						}
+						publishReplacement(connectionState, {
+							status: "disconnected",
+							since: "again",
+							reason: "second interruption",
+							retryAt: null,
+						});
+						publishReplacement(attachment, { status: "attaching", sessionId });
+						publishReplacement(connectionState, { status: "connected", since: "again" });
+						publishReplacement(attachment, { status: "attached", sessionId });
+						release.resolve();
+						await vi.waitFor(() => {
+							expect(component.render(80).join("\n")).toContain("test/one");
+							expect(component.render(80).join("\n")).not.toContain("Reattaching");
+						});
+						component.handleInput("hello after recovery");
+						component.handleInput("\r");
+						finishPrompt();
+						await vi.waitFor(() => expect(component.render(80).join("\n")).toContain("remote answer"));
+						return;
+					} finally {
+						release.resolve();
+						paused.mockRestore();
+					}
+				}
+
+				if (kind === "close-during-recovery") {
+					recovering = true;
+					publishReplacement(attachment, { status: "attaching", sessionId });
+					publishReplacement(attachment, { status: "attached", sessionId });
+					await recoveryEntered.promise;
+					const closing = component.close();
+					const closed = Promise.allSettled([closing]);
+					let settled = false;
+					void closed.then(() => {
+						settled = true;
+					});
+					await vi.waitFor(() => expect(recoveryCancelled).toBe(true));
+					expect(settled).toBe(false);
+					releaseRecovery.resolve();
+					await closing;
+					const renders = requestRender.mock.calls.length;
+					publishReplacement(transcriptState, {
+						snapshot: laneSnapshot() as LaneTranscriptSnapshot,
+						sequence: 1,
+						stream: null,
+						events: [],
+					});
+					expect(requestRender).toHaveBeenCalledTimes(renders);
+					expect(component.render(80).join("\n")).not.toContain("remote answer");
+					return;
+				}
 				// Startup selection is the only behavior specific to continue and plugin-selected Sessions.
 				if (kind !== "new") return;
 
@@ -463,8 +662,13 @@ describe("experimental client TUI", () => {
 				});
 				expect(requestRender).toHaveBeenCalledTimes(rendersAfterClose);
 			} finally {
-				await component.close();
-				await Promise.all([host.close(), serverProvider.close(), sessionProvider.close()]);
+				releaseRecovery.resolve();
+				await Promise.allSettled([
+					component.close(),
+					host.close(),
+					serverProvider.close(),
+					sessionProvider.close(),
+				]);
 			}
 		},
 	);

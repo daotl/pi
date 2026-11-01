@@ -22,8 +22,10 @@ json            UTF-8 JSON object, jsonLength bytes
 bytes           raw payload, the remaining length - 9 - jsonLength bytes
 ```
 
-All integers are big-endian. A frame is at most 16 MiB; larger transfers are split by the client. A request whose JSON
-does not parse gets an `EINVAL` error; framing errors end the connection.
+All integers are big-endian. The `length` field is at most 16 MiB; larger transfers are split by the client.
+`Connection.request` rejects oversized encoded JSON plus payload locally with `E2BIG`, before dispatch or `onStart`,
+without affecting other requests. A request whose JSON does not parse gets an `EINVAL` error; framing errors end the
+connection.
 
 | type | name | direction | meaning |
 |---|---|---|---|
@@ -49,6 +51,10 @@ request is never lost. `exec` and `pty` kill the command's process group and fin
 without aborting, so the command finishes with the killed process's status, as `cleanup()` does. `scanLines` stops
 between chunks and `listFiles` between entries, with `aborted`. `watch` stops and finishes with `{}`. Other operations
 are short and finish normally.
+
+Before dispatch, `Connection.request` and `Connection.info(signal?)` let an aborted caller stop waiting for startup,
+including command detection/deployment and the handshake. This does not cancel shared startup or other callers.
+Remote path resolution and `listFiles` feature detection use the operation's signal for these metadata waits.
 
 ## Scheduling
 
@@ -124,6 +130,9 @@ caller's commits, at most one output frame per command is unsent, and output fol
 replaced by `skipped { bytes, newlines, endsWithNewline }` on the next event, which carries all output after it
 (`ShellOutputInfo.skipped`). The result is `{ exitCode, spillPath? }`; failures are errors with codes `timeout` or
 `aborted` (carrying `spillPath`), `shell_unavailable`, `spawn_error`, or `unknown` (spill failure).
+Supplied `timeoutMs` and `window.minIntervalMs` must be finite, non-negative milliseconds representable as a duration
+and a monotonic-clock deadline; invalid values fail the request with `EINVAL` without starting a command. Fractional
+milliseconds are accepted. The higher-level environment retains its stricter positive timeout-in-seconds contract.
 
 `watch { targets, mode?, pollIntervalMs?, maxDirectories? }` runs Durable's `NodeFileWatcher` in the daemon. `targets`
 are `{ path, recursive, exclude: { hidden, names } }`. Once coverage is established, an event `{ kind: "ready", mode }`

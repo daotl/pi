@@ -145,7 +145,8 @@ export function radiusProvider(options: RadiusProviderOptions = {}): Provider<"p
 
 			if (!context.allowNetwork || context.signal.aborted) return;
 			const apiKey = context.auth?.apiKey;
-			const config = await loadRadiusGatewayConfig(gateway, apiKey, context.signal, context.auth?.headers);
+			const endpoint = context.auth?.baseUrl ?? context.baseUrl ?? gateway;
+			const config = await loadRadiusGatewayConfig(endpoint, apiKey, context.signal, context.auth?.headers);
 			if (context.signal.aborted) return;
 			const refreshed = getRadiusModelsFromConfig(id, config);
 			await context.publish({

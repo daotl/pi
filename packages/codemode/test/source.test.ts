@@ -117,6 +117,53 @@ describe("parseCodemodeSource", () => {
 		}
 	});
 
+	it("recognizes statement blocks after switch case and default labels", () => {
+		for (const prefix of [
+			"switch (1) { case 1: {} /`/.test('x'); }",
+			"switch (1) { default: {} /`/.test('x'); }",
+			"switch (1) { case true ? 1 : 2: {} /`/.test('x'); }",
+			"switch (1) { case ({ value: 1 }).value: {} /`/.test('x'); }",
+			"switch (1) { case 0: break; case 1: {} /`/.test('x'); }",
+			"switch (1) { case 1: switch (2) { default: {} /`/.test('x'); } {} /`/.test('x'); }",
+			"switch (1) { case (() => { switch (2) { default: break; } return 1; })(): {} /`/.test('x'); }",
+		]) {
+			expect(
+				() => parseCodemodeSource(`${prefix}\n// @options: {"timeout_ms": 1}\nwhile (true) {}`),
+				prefix,
+			).toThrow("found one on line 2");
+		}
+		for (const label of ["case 1:", "default:", "case true ? 1 : 2:", "case ({ value: 1 }).value:"]) {
+			const input = `switch (1) { ${label} {} \`example\n// @options: {}\n\`; }`;
+			expect(parseCodemodeSource(input), label).toEqual({ code: input, options: {} });
+		}
+	});
+
+	it("keeps object and conditional colons inside switch case expressions", () => {
+		for (const expression of [
+			"true ? 1 : {} /",
+			"false ? 1 : true ? 2 : {} /",
+			"true ?.5 : {} /",
+			"({ value: {} /",
+		]) {
+			const suffix = expression.startsWith("(") ? " }).value" : "";
+			const input = `switch (1) { case ${expression} \`example\n// @options: {}\n\`${suffix}: break; }`;
+			expect(parseCodemodeSource(input), expression).toEqual({ code: input, options: {} });
+		}
+		for (const expression of [
+			"value ?? 1",
+			"value?.key",
+			"value.case",
+			"value.default",
+			"({ case: 1, default: 2 }).case",
+			"true ? { value: 1 } : { value: 2 }",
+		]) {
+			const prefix = `switch (1) { case ${expression}: {} /\`/.test('x'); }`;
+			expect(() => parseCodemodeSource(`${prefix}\n// @options: {}\nreturn 1;`), expression).toThrow(
+				"found one on line 2",
+			);
+		}
+	});
+
 	it("recognizes regexps after class declarations without breaking class-expression division", () => {
 		for (const prefix of [
 			"class A {} /`/.test('x');",

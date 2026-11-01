@@ -2,6 +2,7 @@
 //! and coalesced; text followed by more than the window (by a byte or a line) can never be in the caller's tail and is
 //! replaced by counts. Delivery follows the caller's commit pace, and waits while an earlier frame is still unsent.
 
+use crate::errors::Failure;
 use crate::frame::MAX_PAYLOAD;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -14,17 +15,31 @@ pub struct Window {
     pub bytes_per_second: f64,
 }
 
+/// Wire milliseconds must fit both a duration and the platform's monotonic clock.
+pub fn duration_ms(value: &Value, field: &str) -> Result<Duration, Failure> {
+    let invalid = || Failure::new("EINVAL", format!("{field} must be a finite, non-negative duration within the clock range"));
+    let ms = value.as_f64().ok_or_else(invalid)?;
+    if !ms.is_finite() || ms < 0.0 {
+        return Err(invalid());
+    }
+    let duration = Duration::try_from_secs_f64(ms / 1000.0).map_err(|_| invalid())?;
+    Instant::now().checked_add(duration).ok_or_else(invalid)?;
+    Ok(duration)
+}
+
 impl Window {
-    pub fn from_json(json: &Value) -> Option<Window> {
-        let object = json.as_object()?;
-        Some(Window {
+    pub fn from_json(json: &Value) -> Result<Option<Window>, Failure> {
+        let Some(object) = json.as_object() else { return Ok(None); };
+        let min_interval = object.get("minIntervalMs")
+            .map(|value| duration_ms(value, "window.minIntervalMs"))
+            .transpose()?;
+        // Preserve the absent/incomplete window fallback for non-duration fields.
+        Ok((|| Some(Window {
             max_bytes: object.get("maxBytes")?.as_u64()? as usize,
             max_lines: object.get("maxLines")?.as_u64()? as usize,
-            min_interval: Duration::from_secs_f64(
-                object.get("minIntervalMs")?.as_f64()?.max(0.0) / 1000.0,
-            ),
+            min_interval: min_interval?,
             bytes_per_second: object.get("bytesPerSecond")?.as_f64()?.max(1.0),
-        })
+        }))())
     }
 }
 
@@ -52,7 +67,8 @@ pub struct Pending {
     bytes: usize,
     newlines: usize,
     skipped: Option<Skipped>,
-    next_send: Instant,
+    last_send: Instant,
+    send_interval: Duration,
 }
 
 fn newline_count(text: &str) -> usize {
@@ -67,7 +83,8 @@ impl Pending {
             bytes: 0,
             newlines: 0,
             skipped: None,
-            next_send: Instant::now(),
+            last_send: Instant::now(),
+            send_interval: Duration::ZERO,
         }
     }
 
@@ -75,9 +92,9 @@ impl Pending {
         self.segments.is_empty()
     }
 
-    /// When the next delivery may happen.
-    pub fn next_send(&self) -> Instant {
-        self.next_send
+    /// Remaining pacing delay; elapsed time avoids constructing a potentially overflowing deadline.
+    pub fn ready_in(&self, now: Instant) -> Duration {
+        self.send_interval.saturating_sub(now.saturating_duration_since(self.last_send))
     }
 
     pub fn push(&mut self, stream: &'static str, text: String) {
@@ -183,7 +200,8 @@ impl Pending {
         let pace = Duration::from_secs_f64(
             delivered.min(self.window.max_bytes) as f64 / self.window.bytes_per_second,
         );
-        self.next_send = Instant::now() + self.window.min_interval.max(pace);
+        self.last_send = Instant::now();
+        self.send_interval = self.window.min_interval.max(pace);
         let events: Vec<Event> = match self.skipped.take() {
             Some(skipped) => {
                 let stream = segments.last().map(|(stream, _)| *stream).unwrap_or("stdout");
@@ -242,6 +260,31 @@ mod tests {
             max_lines,
             min_interval: Duration::ZERO,
             bytes_per_second: 1e12,
+        }
+    }
+
+    #[test]
+    fn delivery_is_immediate_then_paced_without_losing_queued_output() {
+        for (min_interval, bytes_per_second, interval) in [
+            (Duration::ZERO, 1e20, Duration::ZERO),
+            (Duration::from_secs(2), 1000.0, Duration::from_secs(2)),
+            (Duration::ZERO, 5.0, Duration::from_secs(2)),
+        ] {
+            let mut pending = Pending::new(Window { min_interval, bytes_per_second, ..window(1000, 1000) });
+            pending.push("stdout", "0123456789".into());
+            assert!(pending.ready_in(Instant::now()).is_zero());
+            let first = pending.take();
+            assert_eq!(first[0].text, "0123456789");
+            // Observe synthetic times after a real delivery rather than sleeping.
+            let sent = pending.last_send;
+            assert_eq!(pending.ready_in(sent), interval);
+            pending.push("stderr", "queued output".into());
+            assert_eq!(pending.ready_in(sent + interval / 2), interval - interval / 2);
+            assert!(pending.ready_in(sent + interval).is_zero());
+            let queued = pending.take();
+            assert_eq!(queued[0].stream, "stderr");
+            assert_eq!(queued[0].text, "queued output");
+            assert!(queued[0].skipped.is_none());
         }
     }
 

@@ -26,6 +26,7 @@ import {
 } from "./contract.ts";
 import type { EventOf, ListenerDecl, Resource, ResourceDeclaration, Subscribable, ValueOf } from "./declare.ts";
 import { asChordError, ChordError, invalid, runAll } from "./errors.ts";
+import { copyJson } from "./json.ts";
 import { enqueue } from "./publish.ts";
 import type { Registration, Registry } from "./registry.ts";
 import type { RemoteHost } from "./remote.ts";
@@ -1829,6 +1830,13 @@ export class ObjectImpl {
 		}
 		if (validated?.result) assertValid("result", `${this.address}.${name} result`, validated.result, result);
 		if (!returns) return undefined;
+		if (ref.contract.scope === "remote" && result !== undefined) {
+			try {
+				return copyJson(result, { omitUndefinedProperties: true });
+			} catch (error) {
+				throw invalid("result", `${this.address}.${name} result must be strict JSON`, error);
+			}
+		}
 		return result;
 	}
 

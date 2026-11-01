@@ -1,18 +1,15 @@
 import { type TUI, TuiAltScreen } from "@earendil-works/pi-tui";
-import type { EasterEgg3d } from "./easter-egg-3d.ts";
+import { type EasterEgg3d, playEasterEgg3d as playAnimation } from "./easter-egg-3d.ts";
 
 /**
- * Plays a 3D easter egg (see easter-egg-3d.ts), which loads on first use. Only fullscreen mode can show it, because
- * it dissolves the rendered screen. The screen is captured before loading. Returns false when it cannot play.
+ * Plays a 3D easter egg. Only fullscreen mode can show it, because it dissolves the rendered screen.
+ * The implementation is loaded with the interactive UI, not from a late chunk. Returns false when it cannot play.
  */
 function playEasterEgg3d(tui: TUI, egg: EasterEgg3d): boolean {
 	if (!(tui instanceof TuiAltScreen)) return false;
 	if (tui.hasOverlay()) return true;
 	const screen = tui.getScreenLines();
-	import("./easter-egg-3d.ts").then(
-		(module) => module.playEasterEgg3d(tui, screen, egg),
-		() => {},
-	);
+	void playAnimation(tui, screen, egg);
 	return true;
 }
 

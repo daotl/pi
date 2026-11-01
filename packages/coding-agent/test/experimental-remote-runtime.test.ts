@@ -5,13 +5,17 @@ import { createHost, type Frame, hostNamed, method, remote } from "@earendil-wor
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import { Client, ServerError as ClientServerError } from "@earendil-works/pi-client";
 import { createUnixTransportFactory } from "@earendil-works/pi-client/unix";
+import { ProcessTerminal, TuiMainScreen } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, type Mock, test, vi } from "vitest";
 import { ExampleFacetService } from "../examples/plugins/pi-example-plugin/src/contract.ts";
 import { runClient } from "../src/experimental/client.ts";
 import { activateBuiltinClientServices, openClientRuntime } from "../src/experimental/client-runtime.ts";
+import { ExperimentalClientTui } from "../src/experimental/client-tui.ts";
 import { loadPresentationFacets } from "../src/experimental/plugins/bundled.ts";
 import * as processRuntime from "../src/experimental/process.ts";
+import type { RadiusRelayWebSocket } from "../src/experimental/radius-relay.ts";
+import * as radiusRelay from "../src/experimental/radius-relay.ts";
 import { type RunningServer, startServer } from "../src/experimental/server.ts";
 import { AgentController } from "../src/experimental/services/agent-controller.ts";
 import {
@@ -23,12 +27,14 @@ import { Models } from "../src/experimental/services/models.ts";
 import { SessionPlugins } from "../src/experimental/services/plugins.ts";
 import { SessionDirectory, SessionManagement } from "../src/experimental/services/sessions.ts";
 import { Transcript } from "../src/experimental/services/transcript.ts";
+import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import {
 	configureExperimentalWorkerModel,
 	createExperimentalSessions,
 	readExperimentalSessionState,
 } from "./experimental-session-support.ts";
 import { KeyedProbe } from "./fixtures/keyed-service.ts";
+import { allowNetwork } from "./test-network-env.ts";
 
 const servers = new Set<RunningServer>();
 const clients = new Set<Client>();
@@ -394,6 +400,167 @@ describe("experimental durable server composition", () => {
 			await loaded.dispose();
 		} finally {
 			await second.dispose();
+		}
+	});
+
+	test("restores the Session plugin selection before Radius reattachment so /reload still works", async ({
+		onTestFinished,
+	}) => {
+		const spawn = vi.spyOn(processRuntime, "spawnInternalProcess").mockImplementation((role, args, options) =>
+			realSpawnInternalProcess(role, args, {
+				...options,
+				env: { ...options?.env, PI_OFFLINE: "1" },
+			}),
+		);
+		onTestFinished(() => spawn.mockRestore());
+		const { directory, runtime } = await makeServer();
+		const packagePath = join(directory, "branch-plugin");
+		await mkdir(join(packagePath, "src"), { recursive: true });
+		await writeFile(join(packagePath, "package.json"), JSON.stringify({ name: "test-reconnect-branch" }));
+		const sourcePath = join(packagePath, "src", "tui.ts");
+		const source = `import { defineFacet, local } from "@earendil-works/chord";
+import { SlashCommands, PresentationUI } from "@earendil-works/pi-coding-agent/experimental/plugin";
+import { Type } from "typebox";
+const Commands = local("test.reconnect-branch", { version: 1, input: Type.Object({}) });
+export default defineFacet(({ serve }) => serve(Commands, (_input, _principal, self) => {
+	const commands = self.get(SlashCommands, {});
+	const ui = self.get(PresentationUI, {});
+	self.resource("command", { version: 1, deps: [commands, ui],
+		open: () => commands.registry.replace({ name: "branch", description: "Read branch generation",
+			run: (_args, context) => ui.ui.showStatus("Branch generation: before", context) }),
+		close: (unregister) => unregister() });
+	return {};
+}, { lifetime: "host" }));
+`;
+		await writeFile(sourcePath, source);
+		const local = await openClientRuntime({
+			command: "client",
+			connect: { transport: "unix", path: runtime.socketPath },
+		});
+		try {
+			const selected = await activateBuiltinClientServices(local.servers[0]!);
+			await selected.server.host.root((ctx) =>
+				selected.plugins.prepareSession({ sessionId: "demo-1", packagePaths: [packagePath] }, ctx),
+			);
+		} finally {
+			await local.dispose();
+		}
+
+		// Only the WebSocket edge is controlled: every attempt runs the real Radius byte transport,
+		// protocol handshake and server attachClient, which creates a fresh server provider Host.
+		const sockets: RadiusRelayWebSocket[] = [];
+		const transportFactory = radiusRelay.createRadiusClientTransportFactory;
+		const factory = vi.spyOn(radiusRelay, "createRadiusClientTransportFactory").mockImplementation((options) =>
+			transportFactory({
+				...options,
+				webSocketFactory: ({ protocol }) => {
+					const events = new EventTarget();
+					let readyState = 0;
+					const socket: RadiusRelayWebSocket = {
+						binaryType: "arraybuffer",
+						bufferedAmount: 0,
+						protocol,
+						get readyState() {
+							return readyState;
+						},
+						OPEN: 1,
+						send(data) {
+							if (!(data instanceof ArrayBuffer)) throw new Error("Expected binary client frame");
+							handler.onData(new Uint8Array(data));
+						},
+						close(code = 1000, reason = "") {
+							if (socket.readyState === 3) return;
+							readyState = 3;
+							handler.onClose();
+							events.dispatchEvent(Object.assign(new Event("close"), { code, reason }));
+						},
+						addEventListener(type, listener, options) {
+							events.addEventListener(type, listener as EventListener, options);
+						},
+						removeEventListener(type, listener) {
+							events.removeEventListener(type, listener as EventListener);
+						},
+					};
+					const handler = runtime.server.accept({
+						get closed() {
+							return socket.readyState === 3;
+						},
+						async send(chunk) {
+							events.dispatchEvent(new MessageEvent("message", { data: chunk.slice().buffer }));
+						},
+						async close(finalChunk) {
+							if (finalChunk !== undefined)
+								events.dispatchEvent(new MessageEvent("message", { data: finalChunk.slice().buffer }));
+							socket.close();
+						},
+					});
+					sockets.push(socket);
+					queueMicrotask(() => {
+						readyState = socket.OPEN;
+						events.dispatchEvent(new Event("open"));
+					});
+					return socket;
+				},
+			}),
+		);
+		onTestFinished(() => factory.mockRestore());
+		allowNetwork();
+		vi.stubEnv("PI_RADIUS_GATEWAY", "http://127.0.0.1:1");
+		const command = {
+			command: "client",
+			connect: { transport: "radius", serverId: runtime.serverId },
+			auth: { type: "token", token: "controlled-relay" },
+			sessionId: "demo-1",
+		} as const;
+		const clientRuntime = await openClientRuntime(command);
+		let component: ExperimentalClientTui | undefined;
+		try {
+			initTheme("dark");
+			const server = clientRuntime.servers[0]!;
+			component = await ExperimentalClientTui.create({
+				command,
+				ui: new TuiMainScreen(new ProcessTerminal()),
+				servers: [{ serverId: runtime.serverId, radius: true, server: server.server, session: server.session }],
+				requestRender() {},
+				finish() {},
+			});
+			const firstAttachment = server.client.attachment!;
+			component.handleInput("/branch");
+			component.handleInput("\u001b");
+			component.handleInput("\r");
+			await vi.waitFor(() => expect(component!.render(80).join("\n")).toContain("Branch generation: before"));
+
+			sockets[0]!.close(4001, "physical relay connection lost");
+			expect(server.client.connected).toBe(false);
+			expect(server.client.attachment).toBeUndefined();
+			await vi.waitFor(
+				() => {
+					expect(sockets).toHaveLength(2);
+					expect(server.session.attachment.value).toEqual({ status: "attached", sessionId: "demo-1" });
+					expect(component!.render(80).join("\n")).not.toContain("Reattaching");
+				},
+				{ timeout: 10_000 },
+			);
+			expect(server.client.attachment!.attachmentId).not.toBe(firstAttachment.attachmentId);
+
+			// A resource keeps its open value until its version or dependencies change.
+			await writeFile(
+				sourcePath,
+				source
+					.replace("Branch generation: before", "Branch generation: after")
+					.replace("version: 1, deps: [commands, ui]", "version: 2, deps: [commands, ui]"),
+			);
+			component.handleInput("/reload");
+			component.handleInput("\u001b");
+			component.handleInput("\r");
+			await vi.waitFor(() => expect(component!.render(80).join("\n")).toContain("Reloaded plugins."));
+			component.handleInput("/branch");
+			component.handleInput("\u001b");
+			component.handleInput("\r");
+			await vi.waitFor(() => expect(component!.render(80).join("\n")).toContain("Branch generation: after"));
+		} finally {
+			await component?.close();
+			await clientRuntime.dispose();
 		}
 	});
 

@@ -5,7 +5,7 @@ use crate::errors::Failure;
 use crate::frame::{EVENT, Frame};
 use crate::output::Output;
 use crate::sys;
-use crate::window::{Pending, Window};
+use crate::window::{Pending, Window, duration_ms};
 use serde_json::{Map, Value, json};
 #[cfg(unix)]
 use std::collections::HashSet;
@@ -155,16 +155,16 @@ impl ExecRequest {
             env: json["env"].as_object().cloned().unwrap_or_default(),
             inherit_env: json["inheritEnv"].as_bool().unwrap_or(true),
             shell_path: json["shellPath"].as_str().map(str::to_string),
-            timeout: json["timeoutMs"]
-                .as_f64()
-                .map(|ms| Duration::from_secs_f64(ms / 1000.0)),
+            timeout: json.get("timeoutMs")
+                .map(|value| duration_ms(value, "timeoutMs"))
+                .transpose()?,
             spill: json["spill"].as_object().and_then(|spill| {
                 Some((
                     spill.get("afterBytes")?.as_u64()?,
                     spill.get("afterLines")?.as_u64()?,
                 ))
             }),
-            window: Window::from_json(&json["window"]),
+            window: Window::from_json(&json["window"])?,
         })
     }
 }
@@ -378,6 +378,11 @@ fn run_with_shell(
             ),
         ));
     }
+    // Validate the deadline before creating a process that an invalid request would otherwise abandon.
+    let deadline = request.timeout.map(|timeout| {
+        Instant::now().checked_add(timeout)
+            .ok_or_else(|| Failure::new("EINVAL", "timeoutMs exceeds the clock range"))
+    }).transpose()?;
     #[cfg(unix)]
     let child = spawn(&request, &program, &args, stdin_command.is_some(), groups);
     #[cfg(windows)]
@@ -395,7 +400,6 @@ fn run_with_shell(
     let job = child.job.clone();
     #[cfg(unix)]
     let pid = child.id();
-    let deadline = request.timeout.map(|timeout| Instant::now() + timeout);
     let stop = Arc::new(AtomicBool::new(false));
     // Without a window, output is not coalesced; reading then waits for the link.
     let gate = if request.window.is_none() {
@@ -518,7 +522,7 @@ fn run_with_shell(
         }
         if let Some(pending) = &mut pending
             && !pending.is_empty()
-            && now >= pending.next_send()
+            && pending.ready_in(now).is_zero()
             && unsent.load(Ordering::SeqCst) == 0
         {
             deliver(pending);
@@ -538,7 +542,7 @@ fn run_with_shell(
             wait = wait.min(if unsent.load(Ordering::SeqCst) > 0 {
                 UNSENT_POLL
             } else {
-                pending.next_send().saturating_duration_since(now)
+                pending.ready_in(now)
             });
         }
         match receiver.recv_timeout(wait) {

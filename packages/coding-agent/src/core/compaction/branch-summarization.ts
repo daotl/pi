@@ -424,7 +424,6 @@ export async function generateBranchSummary(
 		timestamp: Date.now(),
 	};
 	const promptBudget = contextWindow - maxTokens;
-	const nativePromptBudget = clampMaxTokensToInput(model, 0, Number.POSITIVE_INFINITY) - maxTokens;
 	const { messages } = preparation;
 	const firstMessageIndex = projection.messages.indexOf(messages[0]);
 	// Restore only preceding system state, never shared conversation. A standalone
@@ -457,7 +456,6 @@ export async function generateBranchSummary(
 			: convertToLlm(input);
 		const useNativeBudget = nativeHeadroom();
 		const count = useNativeBudget ? estimateMessageTokens : estimateTokens;
-		const availablePromptBudget = useNativeBudget ? nativePromptBudget : promptBudget;
 		// Systems stay in their original order, including patches between calls/results.
 		// Retention may discard conversation, never reintroduce policy removed by a hook.
 		const groups: number[][] = [];
@@ -482,13 +480,25 @@ export async function generateBranchSummary(
 			(total, group) => total + group.reduce((tokens, index) => tokens + messageTokens[index], 0),
 			0,
 		);
+		// Prefer the full summary allowance, trimming older groups before reducing it.
+		// Small native windows can still summarize when the newest group and all authority
+		// leave more than the adapter's one-token emergency floor.
+		const newestRequestTokens =
+			inputTokens -
+			historyTokens +
+			(groups.at(-1)?.reduce((tokens, index) => tokens + messageTokens[index], 0) ?? 0);
+		const outputTokens = useNativeBudget ? clampMaxTokensToInput(model, newestRequestTokens, maxTokens) : maxTokens;
+		if (useNativeBudget && outputTokens <= 1) throw budgetError;
+		const availablePromptBudget = useNativeBudget
+			? clampMaxTokensToInput(model, 0, Number.POSITIVE_INFINITY) - outputTokens
+			: promptBudget;
 		const removed = new Set<number>();
 		for (
 			let groupIndex = 0;
 			inputTokens > availablePromptBudget || (tokenBudget > 0 && historyTokens > tokenBudget);
 			groupIndex++
 		) {
-			// The newest atomic group must fit with the intended output allowance.
+			// Keep the newest atomic group intact, including when output room was reduced.
 			if (groupIndex >= groups.length - 1) throw budgetError;
 			for (const index of groups[groupIndex]) {
 				removed.add(index);
@@ -499,8 +509,8 @@ export async function generateBranchSummary(
 		}
 		const llmMessages = converted.filter((_message, index) => !removed.has(index));
 		const context = normalizeContext({ messages: [...llmMessages, instruction] });
-		if (useNativeBudget && clampMaxTokensToInput(model, inputTokens, maxTokens) < maxTokens) throw budgetError;
-		attemptOptions.maxTokens = maxTokens;
+		if (useNativeBudget && clampMaxTokensToInput(model, inputTokens, outputTokens) < outputTokens) throw budgetError;
+		attemptOptions.maxTokens = outputTokens;
 		fileOps = createFileOps();
 		attributable = canAttributeRequestHistory(model, agent, streamFn, options.requestHistoryPolicy);
 		if (attributable) {

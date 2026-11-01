@@ -8,6 +8,8 @@ function printUsage() {
 	console.log(`Usage: node scripts/pack-packages.mjs --out <dir> [options]
 
 Builds every public package and writes one coherent local artifact set.
+Skips release-daemon completeness; does not certify a deployable pi-env release.
+Publication still requires all daemon assets.
 
 Options:
   --out <dir>            Output directory; .artifacts/ is ignored by Git
@@ -33,12 +35,14 @@ if (values.help) {
 }
 if (!values.out) throw new Error("--out is required");
 
+console.warn("Local artifacts: skipping release-daemon completeness; this does not certify a deployable pi-env release. Publication still requires all daemon assets.");
 const artifactSet = produceArtifactSet({
 	build: !values["skip-build"],
 	force: values.force,
 	offlineModelData: values["offline-model-data"],
 	outDir: values.out,
 	repoRoot: process.cwd(),
+	requireEnvReleaseAssets: false,
 });
 console.log(`\nLocal package artifacts created: ${artifactSet.artifactDirectory}`);
 console.log(`Manifest: ${artifactSet.manifestPath}`);

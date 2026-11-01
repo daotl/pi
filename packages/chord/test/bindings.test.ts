@@ -229,6 +229,110 @@ describe("shared bindings: identity", () => {
 	});
 });
 
+describe("remote result delivery", () => {
+	it("rejects cyclic unknown results without breaking the link and owns in-host remote results", async () => {
+		const { server, browser } = setup();
+		const Result = remote("t.strict-results", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: {
+				main: {
+					methods: {
+						read: method(Type.Boolean(), Type.Unknown()),
+						ignore: method(),
+						absent: method(undefined, Type.Unknown()),
+					},
+				},
+			},
+		});
+		const value = { nested: { n: 1 }, omitted: undefined };
+		const cycle: { self?: unknown } = {};
+		cycle.self = cycle;
+		server.serve(Result, () => ({
+			variant: "main" as const,
+			read: (bad: boolean) => (bad ? cycle : value),
+			ignore: () => cycle as never,
+			absent: () => undefined,
+		}));
+		try {
+			const remoteRef = await browser.get(Result, {});
+			await assert.rejects(
+				remoteRef.read(true),
+				(error) => isChordError(error, "invalid") && error.reason === "result",
+			);
+			assert.deepEqual(await remoteRef.read(false), { nested: { n: 1 } });
+			assert.equal(await remoteRef.ignore(), undefined);
+			assert.equal(await remoteRef.absent(), undefined);
+			const localRef = await server.get(Result, {});
+			const owned = (await localRef.read(false)) as { nested: { n: number } };
+			value.nested.n = 2;
+			assert.deepEqual(owned, { nested: { n: 1 } });
+		} finally {
+			await browser.close();
+			await server.close();
+		}
+	});
+	for (const failMethod of [false, true]) {
+		it(`closes a failed ${failMethod ? "error" : "success"} response write so its caller settles`, async () => {
+			const failure = new Error("response write failed");
+			const reported: unknown[] = [];
+			const server = createHost({
+				self: {},
+				name: "server",
+				onError: (error) => {
+					reported.push(error);
+					throw error;
+				},
+			});
+			const [down, up] = memoryLinkPair();
+			const broken: Link = {
+				get closed() {
+					return down.closed;
+				},
+				send: (frame) => {
+					if (frame.t === "result") throw failure;
+					return down.send(frame);
+				},
+				receive: (handler) => down.receive(handler),
+				onClose: (handler) => down.onClose(handler),
+				close: (reason) => down.close(reason),
+			};
+			server.accept(broken, { principal: {} });
+			const browser = createHost({
+				self: {},
+				name: "browser",
+				kind: "client",
+				upstream: { link: up, principal: {} },
+				onError: () => {},
+			});
+			const Result = remote("t.failed-result-send", {
+				version: 1,
+				input: Type.Object({}),
+				host: hostNamed("server"),
+				variants: { main: { methods: { read: method(undefined, Type.String()) } } },
+			});
+			server.serve(Result, () => ({
+				variant: "main",
+				read: () => {
+					if (failMethod) throw new Error("method failed");
+					return "ok";
+				},
+			}));
+			try {
+				const ref = await browser.get(Result, {});
+				await assert.rejects(ref.read(), (error) => isChordError(error, "unavailable"));
+				await tick();
+				assert.equal(up.closed, true);
+				assert.deepEqual(reported, [failure]);
+			} finally {
+				await browser.close();
+				await server.close();
+			}
+		});
+	}
+});
+
 describe("hydration over a link", () => {
 	const Matrix = remote("t.e8-matrix", {
 		version: 1,
@@ -238,6 +342,7 @@ describe("hydration over a link", () => {
 			values: { state: { none: Type.Null(), empty: Type.Array(Type.String()), maybe: Type.Unknown() } },
 			bare: { methods: { ping: method(undefined, Type.String()) } },
 			broken: { state: { n: Type.Number() } },
+			missing: { state: { n: Type.Number() } },
 		},
 	});
 	const disposedVariants: string[] = [];
@@ -252,6 +357,10 @@ describe("hydration over a link", () => {
 				},
 			});
 			if (variant === "bare") return { variant: "bare", ping: () => "pong" };
+			if (variant === "missing") {
+				const source = self.state("source", Type.Null(), null);
+				return { variant: "missing", n: self.derive([source], () => undefined as unknown as number) };
+			}
 			if (variant === "broken") {
 				const source = self.state("source", Type.String(), "not a number");
 				// A derivation exposed under a number schema: its snapshot fails validation.
@@ -292,6 +401,9 @@ describe("hydration over a link", () => {
 		await assert.rejects(broken.ready, (error) => isChordError(error, "invalid"));
 		assert.equal(broken.status, "gone");
 		await until(() => disposedVariants.includes("broken"));
+		const missing = browser.hold(Matrix, { variant: "missing" });
+		await assert.rejects(missing.ready, (error) => isChordError(error, "invalid") && error.reason === "state");
+		assert.equal(missing.status, "gone");
 		await browser.close();
 		await server.close();
 	});

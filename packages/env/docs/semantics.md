@@ -40,6 +40,9 @@ env conformance suite and `test/differential.test.ts` check each rule below.
 - `readBinaryFile` returns a `Buffer`, reader reads a plain `Uint8Array`, as Node does.
 - Windows: error codes are libuv's translations; `rm` of a symbolic link or junction to a directory removes the link;
   creating a file where a directory exists fails with `EISDIR`; modification times before 1970 are negative.
+- Remote metadata waits used for path resolution, temporary paths and `listFiles` feature detection are abortable,
+  including an explicit command `cwd`. An already-aborted file operation does not start a connection; aborting one
+  startup waiter does not cancel the shared connection startup needed by other callers.
 
 ## Commands
 

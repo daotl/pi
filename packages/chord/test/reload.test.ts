@@ -355,6 +355,67 @@ describe("reload", () => {
 		assert.deepEqual(log, ["open cache 2", "close lock 1", "open lock 2", "close cache 1"]);
 	});
 
+	for (const fail of [false, true]) {
+		it(`closes an old exclusive resource before a nonexclusive replacement${fail ? " and restores it on failure" : ""}`, async () => {
+			const host = quiet();
+			let owner: number | undefined;
+			const effects: string[] = [];
+			const facet = (version: number): Facet => ({
+				name: "exclusive-downgrade",
+				setup: ({ serve }) =>
+					serve(Greeter, (_input, _principal, self) => {
+						const resource = self.resource("lock", {
+							version: 1,
+							exclusive: version === 1,
+							open: () => {
+								assert.equal(owner, undefined, "replacement must not overlap the displaced exclusive owner");
+								effects.push(`open ${version}`);
+								if (fail && version === 2) throw new Error("downgrade failed");
+								owner = version;
+								return version;
+							},
+							close: () => {
+								effects.push(`close ${version}`);
+								owner = undefined;
+							},
+						});
+						const dependent = self.resource("dependent", {
+							version: 1,
+							deps: [resource],
+							open: () => {
+								effects.push(`dependent open ${resource.value}`);
+								return resource.value;
+							},
+							close: () => {
+								effects.push(`dependent close ${resource.value}`);
+							},
+						});
+						return {
+							count: self.state("count", Type.Number(), 0),
+							greet: () => `${resource.value}:${dependent.value}`,
+						};
+					}),
+			});
+			try {
+				await host.install(facet(1));
+				const ref = await host.get(Greeter, {});
+				assert.equal(await ref.greet("read"), "1:1");
+				effects.length = 0;
+				if (fail) {
+					await assert.rejects(host.reload([facet(2)]), /downgrade failed/);
+					assert.equal(await ref.greet("read"), "1:1");
+					assert.deepEqual(effects, ["dependent close 1", "close 1", "open 2", "open 1", "dependent open 1"]);
+				} else {
+					await host.reload([facet(2)]);
+					assert.equal(await ref.greet("read"), "2:2");
+					assert.deepEqual(effects, ["dependent close 1", "close 1", "open 2", "dependent open 2"]);
+				}
+			} finally {
+				await host.close();
+			}
+		});
+	}
+
 	for (const [failOpen, exclusive] of [
 		[false, false],
 		[false, true],

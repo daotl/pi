@@ -422,6 +422,52 @@ describe("Watch ends", () => {
 		expect(recorded.detached).toBe(1);
 	});
 
+	for (const native of [false, true]) {
+		for (const callback of ["report", "detach", "both"] as const) {
+			it(`settles ${native ? "native" : "JSON"} listener failure despite throwing ${callback}`, async () => {
+				const failure = new Error("listener failed");
+				let detached = 0;
+				const values: number[] = [];
+				const detach = () => {
+					detached++;
+					if (callback !== "report") throw new Error("detach failed");
+				};
+				const report = () => {
+					if (callback !== "detach") throw new Error("report failed");
+				};
+				const watch = native ? new NativeWatch(0, detach, report) : new Watch(0, detach, report);
+				watch.start(async (value) => {
+					values.push(value);
+					throw failure;
+				});
+				if (watch instanceof NativeWatch) watch.advance(1, context);
+				else watch.advance(1, [["r", 1]], context);
+				expect(await watch.closed).toEqual({ reason: "listener_error", error: failure });
+				if (watch instanceof NativeWatch) watch.advance(2, context);
+				else watch.advance(2, [["r", 2]], context);
+				expect(await watch.stop()).toEqual({ reason: "listener_error", error: failure });
+				await flush();
+				expect(values).toEqual([1]);
+				expect(detached).toBe(1);
+			});
+		}
+	}
+
+	it("settles an explicit stop when detach and its reporter throw", async () => {
+		const watch = new Watch(
+			0,
+			() => {
+				throw new Error("detach");
+			},
+			() => {
+				throw new Error("report");
+			},
+		);
+		expect(await watch.stop()).toEqual({ reason: "stopped" });
+		expect(await watch.closed).toEqual({ reason: "stopped" });
+		expect(await watch.stop()).toEqual({ reason: "stopped" });
+	});
+
 	it("wraps a thrown non-Error in an Error", async () => {
 		const { watch } = recordedWatch<JsonValue>(0);
 		watch.start(() => Promise.reject("plain"));

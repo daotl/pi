@@ -488,13 +488,14 @@ describe("links review: cross-host reload", () => {
 
 	it("#3 an abort while the child is still loading modules frees its reload slot; a later reload works", async () => {
 		const gate = latch();
-		const { server, worker, modules } = setup({ slowLoad: gate.promise });
+		const { server, worker, modules, link } = setup({ slowLoad: gate.promise });
 		await tick();
 		modules.set("greeter", greeterFacet("v2"));
-		await assert.rejects(server.reload([], { remote: { "session:": ["greeter"] }, voteDeadline: 30 }), (error) =>
-			isChordError(error, "aborted"),
-		);
+		const reloading = server.reload([], { remote: { "session:": ["greeter"] }, voteDeadline: 30 });
+		const rejected = assert.rejects(reloading, (error) => isChordError(error, "aborted"));
+		await until(() => link.sent.some((frame) => frame.t === "abort"));
 		gate.open();
+		await rejected;
 		await until(() => !internals(worker).reloading);
 		await server.reload([], { remote: { "session:": ["greeter"] } });
 		assert.equal(await server.hold(Greeter, {}).greet("x"), "v2 x");

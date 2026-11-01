@@ -370,6 +370,42 @@ it("rejects an oversized converted request before native dispatch when bounded h
 	expect(current.summaries).toEqual([]);
 });
 
+it("summarizes a short native branch in an 8192-token context with a reduced output allowance", async () => {
+	const current = await createNativeTokenizerFixture({ settings: { branchSummary: { reserveTokens: 1024 } } });
+	fixtures.push(current);
+	const selected = current.session.model;
+	if (!selected) throw new Error("Missing model");
+	const model = { ...selected, contextWindow: 8192, maxTokens: 4096 };
+	await current.session.setModel(model);
+	const target = current.manager.getLeafId();
+	if (!target) throw new Error("Missing target");
+	current.manager.appendMessage({ role: "user", content: "SHORT_ABANDONED_BRANCH", timestamp: 1 });
+	current.session.refreshContext();
+	const convert = current.session.agent.convertToLlm;
+	let visible: Message[] = [];
+	current.session.agent.convertToLlm = async (messages) => {
+		visible = structuredClone(await convert(messages));
+		return visible;
+	};
+	const before = structuredClone(current.manager.getEntries());
+	const result = await current.session.navigateTree(target, { summarize: true });
+	expect(result.summaryEntry?.summary).toContain("safe checkpoint");
+	expect(result.summaryEntry?.parentId).toBe(target);
+	expect(current.summaries).toHaveLength(1);
+	const wire = JSON.parse(current.summaries[0].body);
+	const instruction = wire.messages.at(-1).content as string;
+	const inputTokens = visible.reduce(
+		(total, message) => total + estimateMessageTokens(message),
+		estimateMessageTokens({ role: "user", content: instruction, timestamp: 0 }),
+	);
+	const cap = wire.max_completion_tokens ?? wire.max_tokens;
+	expect(cap).toBe(clampMaxTokensToInput(model, inputTokens, 4096));
+	expect(cap).toBeGreaterThan(1);
+	expect(cap).toBeLessThan(4096);
+	expect(current.summaries[0].body).toContain("SHORT_ABANDONED_BRANCH");
+	for (const entry of before) expect(current.manager.getEntry(entry.id)).toEqual(entry);
+});
+
 it("reselects complete native branch groups to leave useful adapter output headroom", async () => {
 	const current = await createNativeTokenizerFixture({ settings: { branchSummary: { reserveTokens: 1024 } } });
 	fixtures.push(current);
@@ -589,7 +625,7 @@ it("reconsiders full branch history after a retry policy removes the oversized b
 	expect(current.summaries[1].body).not.toContain("RETRY_PRIVATE_BASELINE");
 });
 
-it("rejects a newest native branch group that leaves only two output tokens without dispatch", async () => {
+it("rejects a newest native branch group that leaves only the emergency output floor without dispatch", async () => {
 	const current = await createNativeTokenizerFixture();
 	fixtures.push(current);
 	const selected = current.session.model;
@@ -627,7 +663,7 @@ it("rejects a newest native branch group that leaves only two output tokens with
 	const fixedTokens = visible
 		.filter((message) => message.role !== "user")
 		.reduce((total, message) => total + estimateMessageTokens(message), instructionTokens);
-	const targetInputTokens = clampMaxTokensToInput(model, 0, Number.POSITIVE_INFINITY) - 2;
+	const targetInputTokens = clampMaxTokensToInput(model, 0, Number.POSITIVE_INFINITY) - 1;
 	const countUser = (characters: number) =>
 		estimateMessageTokens({ role: "user", content: "x".repeat(characters), timestamp: 0 });
 	let lower = 0;

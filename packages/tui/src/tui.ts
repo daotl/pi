@@ -26,6 +26,8 @@ import {
 	normalizeTerminalOutput,
 	sliceByColumn,
 	sliceWithWidth,
+	terminalLinePhysicalRows,
+	terminalLineRows,
 	visibleWidth,
 	withWrappedLines,
 } from "./utils.ts";
@@ -1464,12 +1466,20 @@ export abstract class TuiBase extends Container implements TUI {
 					const imageRow = row + i - anchorOffset;
 					const imageRows = getKittyImagePlacementRows(line) ?? anchorOffset + 1;
 					const visibleRows = Math.min(imageRows, overlayLines.length - i + anchorOffset, termHeight - imageRow);
-					const imageCol = col + visibleWidth(line.slice(0, imageStart));
+					const imageCursor = { index: imageStart, row: 0, col: 0 };
+					terminalLineRows(line.slice(0, imageStart), termWidth - col, imageCursor);
+					const imageCol = col + imageCursor.col;
 					const itermColumns =
 						kittyStart === -1
 							? /;width=(\d+)(?:;|$)/.exec(line.slice(imageStart, line.indexOf(":", imageStart)))
 							: null;
-					const imageColumns = metadata?.columns ?? (itermColumns ? Number(itermColumns[1]) : w);
+					const kittyColumns =
+						kittyStart === -1
+							? undefined
+							: /(?:^|,)c=(\d+)(?:,|$)/.exec(line.slice(kittyStart + 3, line.indexOf(";", kittyStart)))?.[1];
+					const imageColumns = kittyColumns
+						? Number(kittyColumns)
+						: (metadata?.columns ?? (itermColumns ? Number(itermColumns[1]) : w));
 					const covered = this.renderedOverlayLayouts.some(
 						(overlay) =>
 							overlay.entry.focusOrder > entry.focusOrder &&
@@ -1479,24 +1489,51 @@ export abstract class TuiBase extends Container implements TUI {
 							overlay.row + overlay.height > imageRow,
 					);
 					if (visibleRows > 0 && !covered) {
-						const clipped = metadata ? cropKittyImageLine(line, 0, visibleRows) : line;
-						this.renderedOverlayImages.push({
-							row: imageRow,
-							rows: visibleRows,
-							anchorRow: row + i,
-							col: imageCol,
-							line: clipped,
-						});
+						const clipped = kittyStart === -1 ? line : cropKittyImageLine(line, 0, visibleRows);
+						// Unknown source geometry cannot safely replay a placement beyond the
+						// overlay's declared height. Never emit the original taller placement.
+						if (
+							kittyStart === -1 ||
+							imageRows <= visibleRows ||
+							getKittyImagePlacementRows(clipped) === visibleRows
+						) {
+							this.renderedOverlayImages.push({
+								row: imageRow,
+								rows: visibleRows,
+								anchorRow: row + i,
+								col: imageCol,
+								line: clipped,
+							});
+						}
 					}
 					let text = "";
 					for (let offset = 0; offset < line.length; ) {
 						const ansi = extractAnsiCode(line, offset);
 						if (ansi) {
-							if (ansi.code === CURSOR_MARKER || ansi.code.endsWith("m") || ansi.code.startsWith("\x1b]8;")) {
+							if (
+								ansi.code === CURSOR_MARKER ||
+								ansi.code.endsWith("m") ||
+								ansi.code.startsWith("\x1b]8;") ||
+								/^\x1b\[\d*C$/.test(ansi.code)
+							) {
 								text += ansi.code;
 							}
 							offset += ansi.length;
 						} else text += line[offset++];
+					}
+					if (/\x1b\[\d*C/.test(text)) {
+						const markerIndex = text.indexOf(CURSOR_MARKER);
+						const cursor = { index: markerIndex, row: 0, col: 0 };
+						if (markerIndex !== -1) terminalLineRows(text.slice(0, markerIndex), termWidth - col, cursor);
+						text = terminalLinePhysicalRows(text, termWidth - col, 0, 1)[0] ?? "";
+						if (markerIndex !== -1) {
+							const parts = extractSegments(text, cursor.col, cursor.col, Math.max(0, w - cursor.col), true);
+							text =
+								parts.before +
+								" ".repeat(Math.max(0, cursor.col - parts.beforeWidth)) +
+								CURSOR_MARKER +
+								parts.after;
+						}
 					}
 					// Do not mutate cached component lines: closing the covering overlay
 					// must restore the original, uncropped placement.

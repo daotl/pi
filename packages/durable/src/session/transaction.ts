@@ -752,10 +752,12 @@ export class Transaction implements Tx {
 	/**
 	 * Internal: what a deferred commit holds in memory instead of storing (`CommitPersistence`), each changed incarnation
 	 * with its operations and whether they selected a base; `undefined` when the commit must be stored. It may be held
-	 * only when every write changes an existing `latest`, `initial`-fork conversation document at its stored version.
+	 * only when it accesses one existing `latest`, `initial`-fork conversation document at its stored version.
 	 */
 	holdable(): { readonly loaded: LoadedDocument; readonly ops: readonly Op[]; readonly base: boolean }[] | undefined {
 		if (this.#writes.some((write) => write.type !== "document.change")) return undefined;
+		// Independent holds cannot preserve a transaction's multi-document writes or read dependencies.
+		if (this.#plans.length !== 1) return undefined;
 		const held = [];
 		for (const plan of this.#plans) {
 			const { content, change } = plan;

@@ -164,6 +164,8 @@ export async function openClientRuntime(
 				reconnectors.push(
 					new RadiusClientReconnect(client, async (sessionId) => {
 						await server.host.root(async (ctx) => {
+							const plugins = await ctx.get(PresentationPlugins, {});
+							await plugins.prepareSession({ sessionId, packagePaths: null }, ctx);
 							const management = await ctx.get(SessionManagement, {});
 							await management.attach(sessionId, ctx);
 						});

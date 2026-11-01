@@ -326,9 +326,21 @@ describe("read of images, with the Photon image processor", () => {
 		});
 		const block = onlyImage(result);
 		expect(decodedImage(block.data)).toMatchObject({ width: 20, height: 5 });
-		expect(messages(result)).toEqual([
-			`Read image file [${block.mimeType}]. Resized from 40x10 to 20x5. Multiply coordinates by 2.00 to map them to the original.`,
-		]);
+		const factor = Number(
+			messages(result)
+				.join(" ")
+				.match(/Multiply coordinates by ([\d.]+)/)?.[1],
+		);
+		expect({ x: 10 * factor, y: 3 * factor }).toEqual({ x: 20, y: 6 });
+	});
+
+	it("maps each axis back independently when a thin image's resized dimensions round differently", async () => {
+		const result = await read("thin.png", encode(2, 6000, "png"), { images: processor });
+		expect(decodedImage(onlyImage(result).data)).toMatchObject({ width: 1, height: 2000 });
+		const mapping = messages(result).join(" ");
+		const scaleX = Number(mapping.match(/x coordinates by ([\d.]+)/)?.[1]);
+		const scaleY = Number(mapping.match(/y coordinates by ([\d.]+)/)?.[1]);
+		expect({ x: 1 * scaleX, y: 1000 * scaleY }).toEqual({ x: 2, y: 3000 });
 	});
 
 	// Multiple full-image encodes can exceed Vitest's 5s default on shared CI runners.

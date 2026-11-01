@@ -202,7 +202,6 @@ export function fits(subSchema: unknown, supSchema: unknown, mode: "value" | "cl
 	if (!subTypes.every((type) => supTypes.includes(type) || (type === "integer" && supTypes.includes("number")))) {
 		return false;
 	}
-	if ("const" in sub || Array.isArray(sub.enum)) return true;
 	if (subTypes.includes("object") && !objectFits(sub, sup, mode)) return false;
 	if (subTypes.includes("array") && !arrayFits(sub, sup, mode)) return false;
 	if (subTypes.includes("function")) return functionFits(sub, sup);

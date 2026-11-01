@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { Type } from "typebox";
+import { type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
 import { describe, it } from "vitest";
 import { bind, coverage, hostFamily, hostNamed, isChordError, local, method, opaque, remote } from "../src/index.ts";
@@ -122,6 +122,38 @@ describe("contracts", () => {
 			}
 		}
 	});
+
+	for (const container of ["object", "array"] as const) {
+		for (const finite of ["const", "enum"] as const) {
+			it(`rejects ${finite} ${container} outputs with incompatible nested types`, () => {
+				const value = container === "object" ? { x: 1 } : [1];
+				const membership = finite === "const" ? { const: value } : { enum: [value] };
+				const offered =
+					container === "object"
+						? Type.Object({ x: Type.Number() }, membership)
+						: Type.Array(Type.Number(), membership);
+				const wanted = container === "object" ? Type.Object({ x: Type.String() }) : Type.Array(Type.String());
+				for (const member of ["result", "state"] as const) {
+					const contract = (schema: TSchema) =>
+						remote(`t.finite-container-${member}`, {
+							version: 1,
+							input: Type.Object({}),
+							host: hostNamed("server"),
+							variants: {
+								main:
+									member === "result"
+										? { methods: { read: method(undefined, schema) } }
+										: { state: { value: schema } },
+							},
+						});
+					assert.throws(
+						() => bind(contract(offered), undefined, contract(wanted)),
+						(error) => isChordError(error, "contract_mismatch"),
+					);
+				}
+			});
+		}
+	}
 
 	it("named properties must fit every matching provider pattern without rejecting additive methods", () => {
 		const consumerArgs = Type.Object({ x: Type.String() }, { additionalProperties: false });

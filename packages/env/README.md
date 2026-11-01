@@ -74,9 +74,9 @@ the binary named by `PI_ENV_DAEMON` (CI tests the release builds this way). They
 against `RemoteExecutionEnv` and compare random operation sequences and Durable's tools against `NodeExecutionEnv` on
 the same machine. `test/ssh-external.test.ts` runs the suite over a real SSH server when `PI_ENV_SSH_HOST` is set.
 
-Local artifact production (`npm run pack:packages`) requires the release daemon assets under `packages/env/bin/` before packing this package. The artifact packer rejects missing or empty binaries instead of certifying an import-only package that cannot start an environment. Prepare the artifacts produced by `.github/workflows/env-daemons.yml` for Linux, Android, and macOS (`x64` and `arm64`, `pi-env`) and Windows (`x64` and `arm64`, `pi-env.exe`). A host debug daemon supplied through `PI_ENV_DAEMON` is a test override, not a substitute for this release matrix.
+Local artifact production (`npm run pack:packages` and `npm run release:local`) explicitly skips release-daemon completeness and announces that limitation, so installation and import testing work without the separately built daemon matrix. These commands, like `npm run check:package-install`, do not certify deployable `pi-env` tarballs. Environment startup still needs matching-source daemon assets under `packages/env/bin/`.
 
-`npm run check:package-install` checks isolated installation, exports, SDK loading, and CLI identity only. It explicitly skips release-daemon completeness and reports that limit; it does not certify a deployable `pi-env` release. Production artifact commands retain the complete-asset check by default.
+Publication retains the artifact packer's strict check for all eight nonempty daemon binaries. Prepare the artifacts produced by `.github/workflows/env-daemons.yml` for Linux, Android, and macOS (`x64` and `arm64`, `pi-env`) and Windows (`x64` and `arm64`, `pi-env.exe`) before publication. A host debug daemon supplied through `PI_ENV_DAEMON` is a test override, not a substitute for this release matrix.
 
 Local release tests honor `PI_ENV_DAEMON`. Without that override, release scripts build the host daemon with the repository's Rust toolchain into a temporary external Cargo target, pass its path to `test.sh`, and remove that temporary target afterward. They do not overwrite an existing checkout target directory.
 

@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { defineFacet, type Host, type JsonValue, local } from "@earendil-works/chord";
+import { ChordError, defineFacet, type Host, type JsonValue, local } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
 	CombinedAutocompleteProvider,
@@ -97,7 +97,7 @@ export class ExperimentalClientTui implements Component {
 	#presentationFacets: LoadedPluginFacets | undefined;
 	#facetHost: Host | undefined;
 	#facetReloadTail = Promise.resolve();
-	#rebindPresentation: (() => Promise<void>) | undefined;
+	#rebindPresentation: ((generation: number) => Promise<void>) | undefined;
 	readonly #statusUnsubscribes: (() => void)[] = [];
 	#session: SessionFeature | undefined;
 	#slashCommands: SlashCommands | undefined;
@@ -113,6 +113,7 @@ export class ExperimentalClientTui implements Component {
 	#closed = false;
 	#closePromise: Promise<void> | undefined;
 	#recoveryTransition: Promise<void> = Promise.resolve();
+	#attachmentGeneration = 0;
 	#laneUnsubscribe: (() => void) | undefined;
 	#chatView: ExperimentalChatView | undefined;
 
@@ -290,6 +291,7 @@ export class ExperimentalClientTui implements Component {
 							version: 1,
 							deps: [commands, controller, transcript],
 							open: () => {
+								if (this.#closed) throw new ChordError("gone", "Experimental TUI is closed");
 								const registry = commands.registry!;
 								const feature: SessionFeature = {
 									serverId: server.serverId,
@@ -322,9 +324,11 @@ export class ExperimentalClientTui implements Component {
 			...this.#sharedFacets.facets,
 			...presentationFacets.facets,
 		];
-		this.#rebindPresentation = async () => {
+		this.#rebindPresentation = async (generation) => {
 			await this.#facetReloadTail;
+			if (!this.#isCurrentAttachment(server, generation)) return;
 			await facetHost.reload([], { remove: facets().map((facet) => facet.name) });
+			if (!this.#isCurrentAttachment(server, generation)) return;
 			await facetHost.load(facets());
 		};
 		await facetHost.load(facets());
@@ -333,10 +337,7 @@ export class ExperimentalClientTui implements Component {
 				server.server.connection.subscribe((state) => this.#handleConnectionState(server.serverId, state)),
 			);
 			this.#statusUnsubscribes.push(
-				server.session.attachment.subscribe((state) => {
-					const feature = this.#session;
-					if (feature !== undefined) this.#handleAttachmentState(feature, state);
-				}),
+				server.session.attachment.subscribe((state) => this.#handleAttachmentState(server, state)),
 			);
 		}
 	}
@@ -359,21 +360,16 @@ export class ExperimentalClientTui implements Component {
 		this.#completeSelection(undefined);
 		const errors: unknown[] = [];
 		for (const unsubscribe of this.#statusUnsubscribes.splice(0)) unsubscribe();
-		try {
-			await this.#recoveryTransition;
-			await this.#closeLane();
-			await this.#facetReloadTail;
-		} catch (error) {
-			errors.push(error);
-		}
-		if (this.#facetHost !== undefined) {
-			try {
-				await this.#facetHost.close();
-			} catch (error) {
-				errors.push(error);
-			}
-			this.#facetHost = undefined;
-		}
+		// Host shutdown cancels activation that an in-flight presentation rebind may be awaiting.
+		const hostClose = this.#facetHost?.close();
+		const transitions = await Promise.allSettled([
+			hostClose,
+			this.#recoveryTransition,
+			this.#closeLane(),
+			this.#facetReloadTail,
+		]);
+		errors.push(...transitions.flatMap((result) => (result.status === "rejected" ? [result.reason] : [])));
+		this.#facetHost = undefined;
 		const generations = [this.#presentationFacets, this.#sharedFacets].filter(
 			(generation): generation is LoadedPluginFacets => generation !== undefined,
 		);
@@ -473,21 +469,34 @@ export class ExperimentalClientTui implements Component {
 			}
 			return;
 		}
+		this.#attachmentGeneration++;
+		// The Client ends remote references before notifying connection listeners.
+		// Drop the stale consumer view before any footer or autocomplete redraw.
+		this.#session = undefined;
+		this.#controller = undefined;
+		this.#slashCommands = undefined;
 		this.#busy = true;
 		this.#status = state.status === "connecting" ? "Reconnecting to Radius…" : "Radius disconnected; retrying…";
 		this.#queueRecovery(() => this.#closeLane());
 		this.#rebuild();
 	}
 
-	#handleAttachmentState(feature: SessionFeature, state: SessionAttachmentState): void {
-		if (this.#closed || this.#selectedServerId !== feature.serverId || this.#sessionId === undefined) return;
+	#handleAttachmentState(server: ClientTuiServer, state: SessionAttachmentState): void {
+		if (this.#closed || this.#selectedServerId !== server.serverId || this.#sessionId === undefined) return;
+		const generation = ++this.#attachmentGeneration;
 		if (state.status === "attached" && state.sessionId === this.#sessionId) {
+			this.#busy = true;
+			this.#status = "Reattaching Session…";
+			this.#rebuild();
 			this.#queueRecovery(async () => {
+				if (!this.#isCurrentAttachment(server, generation)) return;
 				if (this.#laneUnsubscribe === undefined) {
-					await this.#rebindPresentation?.();
+					await this.#rebindPresentation?.(generation);
+					if (!this.#isCurrentAttachment(server, generation)) return;
 					const active = this.#session;
 					if (active === undefined) throw new Error("Session presentation did not reactivate");
-					await this.#openLane(active);
+					await this.#openLane(active, generation);
+					if (!this.#isCurrentAttachment(server, generation)) return;
 				}
 				this.#busy = false;
 				this.#status = "";
@@ -495,35 +504,61 @@ export class ExperimentalClientTui implements Component {
 			});
 			return;
 		}
-		if (state.status === "attaching" && state.sessionId === this.#sessionId) {
-			this.#busy = true;
-			this.#status = "Reattaching Session…";
-			this.#queueRecovery(() => this.#closeLane());
-			this.#rebuild();
-		}
+		this.#session = undefined;
+		this.#controller = undefined;
+		this.#slashCommands = undefined;
+		this.#busy = true;
+		this.#status =
+			state.status !== "detached" && state.sessionId === this.#sessionId
+				? "Reattaching Session…"
+				: "Session detached; waiting for the selected Session…";
+		this.#queueRecovery(() => this.#closeLane());
+		this.#rebuild();
+	}
+
+	#isCurrentAttachment(server: ClientTuiServer, generation: number): boolean {
+		const attachment = server.session.attachment.value;
+		return (
+			!this.#closed &&
+			generation === this.#attachmentGeneration &&
+			this.#selectedServerId === server.serverId &&
+			attachment?.status === "attached" &&
+			attachment.sessionId === this.#sessionId
+		);
 	}
 
 	#queueRecovery(operation: () => Promise<void>): void {
-		this.#recoveryTransition = this.#recoveryTransition
+		const transition = this.#recoveryTransition
+			.catch(() => {})
 			.then(async () => {
-				if (!this.#closed) await operation();
-			})
-			.catch((error: unknown) => {
 				if (this.#closed) return;
-				this.#busy = true;
-				this.#status = `Reconnect error: ${message(error)}`;
-				this.#rebuild();
+				try {
+					await operation();
+				} catch (error) {
+					if (this.#closed && error instanceof ChordError && (error.code === "gone" || error.code === "aborted"))
+						return;
+					throw error;
+				}
 			});
+		this.#recoveryTransition = transition;
+		void transition.catch((error: unknown) => {
+			if (this.#closed) return;
+			this.#busy = true;
+			this.#status = `Reconnect error: ${message(error)}`;
+			this.#rebuild();
+		});
 	}
 
-	async #openLane(feature: SessionFeature): Promise<void> {
+	async #openLane(feature: SessionFeature, generation?: number): Promise<void> {
 		await this.#closeLane();
+		if (this.#closed || (generation !== undefined && generation !== this.#attachmentGeneration)) return;
 		const view = new ExperimentalChatView(this.#ui, process.cwd());
 		this.#chatView = view;
 		this.#documentContainer.addChild(this.#sessionHeading);
 		this.#documentContainer.addChild(view.transcript);
 		this.#pendingMessagesContainer.addChild(view.pendingMessages);
 		this.#laneUnsubscribe = feature.transcript.state.subscribe((value) => {
+			if (this.#closed || this.#session !== feature) return;
 			if (value.snapshot === null) return;
 			view.apply(value.snapshot);
 			this.#rebuild();
@@ -542,6 +577,7 @@ export class ExperimentalClientTui implements Component {
 		this.#documentContainer.clear();
 		this.#pendingMessagesContainer.clear();
 		this.#statusContainer.clear();
+		if (!this.#closed) this.#rebuild();
 	}
 
 	async #runPrompt(messageText: string): Promise<void> {
@@ -794,6 +830,7 @@ export async function runClientTui(command: ClientCommand, options: RunClientTui
 		showError: (error) => component?.showError(error),
 		onChanged: () => component?.refreshTheme(),
 	});
+	const errors: unknown[] = [];
 	try {
 		let finish!: () => void;
 		const finished = new Promise<void>((resolve) => {
@@ -826,13 +863,29 @@ export async function runClientTui(command: ClientCommand, options: RunClientTui
 		tui.start();
 		themeController.applyFromSettings();
 		await finished;
-	} finally {
-		themeController.dispose();
-		stopThemeWatcher();
-		if (tuiStarted) tui.stop();
-		await component?.close();
-		await runtime.dispose();
+	} catch (error) {
+		errors.push(error);
 	}
+	for (const cleanup of [
+		() => themeController.dispose(),
+		stopThemeWatcher,
+		() => {
+			if (tuiStarted) tui.stop();
+		},
+	]) {
+		try {
+			cleanup();
+		} catch (error) {
+			errors.push(error);
+		}
+	}
+	const results = await Promise.allSettled([
+		Promise.resolve().then(() => component?.close()),
+		Promise.resolve().then(() => runtime.dispose()),
+	]);
+	for (const result of results) if (result.status === "rejected") errors.push(result.reason);
+	if (errors.length === 1) throw errors[0];
+	if (errors.length > 1) throw new AggregateError(errors, "Failed to run or close experimental client TUI");
 }
 
 function requireSingleServer<T>(features: readonly T[]): T {

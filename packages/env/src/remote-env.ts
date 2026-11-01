@@ -65,8 +65,8 @@ type RemoteFileInfo = { name: string; kind: FileKind | "other"; size: number; mt
 type RemoteDirEntry = { name: string; raw?: number[]; info?: RemoteFileInfo; error?: Json };
 
 /** Node's path rules of the remote system. */
-export async function remotePath(connection: Connection): Promise<PlatformPath> {
-	return nodePlatform(await connection.info()).platform === "win32" ? win32 : posix;
+export async function remotePath(connection: Connection, signal?: AbortSignal): Promise<PlatformPath> {
+	return nodePlatform(await connection.info(signal)).platform === "win32" ? win32 : posix;
 }
 
 function toInfo(path: string, remote: RemoteFileInfo, paths: PlatformPath): Result<FileInfo, FileError> {
@@ -180,7 +180,11 @@ class RemoteBinaryReader implements BinaryReader {
 		if (early) return early;
 		try {
 			const { json } = await this.#handle.request("fstat");
-			return toInfo(this.#path, json as unknown as RemoteFileInfo, await remotePath(this.#handle.env.connection));
+			return toInfo(
+				this.#path,
+				json as unknown as RemoteFileInfo,
+				await remotePath(this.#handle.env.connection, context.abortSignal),
+			);
 		} catch (error) {
 			return err(toFileError(error, this.#path));
 		}
@@ -262,7 +266,7 @@ class RemoteDirReader implements DirReader {
 		}
 		const entries: FileInfo[] = [];
 		try {
-			const paths = await remotePath(this.#handle.env.connection);
+			const paths = await remotePath(this.#handle.env.connection, context.abortSignal);
 			// Like `NodeDirReader`, count only entries that are part of the listing.
 			while (!this.#done && entries.length < maxEntries) {
 				const { json } = await this.#handle.request("readdir", { max: maxEntries - entries.length });
@@ -373,8 +377,8 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 	}
 
 	/** Node's `resolvePath` on the remote system, with its home directory and working directories. */
-	async #resolve(path: string): Promise<string> {
-		const info = await this.connection.info();
+	async #resolve(path: string, signal?: AbortSignal): Promise<string> {
+		const info = await this.connection.info(signal);
 		const windows = nodePlatform(info).platform === "win32";
 		const paths = windows ? win32 : posix;
 		let normalized = path;
@@ -410,9 +414,11 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 		run: (resolved: string) => Promise<T>,
 		check: "before" | "both" = "before",
 	): Promise<Result<T, FileError>> {
+		const early = abortResult<T>(context.abortSignal, path);
+		if (early) return early;
 		let resolved: string;
 		try {
-			resolved = await this.#resolve(path);
+			resolved = await this.#resolve(path, context.abortSignal);
 		} catch (error) {
 			return err(toFileError(error, path));
 		}
@@ -435,17 +441,17 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 		return { handle: new Handle(this, reply.json.handle as number, reply.session, resolved), json: reply.json };
 	}
 
-	async absolutePath(path: string, _context: Context): Promise<Result<string, FileError>> {
+	async absolutePath(path: string, context: Context): Promise<Result<string, FileError>> {
 		try {
-			return ok(await this.#resolve(path));
+			return ok(await this.#resolve(path, context.abortSignal));
 		} catch (error) {
 			return err(toFileError(error, path));
 		}
 	}
 
-	async joinPath(parts: string[], _context: Context): Promise<Result<string, FileError>> {
+	async joinPath(parts: string[], context: Context): Promise<Result<string, FileError>> {
 		try {
-			return ok((await remotePath(this.connection)).join(...parts));
+			return ok((await remotePath(this.connection, context.abortSignal)).join(...parts));
 		} catch (error) {
 			return err(toFileError(error));
 		}
@@ -674,8 +680,8 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 		let source: string;
 		let destination: string;
 		try {
-			source = await this.#resolve(sourcePath);
-			destination = await this.#resolve(destinationPath);
+			source = await this.#resolve(sourcePath, context.abortSignal);
+			destination = await this.#resolve(destinationPath, context.abortSignal);
 		} catch (error) {
 			return err(toFileError(error, sourcePath));
 		}
@@ -692,7 +698,11 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 	async fileInfo(path: string, context: Context): Promise<Result<FileInfo, FileError>> {
 		const result = await this.#fileOp(path, context, async (resolved) => {
 			const { json } = await this.connection.request("lstat", { path: resolved });
-			return toInfo(resolved, json as unknown as RemoteFileInfo, await remotePath(this.connection));
+			return toInfo(
+				resolved,
+				json as unknown as RemoteFileInfo,
+				await remotePath(this.connection, context.abortSignal),
+			);
 		});
 		return result.ok ? result.value : result;
 	}
@@ -712,7 +722,7 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 			}
 			// Node's `readdir` fails on any entry it cannot lstat. libuv sorts names by their bytes on POSIX; on Windows it
 			// keeps the file system's order, which the daemon reports.
-			const paths = await remotePath(this.connection);
+			const paths = await remotePath(this.connection, context.abortSignal);
 			if (paths === posix) {
 				const key = (entry: RemoteDirEntry) => Buffer.from(entry.raw ?? Buffer.from(entry.name, "utf8"));
 				entries.sort((a, b) => Buffer.compare(key(a), key(b)));
@@ -737,7 +747,7 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 	): Promise<Result<FileListing, FileError>> {
 		let resolved: string;
 		try {
-			resolved = await this.#resolve(path);
+			resolved = await this.#resolve(path, context.abortSignal);
 		} catch (error) {
 			return err(toFileError(error, path));
 		}
@@ -802,8 +812,8 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 		const aborted = abortResult<string>(context.abortSignal);
 		if (aborted) return aborted;
 		try {
-			const { tmpdir } = await this.connection.info();
-			const paths = await remotePath(this.connection);
+			const { tmpdir } = await this.connection.info(context.abortSignal);
+			const paths = await remotePath(this.connection, context.abortSignal);
 			const { json } = await this.connection.request("mkdtemp", { path: paths.join(tmpdir, prefix ?? "tmp-") });
 			return ok(json.path as string);
 		} catch (error) {
@@ -819,7 +829,7 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 		if (!dir.ok) return dir;
 		let filePath = "";
 		try {
-			const paths = await remotePath(this.connection);
+			const paths = await remotePath(this.connection, context.abortSignal);
 			filePath = paths.join(dir.value, `${options?.prefix ?? ""}${randomUUID()}${options?.suffix ?? ""}`);
 			// Node's `writeFile(filePath, "")`, which does not create parents.
 			await this.connection.request(
@@ -842,7 +852,7 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 		if (aborted) return aborted;
 		try {
 			const resolved = await Promise.all(
-				targets.map(async (target) => ({ ...target, path: await this.#resolve(target.path) })),
+				targets.map(async (target) => ({ ...target, path: await this.#resolve(target.path, context.abortSignal) })),
 			);
 			const afterResolve = abortResult<FileWatcher>(context.abortSignal);
 			if (afterResolve) return afterResolve;
@@ -877,8 +887,9 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 		const inheritEnv = options?.inheritEnv ?? true;
 		let cwd: string;
 		try {
-			cwd = options?.cwd ? await this.#resolve(options.cwd) : this.cwd;
+			cwd = options?.cwd ? await this.#resolve(options.cwd, signal) : this.cwd;
 		} catch (error) {
+			if (signal?.aborted) return err(new ExecutionError("aborted", "aborted"));
 			return err(new ExecutionError("unknown", error instanceof Error ? error.message : String(error)));
 		}
 		if (signal?.aborted) return err(new ExecutionError("aborted", "aborted"));

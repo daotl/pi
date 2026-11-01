@@ -478,6 +478,34 @@ describe("cross-host reload", () => {
 		assert.deepEqual(effects, ["open 1", "closing 1", "closed 1", "open 1"]);
 	});
 
+	it("disconnects a child whose completed rollback receipt never arrives before allowing retry", async () => {
+		const [down, up] = memoryLinkPair();
+		const server = createHost({ self: {}, name: "server", onError: () => {} });
+		server.accept(down, { kind: "host", name: "worker", principal: {} });
+		const worker = createHost({
+			self: {},
+			name: "worker",
+			onError: () => {},
+			upstream: { link: dropping(up, (frame) => frame.t === "vote" || frame.t === "aborted"), principal: {} },
+		});
+		server.serve(Ping, () => ({ variant: "main", ping: () => "pong" }));
+		try {
+			await tick();
+			await assert.rejects(
+				server.reload([], { voteDeadline: 30 }),
+				(error) => isChordError(error, "aborted") && error.reason === "vote_deadline",
+			);
+			assert.equal(down.closed, true, "a participant without rollback completion cannot remain synced");
+			const before = server.codeVersion;
+			await server.reload([]);
+			assert.ok(server.codeVersion > before);
+			assert.equal(await server.hold(Ping, {}).ping(), "pong");
+		} finally {
+			await worker.close();
+			await server.close();
+		}
+	});
+
 	it("a worker gate blocked past its deadline aborts the whole reload", async () => {
 		const { server, worker, modules } = setup();
 		await tick();
@@ -680,13 +708,15 @@ describe("cross-host reload", () => {
 		await greeter.greet("a");
 		const log: string[] = [];
 		const go = latch();
+		const cancelled = latch();
 		const slow: Facet = {
 			name: "greeter",
 			setup: (api) =>
 				api.serve(Greeter, (_input, _principal, self) => {
 					self.resource("late", {
 						version: 1,
-						open: async () => {
+						open: async ({ signal }) => {
+							signal.addEventListener("abort", cancelled.open, { once: true });
 							await go.promise;
 							log.push("opened");
 						},
@@ -698,11 +728,18 @@ describe("cross-host reload", () => {
 		};
 		modules.set("greeter", slow);
 		const codeVersion = worker.codeVersion;
-		await assert.rejects(server.reload([], { remote: { "session:": ["greeter"] }, voteDeadline: 50 }), (error) =>
-			isChordError(error, "aborted"),
-		);
+		let settled = false;
+		const reloading = server.reload([], { remote: { "session:": ["greeter"] }, voteDeadline: 500 });
+		const rejected = assert
+			.rejects(reloading, (error) => isChordError(error, "aborted"))
+			.then(() => {
+				settled = true;
+			});
+		await cancelled.promise;
+		await tick();
+		assert.equal(settled, false, "coordinator retains the reload slot until child cleanup completes");
 		go.open();
-		for (let i = 0; i < 50 && !log.includes("closed"); i++) await tick();
+		await rejected;
 		assert.deepEqual(log, ["opened", "closed"]);
 		assert.equal(worker.codeVersion, codeVersion);
 		modules.set("greeter", greeterFacet("v3"));

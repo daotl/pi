@@ -71,9 +71,9 @@ Required invariants:
 3. All visible progress is durable, except what a deferred commit holds: what
    watches see can be ahead of Storage by up to that commit's window
    (`withinMs`), and a crash loses it. A commit is deferred only when its caller
-   marks it so, and only when it changes nothing but existing latest,
-   initial-fork conversation documents (section 4.1). Every stored document is
-   a state memory had.
+   marks it so, and only when it accesses one existing latest, initial-fork
+   conversation document and writes only changes to it (section 4.1). Every
+   stored document is a state memory had.
 4. External effects do not run inside the Session mutation transaction.
 5. Entries and IDs are immutable and never reused after a committed write.
 6. Document drafts are fully revoked when their transaction callback settles:
@@ -1796,11 +1796,13 @@ Harness uses `settings.progress.persistWithinMs` (default 1,000) and a plain
 Session its `persistWithinMs` option (default 1,000).
 
 The mark is a permission. A deferred commit is **held** only when, after its
-callback, settlement, and the read-only check, every write it makes changes an
-existing conversation document with `history: "latest"` and `fork: "initial"`
-at its stored version. Anything else, such as an entry, a task state, a
-submission, another document, a document's creation, migration, or retirement,
-makes it immediate, a normal commit. A held commit is adopted in memory by
+callback, settlement, and the read-only check, it accesses only one document and
+every write changes that existing conversation document with `history: "latest"`
+and `fork: "initial"` at its stored version. Accessing another document, even
+without changing it, makes the whole commit immediate to preserve atomic writes
+and read dependencies. An entry, a task state, a submission, or a document's
+creation, migration, or retirement also makes it immediate, a normal commit.
+A held commit is adopted in memory by
 pointer swap, resolves, and is published to the Session's own observers: document
 watches, the conversation view and agent events (section 9). Its stored
 version and delta count stay; its operations wait, folded per incarnation

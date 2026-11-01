@@ -44,7 +44,9 @@ export class ProgramStatusReporter {
 				this.runResult =
 					event.message.stopReason === "error"
 						? { state: "error", message: firstLine(event.message.errorMessage) }
-						: { state: "done" };
+						: event.message.stopReason === "length"
+							? { state: "error", message: "Response was truncated: the model reached its output token limit." }
+							: { state: "done" };
 				break;
 			case "compaction_start":
 				this.compacting = true;

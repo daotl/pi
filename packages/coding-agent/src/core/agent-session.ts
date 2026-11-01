@@ -322,7 +322,7 @@ export interface AgentSessionConfig {
 	modelRuntime: ModelRuntime;
 	/** Keeps the prompt cache entry of the last session request warm. */
 	cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed">;
-	/** Initial active built-in tool names. Default: [read, bash, edit, write] */
+	/** Initial active tool names, retained until registration. Default: [read, bash, edit, write] */
 	initialActiveToolNames?: string[];
 	/**
 	 * Whether the initial tools come from the `defaultTools` setting. When true, a resumed session
@@ -748,8 +748,10 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
-		if (this._usesDefaultTools) this._restoreToolsFromTranscript(this._defaultToolModifiers);
-		for (const name of applyToolModifiers([], this._defaultToolModifiers)) {
+		const restoredTools = this._usesDefaultTools && this._restoreToolsFromTranscript(this._defaultToolModifiers);
+		// A recorded loadout replaces configured defaults, including tools still waiting for registration.
+		const pendingTools = restoredTools ? [] : (this._initialActiveToolNames ?? []);
+		for (const name of applyToolModifiers(pendingTools, this._defaultToolModifiers)) {
 			if (!this._toolRegistry.has(name) && this._isAllowedTool(name)) this._pendingToolNames.add(name);
 		}
 	}
@@ -3258,8 +3260,9 @@ export class AgentSession {
 	 * Tools reachable only from other tools are never declared, but they do not depend on the active
 	 * set, so the transcript's declarations are the whole loadout.
 	 * @param modifiers `+name`/`-name` entries applied to the restored loadout.
+	 * @returns Whether the transcript declared a loadout, including an empty one.
 	 */
-	private _restoreToolsFromTranscript(modifiers: readonly string[] = [], persist = true): void {
+	private _restoreToolsFromTranscript(modifiers: readonly string[] = [], persist = true): boolean {
 		this._pendingToolNames.clear();
 		const branchSystemMessages = this.sessionManager
 			.getBranch()
@@ -3274,7 +3277,7 @@ export class AgentSession {
 		const systemMessages = checkpoint?.systemMessage
 			? projection.messages.filter((message): message is SystemMessage => message.role === "system")
 			: branchSystemMessages;
-		if (systemMessages.length === 0) return;
+		if (systemMessages.length === 0) return false;
 		// Earlier removals distinguish an intentionally disabled extension from a newly registered one.
 		const mentioned = new Set(
 			[...systemMessages, ...branchSystemMessages].flatMap((message) =>
@@ -3296,6 +3299,7 @@ export class AgentSession {
 			for (const tool of tools) this._pendingToolNames.delete(tool.name);
 			this._baseSystemPrompt = this._rebuildSystemPrompt(tools.map((tool) => tool.name));
 		}
+		return true;
 	}
 
 	/**
@@ -6465,7 +6469,7 @@ export class AgentSession {
 		// during the session stay disabled unless the setting newly adds them.
 		const addedDefaultTools = getDefaultTools().filter((name) => !previousDefaultTools.has(name));
 		// Tools the new extensions register later, such as MCP tools, are pending until then.
-		for (const name of this.getActiveToolNames()) this._pendingToolNames.add(name);
+		for (const name of [...this.getActiveToolNames(), ...addedDefaultTools]) this._pendingToolNames.add(name);
 		this._buildRuntime({
 			activeToolNames: [...this.getActiveToolNames(), ...addedDefaultTools],
 			flagValues: previousFlagValues,

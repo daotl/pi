@@ -108,9 +108,13 @@ function wellFormed(_key: string, value: unknown): unknown {
 }
 
 function frame(type: number, id: number, json: Json, payload: Uint8Array = new Uint8Array(0)): Buffer {
-	const body = Buffer.from(JSON.stringify(json, wellFormed), "utf8");
+	const encoded = JSON.stringify(json, wellFormed);
+	const jsonLength = Buffer.byteLength(encoded, "utf8");
+	const length = 9 + jsonLength + payload.length;
+	if (length > MAX_FRAME) throw new RemoteError({ code: "E2BIG", message: "Request exceeds the 16 MiB frame limit" });
+	const body = Buffer.from(encoded, "utf8");
 	const header = Buffer.alloc(13);
-	header.writeUInt32BE(9 + body.length + payload.length, 0);
+	header.writeUInt32BE(length, 0);
 	header.writeUInt8(type, 4);
 	header.writeUInt32BE(id, 5);
 	header.writeUInt32BE(body.length, 9);
@@ -190,9 +194,9 @@ export class Connection {
 		this.#options = options;
 	}
 
-	/** Connect if needed and return what the daemon reported about its machine. */
-	async info(): Promise<RemoteInfo> {
-		return (await this.#connect()).info;
+	/** Connect if needed and return machine metadata; abort stops only this caller's shared-startup wait. */
+	async info(signal?: AbortSignal): Promise<RemoteInfo> {
+		return (await this.#connectFor(signal)).info;
 	}
 
 	/** Connect if needed and return the live session's id. */
@@ -210,23 +214,7 @@ export class Connection {
 			}
 			return this.#send(current, op, json, options);
 		}
-		const ready = this.#connect();
-		let onAbort: (() => void) | undefined;
-		const aborted =
-			signal === undefined
-				? undefined
-				: new Promise<never>((_resolve, reject) => {
-						onAbort = () => reject(new RemoteError({ code: "aborted", message: "aborted" }));
-						signal.addEventListener("abort", onAbort, { once: true });
-						if (signal.aborted) onAbort();
-					});
-		let session: Session;
-		try {
-			// Only this caller stops waiting: other requests still need the shared startup.
-			({ session } = await (aborted === undefined ? ready : Promise.race([ready, aborted])));
-		} finally {
-			if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
-		}
+		const { session } = await this.#connectFor(signal);
 		return this.#send(session, op, json, options);
 	}
 
@@ -255,10 +243,29 @@ export class Connection {
 		return this.#ready;
 	}
 
+	async #connectFor(signal?: AbortSignal): Promise<{ info: RemoteInfo; session: Session }> {
+		if (signal?.aborted) throw new RemoteError({ code: "aborted", message: "aborted" });
+		const ready = this.#connect();
+		if (signal === undefined) return ready;
+		let onAbort: (() => void) | undefined;
+		const aborted = new Promise<never>((_resolve, reject) => {
+			onAbort = () => reject(new RemoteError({ code: "aborted", message: "aborted" }));
+			signal.addEventListener("abort", onAbort, { once: true });
+			if (signal.aborted) onAbort();
+		});
+		try {
+			// Only this caller stops waiting: other requests still need the shared startup.
+			return await Promise.race([ready, aborted]);
+		} finally {
+			if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+		}
+	}
+
 	#send(session: Session, op: string, json: Json, options: RequestOptions): Promise<Reply> {
 		if (options.signal?.aborted) return Promise.reject(new RemoteError({ code: "aborted", message: "aborted" }));
 		if (!session.live) return Promise.reject(lost("pi-env connection lost"));
 		const id = this.#nextId++;
+		const data = frame(REQUEST, id, { ...json, op }, options.payload);
 		return new Promise((resolve, reject) => {
 			const onAbort = () => this.#write(session, frame(CANCEL, id, {}));
 			const done = () => options.signal?.removeEventListener("abort", onAbort);
@@ -275,7 +282,7 @@ export class Connection {
 			});
 			options.signal?.addEventListener("abort", onAbort, { once: true });
 			options.onStart?.(id, session.id);
-			this.#write(session, frame(REQUEST, id, { ...json, op }, options.payload));
+			this.#write(session, data);
 			if (options.signal?.aborted) onAbort();
 		});
 	}

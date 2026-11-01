@@ -32,6 +32,8 @@ Run repository commands from the repo root (two directories above this skill), u
    ```
    Verify both Node and Bun startup, model/account listing, interactive startup, and at least one real prompt with the intended default provider. The bare commands `/tmp/pi-local-release/node/pi` and `/tmp/pi-local-release/bun/pi` start interactive mode; run each in tmux, submit a prompt, and wait for the model reply before considering the interactive smoke test passed. Failures are release blockers unless the user explicitly accepts the risk.
 
+   Local artifact packing explicitly skips release-daemon completeness and prints that limitation. These smoke tests do not certify deployable `pi-env` tarballs: environment startup requires matching-source daemon assets in `packages/env/bin/`. The host daemon used by the test suite is only a test override, not the eight-platform release matrix. Publication still rejects missing or empty release daemon assets; see [pi-env development](../../packages/env/README.md#development).
+
    Load and follow [interactive-testing.md](interactive-testing.md) for the tmux workflow. Start each release binary from `/tmp`, not the repo root.
 
 3. **Run the release script**:

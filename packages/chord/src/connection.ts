@@ -1475,7 +1475,24 @@ export class Connection implements RemoteChannel {
 				(value) => this.send({ t: "result", id: frame.id, value }),
 				(error: unknown) => this.send({ t: "result", id: frame.id, error: toWireError(error) }),
 			)
-			.finally(() => this.incoming.delete(frame.id));
+			.finally(() => this.incoming.delete(frame.id))
+			.catch((error: unknown) => {
+				// A response write may already have reached the peer. Never retry it: close to settle pending calls.
+				try {
+					this.link.close("call response delivery failed");
+				} catch (cleanup) {
+					try {
+						this.host.report(cleanup);
+					} catch {
+						// A user reporter cannot reject this terminal response handler.
+					}
+				}
+				try {
+					this.host.report(error);
+				} catch {
+					// The link is already closed; reporting is best-effort.
+				}
+			});
 	}
 
 	/**
@@ -1658,7 +1675,6 @@ async function relayCall(
  * the consumer's contract for one through an `accepts` adapter (the adapter's view is what the consumer gets).
  */
 function validateSnapshot(ref: RefImpl, member: string, value: unknown): void {
-	if (value === undefined) return;
 	const installed = ref.object.currentInstalled();
 	if (installed === undefined) return;
 	const view = ref.currentView();

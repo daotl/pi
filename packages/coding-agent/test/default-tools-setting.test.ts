@@ -191,6 +191,77 @@ describe("defaultTools setting", () => {
 		toolLess.dispose();
 	});
 
+	it.each([[["read", "late_tool"]], [["+late_tool", "-bash", "-edit", "-write"]]])(
+		"retains configured defaults %j until inactive tools register",
+		async (defaultTools) => {
+			const session = await createSession(defaultTools, {}, [
+				(pi) => {
+					pi.on("session_start", () => {
+						pi.registerTool({
+							name: "late_tool",
+							label: "Late tool",
+							description: "Configured late tool",
+							parameters: Type.Object({}),
+							defaultActive: false,
+							execute: async () => ({ content: [{ type: "text", text: "late result" }], details: {} }),
+						});
+					});
+				},
+			]);
+			try {
+				expect(session.getActiveToolNames()).toEqual(["read"]);
+				await session.bindExtensions({});
+				expect(session.getActiveToolNames()).toEqual(["read", "late_tool"]);
+				expect(session.getCallableToolNames()).toEqual(["read", "late_tool"]);
+			} finally {
+				session.dispose();
+			}
+		},
+	);
+
+	it.each(["replacement", "negative modifier", "excluded", "allowlist", "all", "builtin"] as const)(
+		"does not retain configured late tools after %s overrides the selection",
+		async (selection) => {
+			const session = await createSession(
+				["read", "write", "late_tool"],
+				{
+					tools:
+						selection === "negative modifier" ? ["-late_tool"] : selection === "allowlist" ? ["read"] : undefined,
+					excludeTools: selection === "excluded" ? ["late_tool"] : undefined,
+					noTools: selection === "all" || selection === "builtin" ? selection : undefined,
+				},
+				[
+					(pi) => {
+						pi.on("session_start", () => {
+							pi.registerTool({
+								name: "late_tool",
+								label: "Late tool",
+								description: "Configured late tool",
+								parameters: Type.Object({}),
+								defaultActive: false,
+								execute: async () => ({ content: [{ type: "text", text: "late result" }], details: {} }),
+							});
+						});
+					},
+				],
+			);
+			try {
+				if (selection === "replacement") session.setActiveToolsByName(["read"]);
+				await session.bindExtensions({});
+				const expected =
+					selection === "all" || selection === "builtin"
+						? []
+						: selection === "replacement" || selection === "allowlist"
+							? ["read"]
+							: ["read", "write"];
+				expect(session.getActiveToolNames()).toEqual(expected);
+				expect(session.getCallableToolNames()).toEqual(expected);
+			} finally {
+				session.dispose();
+			}
+		},
+	);
+
 	it.each([undefined, "builtin"] as const)(
 		"retains +name until inactive session_start tools register with noTools=%s",
 		async (noTools) => {
@@ -336,13 +407,13 @@ describe("defaultTools setting", () => {
 		const writeSettings = (settings: object) =>
 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify(settings));
 
-		async function createFileSession(options: ToolOptions = {}) {
+		async function createFileSession(options: ToolOptions = {}, extensionFactories = [inactiveTool]) {
 			const settingsManager = SettingsManager.create(tempDir, agentDir);
 			const resourceLoader = new DefaultResourceLoader({
 				cwd: tempDir,
 				agentDir,
 				settingsManager,
-				extensionFactories: [inactiveTool],
+				extensionFactories,
 			});
 			await resourceLoader.reload();
 			return (
@@ -386,6 +457,55 @@ describe("defaultTools setting", () => {
 			expect(session.getActiveToolNames().sort()).toEqual(["grep", "inactive_tool", "read"]);
 			session.dispose();
 		});
+
+		it.each(["default", "negative modifier", "excluded", "allowlist", "all", "builtin"] as const)(
+			"handles newly configured inactive reload tools with %s selection",
+			async (selection) => {
+				writeSettings({ defaultTools: ["read"] });
+				const session = await createFileSession(
+					{
+						tools:
+							selection === "negative modifier"
+								? ["-late_tool"]
+								: selection === "allowlist"
+									? ["read"]
+									: undefined,
+						excludeTools: selection === "excluded" ? ["late_tool"] : undefined,
+						noTools: selection === "all" || selection === "builtin" ? selection : undefined,
+					},
+					[
+						(pi) => {
+							pi.on("session_start", (event) => {
+								if (event.reason !== "reload") return;
+								pi.registerTool({
+									name: "late_tool",
+									label: "Late tool",
+									description: "Newly configured reload tool",
+									parameters: Type.Object({}),
+									defaultActive: false,
+									execute: async () => ({ content: [{ type: "text", text: "late result" }], details: {} }),
+								});
+							});
+						},
+					],
+				);
+				try {
+					await session.bindExtensions({ onError: () => {} });
+					writeSettings({ defaultTools: ["read", "late_tool"] });
+					await session.reload();
+					const expected =
+						selection === "default"
+							? ["read", "late_tool"]
+							: selection === "all" || selection === "builtin"
+								? []
+								: ["read"];
+					expect(session.getActiveToolNames()).toEqual(expected);
+					expect(session.getCallableToolNames()).toEqual(expected);
+				} finally {
+					session.dispose();
+				}
+			},
+		);
 
 		it("keeps explicit tool options on reload", async () => {
 			const allowlisted = await createFileSession({ tools: ["read"] });
@@ -462,8 +582,9 @@ describe("defaultTools setting", () => {
 			sessionManager: SessionManager,
 			options: ToolOptions = {},
 			extensions: InlineExtension[] = [],
+			defaultTools?: string[],
 		) {
-			const settingsManager = SettingsManager.inMemory();
+			const settingsManager = SettingsManager.inMemory({ defaultTools });
 			const resourceLoader = new DefaultResourceLoader({
 				cwd: tempDir,
 				agentDir,
@@ -637,6 +758,40 @@ describe("defaultTools setting", () => {
 			expect(session.getActiveToolNames().sort()).toEqual(["inactive_tool", "read", "write"]);
 			session.dispose();
 		});
+
+		it.each(["unrecorded", "removed", "invocation removal"] as const)(
+			"keeps configured late defaults out of a resumed %s loadout",
+			async (selection) => {
+				const manager = createRecordedSession(selection === "unrecorded" ? ["read"] : ["read", "late_tool"]);
+				if (selection === "removed") recordLoadoutChange(manager, [], ["late_tool"]);
+				const session = await resume(
+					manager,
+					selection === "invocation removal" ? { tools: ["-late_tool"] } : {},
+					[
+						(pi) => {
+							pi.on("session_start", () => {
+								pi.registerTool({
+									name: "late_tool",
+									label: "Late tool",
+									description: "Configured late tool",
+									parameters: Type.Object({}),
+									defaultActive: false,
+									execute: async () => ({ content: [{ type: "text", text: "late result" }], details: {} }),
+								});
+							});
+						},
+					],
+					["read", "late_tool"],
+				);
+				try {
+					await session.bindExtensions({});
+					expect(session.getActiveToolNames()).toEqual(["read", "active_tool"]);
+					expect(session.getCallableToolNames()).toEqual(["read", "active_tool"]);
+				} finally {
+					session.dispose();
+				}
+			},
+		);
 
 		it("uses the default tools when the transcript records no loadout", async () => {
 			const sessionManager = SessionManager.inMemory(tempDir);

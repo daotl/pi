@@ -95,6 +95,54 @@ describe("AgentSession tool orchestration", () => {
 		},
 	);
 
+	it.each(["selected", "replaced", "next run"] as const)(
+		"declares late initial tools only while the %s pending loadout applies",
+		async (selection) => {
+			let registerLate: (() => void) | undefined;
+			const harness = await createHarness({
+				initialActiveToolNames: ["read", "write", "late_tool"],
+				extensionFactories: [
+					(pi) => {
+						registerLate = () => {
+							pi.registerTool({
+								name: "late_tool",
+								label: "Late tool",
+								description: "Initial late tool",
+								parameters: Type.Object({}),
+								defaultActive: false,
+								execute: async () => ({ content: [{ type: "text", text: "late result" }], details: {} }),
+							});
+						};
+					},
+				],
+			});
+			harnesses.push(harness);
+			await harness.session.bindExtensions({});
+			if (selection === "replaced") harness.session.setActiveToolsByName(["read"]);
+			if (selection === "next run") {
+				harness.setResponses([fauxAssistantMessage("first run completed without late tools")]);
+				await harness.session.prompt("start before registration");
+			}
+			if (!registerLate) throw new Error("Missing late tool registration");
+			registerLate();
+			let declared: string[] | undefined;
+			harness.setResponses([
+				(context) => {
+					declared = getCurrentTools(context.messages).map((tool) => tool.name);
+					return fauxAssistantMessage("loadout received");
+				},
+			]);
+			await harness.session.prompt("inspect late initial selection");
+			expect(declared).toEqual(
+				selection === "selected"
+					? ["read", "write", "late_tool"]
+					: selection === "replaced"
+						? ["read"]
+						: ["read", "write"],
+			);
+		},
+	);
+
 	// #22: invocation modifiers must survive every selected-branch restoration path.
 	it.each(["navigate", "swipe", "regenerate"] as const)(
 		"keeps invocation tool modifiers across repeated %s restoration and provider requests",

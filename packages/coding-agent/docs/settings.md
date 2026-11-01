@@ -58,6 +58,8 @@ This replaces `bash` with `powershell` and enables `grep`: `["-bash", "+powershe
 
 `/reload` enables tools newly added to `defaultTools`. It does not disable tools removed from it or re-enable unchanged tools you turned off. `--tools` with plain names, `--no-tools`, and `--no-builtin-tools` override `defaultTools`, also on reload.
 
+Tools selected by `defaultTools`, including newly added tools on `/reload`, remain selected until they register, even when registered inactive. An explicit loadout that deactivates a tool, or the next agent run, clears selections still waiting for registration. On resume, the transcript's recorded loadout replaces configured defaults; invocation `+name` and `-name` entries still apply.
+
 CLI tool options override this setting for one invocation. `--tools` with only `+name` and `-name` entries changes the resolved `defaultTools` selection instead, for example `pi --tools +codemode`. On `/reload`, these entries apply to the reloaded setting too, so a tool removed with `-name` stays removed. See [Command Line](cli.md#tools).
 
 ## Sessions and context

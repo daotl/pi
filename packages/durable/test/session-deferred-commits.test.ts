@@ -628,6 +628,61 @@ describe("pinning", () => {
 });
 
 describe("crash", () => {
+	for (const flush of ["commit", "version reload"] as const) {
+		it(`recovers both documents of a deferred transaction after a partial ${flush} and crash`, async () => {
+			const { session, storage, conversationId } = await open();
+			const other = await createConversation(session);
+			await session.commit(async (tx) => void (await tx.doc(TextDoc, other)), context);
+			await session.commit(
+				async (tx) => {
+					(await tx.doc(TextDoc, conversationId)).text = "one";
+					(await tx.doc(TextDoc, other)).text = "one";
+				},
+				context,
+				within(Number.POSITIVE_INFINITY),
+			);
+			if (flush === "commit") {
+				await session.commit(async (tx) => {
+					await tx.doc(TextDoc, conversationId);
+					await tx.appendEntry(conversationId, { kind: "test.note" });
+				}, context);
+			} else {
+				await session.snapshot(TextDocV2, conversationId, context);
+			}
+			session.fail(new Error("crash"));
+			await session.closed;
+			const reopened = new SessionImpl(storage.reopen(), Date.now, () => 600_000);
+			expect(await reopened.snapshot(TextDoc, conversationId, context)).toEqual({ text: "one" });
+			expect(await reopened.snapshot(TextDoc, other, context)).toEqual({ text: "one" });
+			await reopened.close(context);
+		});
+	}
+
+	it("recovers a held source together with the document a deferred transaction derives from it", async () => {
+		const { session, storage, conversationId } = await open();
+		const other = await createConversation(session);
+		await session.commit(async (tx) => void (await tx.doc(TextDoc, other)), context);
+		await append(session, conversationId, "source", within(Number.POSITIVE_INFINITY));
+		await session.commit(
+			async (tx) => {
+				const source = (await tx.doc(TextDoc, conversationId)).text;
+				(await tx.doc(TextDoc, other)).text = source;
+			},
+			context,
+			within(Number.POSITIVE_INFINITY),
+		);
+		await session.commit(async (tx) => {
+			await tx.doc(TextDoc, other);
+			await tx.appendEntry(other, { kind: "test.derived" });
+		}, context);
+		session.fail(new Error("crash"));
+		await session.closed;
+		const reopened = new SessionImpl(storage.reopen(), Date.now, () => 600_000);
+		expect(await reopened.snapshot(TextDoc, conversationId, context)).toEqual({ text: "source" });
+		expect(await reopened.snapshot(TextDoc, other, context)).toEqual({ text: "source" });
+		await reopened.close(context);
+	});
+
 	it("leaves Storage at the last stored state, which memory had, and nothing held after reopen", async () => {
 		const { session, storage, conversationId, recordId, fire } = await open();
 		const states: string[] = [];

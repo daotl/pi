@@ -42,6 +42,9 @@ function gate(name: string): Deferred<Ending> {
 /** How often each named task started its run phase. */
 const runs = new Map<string, number>();
 
+/** Observe handler entry before any artificial abort gate can delay it. */
+const abortEntries = new Map<string, () => void>();
+
 /**
  * A task that holds until its named gate opens or it is aborted. With `slowAbort`, its abort handler first waits for
  * the gate `abort.<name>`.
@@ -64,6 +67,7 @@ const Hold = defineTask<{ name: string; slowAbort?: boolean }, { phase: "hold" }
 		},
 	},
 	abort: async (task, runtime, ctx) => {
+		abortEntries.get(task.input.name)?.();
 		if (task.input.slowAbort === true) await gate(`abort.${task.input.name}`).promise;
 		await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx);
 	},
@@ -124,6 +128,7 @@ const directories = new Set<string>();
 afterEach(async () => {
 	gates.clear();
 	runs.clear();
+	abortEntries.clear();
 	for (const directory of directories) await rm(directory, { recursive: true, force: true });
 	directories.clear();
 });
@@ -410,18 +415,31 @@ describe("ownership", () => {
 		for (let n = depth - 1; n >= 0; n--) open(`link${n}`, "completed");
 		for (const id of tree.links) await harness.waitForTask(id, context);
 		const c = (await harness.conversation(tree.c, context))!;
-		const create = (name: string) =>
-			c.commit((tx) => tx.createTask(Hold, { name }, { ownership: { kind: "conversation" } }), context);
+		const create = (name: string, slowAbort = false) =>
+			c.commit((tx) => tx.createTask(Hold, { name, slowAbort }, { ownership: { kind: "conversation" } }), context);
 		return { harness, root, p: tree.p, create };
 	}
 
 	for (const depth of [2, 5]) {
 		it(`aborts work below ${depth} ended tasks with their live owner, which waits for it`, async () => {
 			const { harness, p, create } = await endedBridge(depth);
-			const d = await create("d");
+			const d = await create("d", true);
+			const descendantEntered = deferred();
+			const parentEntered = deferred();
+			let descendantAtParentEntry: Promise<string> | undefined;
+			abortEntries.set("d", () => descendantEntered.resolve());
+			abortEntries.set("p", () => {
+				descendantAtParentEntry = status(harness, d).then((state) => state.status);
+				parentEntered.resolve();
+			});
 			await harness.abortTask(p, context);
+			await descendantEntered.promise;
+			expect(await settled(parentEntered.promise)).toBe(false);
+			expect((await status(harness, d)).status).not.toBe("terminal");
+			open("abort.d", "completed");
+			await parentEntered.promise;
+			expect(await descendantAtParentEntry).toBe("terminal");
 			expect((await harness.waitForTask(d, context)).state.outcome.status).toBe("aborted");
-			// P's abort handler ran only after D ended.
 			open("abort.p", "completed");
 			expect((await harness.waitForTask(p, context)).state.outcome.status).toBe("aborted");
 			await harness.close(context);

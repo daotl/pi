@@ -80,6 +80,15 @@ describe("ProgramStatusReporter", () => {
 		expect(last()).toEqual({ state: "idle" });
 	});
 
+	it("reports an unrecovered output limit as an error and clears it after a successful retry", () => {
+		const { send, last } = setup("Session");
+		send({ type: "agent_start" }, assistantEnd("length"), settled);
+		expect(last()).toEqual({ state: "error", message: expect.stringMatching(/truncat.*output token limit/i) });
+
+		send({ type: "agent_start" }, assistantEnd("length"), assistantEnd("stop"), settled);
+		expect(last()).toEqual({ state: "done", message: "Session" });
+	});
+
 	it("reports a failed recovery compaction as the run's error unless a later response succeeds", () => {
 		const { send, last } = setup();
 		send(
