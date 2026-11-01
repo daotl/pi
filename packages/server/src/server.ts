@@ -1,4 +1,4 @@
-import { ChordError } from "@earendil-works/chord";
+import { ChordError, type Frame, stringifyFrame } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, type SessionMetadata, TODO_CONTEXT } from "@earendil-works/pi-agent-core";
 import {
 	type ClientHello,
@@ -353,6 +353,9 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 		if (connection.disconnected || connection.connection.closed) return false;
 		let frame: Uint8Array;
 		try {
+			if (message.type === "chord") {
+				message = { ...message, frame: JSON.parse(stringifyFrame(message.frame)) as Frame };
+			}
 			frame = encodeServerMessage(message, { maxFrameLength: this.maxFrameLength });
 		} catch (error) {
 			this.reportError(error);

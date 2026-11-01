@@ -26,6 +26,37 @@ function harness() {
 	return { nodes, requests, respond, key, click, focusCategory, blurCategory, changeCategory, poll: () => poll(), tab: (view) => tabs.find((tab) => tab.dataset.view === view).onclick(), category: (value) => { nodes.cat.value = value; listeners.change({ target: { id: "cat", value, dataset: {} } }); } };
 }
 
+for (const view of ["inbox", "decided", "all"]) {
+	test(`selecting ${view} before the initial state arrives preserves the chosen view`, async () => {
+		const ui = harness();
+		ui.tab(view);
+		const decided = issue(10); decided.decision = { priority: "p0" };
+		await ui.respond(ui.requests[0], snapshot([decided, issue(20)]));
+		if (view === "inbox") assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 10/);
+		else assert.match(ui.nodes.main.innerHTML, /Issue 10/);
+		if (view === "decided") assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 20/);
+		else assert.match(ui.nodes.main.innerHTML, /Issue 20/);
+	});
+}
+
+for (const failure of ["http", "network"]) {
+	test(`tabs remain usable after an initial ${failure} failure and Sync restores the selected view`, async () => {
+		const ui = harness();
+		ui.requests[0].resolve(failure === "http"
+			? { ok: false, status: 503, text: async () => "unavailable" }
+			: Promise.reject(new Error("offline")));
+		await tick();
+		ui.tab("inbox"); ui.tab("all"); ui.tab("decided");
+		assert.match(ui.nodes.status.innerHTML, /State refresh failed/);
+		ui.nodes.sync.retry();
+		const decided = issue(10); decided.decision = { priority: "p0" };
+		await ui.respond(ui.requests[1], snapshot([decided, issue(20)]));
+		assert.match(ui.nodes.main.innerHTML, /Issue 10/);
+		assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 20/);
+		assert.doesNotMatch(ui.nodes.status.innerHTML, /State refresh failed/);
+	});
+}
+
 test("a delayed poll preserves a category selection and installs its snapshot after blur", async () => {
 	const ui = harness();
 	await ui.respond(ui.requests[0], snapshot([issue(10)]));

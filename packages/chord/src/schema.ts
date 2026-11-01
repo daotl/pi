@@ -9,6 +9,9 @@ type Schema = { readonly [key: string]: unknown };
 const asSchema = (schema: unknown): Schema =>
 	schema !== null && typeof schema === "object" ? (schema as Schema) : schema === false ? { not: {} } : {};
 
+/** Received roots execute only the projection assembled from their registered provider during binding. */
+export const receivedSchemaRoots = new WeakMap<TSchema, TSchema>();
+
 /** Canonical JSON: sorted object keys, `undefined` members dropped. */
 export function canonicalJson(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
@@ -37,6 +40,7 @@ export function deepEqual(a: unknown, b: unknown): boolean {
 
 /** Throws `invalid` (with `reason`) and the first schema errors when `value` does not match. */
 export function assertValid(reason: ChordErrorReason, what: string, schema: TSchema, value: unknown): void {
+	schema = receivedSchemaRoots.get(schema) ?? schema;
 	if (Value.Check(schema, value)) return;
 	const errors = [...Value.Errors(schema, value)].slice(0, 3);
 	const summary = errors.map((error) => `${error.instancePath || "/"} ${error.message}`).join("; ");
@@ -71,12 +75,14 @@ function cloneForProjection(value: unknown, copies = new WeakMap<object, unknown
 
 /** Own and project remote JSON arguments, preserving omitted arguments and omitting undefined object properties. */
 export function projectJson(schema: TSchema, value: unknown): unknown {
+	schema = receivedSchemaRoots.get(schema) ?? schema;
 	const projected = Value.Clean(schema, cloneForProjection(value));
 	return projected === undefined ? undefined : copyJson(projected, { omitUndefinedProperties: true });
 }
 
 /** Applies defaults, strips unknown fields, validates. Returns a fresh value. */
 export function normalize(schema: TSchema, value: unknown, what: string): unknown {
+	schema = receivedSchemaRoots.get(schema) ?? schema;
 	const normalized = copyJson(
 		Value.Clean(schema, Value.Default(schema, cloneForProjection(value === undefined ? {} : value))),
 		{ omitUndefinedProperties: true },

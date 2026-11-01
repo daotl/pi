@@ -496,7 +496,17 @@ export class CtxImpl implements Ctx {
 		this.#closed = true;
 		this.#closing.abort(new ChordError("aborted", "ctx expired: its call already settled", { reason: "expired" }));
 		this.#release();
-		for (const ref of this.#refs.splice(0)) ref.release();
+		let errors: unknown[] | undefined;
+		for (const ref of this.#refs.splice(0)) {
+			try {
+				ref.release();
+			} catch (error) {
+				errors ??= [];
+				errors.push(error);
+			}
+		}
+		if (errors?.length === 1) throw errors[0];
+		if (errors !== undefined) throw new AggregateError(errors, `${this.rootId}: context cleanup failed`);
 	}
 }
 
@@ -724,8 +734,10 @@ class MemberReadable implements Readable<unknown> {
 	bind(): void {
 		const source = this.#values.size + this.#events.size > 0 ? this.#current() : undefined;
 		if (source === this.#source) return;
-		this.#upstream();
+		const upstream = this.#upstream;
 		this.#upstream = noop;
+		this.#source = undefined;
+		upstream();
 		this.#source = source;
 		if (source === undefined) return;
 		let first = true;

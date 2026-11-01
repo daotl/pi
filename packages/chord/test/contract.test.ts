@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
 import { describe, it } from "vitest";
+import { contractFromDescription } from "../src/contract.ts";
 import {
 	bind,
 	coverage,
@@ -13,6 +14,7 @@ import {
 	memoryLinkPair,
 	method,
 	opaque,
+	type Ref,
 	remote,
 } from "../src/index.ts";
 import { canonicalIdentity, fits, normalize } from "../src/schema.ts";
@@ -298,6 +300,265 @@ describe("contracts", () => {
 			variants: { main: { methods: { send: method(Type.Object({ rows: after })) } } },
 		});
 		assert.equal(bind(provider, undefined, consumer), undefined);
+	});
+
+	for (const surface of ["input", "args", "result", "state"] as const) {
+		it(`unchanged nested primitive unions allow additive ${surface} siblings locally and over a link`, async () => {
+			const oldShape = Type.Object({ choice: Type.Union([Type.String(), Type.Number()]) });
+			const newShape = Type.Object({
+				choice: Type.Union([Type.String(), Type.Number()]),
+				added: Type.Optional(Type.Number()),
+			});
+			const contract = <S extends typeof oldShape>(shape: S) =>
+				remote(`t.additive-union-${surface}`, {
+					version: 1,
+					input: surface === "input" ? Type.Object({ nested: shape }) : Type.Object({}),
+					host: hostNamed("server"),
+					variants: {
+						main: {
+							state: { value: surface === "state" ? Type.Object({ nested: shape }) : Type.Number() },
+							methods: {
+								read: method(
+									surface === "args" ? Type.Object({ nested: shape }) : Type.Object({}),
+									surface === "result" ? Type.Object({ nested: shape }) : Type.String(),
+								),
+							},
+						},
+					},
+				});
+			const consumer = contract(oldShape);
+			const provider = contract(newShape);
+			assert.equal(coverage(provider.description, consumer.description), undefined);
+			assert.equal(bind(provider, undefined, consumer), undefined);
+			const server = createHost({ self: {}, name: "server" });
+			const [down, up] = memoryLinkPair();
+			server.accept(down, { principal: {} });
+			const client = createHost({ self: {}, kind: "client", upstream: { link: up, principal: {} } });
+			try {
+				server.serve(provider, (input, _principal, self) => ({
+					variant: "main",
+					value: self.state(
+						"value",
+						provider.def.variants.main.state.value,
+						surface === "state" ? { nested: { choice: "snapshot", added: 3 } } : 0,
+					),
+					read: (args) => {
+						if (surface === "args") assert.deepEqual(args, { nested: { choice: 7 } });
+						if (surface === "input") assert.deepEqual(input, { nested: { choice: "address" } });
+						return surface === "result" ? { nested: { choice: 9, added: 4 } } : "accepted";
+					},
+				}));
+				for (const host of [server, client]) {
+					const ref = await host.get(consumer, surface === "input" ? { nested: { choice: "address" } } : {});
+					const result = await ref.read(surface === "args" ? { nested: { choice: 7 } } : {});
+					assert.deepEqual(result, surface === "result" ? { nested: { choice: 9, added: 4 } } : "accepted");
+					assert.deepEqual(
+						ref.value.value,
+						surface === "state" ? { nested: { choice: "snapshot", added: 3 } } : 0,
+					);
+					ref.release();
+				}
+			} finally {
+				await client.close();
+				await server.close();
+			}
+		});
+	}
+
+	it("additive siblings do not authorize peer references, schema DAGs, regexes or spoofed union branches", async () => {
+		const provider = remote("t.nested-union-trust", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: {
+				main: {
+					methods: {
+						call: method(
+							Type.Object({
+								choice: Type.Union([Type.String(), Type.Number()]),
+								added: Type.Optional(Type.Number()),
+							}),
+						),
+					},
+				},
+			},
+		});
+		let invoked = false;
+		const server = createHost({ self: {}, name: "server" });
+		server.serve(provider, () => ({
+			variant: "main",
+			call: () => {
+				invoked = true;
+			},
+		}));
+		const defs: Record<string, object> = { n0: {} };
+		for (let i = 1; i <= 14; i++)
+			defs[`n${i}`] = { allOf: [{ $ref: `#/$defs/n${i - 1}` }, { $ref: `#/$defs/n${i - 1}` }] };
+		try {
+			for (const choice of [
+				{ anyOf: [{ $defs: defs, $ref: "#/$defs/n14" }] },
+				{ anyOf: [{ type: "string", pattern: "^(a+)+$" }, { type: "number" }] },
+				{ anyOf: [{ type: "string", "~kind": "Cyclic" }, { type: "number" }] },
+				{ "~kind": "Cyclic", $defs: defs },
+			]) {
+				const peer = contractFromDescription({
+					...provider.description,
+					variants: { main: { call: { kind: "method", args: Type.Object({ choice }) } } },
+				});
+				assert.throws(
+					() => server.hold(peer, {}),
+					(error) => isChordError(error, "invalid") && error.reason === "token",
+				);
+			}
+			assert.equal(invoked, false);
+		} finally {
+			await server.close();
+		}
+	});
+
+	it("received union projections retain the consumer shape and cannot be changed through shared metadata", async () => {
+		const consumer = remote("t.owned-union-projection", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: {
+				main: {
+					methods: { call: method(Type.Object({ choice: Type.Union([Type.String(), Type.Number()]) })) },
+				},
+			},
+		});
+		const provider = remote(consumer.name, {
+			...consumer.def,
+			variants: {
+				main: {
+					methods: {
+						call: method(
+							Type.Object({
+								choice: Type.Union([Type.String(), Type.Number()]),
+								added: Type.Optional(Type.Number()),
+							}),
+						),
+					},
+				},
+			},
+		});
+		const description = JSON.parse(JSON.stringify(consumer.description)) as typeof consumer.description;
+		const peer = contractFromDescription(description);
+		const shared = contractFromDescription(description);
+		const server = createHost({ self: {}, name: "server" });
+		const seen: unknown[] = [];
+		server.serve(provider, () => ({
+			variant: "main",
+			call: (args) => {
+				seen.push(args);
+			},
+		}));
+		try {
+			const ref = (await server.get(peer, {})) as unknown as Ref<typeof consumer>;
+			const member = description.variants.main.call;
+			assert.ok(member.kind === "method");
+			member.args = Type.Object({ choice: Type.Unknown(), added: Type.Number() });
+			for (const value of ["text", 7]) {
+				const args = { choice: value, added: 99 };
+				await ref.call(args);
+			}
+			const other = (await server.get(shared, {})) as unknown as Ref<typeof consumer>;
+			await other.call({ choice: 8 });
+			assert.deepEqual(seen, [{ choice: "text" }, { choice: 7 }, { choice: 8 }]);
+			other.release();
+			ref.release();
+		} finally {
+			await server.close();
+		}
+	});
+
+	it("object arguments stay callable and cleaned with a record provider locally and over a link", async () => {
+		const consumer = remote("t.object-record-arguments", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: {
+				main: {
+					methods: {
+						send: method(Type.Object({ x: Type.String() }, { additionalProperties: false }), Type.String()),
+					},
+				},
+			},
+		});
+		const provider = remote(consumer.name, {
+			...consumer.def,
+			variants: { main: { methods: { send: method(Type.Record(Type.String(), Type.String()), Type.String()) } } },
+		});
+		assert.equal(coverage(provider.description, consumer.description), undefined);
+		const server = createHost({ self: {}, name: "server" });
+		const [down, up] = memoryLinkPair();
+		server.accept(down, { principal: {} });
+		const client = createHost({ self: {}, kind: "client", upstream: { link: up, principal: {} } });
+		try {
+			server.serve(provider, () => ({
+				variant: "main",
+				send: (args) => {
+					assert.deepEqual(args, { x: "ok" });
+					return args.x;
+				},
+			}));
+			for (const host of [server, client]) {
+				const ref = await host.get(consumer, {});
+				const args = { x: "ok", extra: "discard" };
+				assert.equal(await ref.send(args), "ok");
+				ref.release();
+			}
+		} finally {
+			await client.close();
+			await server.close();
+		}
+	});
+
+	it("rebinding a received object token cannot change an existing reference's argument projection", async () => {
+		const consumer = remote("t.rebound-object-record", {
+			version: 1,
+			input: Type.Object({}),
+			host: hostNamed("server"),
+			variants: {
+				main: {
+					methods: {
+						send: method(Type.Object({ x: Type.String() }, { additionalProperties: false }), Type.String()),
+					},
+				},
+			},
+		});
+		const recordProvider = remote(consumer.name, {
+			...consumer.def,
+			variants: { main: { methods: { send: method(Type.Record(Type.String(), Type.String()), Type.String()) } } },
+		});
+		const incompatible = remote(consumer.name, {
+			...consumer.def,
+			variants: { main: { methods: { send: method(Type.Record(Type.String(), Type.Number()), Type.String()) } } },
+		});
+		const peer = contractFromDescription(consumer.description);
+		const server = createHost({ self: {}, name: "server" });
+		try {
+			server.serve(consumer, () => ({
+				variant: "main",
+				send: (args) => {
+					assert.deepEqual(args, { x: "retained" });
+					return args.x;
+				},
+			}));
+			const ref = (await server.get(peer, {})) as unknown as Ref<typeof consumer>;
+			const args = { x: "retained", extra: "discard" };
+			assert.equal(await ref.send(args), "retained");
+			assert.throws(
+				() => bind(incompatible, undefined, peer),
+				(error) => isChordError(error, "contract_mismatch"),
+			);
+			assert.equal(await ref.send(args), "retained");
+			assert.equal(bind(recordProvider, undefined, peer), undefined);
+			assert.equal(await ref.send(args), "retained");
+			ref.release();
+		} finally {
+			await server.close();
+		}
 	});
 
 	it("fingerprints are stable and description-based", () => {

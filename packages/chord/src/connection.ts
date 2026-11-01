@@ -289,16 +289,26 @@ export class RelayRef {
 	close(error: unknown, options: { readonly releaseDown: boolean; readonly notify: boolean }): void {
 		if (this.closed) return;
 		this.closed = true;
-		for (const call of [...this.calls.values()]) call.cancel(error, options.releaseDown);
+		const errors: unknown[] = [];
+		const attempt = (step: () => void): void => {
+			try {
+				step();
+			} catch (failure) {
+				errors.push(failure);
+			}
+		};
+		for (const call of [...this.calls.values()]) attempt(() => call.cancel(error, options.releaseDown));
 		this.origin.dropHoldState(this.originId);
 		if (this.origin.served.get(this.originId)?.kind === "relay") this.origin.served.delete(this.originId);
 		if (this.down !== undefined) {
 			this.down.relayedRefs.delete(this.downId);
-			if (options.releaseDown) this.down.send({ t: "release", id: this.downId });
+			if (options.releaseDown) attempt(() => this.down?.send({ t: "release", id: this.downId }));
 		}
-		for (const waiter of this.#waiters) waiter.reject(error);
+		for (const waiter of this.#waiters) attempt(() => waiter.reject(error));
 		this.#waiters.clear();
-		if (options.notify) this.origin.send({ t: "gone", id: this.originId, error: toWireError(error) });
+		if (options.notify) attempt(() => this.origin.send({ t: "gone", id: this.originId, error: toWireError(error) }));
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) throw new AggregateError(errors, "relayed hold cleanup failed");
 	}
 }
 
@@ -331,8 +341,11 @@ export class RelayCall {
 	/** Cancels downstream (when the downstream hold still exists) and settles with `error`. */
 	cancel(error: unknown, forward: boolean): void {
 		if (this.#settled) return;
-		if (forward) this.relay.down?.send({ t: "cancel", id: this.downId });
-		this.finish(error);
+		try {
+			if (forward) this.relay.down?.send({ t: "cancel", id: this.downId });
+		} finally {
+			this.finish(error);
+		}
 	}
 }
 
@@ -1412,10 +1425,28 @@ export class Connection implements RemoteChannel {
 			});
 			return;
 		}
-		for (const feed of served.feeds.values()) feed.unsubscribe();
+		const feeds = [...served.feeds.values()];
 		served.feeds.clear();
 		this.dropHoldState(id);
-		if (release) served.ref.release();
+		let errors: unknown[] | undefined;
+		for (const feed of feeds) {
+			try {
+				feed.unsubscribe();
+			} catch (error) {
+				errors ??= [];
+				errors.push(error);
+			}
+		}
+		if (release) {
+			try {
+				served.ref.release();
+			} catch (error) {
+				errors ??= [];
+				errors.push(error);
+			}
+		}
+		if (errors?.length === 1) throw errors[0];
+		if (errors !== undefined) throw new AggregateError(errors, `served hold ${id}: cleanup failed`);
 	}
 
 	#onCall(frame: Extract<Frame, { t: "call" }>): void {
@@ -1587,42 +1618,63 @@ export class Connection implements RemoteChannel {
 	// ─── lifetime ───
 
 	#closed(reason: string): void {
-		const told = /^protocol-version (\d+)$/.exec(reason);
-		if (told !== null && Number(told[1]) !== PROTOCOL_VERSION) this.#protocolMismatch(Number(told[1]), false);
+		const errors: unknown[] = [];
+		const attempt = (step: () => void): void => {
+			try {
+				step();
+			} catch (failure) {
+				errors.push(failure);
+			}
+		};
 		if (this.#pinger !== undefined) clearInterval(this.#pinger);
 		if (this.#ackTimer !== undefined) clearTimeout(this.#ackTimer);
 		this.#pending.clear();
 		this.#pendingBytes = 0;
 		const error = unavailable(`link to ${this.name ?? "peer"} closed: ${reason}`);
 		// As origin: everything the peer held here, relayed or not, is released (downstream calls cancelled).
-		for (const id of [...this.served.keys()]) this.#dropServed(id, true);
-		for (const controller of this.incoming.values()) controller.abort(error);
+		for (const id of [...this.served.keys()]) attempt(() => this.#dropServed(id, true));
+		for (const controller of this.incoming.values()) attempt(() => controller.abort(error));
 		this.incoming.clear();
-		for (const pending of this.calls.values()) pending.reject(error);
+		for (const pending of this.calls.values()) attempt(() => pending.reject(error));
 		this.calls.clear();
-		for (const vote of this.votes.values()) vote.reject(error);
+		for (const vote of this.votes.values()) attempt(() => vote.reject(error));
 		this.votes.clear();
-		for (const pending of this.abortions.values()) pending.reject(error);
+		for (const pending of this.abortions.values()) attempt(() => pending.reject(error));
 		this.abortions.clear();
-		for (const pending of this.preparations.values()) pending.reject(error);
+		for (const pending of this.preparations.values()) attempt(() => pending.reject(error));
 		this.preparations.clear();
-		for (const receipts of this.replacements.values()) for (const receipt of receipts) receipt.reject(error);
+		for (const receipts of this.replacements.values())
+			for (const receipt of receipts) attempt(() => receipt.reject(error));
 		this.replacements.clear();
-		for (const waiter of this.#syncWaiters) waiter.reject(error);
+		for (const waiter of this.#syncWaiters) attempt(() => waiter.reject(error));
 		this.#syncWaiters.clear();
 		// As downstream of relays: their origins lose the hold.
-		for (const relay of [...this.relayedRefs.values()]) relay.close(error, { releaseDown: false, notify: true });
+		for (const relay of [...this.relayedRefs.values()])
+			attempt(() => relay.close(error, { releaseDown: false, notify: true }));
 		this.relayedRefs.clear();
+		for (const call of [...this.relayedCalls.values()]) attempt(() => call.cancel(error, false));
 		this.relayedCalls.clear();
 		const bindings = [...this.remotes.values()];
 		this.remotes.clear();
 		this.pendingCandidates.clear();
 		for (const binding of bindings) {
 			// An upstream link may be replaced (reconnect); a downstream host that went away is gone.
-			if (this.role === "upstream") binding.detached();
-			else binding.gone(error);
+			attempt(() => {
+				if (this.role === "upstream") binding.detached();
+				else binding.gone(error);
+			});
 		}
-		this.host.connectionClosed(this);
+		attempt(() => this.host.connectionClosed(this));
+		const told = /^protocol-version (\d+)$/.exec(reason);
+		if (told !== null && Number(told[1]) !== PROTOCOL_VERSION)
+			attempt(() => this.#protocolMismatch(Number(told[1]), false));
+		if (errors.length > 0) {
+			try {
+				this.host.report(errors.length === 1 ? errors[0] : new AggregateError(errors, "connection cleanup failed"));
+			} catch {
+				// Teardown is complete; a user reporter must not interrupt transport close handlers.
+			}
+		}
 	}
 }
 

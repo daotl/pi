@@ -10,6 +10,8 @@ The server tunnels native Chord frames over connection-scoped server and present
 - Session contract frames use the presentation-scoped link, including state updates and cancellation;
 - `createRoutedLinkPair()` connects an application Host to the routed byte transport without the removed service/member protocol.
 
+Attachments may return native Chord links directly, including `memoryLinkPair()` and IPC links; `createRoutedLinkPair()` is optional. Before strict protocol encoding, the server normalizes outgoing frames on both server and Session routes with Chord's `stringifyFrame()`: packed snapshots and results are inflated, and undefined optional protocol fields (including void results) are omitted. Invalid application data is rejected rather than coerced.
+
 A Session may have multiple presentation attachments. Repeating `attach` from one connection is idempotent; every successful attachment has a server-generated `attachmentId` delivered only as routing control data. Session requests carry `{ serverId, sessionId, attachmentId }`, and the server rejects stale or mismatched routes. Losing a connection rejects its local responses but releases its attachment only after admitted service calls settle. The host decides when zero presentation demand and worker-local Harness activity permit worker retirement. Server shutdown closes every routed Session handle, releasing its worker and Session writer ownership.
 
 ```ts

@@ -1,7 +1,7 @@
 import { type Static, type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
 import { ChordError, invalid } from "./errors.ts";
-import { canonicalJson, fits, hash64 } from "./schema.ts";
+import { canonicalJson, fits, hash64, receivedSchemaRoots } from "./schema.ts";
 import type { Ctx, Exposed, Readable, RefBase, StateSource } from "./types.ts";
 
 const MEMBER = Symbol("chord.member");
@@ -268,13 +268,32 @@ export function local<const D extends LocalDef>(name: string, def: D): LocalCont
 
 const receivedContracts = new WeakSet<AnyContract>();
 
+const STRUCTURAL_KINDS: Readonly<Record<string, true>> = {
+	Object: true,
+	Record: true,
+	Array: true,
+	Tuple: true,
+	String: true,
+	Number: true,
+	Integer: true,
+	Boolean: true,
+	Null: true,
+	Literal: true,
+	Unknown: true,
+	Any: true,
+	Never: true,
+	Optional: true,
+	Readonly: true,
+};
+
 /** Whether the token was reconstructed from declarative peer metadata, not registered application code. */
 export const isReceivedContract = (contract: AnyContract): boolean => receivedContracts.has(contract);
 
 /**
  * A consumer token received over a link. Descriptions are bounded to 64 levels, 16384 nodes and 256 KiB of text
  * before hashing or compatibility. Input normalization uses registered provider schemas. Peer regex sources must
- * match registered schemas; reference/combinator/custom-kind execution requires the identical trusted schema root.
+ * match registered schemas; flat primitive unions may match their registered subtree, while references and other
+ * executable forms require the identical trusted schema root. Runtime projection uses the registered kinds/subtrees.
  * Adapters have no historical schemas, so unmatched executable old-version schemas are refused.
  */
 export function contractFromDescription(description: Description): AnyContract {
@@ -298,6 +317,15 @@ export function contractFromDescription(description: Description): AnyContract {
 		}
 	}
 	if (characters > 262144) throw invalid("token", "contract description exceeds metadata limits");
+	// Own each received token independently. Neither caller mutation nor another token sharing a schema object may
+	// change the schema associated with a bound runtime projection. Wire metadata has no hidden TypeBox properties.
+	description = JSON.parse(canonicalJson(description)) as Description;
+	const owned: object[] = [description];
+	while (owned.length > 0) {
+		const value = owned.pop()!;
+		for (const child of Object.values(value)) if (child !== null && typeof child === "object") owned.push(child);
+		Object.freeze(value);
+	}
 	const { name, scope, version, input, host } = description;
 	if (
 		typeof name !== "string" ||
@@ -359,10 +387,14 @@ export type Accepts = Readonly<Record<number, Adapter>>;
 
 /** How a consumer token binds to a provider: directly or through an `accepts` adapter. Throws contract_mismatch. */
 export function bind(provider: AnyContract, accepts: Accepts | undefined, consumer: AnyContract): Adapter | undefined {
+	const projections: { wanted: TSchema; projected: TSchema }[] = [];
 	if (isReceivedContract(consumer)) {
-		const pending: { offered: unknown; wanted: unknown; root?: { offered: unknown; wanted: unknown } }[] = [
-			{ offered: provider.input, wanted: consumer.input },
-		];
+		const pending: {
+			offered: unknown;
+			wanted: unknown;
+			projected?: unknown;
+			root?: { offered: unknown; wanted: unknown; projected: TSchema };
+		}[] = [{ offered: provider.input, wanted: consumer.input }];
 		for (const [variant, members] of Object.entries(consumer.description.variants)) {
 			for (const [name, wanted] of Object.entries(members)) {
 				const offered = provider.description.variants[variant]?.[name];
@@ -377,37 +409,76 @@ export function bind(provider: AnyContract, accepts: Accepts | undefined, consum
 				}
 			}
 		}
-		for (const entry of pending) entry.root = { offered: entry.offered, wanted: entry.wanted };
+		const roots = pending.map((entry) => {
+			const projected = JSON.parse(canonicalJson(entry.wanted)) as TSchema;
+			entry.projected = projected;
+			entry.root = { offered: entry.offered, wanted: entry.wanted, projected };
+			return entry.root;
+		});
 		while (pending.length > 0) {
-			const { offered, wanted, root } = pending.pop()!;
+			const { offered, wanted, projected, root } = pending.pop()!;
 			if (wanted === null || typeof wanted !== "object") continue;
 			const schema = wanted as Record<string, unknown>;
 			const trusted = offered !== null && typeof offered === "object" ? (offered as Record<string, unknown>) : {};
+			const projection = projected as Record<string, unknown>;
+			delete projection["~kind"];
+			// Only a flat primitive union is context-independent: no refs, recursive definitions, combinator branches,
+			// or custom kinds. Other executable schemas retain the whole-root check below, including reference context.
+			const primitiveUnion =
+				trusted["~kind"] === "Union" &&
+				Object.keys(schema).every((key) => key === "anyOf" || key === "~kind") &&
+				Array.isArray(schema.anyOf) &&
+				schema.anyOf.length <= 64 &&
+				Array.isArray(trusted.anyOf) &&
+				trusted.anyOf.every((branch: unknown) => {
+					if (branch === null || typeof branch !== "object") return false;
+					const primitive = branch as Record<string, unknown>;
+					const kind = primitive["~kind"];
+					return (
+						kind === "Literal" ||
+						(typeof primitive.type === "string" &&
+							typeof kind === "string" &&
+							kind.toLowerCase() === primitive.type)
+					);
+				}) &&
+				schema.anyOf.every((branch: unknown) => {
+					if (branch === null || typeof branch !== "object") return false;
+					const primitive = branch as Record<string, unknown>;
+					return (
+						["string", "number", "integer", "boolean", "null"].includes(String(primitive.type)) &&
+						Object.keys(primitive).every((key) => key === "type" || key === "const")
+					);
+				}) &&
+				canonicalJson(schema) === canonicalJson(trusted);
 			if (
 				(["$ref", "$dynamicRef", "$recursiveRef", "allOf", "anyOf", "oneOf", "not", "if", "then", "else"].some(
 					(key) => key in schema,
 				) ||
-					(typeof schema["~kind"] === "string" &&
-						![
-							"Object",
-							"Record",
-							"Array",
-							"Tuple",
-							"String",
-							"Number",
-							"Integer",
-							"Boolean",
-							"Null",
-							"Literal",
-							"Unknown",
-							"Any",
-							"Never",
-							"Optional",
-							"Readonly",
-						].includes(schema["~kind"]))) &&
-				canonicalJson(root?.wanted) !== canonicalJson(root?.offered)
-			)
-				throw invalid("token", "peer executable schemas must match the registered provider schema");
+					(typeof schema["~kind"] === "string" && !Object.hasOwn(STRUCTURAL_KINDS, schema["~kind"]))) &&
+				!primitiveUnion
+			) {
+				if (canonicalJson(root?.wanted) !== canonicalJson(root?.offered))
+					throw invalid("token", "peer executable schemas must match the registered provider schema");
+				root!.projected = root!.offered as TSchema;
+			}
+			if (primitiveUnion) {
+				Object.defineProperties(projection, Object.getOwnPropertyDescriptors(trusted));
+				continue;
+			}
+			// JSON type does not distinguish TypeBox Object/Record or Array/Tuple layouts.
+			let kind: string | undefined;
+			if (schema.type === "object") {
+				if (schema.properties !== null && typeof schema.properties === "object") kind = "Object";
+				else if (
+					schema.patternProperties !== null &&
+					typeof schema.patternProperties === "object" &&
+					Object.keys(schema.patternProperties).length === 1
+				)
+					kind = "Record";
+			} else if (schema.type === "array" && schema.items !== null && typeof schema.items === "object") {
+				kind = Array.isArray(schema.items) ? "Tuple" : "Array";
+			}
+			if (kind !== undefined) Object.defineProperty(projection, "~kind", { value: kind, configurable: true });
 			if ("pattern" in schema && canonicalJson(schema.pattern) !== canonicalJson(trusted.pattern))
 				throw invalid("token", "peer regular expressions must match the registered provider schema");
 			// Property/member names are data, not schema keywords; only descend through schema-bearing locations.
@@ -430,7 +501,12 @@ export function bind(provider: AnyContract, accepts: Accepts | undefined, consum
 				)
 					throw invalid("token", "peer regular expressions must match the registered provider schema");
 				for (const [name, child] of Object.entries(children))
-					pending.push({ offered: trustedChildren[name], wanted: child, root });
+					pending.push({
+						offered: trustedChildren[name],
+						wanted: child,
+						projected: (projection[key] as Record<string, unknown>)[name],
+						root,
+					});
 			}
 			for (const key of [
 				"items",
@@ -455,39 +531,67 @@ export function bind(provider: AnyContract, accepts: Accepts | undefined, consum
 				if (Array.isArray(children)) {
 					const known = Array.isArray(trusted[key]) ? (trusted[key] as unknown[]) : [];
 					children.forEach((child, index) => {
-						pending.push({ offered: known[index], wanted: child, root });
+						pending.push({
+							offered: known[index],
+							wanted: child,
+							projected: (projection[key] as unknown[])[index],
+							root,
+						});
 					});
-				} else pending.push({ offered: trusted[key], wanted: children, root });
+				} else pending.push({ offered: trusted[key], wanted: children, projected: projection[key], root });
 			}
 		}
+		for (const root of roots) {
+			if (root.wanted !== null && typeof root.wanted === "object")
+				projections.push({ wanted: root.wanted as TSchema, projected: root.projected });
+		}
 	}
+	let adapter: Adapter | undefined;
 	if (
 		provider.fingerprint === consumer.fingerprint &&
 		canonicalJson(provider.description) === canonicalJson(consumer.description)
-	)
-		return undefined;
-	// A moved type is another type for its consumers: no adapter reaches across hosts.
-	if (!samePlacement(provider.description, consumer.description)) {
+	) {
+		// Exact tokens need no compatibility check after the received-schema guard.
+	} else if (!samePlacement(provider.description, consumer.description)) {
 		throw new ChordError(
 			"contract_mismatch",
 			`${provider.name} lives on ${placementOf(provider.description)}, the consumer expects ${placementOf(consumer.description)}`,
 		);
-	}
-	if (provider.version === consumer.version) {
+	} else if (provider.version === consumer.version) {
 		const reason = coverage(provider.description, consumer.description);
-		if (reason === undefined) return undefined;
-		throw new ChordError(
-			"contract_mismatch",
-			`${provider.name}@${provider.version} does not cover the consumer's description (${reason}); forgotten version bump?`,
-		);
+		if (reason !== undefined)
+			throw new ChordError(
+				"contract_mismatch",
+				`${provider.name}@${provider.version} does not cover the consumer's description (${reason}); forgotten version bump?`,
+			);
+	} else {
+		adapter = accepts?.[consumer.version];
+		if (adapter === undefined) {
+			throw new ChordError(
+				"contract_mismatch",
+				`${provider.name}: provider version ${provider.version}, consumer version ${consumer.version}, no accepts adapter`,
+			);
+		}
 	}
-	const adapter = accepts?.[consumer.version];
-	if (adapter === undefined) {
-		throw new ChordError(
-			"contract_mismatch",
-			`${provider.name}: provider version ${provider.version}, consumer version ${consumer.version}, no accepts adapter`,
-		);
+	// A later compatible provider must not replace the projection used by existing references.
+	for (const { wanted, projected } of projections) {
+		const existing = receivedSchemaRoots.get(wanted);
+		if (existing === undefined) continue;
+		if (canonicalJson(existing) !== canonicalJson(projected))
+			throw invalid("token", "received schema projection changed across bindings");
+		const pending: { existing: unknown; projected: unknown }[] = [{ existing, projected }];
+		while (pending.length > 0) {
+			const pair = pending.pop()!;
+			if (pair.existing === null || typeof pair.existing !== "object") continue;
+			const previous = pair.existing as Record<string, unknown>;
+			const next = pair.projected as Record<string, unknown>;
+			if (previous["~kind"] !== next["~kind"])
+				throw invalid("token", "received schema projection changed across bindings");
+			for (const [key, child] of Object.entries(previous)) pending.push({ existing: child, projected: next[key] });
+		}
 	}
+	for (const { wanted, projected } of projections)
+		if (!receivedSchemaRoots.has(wanted)) receivedSchemaRoots.set(wanted, projected);
 	return adapter;
 }
 

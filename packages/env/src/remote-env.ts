@@ -353,6 +353,11 @@ class RemoteTextLineReader implements TextLineReader {
 	}
 }
 
+type PendingExec = {
+	controller: AbortController;
+	running?: { id: number; session: number };
+};
+
 /**
  * An `ExecutionEnv` on another machine, reached through a pi-env daemon. Results match `NodeExecutionEnv` running on
  * that machine: the daemon performs the system calls, and this class applies Node's path, error, and result rules.
@@ -364,8 +369,8 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 	readonly #shellPath: string | undefined;
 	readonly #shellEnv: Record<string, string> | undefined;
 	readonly #watchOptions: RemoteWatchOptions;
-	/** Running commands this environment started, for `cleanup()`. */
-	readonly #running = new Map<number, number>();
+	/** Commands admitted by this environment, including ones still waiting for shared startup. */
+	readonly #pendingExec = new Set<PendingExec>();
 
 	constructor(options: RemoteExecutionEnvOptions) {
 		this.id = options.id;
@@ -890,14 +895,6 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 			}
 		}
 		const inheritEnv = options?.inheritEnv ?? true;
-		let cwd: string;
-		try {
-			cwd = options?.cwd ? await this.#resolve(options.cwd, signal) : this.cwd;
-		} catch (error) {
-			if (signal?.aborted) return err(new ExecutionError("aborted", "aborted"));
-			return err(new ExecutionError("unknown", error instanceof Error ? error.message : String(error)));
-		}
-		if (signal?.aborted) return err(new ExecutionError("aborted", "aborted"));
 		const env: Record<string, string> = {};
 		for (const [key, value] of Object.entries(
 			inheritEnv ? { ...this.#shellEnv, ...options?.env } : { ...options?.env },
@@ -906,11 +903,20 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 		}
 		let callbackError: ExecutionError | undefined;
 		let settled = false;
-		let running: number | undefined;
 		const controller = new AbortController();
+		const execution: PendingExec = { controller };
+		this.#pendingExec.add(execution);
 		const onAbort = () => controller.abort();
 		signal?.addEventListener("abort", onAbort, { once: true });
 		try {
+			let cwd: string;
+			try {
+				cwd = options?.cwd ? await this.#resolve(options.cwd, controller.signal) : this.cwd;
+			} catch (error) {
+				if (controller.signal.aborted) return err(new ExecutionError("aborted", "aborted"));
+				return err(new ExecutionError("unknown", error instanceof Error ? error.message : String(error)));
+			}
+			if (controller.signal.aborted) return err(new ExecutionError("aborted", "aborted"));
 			const { json } = await this.connection.request(
 				"exec",
 				{
@@ -926,8 +932,7 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 				{
 					signal: controller.signal,
 					onStart: (requestId, session) => {
-						running = requestId;
-						this.#running.set(requestId, session);
+						execution.running = { id: requestId, session };
 					},
 					onEvent: (event, payload) => {
 						if (settled || callbackError !== undefined || event.kind !== "output") return;
@@ -973,14 +978,17 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 		} finally {
 			settled = true;
 			signal?.removeEventListener("abort", onAbort);
-			if (running !== undefined) this.#running.delete(running);
+			this.#pendingExec.delete(execution);
 		}
 	}
 
 	async cleanup(_context: Context): Promise<void> {
-		// Kill without aborting, so the commands settle with their killed status, as `NodeExecutionEnv` does.
-		for (const [id, session] of this.#running) this.connection.kill(id, session);
-		this.#running.clear();
+		for (const execution of this.#pendingExec) {
+			// Dispatched commands keep their killed status, as in Node; pending commands must never dispatch.
+			if (execution.running) this.connection.kill(execution.running.id, execution.running.session);
+			else execution.controller.abort();
+		}
+		this.#pendingExec.clear();
 	}
 }
 

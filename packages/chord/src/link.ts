@@ -187,7 +187,8 @@ function packObject(frame: Frame, compress: boolean): unknown {
 	const field = payloadField(frame);
 	if (field === undefined) return frame;
 	const value = (frame as Record<string, unknown>)[field];
-	const bytes = packedBytes(value, compress, compress && zlib !== undefined ? JSON.stringify(value) : undefined);
+	const json = compress && zlib !== undefined && !(value instanceof Packed) ? JSON.stringify(value) : undefined;
+	const bytes = packedBytes(value, compress, json);
 	if (bytes === undefined) return frame;
 	return {
 		...envelopeOf(frame, field),

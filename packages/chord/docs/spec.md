@@ -68,6 +68,13 @@ Finite `const` and `enum` container schemas must also satisfy structural object-
 
 Additive changes need no bump. Breaking changes (remove/rename/retype, newly required, or a change of meaning with the same shape) bump the number. Same version + non-covering description = forgotten bump, refused. Meaning changes without a bump are undetectable (author's responsibility, as with Durable document versions).
 
+Received contract metadata is bounded, copied and frozen before binding. An unchanged nested union of at most 64
+primitive branches may match its registered provider subtree even when an optional sibling is added. Argument
+projection preserves the consumer's fields and derives container kinds from their layout, using registered union subtrees; peer references,
+schema DAGs, custom kinds and other executable forms still require an identical registered schema root. This
+restriction applies through links and adapters; an adapter does not authorize an unregistered executable schema.
+The first successful received-root projection remains stable across later bindings. A conflicting projection is refused before any root mapping changes, so rebinding cannot alter an existing reference's executable schema.
+
 Checked at: `get` binding, reload prepare (new provider token vs every surviving consumer holding the type and every loaded plugin importing it), remote references (consumer token in the `hold` frame).
 
 The exact host-owned reference to a `lifetime: "host"` object is a lifecycle pin, not a surviving old-contract consumer. When its
@@ -281,6 +288,7 @@ Per-code-version immutable tables; order = first registration order, kept on rep
 
 - `createHost({ name, self, principalKey, upstream?: { link, principal } })`; `host.accept(link, { principal })` for children; `host.connect(link, { principal })` for the parent; `host.route(prefix, { authorize(principal, hostName), resolve(hostName) => Promise<Link>, principal(hostName) })`.
 - Links: `memoryLinkPair()` (tests), Node IPC (child_process), WebSocket (server `ws`, browser `WebSocket`).
+- Packed payload relays preserve the compressed bytes without JSON-encoding their byte arrays again; IPC retains its base64 envelope.
 - Principal stamping: the accepting side stamps the principal of what connects (from its authenticator); forwarded principals accepted only from the parent link; the parent's own requests (no forwarded principal) act as the principal given to `connect`; payload principal fields ignored.
 - A child that connects behind its parent's code version is fenced (nothing routed to it) and reconciled by a reload of its modules to the parent's code version. Calls its roots of the old code version make upstream are admitted in the parent's current code version (the parent never ran that code version), not rejected `superseded`.
 - Relay: server forwards a hold to the child link of its target host (`at`, resolved by the consumer from the contract's placement and the normalized input, and checked against both), mapping references per origin connection; authorizes before resolving/spawning and re-checks after.

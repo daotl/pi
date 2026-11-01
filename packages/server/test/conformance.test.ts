@@ -12,7 +12,7 @@ import {
 import { BACKGROUND_CONTEXT, type SessionMetadata } from "@earendil-works/pi-agent-core";
 import { encodeClientMessage } from "@earendil-works/pi-protocol";
 import { Type } from "typebox";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { Client, createClientChordLink } from "../../client/src/index.ts";
 import type { ByteConnectionHandler } from "../src/connection.ts";
 import { createRoutedLinkPair } from "../src/link.ts";
@@ -283,6 +283,95 @@ describe("packed payloads across routed JSON bridges", () => {
 			ref.release();
 		},
 	);
+
+	test.each(["server", "Session"] as const)(
+		"preserves packed snapshots, results, and void results from a native %s attachment",
+		async (route) => {
+			const snapshot = `snapshot:${"s".repeat(PACK_THRESHOLD + 1)}`;
+			const payload = `request:${"q".repeat(PACK_THRESHOLD + 1)}`;
+			const result = `result:${"r".repeat(PACK_THRESHOLD + 1)}`;
+			const provider = createHost({ name: "worker:packed", self: null, readyTimeout: 1_000 });
+			const consumer = createHost({ name: "native-presentation", self: null, kind: "client", readyTimeout: 1_000 });
+			for (const host of [provider, consumer]) hosts.add(host);
+			provider.serve(PackedContract, (_input, _principal, self) => ({
+				variant: "live",
+				snapshot: self.state("snapshot", Type.String(), snapshot),
+				store: (value) => {
+					expect(value).toBe(payload);
+					return result;
+				},
+				ping: () => {},
+			}));
+			const [link, providerLink] = memoryLinkPair();
+			provider.accept(providerLink, { principal: null });
+			const attachment = { link, release: () => link.close() };
+			const services = createTestServerServices();
+			const server = createServer({
+				serverServices: route === "server" ? { attachClient: () => attachment } : services,
+				resolveSession: async () => ({ id: "packed", createdAt: 1, storageVersion: 1 }),
+				openSession: async () => ({ attachClient: () => attachment, close: async () => {} }),
+			});
+			const client = await connectClient(server);
+			if (route === "Session") {
+				const managementHost = createHost({ name: "native-management", self: null, kind: "client" });
+				hosts.add(managementHost);
+				managementHost.connect(
+					createClientChordLink(client, () => ({ serverId })),
+					{ principal: null },
+				);
+				const management = await managementHost.get(TestSessionManagement, {});
+				await managementHost.root((ctx) => management.attach("packed", ctx));
+				management.release();
+			}
+			consumer.connect(
+				createClientChordLink(client, () => (route === "server" ? { serverId } : client.attachment)),
+				{ principal: null },
+			);
+			const ref = await consumer.get(PackedContract, {});
+			expect(ref.snapshot.value).toBe(snapshot);
+			await expect(consumer.root((ctx) => ref.store(payload, ctx))).resolves.toBe(result);
+			await expect(consumer.root((ctx) => ref.ping(ctx))).resolves.toBeUndefined();
+			expect(client.connected).toBe(true);
+			ref.release();
+		},
+	);
+
+	test("rejects invalid native application data instead of coercing it at the server boundary", async () => {
+		const [link, provider] = memoryLinkPair();
+		const errors: Error[] = [];
+		const server = new Server(
+			{
+				serverServices: { attachClient: () => ({ link, release: () => link.close() }) },
+				resolveSession: async () => {
+					throw new Error("No Session route");
+				},
+				openSession: async () => {
+					throw new Error("No Session route");
+				},
+			},
+			{ listeners: [], serverId, onError: (error) => errors.push(error) },
+		);
+		servers.add(server);
+		// Memory transport's own JSON round trip cannot carry invalid data. Inject it at its receiver,
+		// where an application-owned Link can hand arbitrary native frames to the server.
+		const receive = link.receive.bind(link);
+		const invalid = vi.spyOn(link, "receive").mockImplementation((handler) => {
+			receive((frame) => {
+				if (frame.t === "result") handler({ ...frame, value: { missing: undefined } });
+				else handler(frame);
+			});
+		});
+		try {
+			const client = await connectClient(server);
+			provider.send({ t: "result", id: 1, value: "valid before native receiver" });
+			await expect.poll(() => client.connected).toBe(false);
+			expect(errors).toHaveLength(1);
+			expect(errors[0]).toBeInstanceOf(TypeError);
+		} finally {
+			invalid.mockRestore();
+			provider.close();
+		}
+	});
 
 	test("counts normalized JSON characters and routed encoded bytes for packed frames", async () => {
 		const [sender, receiver] = memoryLinkPair();

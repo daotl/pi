@@ -63,6 +63,10 @@ await host.root(async (ctx) => {
 });
 ```
 
+Root cleanup releases every `ctx.get` reference and ends the root's code-version leases even if a readable's
+unsubscribe throws. The root rejects with the cleanup error, or an `AggregateError` when several steps fail;
+if its callback also failed, that failure is the aggregate's first error.
+
 ## Documentation
 
 - [Tutorial](docs/tutorial.md): a shared todo list, built up section by section. Every example runs as `test/tutorial.test.ts`.
@@ -251,3 +255,7 @@ received packed payloads before delivering their frames. `Link.send` must contin
 reporting the size in its transport's existing units: JSON text length for a JSON
 link, encoded byte length for a routed byte link, or undefined when sizes are not
 reported. Count the normalized frame as actually encoded, not its packed source.
+
+When a link closes, Chord tears down every served hold and state feed, settles pending calls and reload receipts,
+and notifies the host before reporting cleanup failures through `onError`. A failing unsubscribe or error reporter
+does not prevent the remaining connection teardown.

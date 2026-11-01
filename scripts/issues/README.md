@@ -59,3 +59,5 @@ The agent authenticates through `~/.pi/agent/auth.json`, the same credentials pi
 - `o`: open the issue on GitHub
 
 Background state refreshes and unrelated Sync or retriage completions leave a focused category selector in place, including when a refresh fails. Errors appear in the status line immediately; deferred controls and snapshots update after focus leaves all selectors. Submitting a decision still disables decision controls until an authoritative state refresh succeeds.
+
+You can select Inbox, Decided, or All before the initial state loads. If that request fails, the status line reports the error; use Sync to retry. The selected tab is preserved when the state arrives.

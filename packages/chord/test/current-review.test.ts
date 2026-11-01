@@ -11,6 +11,7 @@ import {
 	memoryLinkPair,
 	method,
 	type Readable,
+	type Ref,
 	remote,
 } from "../src/index.ts";
 import type { Factory } from "../src/object.ts";
@@ -305,6 +306,195 @@ describe("current review regressions", () => {
 			assert.deepEqual(closed, ["native"]);
 		});
 	}
+
+	for (const bodyFails of [false, true]) {
+		it(`releases every root reference and retires its code when cleanup fails${bodyFails ? " after a body failure" : ""}`, async () => {
+			const host = new HostImpl({ self: null, onError: () => {} });
+			const State = local("review.root-cleanup", {
+				version: 1,
+				input: Type.Object({ id: Type.Number() }),
+				members: { value: Type.Number(), read: method(undefined, Type.Number()) },
+			});
+			const failures = [new Error("first cleanup failed"), new Error("second cleanup failed")];
+			const bodyFailure = new Error("root body failed");
+			const stopped: number[] = [];
+			host.serve(
+				State,
+				({ id }) => ({
+					value: {
+						value: id,
+						subscribe: (listener) => {
+							listener(id);
+							return () => {};
+						},
+						events: (listener) => {
+							listener({ type: "snap", value: id });
+							return () => {
+								stopped.push(id);
+								if (id < failures.length) throw failures[id];
+							};
+						},
+					},
+					read: () => id,
+				}),
+				{ linger: 60_000 },
+			);
+			const entered = latch<void>();
+			const finish = latch<void>();
+			const refs: Ref<typeof State>[] = [];
+			const original = host.current;
+			const running = host.root(async (ctx) => {
+				for (const id of [0, 1, 2]) {
+					const ref = await ctx.get(State, { id });
+					refs.push(ref);
+					ref.value.subscribe(() => {});
+					assert.equal(await ref.read(ctx), id);
+				}
+				entered.resolve();
+				await finish.promise;
+				if (bodyFails) throw bodyFailure;
+			});
+			const rejected = assert.rejects(running, (error) => {
+				assert.ok(error instanceof AggregateError);
+				if (bodyFails) {
+					assert.equal(error.errors[0], bodyFailure);
+					assert.ok(error.errors[1] instanceof AggregateError);
+					assert.deepEqual(error.errors[1].errors, failures);
+				} else assert.deepEqual(error.errors, failures);
+				return true;
+			});
+			try {
+				await entered.promise;
+				const objects = [...host.objects.values()];
+				await host.reload([]);
+				assert.equal(host.previous, original);
+				finish.resolve();
+				await rejected;
+				assert.deepEqual(stopped, [0, 1, 2]);
+				assert.deepEqual(
+					refs.map((ref) => ref.status),
+					["released", "released", "released"],
+				);
+				for (const object of objects) {
+					assert.equal(object.refs.size, 0);
+					assert.equal(object.leases.size, 0);
+				}
+				assert.equal(original.roots.size, 0);
+				assert.equal(host.previous, undefined);
+				assert.equal(host.codeVersions.has(original.id), false);
+				await host.reload([], { retireDeadline: Infinity });
+				const next = await host.get(State, { id: 2 });
+				assert.equal(await next.read(), 2);
+				next.release();
+			} finally {
+				finish.resolve();
+				await running.catch(() => {});
+				await host.close();
+			}
+		});
+	}
+
+	for (const reporterThrows of [false, true]) {
+		it(`settles calls and reload receipts after remote readable teardown fails${reporterThrows ? " and reporting throws" : ""}`, async () => {
+			const reports: unknown[] = [];
+			const provider = new HostImpl({
+				name: "provider",
+				self: null,
+				onError: (error) => {
+					reports.push(error);
+					if (reporterThrows) throw new Error("reporter failed");
+				},
+			});
+			const peer = new HostImpl({ name: "peer", self: null, onError: () => {} });
+			const State = remote("review.connection-cleanup", {
+				version: 1,
+				input: Type.Object({ id: Type.Number() }),
+				host: hostNamed("provider"),
+				variants: { main: { state: { first: Type.Number(), second: Type.Number() } } },
+			});
+			const Waiting = remote("review.connection-pending", {
+				version: 1,
+				input: Type.Object({}),
+				host: hostNamed("peer"),
+				variants: { main: { methods: { wait: method() } } },
+			});
+			const stopped: string[] = [];
+			const failure = new Error("remote readable cleanup failed");
+			provider.serve(State, ({ id }) => {
+				const source = (member: string): Readable<number> => ({
+					value: id,
+					subscribe: (listener) => {
+						listener(id);
+						return () => {};
+					},
+					events: (listener) => {
+						listener({ type: "snap", value: id });
+						return () => {
+							stopped.push(`${id}:${member}`);
+							if (id === 0 && member === "first") throw failure;
+						};
+					},
+				});
+				return { variant: "main", first: source("first"), second: source("second") };
+			});
+			const started = latch<void>();
+			const cancelled = latch<void>();
+			peer.serve(Waiting, () => ({
+				variant: "main",
+				wait: async (ctx) => {
+					started.resolve();
+					await new Promise<void>((resolve) =>
+						ctx.signal.addEventListener(
+							"abort",
+							() => {
+								cancelled.resolve();
+								resolve();
+							},
+							{ once: true },
+						),
+					);
+				},
+			}));
+			const [up, down] = memoryLinkPair();
+			peer.connect(up, { principal: null });
+			provider.accept(down, { principal: null, kind: "host", name: "peer" });
+			try {
+				await peer.get(State, { id: 0 });
+				await peer.get(State, { id: 1 });
+				const waiting = await provider.get(Waiting, {});
+				const connection = [...provider.connections][0]!;
+				const served = [...connection.served.values()];
+				const rejected = assert.rejects(waiting.wait(), { code: "unavailable" });
+				await started.promise;
+				const receiptRejected = assert.rejects(connection.replace(999, "pending-reload", false), {
+					code: "unavailable",
+				});
+				// No await: the receipt must still be in flight when the transport closes.
+				down.close("connection lost");
+				await Promise.all([rejected, receiptRejected, cancelled.promise]);
+				assert.deepEqual(stopped, ["0:first", "0:second", "1:first", "1:second"]);
+				for (const hold of served) {
+					assert.equal(hold.kind, "local");
+					if (hold.kind === "local") {
+						assert.equal(hold.ref.status, "released");
+						assert.equal(hold.ref.object.refs.size, 0);
+						assert.equal(hold.feeds.size, 0);
+					}
+				}
+				assert.equal(connection.calls.size, 0);
+				assert.equal(connection.replacements.size, 0);
+				assert.equal(connection.served.size, 0);
+				assert.equal(connection.remotes.size, 0);
+				assert.equal(provider.connections.has(connection), false);
+				assert.equal(waiting.status, "gone");
+				assert.deepEqual(reports, [failure]);
+			} finally {
+				await peer.close();
+				await provider.close();
+			}
+		});
+	}
+
 	for (const cancelGet of [false, true]) {
 		it(`settles method-only readiness when the last state view ${cancelGet ? "is cancelled" : "is released"} mid-hydration`, async () => {
 			const Service = remote("review.pending-shape", {

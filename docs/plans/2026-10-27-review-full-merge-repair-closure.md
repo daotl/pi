@@ -2708,3 +2708,120 @@ No unimplemented accepted source finding remains in this round. Historical nativ
 ### Verdict
 
 **All 22 accepted source findings repaired and locally verified. Whole merge remains NOT READY for unconditional native-platform acceptance.** Validation used additional bounded batches rather than the skill's single-batch topology; that procedural deviation remains explicit. Local source correctness evidence does not certify Windows, external SSH/Gondolin, native image pixels, production Cloudflare, or release publication.
+
+
+## Complete merge review after 52499a182
+
+**Scope:** `98dfe28cbeec4e1f2f61516e227420b2407dcdf9 -> 52499a182a030f6055c4cb11e12882f4b133a410`, including merge `8322aa1d` and all later changes; **1296 changed paths**. Current pre-review checkpoint is `52499a182`; worktree was clean, so no empty pre-review commit was created. **Mode:** markdown local-apply, explicitly requested by the user. No push or PR. Prior review sections remain historical records, not evidence for this review.
+
+### Actionable Findings
+
+| # | Severity | Location | Finding | Confidence |
+|---|---|---|---|---|
+| 1 | P2 | `packages/chord/src/host.ts:798` | Release root bookkeeping when context cleanup fails | 100 |
+| 2 | P2 | `scripts/issues/ui.html:260` | Guard tab rendering until initial state loads | 100 |
+| 3 | P2 | `packages/chord/src/connection.ts:1598` | Finish connection teardown after readable cleanup throws | 75 |
+| 4 | P2 | `packages/chord/src/contract.ts:408` | Keep additive union contracts usable across native links | 75 |
+| 5 | P2 | `packages/chord/src/link.ts:190` | Skip JSON encoding of already packed relay payloads | 75 |
+| 7 | P2 | `packages/env/src/remote-env.ts:982` | Cleanup during SSH startup lets commands run after shutdown | 75 |
+| 8 | P2 | `packages/server/src/server.ts:288` | Normalize native server frames before strict protocol encoding | 75 |
+| 9 | P2 | `scripts/npm-audit.mjs:24` | Audit guard accepts an unsuccessful npm process | 75 |
+
+- **#1:** A completed root that acquired a reference with a failing readable cleanup remains recorded as active indefinitely. ctx.close() can throw while releasing its acquired references, so joinRoot never decrements codeVersion.roots, sends root-end cleanup, or triggers retirement; a later reload unnecessarily waits out retirement deadlines and retains old implementations. With several context-owned references, the first failed release also prevents the remaining references from being released. Response: Make CtxImpl.close attempt every acquired reference release and aggregate cleanup errors after the loop. Wrap ctx.close in its own try/finally inside joinRoot so root-count decrement, endRoot, retirement, and notification always execute, even if cleanup fails. Preserve the cleanup error for the root caller after the bookkeeping is complete. Add a targeted root scenario acquiring two references, with the first readable cleanup throwing, and assert both references release, no root remains active, and a subsequent reload does not wait for that finished root.
+
+- **#2:** Clicking Inbox, Decided, or All before the initial /api/state request completes throws an uncaught TypeError instead of rendering the selected view. The same failure remains reachable after an initial HTTP/network failure, because data stays null while the tabs remain enabled. Their click handler calls render(), which unconditionally reaches visible() and reads data.items; keyboard navigation already avoids this state with its !data guard. Response: After renderStatus() in render(), return immediately when data is null, retaining the selected view so installSnapshot() renders it when the initial request or Sync retry succeeds. Cover clicking a tab while the initial request is pending and after that request fails, then completing a successful retry.
+
+- **#3:** Losing a peer while one served readable has a throwing unsubscribe can leave unrelated calls and reload receipts pending forever, even though the link is already closed. Connection.#closed calls #dropServed before rejecting those waiters; #dropServed invokes each feed's unsubscribe without containment and can also fail to release the underlying reference. MemberReadable's unsubscribe invokes the application's source cleanup, so this is a reachable extension failure, not merely a hypothetical Link implementation. The existing local-reference cleanup regression explicitly supports this failure shape, but does not exercise it through a connection. Response: Contain and collect failures from every feed unsubscribe and served-reference release in #dropServed, always clearing feed/state bookkeeping and releasing the reference. In #closed, isolate each served/relayed/binding cleanup and put waiter rejection plus host.connectionClosed in unconditional cleanup so an extension exception cannot skip them; report or aggregate errors only after teardown completes. Add a targeted remote-link regression with a throwing readable cleanup and another pending call/reload receipt, asserting those promises settle and the connection is removed.
+
+- **#4:** A same-version additive change to a method argument containing a union works for an in-host consumer but makes the identical remote consumer's hold fail with invalid/token. For example, add an optional field beside an unchanged Type.Union([Type.String(), Type.Number()]) property: coverage and local bind accept the change, but the received-token guard compares the entire argument schema root for equality merely because the unchanged nested union has anyOf. This defeats the advertised additive contract rule during independently deployed client/provider updates, including additive changes unrelated to the union itself. Response: Do not require equality of the entire argument/input/result/state root solely because an unchanged, structurally matched nested union appears below it. Retain the peer-schema execution protection, but compare or resolve the executable subschema against the corresponding registered trusted subschema, and use trusted schemas for runtime projection/validation. Exercise the same old/new additive contract both locally and through memoryLinkPair; also retain the existing malicious DAG and spoofed-kind rejection scenarios.
+
+- **#5:** Relaying a large image, tool result, or state snapshot over an IPC link synchronously serializes the already-compressed byte array into a JSON object and immediately discards that string. JavaScript evaluates JSON.stringify(value) before entering packedBytes(), even though packedBytes() returns value.bytes immediately for Packed. The temporary serialization expands every byte into a decimal indexed property, adding substantial CPU and transient heap pressure on the relay event loop precisely for the large payloads this path is intended to forward without decoding. Response: In packObject(), skip computing JSON when value instanceof Packed, as packMessage() already does at line 217. For example compute json only when compression is enabled, zlib exists, and the value is not Packed, then pass it to packedBytes(); preserve the existing compressed bytes and base64 envelope.
+
+- **#7:** A command requested before shutdown can start and continue running after env.cleanup() has resolved. exec() registers the command in #running only in Connection.onStart, after lazy detection/deployment/handshake has finished; cleanup() snapshots only already-dispatched requests. When an owner cleans up while that shared startup is pending, its command is absent from the kill loop and is dispatched later, potentially mutating files after the owner has released its resources. Tracking each execution before its first asynchronous admission step lets cleanup cancel that pending dispatch without closing a connection shared by other environments. Response: Track every exec invocation before cwd resolution/connection startup, not only its dispatched request ID. Have cleanup mark all invocations it captured as killed, prevent their subsequent dispatch (or abort their startup wait), and keep using Connection.kill for already-dispatched IDs. Remove each invocation in finally and preserve other environments sharing the Connection; add a controlled-startup regression where cleanup resolves before startup is released and the queued command never creates its marker file.
+
+- **#8:** An application returning a native Chord Link, as RoutedServerServiceAttachment and RoutedSessionAttachment allow, loses its entire byte connection when that link receives a packed result or snapshot. MemoryLink and IpcLink expose large payloads as Packed instances, but the server forwards them directly to encodeServerMessage, whose strict JSON check rejects them; only createRoutedLinkPair happens to normalize them. The client bridge already calls stringifyFrame, so this is an asymmetric native-Link contract failure rather than invalid application data. Response: Normalize every outgoing chord envelope at the server byte boundary using JSON.parse(stringifyFrame(message.frame)) before encodeServerMessage, covering both server and Session routes. Preserve stringifyFrame's rejection of invalid application data. Add a focused consumer scenario returning memoryLinkPair or an IPC Link directly from attachClient, with a snapshot/result larger than PACK_THRESHOLD and a void result.
+
+- **#9:** The scheduled production-audit step can report success even when npm audit did not complete successfully. The new wrapper checks spawn errors and JSON error fields, but never checks the child signal or exit status; a child that emits a parseable report and then exits 2 or is terminated is treated exactly like a completed audit. The regression fixture always exits 1, so it cannot distinguish npm's expected vulnerability-report exit from abnormal termination. This is statically demonstrated by feeding the existing clean-report fixture through a child that exits 2: execution reaches the success message without any branch that reads the status. Response: Reject result.signal, a null status, and statuses other than 0 or 1 before accepting the report; retain status 1 for a completed audit containing advisories because the wrapper intentionally filters accepted advisories. Parameterize the fake npm fixture's exit behavior and add cases that emit a clean valid report then exit 2 or terminate by SIGTERM, asserting a nonzero wrapper exit rather than the success message.
+
+### Rejected Findings
+
+- #6: The base commit already selects the same exposure-only discovery label, emits the same tool_search loading instruction, and contains both supported fallback scenarios, so the cited unavailable-tool routing defect predates this diff rather than being introduced by the refactored intro.
+
+### Coverage
+
+- Exactly 13 fresh persona reports: independent correctness, project standards, testing, maintainability, agent-native, security, performance, API contract, data migration, reliability, adversarial, asynchronous UI, and deployment verification. Every reviewer received the complete 1296-path inventory and complete canonical diff. They screened that inventory and investigated risk-selected paths; this is **not exhaustive all-hunk semantic approval**. Per-path limitations remain in each coverage artifact. No module-owner fanout or previous findings seeded the reviewers.
+- Nine raw candidates, zero exact/semantic duplicates, zero malformed findings and zero confidence-gate demotions. **One fresh independent validator batch covered stable #1-#9 exactly once: eight validated, one rejected, zero skipped.** No second validation batch or cross-model shortcut. Eight is the normal batch size; no selected actionable candidate was silently omitted.
+- Cross-model pass skipped because the host serving family is unattested; no external code egress. Local adversarial supplied that lens. Graph project and coverage devices failed with WeakMap errors; exact-source/history fallback and available parent TypeScript LSP references were used. No exhaustive dynamic/external caller claim.
+- Both CE config files absent; artifact root defaults to `docs`. Active supplied standards paths govern this review; additional context-file discovery is forbidden by higher-priority runtime instructions, so the standards persona inspected the supplied paths and disclosed that limitation. No unambiguous implementation-ready plan selected; settlement suppression was not evaluated. No learnings corpus, Swift surface or PR-comment context warranted those lenses.
+- Read-only review workers ran no tests, builds, linters, formatters, installations, network requests or source experiments. Required model override selector is not exposed by the host task tool, so reviewers inherited the session model. All 13 successful launches reached terminal collected outcomes; no failed reviewer or unresolved peer job.
+
+### Deployment Notes
+
+SQLite schema 2 rebuild is intentionally forward-only for old binaries. Production rollout still needs consistent WAL-aware backup/restore rehearsal, exclusive ownership, unchanged namespace/prefix, exact task-column/index/schema/allocator comparisons, resource headroom and release-platform daemon receipts. These operational limits are not new source findings or local certification.
+
+### Verdict
+
+**NOT READY / REPAIRS IN PROGRESS.** Eight findings passed the single independent validation gate and await behaviorally verified repair. Historical native Windows acceptance remains unexecuted. Immutable scope, full reports and validation: `/tmp/compound-engineering-501/ce-code-review/20261101-complete-52499a182-f4044c95`.
+
+
+
+## Current single-batch repair checkpoint - 52499a182
+
+All eight findings accepted by this round's **one independent nine-item validator batch** now have local source repairs. The following implementation checkpoint supersedes the prior in-progress source queue, not the outstanding final-suite gate. IDs belong only to this round.
+
+### Applied
+
+| # | File | Repair | Reviewer |
+|---|---|---|---|
+| 1 | `packages/chord/src/host.ts` (+tests/docs) | Release every context-owned reference; always retire root bookkeeping; preserve body and cleanup failures. | reliability |
+| 2 | `scripts/issues/ui.html` (+tests/docs) | Stop render after status update while data is null; preserve selected tab through initial failure/retry. | julik-frontend-races |
+| 3 | `packages/chord/src/connection.ts` (+tests/docs) | Complete served/relay/binding/waiter teardown and notify host before reporting cleanup errors. | reliability |
+| 4 | `packages/chord/src/contract.ts` (+tests/docs) | Own received metadata; narrow trusted primitive unions; preserve consumer container representation and stable first projection across rebind. | api-contract |
+| 5 | `packages/chord/src/link.ts` (+tests/docs) | Forward Packed bytes without discarded JSON serialization. | performance |
+| 7 | `packages/env/src/remote-env.ts` (+tests/docs) | Register exec before startup/cwd await; abort undispatched invocation permanently and retain dispatched kill semantics without closing shared connection. | adversarial-reviewer |
+| 8 | `packages/server/src/server.ts` (+tests/docs) | Normalize outgoing native Chord frames at shared server encoding boundary for server and Session attachments. | api-contract |
+| 9 | `scripts/npm-audit.mjs` (+tests/docs) | Reject signaled/null/unexpected audit exits before accepting parsed reports. | testing |
+
+Public/cross-service contract and concurrency changes remain review-sensitive despite passing targeted tests. The trusted-schema change is deliberately limited to flat primitive unions; references, regexes, DAGs, custom kinds and other executable forms retain the existing registered-root restrictions.
+
+### Verification
+
+- Tests-only bg_1293 reproduced five initial-load tab crashes and two audit false passes. Product fixes gave bg_1294 **43 passed**. Real Chromium loading the old/current dashboard reproduced the old null-items exception and verified pending/failing initialization, tab selection and successful Sync retry without errors on the repaired page. Browser and loopback server released.
+- Env tests-only bg_1295 reproduced two cleanup-during-startup failures. bg_1297 passed **60 tests, three skipped**, including gated startup both with/without cwd, marker noncreation, shared-connection survival and dispatched kill. Cleanup synchronously aborts undispatched invocation controllers; shared startup is not canceled, but its caller wait races abort and the dispatch boundary checks the permanently aborted signal again. This prevents later execution without changing the existing nonwaiting kill contract for dispatched commands. Independent source closure verified that fence. External SSH itself was not exercised.
+- Native server/Session tests-only bg_1296 reproduced packed snapshot/result readiness failures. Shared byte-boundary normalization gave bg_1298 **20 passed**, preserving invalid application-data rejection and void results.
+- Root/connection cleanup tests-only bg_1299 reproduced four failures and two unhandled rejections. bg_1300 and the lint-corrected bg_1302 each passed **22 tests**, with no unhandled errors. Body and cleanup failures remain observable; all acquired refs and root/waiter bookkeeping finish. A lint error from throwing within finally was corrected by carrying an explicit outcome and throwing only after unconditional bookkeeping.
+- Initial trusted-union tests-only bg_1303 reproduced five remote compatibility failures. Initial bg_1304/bg_1308 passed **117 tests** including unchanged malicious-schema suites, but independent post-fix review found an introduced Object-consumer/Record-provider cleaning regression. That first fix was therefore **not accepted as final**.
+- New representation/rebind tests bg_1311 reproduced both failures in the first repair. The correction derives container kinds from consumer layout, validates any existing mapping before publishing any new one, and never overwrites the first successful received-root projection. Failed incompatible binds and successful compatible rebinds preserve existing references. Corrected bg_1312 passed **119 tests**, including local/wire Object-to-Record, additive input/args/result/state, metadata ownership and malicious ref/DAG/regex/spoofed-kind cases. The independent reviewer re-inspected and source-closed the corrected representation and rebinding boundary.
+- Actual IPC packing probe observed **zero extra JSON serialization calls** on an already-packed 190011-byte plain payload / 511-byte compressed payload and exact decoded equality. Existing transport packing regressions passed; no permanent source-text/performance wiring test was added. Throwaway script removed.
+- Full check bg_1315: **1985 files, No fixes applied**, all dependency/import/entry-graph/install-lock/TypeScript/browser-smoke gates passed. Offline build bg_1316 passed: 76 files, 9.4 MiB. Prior check failures exposed only owned lint/test typing problems; schema fixture now retains its generic input type, with no type weakening.
+- Earlier isolated root bg_1307 passed **13520 / 0 / 949** (`artifact://17163`), but it predates the new representation/rebind regression and is **superseded**, not final evidence. Final corrected-source root bg_1314 is pending.
+
+### Coverage and integrity
+
+Both bounded repair readers are source-only; runtime results above are parent-owned. The first trust reader correctly rejected the initial repair before re-reviewing its correction. Final source scope is **22 owned paths including this ledger**; original history prefix remains byte-identical. All 749 protected Cargo-target hashes remain unchanged. No intentional manifests, lockfiles or changelog changes. Historical Windows native acceptance and the separate last-demand worker-retirement observation are not closed by these repairs. No push or PR.
+
+### Actionable Findings
+
+No accepted source finding remains unimplemented; final corrected-source full-suite completion remains a verification gate.
+
+### Verdict
+
+**Eight single-batch-validated findings repaired; final verification pending.** No unconditional native-platform approval.
+
+## Current complete merge repair closure - corrected final epoch
+
+Final authoritative credential-isolated root bg_1314 passed: **13522 passed, 0 failed, 949 skipped**, exit 0, 413.42 seconds. Full output: `artifact://17182`. This run includes the Object/Record representation and failed/successful-rebind regressions. The earlier 13520-test epoch remains explicitly superseded above.
+
+Final full check bg_1315 passed: **1985 files, No fixes applied**. Final offline build bg_1316 passed: **76 files, 9.4 MiB**. Focused corrected contract/security/link tests bg_1312 passed 119; root/connection cleanup passed 22; Env 60 with three skipped; native server routes 20; audit/UI 43, plus real browser and IPC smoke observations. These counts overlap and are not summed. No test exclusions, timeouts, memory limits or meaningful behavioral assertions were weakened.
+
+One independent validation batch covered all nine selected candidates exactly once. Eight were accepted and repaired; #6 was rejected with history evidence as pre-existing and unaffected. No additional validator batch, module-reviewer substitute or cross-model shortcut was used in this round. Independent post-fix review caught and rejected the first #4 implementation, then source-closed the corrected representation and stable rebind mapping. Public schema/contract and cleanup/cancellation changes remain bounded, review-sensitive proof rather than universal safety certification.
+
+The final local save comprises **22 owned paths including this ledger**, on the initially clean review tree. All 749 protected target hashes remain unchanged; `my-merge` and `crystal` retain their preserved refs; the pre-review ledger prefix is byte-identical. No manifest, lockfile or changelog changes. No push or PR.
+
+### Actionable Findings
+
+No unimplemented accepted finding remains in this round. Native Windows acceptance, actual external SSH deployment, production Cloudflare/Nix/publication and the separately recorded worker-retirement observation remain outside the exercised proof.
+
+### Verdict
+
+**Eight findings independently validated in one batch, repaired and locally verified. Whole merge remains NOT READY for unconditional native-platform acceptance.** The current review and repair result supersedes its in-progress checkpoints, without rewriting historical review records.

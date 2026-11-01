@@ -792,22 +792,51 @@ export class HostImpl implements Host, HostCore {
 			codeVersion: codeVersion.id,
 			principal: options.principal === undefined ? this.principal : options.principal,
 		});
+		let outcome: { readonly value: T } | { readonly error: unknown };
+		const errors: unknown[] = [];
 		try {
-			return await fn(ctx);
+			outcome = { value: await fn(ctx) };
+		} catch (error) {
+			outcome = { error };
 		} finally {
-			ctx.close();
-			const count = (codeVersion.roots.get(rootId) ?? 1) - 1;
-			if (count > 0) codeVersion.roots.set(rootId, count);
-			else {
-				if (this.#foreign.has(rootId)) codeVersion.roots.set(rootId, 0);
+			try {
+				ctx.close();
+			} catch (error) {
+				errors.push(error);
+			} finally {
+				const count = (codeVersion.roots.get(rootId) ?? 1) - 1;
+				if (count > 0) codeVersion.roots.set(rootId, count);
 				else {
-					codeVersion.roots.delete(rootId);
-					this.endRoot(rootId);
+					if (this.#foreign.has(rootId)) codeVersion.roots.set(rootId, 0);
+					else {
+						codeVersion.roots.delete(rootId);
+						try {
+							this.endRoot(rootId);
+						} catch (error) {
+							errors.push(error);
+						}
+					}
+					try {
+						this.maybeRetire();
+					} catch (error) {
+						errors.push(error);
+					} finally {
+						try {
+							this.#retirementChanged();
+						} catch (error) {
+							errors.push(error);
+						}
+					}
 				}
-				this.maybeRetire();
-				this.#retirementChanged();
 			}
 		}
+		if (errors.length > 0) {
+			if ("error" in outcome) errors.unshift(outcome.error);
+			if (errors.length === 1) throw errors[0];
+			throw new AggregateError(errors, `${rootId}: root cleanup failed`);
+		}
+		if ("error" in outcome) throw outcome.error;
+		return outcome.value;
 	}
 
 	/** Remembers that calls of `rootId` went out on `connection`, which must hear when the root ends. */

@@ -24,6 +24,11 @@ const result = spawnSync("npm", ["audit", "--omit=dev", "--json"], { encoding: "
 if (result.error) {
 	throw result.error;
 }
+if (result.signal || (result.status !== 0 && result.status !== 1)) {
+	process.stderr.write(result.stderr);
+	console.error(`npm audit failed: ${result.signal ? `signal ${result.signal}` : `exit code ${result.status}`}.`);
+	process.exit(1);
+}
 
 let report;
 try {

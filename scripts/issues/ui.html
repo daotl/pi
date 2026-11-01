@@ -201,6 +201,7 @@ function renderStatus() {
 
 function render(deferForSelect = false) {
 	renderStatus();
+	if (!data) return;
 	if (deferForSelect && document.querySelector("select:focus")) {
 		deferredRender = true;
 		return;

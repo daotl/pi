@@ -356,6 +356,77 @@ describe("RemoteExecutionEnv", () => {
 		expect(existsSync(join(cwd, "cancelled.txt"))).toBe(false);
 	});
 
+	it.each([undefined, "."])(
+		"cleanup cancels commands waiting for shared startup before dispatch (cwd: %s)",
+		async (cwdOverride) => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-env-cleanup-startup-"));
+			dirs.push(cwd);
+			const entered = Promise.withResolvers<void>();
+			const startup = Promise.withResolvers<readonly string[]>();
+			const connection = new Connection({
+				command: () => {
+					entered.resolve();
+					return startup.promise;
+				},
+			});
+			connections.push(connection);
+			const env = new RemoteExecutionEnv({ connection, id: "cleanup-startup", cwd });
+			const other = new RemoteExecutionEnv({ connection, id: "cleanup-survivor", cwd });
+			let settled = false;
+			const cancelled = env
+				.exec(
+					[process.execPath, "-e", 'require("node:fs").writeFileSync("cancelled.txt", "ran")'],
+					cwdOverride === undefined ? undefined : { cwd: cwdOverride },
+					context,
+				)
+				.then((result) => {
+					settled = true;
+					return result;
+				});
+			await entered.promise;
+			const survivor = other.exec([process.execPath, "-e", "process.exit(0)"], undefined, context);
+			try {
+				let cleaned = false;
+				const cleanup = env.cleanup(context).then(() => {
+					cleaned = true;
+				});
+				await nextTurn();
+				expect(cleaned).toBe(true);
+				await cleanup;
+				expect(settled).toBe(true);
+				expect(await cancelled).toMatchObject({ ok: false, error: { code: "aborted" } });
+			} finally {
+				startup.resolve([daemon]);
+				await Promise.all([cancelled, survivor]);
+			}
+			expect(getOrThrow(await survivor).exitCode).toBe(0);
+			expect(existsSync(join(cwd, "cancelled.txt"))).toBe(false);
+			getOrThrow(await other.writeFile("survivor.txt", "still connected", context));
+			expect(getOrThrow(await other.readTextFile("survivor.txt", context))).toBe("still connected");
+		},
+	);
+
+	it("cleanup kills dispatched commands without aborting or closing another environment's connection", async () => {
+		const { env, connection } = environment();
+		const other = new RemoteExecutionEnv({ connection, id: "cleanup-shared", cwd: env.cwd });
+		const ready = Promise.withResolvers<void>();
+		const running = env.exec(
+			[
+				process.execPath,
+				"-e",
+				'process.stdout.write("ready", () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0))',
+			],
+			{ onOutput: () => ready.resolve() },
+			context,
+		);
+		await ready.promise;
+		await env.cleanup(context);
+		expect(getOrThrow(await running).exitCode).toBe(137);
+		expect(
+			getOrThrow(await other.exec([process.execPath, "-e", "process.exit(0)"], undefined, context)).exitCode,
+		).toBe(0);
+	});
+
 	it("rejects a completed scan whose reply arrives after local cancellation", async () => {
 		const { env, connection } = environment();
 		getOrThrow(await env.writeFile("scan.txt", "first\nsecond\n", context));
