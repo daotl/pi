@@ -13,9 +13,10 @@ const snapshot = (items) => ({ repo: "owner/repo", items, categories: [{ name: "
 function harness() {
 	const listeners = {}, requests = [], nodes = Object.fromEntries(["main", "cat", "status", "sync"].map((id) => [id, { innerHTML: "", value: "" }]));
 	let poll, focusedSelect = null;
+	const timers = [];
 	const tabs = ["inbox", "decided", "all"].map((view) => ({ dataset: { view }, classList: { toggle() {} } }));
 	const document = { hidden: false, getElementById: (id) => nodes[id], addEventListener: (name, fn) => { listeners[name] = fn; }, querySelectorAll: (selector) => selector === ".tab" ? tabs : [], querySelector: (selector) => selector === "select:focus" ? focusedSelect : null };
-	runInNewContext(script, { document, queueMicrotask, window: { open() {} }, confirm: () => true, setInterval: (fn) => { poll = fn; }, fetch: (path, options) => new Promise((resolve) => { requests.push({ path, body: options && JSON.parse(options.body), resolve }); }) });
+	runInNewContext(script, { document, queueMicrotask, setTimeout: (fn) => timers.push(fn), window: { open() {}, addEventListener() {} }, confirm: () => true, setInterval: (fn) => { poll = fn; }, fetch: (path, options) => new Promise((resolve) => { requests.push({ path, body: options && JSON.parse(options.body), resolve }); }) });
 	const respond = async (request, value) => { request.resolve({ ok: true, json: async () => value }); await tick(); };
 	const key = (key, repeat = false) => listeners.keydown({ key, repeat, target: { tagName: "BODY" } });
 	const click = (dataset) => listeners.click({ target: { closest: (selector) => selector === "[data-act]" ? { dataset } : null } });
@@ -23,7 +24,9 @@ function harness() {
 	const focusCategory = (number) => { focusedSelect = { tagName: "SELECT", dataset: { act: "cat", n: String(number) }, value: "bugs" }; };
 	const blurCategory = async () => { const target = focusedSelect; focusedSelect = null; listeners.focusout?.({ target }); await tick(); };
 	const changeCategory = (value) => { focusedSelect.value = value; listeners.change({ target: focusedSelect }); };
-	return { nodes, requests, respond, key, click, focusCategory, blurCategory, changeCategory, poll: () => poll(), tab: (view) => tabs.find((tab) => tab.dataset.view === view).onclick(), category: (value) => { nodes.cat.value = value; listeners.change({ target: { id: "cat", value, dataset: {} } }); } };
+	const pointer = (type, pointerId = 1) => listeners[type]?.({ pointerId });
+	const finishPointer = async (type) => { if (type) pointer(type); timers.splice(0).forEach((fn) => fn()); await tick(); };
+	return { nodes, requests, respond, key, click, pointer, finishPointer, focusCategory, blurCategory, changeCategory, poll: () => poll(), tab: (view) => tabs.find((tab) => tab.dataset.view === view).onclick(), category: (value) => { nodes.cat.value = value; listeners.change({ target: { id: "cat", value, dataset: {} } }); } };
 }
 
 for (const view of ["inbox", "decided", "all"]) {
@@ -68,6 +71,43 @@ test("a delayed poll preserves a category selection and installs its snapshot af
 	await ui.blurCategory();
 	assert.match(ui.nodes.main.innerHTML, /Issue 20/);
 });
+
+for (const action of ["prio", "retriage", "allnone"]) {
+	test(`a deferred select refresh preserves the pointer handoff to ${action}`, async () => {
+		const ui = harness();
+		await ui.respond(ui.requests[0], snapshot([issue(10)]));
+		ui.poll();
+		ui.focusCategory(10);
+		await ui.respond(ui.requests[1], snapshot([issue(99)]));
+		ui.pointer("pointerdown");
+		await ui.blurCategory();
+		assert.match(ui.nodes.main.innerHTML, /Issue 10/);
+		assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 99/);
+		ui.pointer("pointerup");
+		await tick();
+		assert.match(ui.nodes.main.innerHTML, /Issue 10/);
+		ui.click({ act: action, n: "10", p: "p0" });
+		await ui.finishPointer();
+		assert.equal(ui.requests[2].path, action === "retriage" ? "/api/retriage" : "/api/decide");
+		assert.deepEqual(ui.requests[2].body, action === "allnone" ? { numbers: [10], priority: "none" } : action === "retriage" ? { number: 10 } : { number: 10, priority: "p0" });
+		assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 99/);
+	});
+}
+
+for (const end of ["pointerup", "pointercancel"]) {
+	test(`a ${end} without an action releases a deferred select refresh`, async () => {
+		const ui = harness();
+		await ui.respond(ui.requests[0], snapshot([issue(10)]));
+		ui.poll();
+		ui.focusCategory(10);
+		await ui.respond(ui.requests[1], snapshot([issue(99)]));
+		ui.pointer("pointerdown");
+		await ui.blurCategory();
+		assert.match(ui.nodes.main.innerHTML, /Issue 10/);
+		await ui.finishPointer(end);
+		assert.match(ui.nodes.main.innerHTML, /Issue 99/);
+	});
+}
 
 test("changing a category invalidates a deferred poll before it can replace the decision refresh", async () => {
 	const ui = harness();

@@ -1,6 +1,6 @@
 import { type AssistantMessage, fauxAssistantMessage, fauxToolCall, type Message } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import { createHarness, type Harness } from "../harness.ts";
+import { createHarness, getMessageText, type Harness } from "../harness.ts";
 
 // https://github.com/earendil-works/pi/issues/11227
 describe("issue #11227 recovery omits tool results with their tool call", () => {
@@ -63,14 +63,23 @@ describe("issue #11227 recovery omits tool results with their tool call", () => 
 		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 
 		let requestMessages: Message[] = [];
+		let responseCalls = 0;
 		harness.setResponses([
 			(context) => {
+				responseCalls++;
 				requestMessages = context.messages;
 				return fauxAssistantMessage("done");
 			},
 		]);
 
 		await harness.session.prompt("continue");
+
+		expect(responseCalls).toBe(1);
+		expect(requestMessages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
+			"check status",
+			"continue",
+		]);
+		expect(harness.session.getLastAssistantText()).toBe("done");
 
 		const requestRoles = requestMessages.map((message) => message.role);
 		expect(requestRoles).not.toContain("toolResult");

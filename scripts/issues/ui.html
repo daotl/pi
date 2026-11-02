@@ -68,6 +68,7 @@ let loadGeneration = 0, pendingMutations = 0, decisionPending = false;
 let loadError = "", mutationError = "";
 let deferredSnapshot = null;
 let deferredRender = false;
+const activePointers = new Set();
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 const gh = (n) => `https://github.com/${data.repo}/issues/${n}`;
@@ -78,7 +79,7 @@ const BAD = new Set(["regression", "spam", "empty", "duplicate cluster"]);
 
 function installSnapshot(snapshot, generation) {
 	if (generation !== loadGeneration || pendingMutations) return false;
-	if (document.querySelector("select:focus")) {
+	if (activePointers.size || document.querySelector("select:focus")) {
 		deferredSnapshot = { snapshot, generation };
 		return false;
 	}
@@ -202,7 +203,7 @@ function renderStatus() {
 function render(deferForSelect = false) {
 	renderStatus();
 	if (!data) return;
-	if (deferForSelect && document.querySelector("select:focus")) {
+	if (activePointers.size || (deferForSelect && document.querySelector("select:focus"))) {
 		deferredRender = true;
 		return;
 	}
@@ -237,13 +238,22 @@ document.addEventListener("click", (e) => {
 	const c = e.target.closest(".card");
 	if (c) { selectedNumber = Number(c.dataset.n); document.querySelectorAll(".card").forEach((x) => x.classList.toggle("sel", x === c)); }
 });
+function flushDeferred() {
+	if (activePointers.size || pendingMutations || document.querySelector("select:focus")) return;
+	if (deferredSnapshot) installSnapshot(deferredSnapshot.snapshot, deferredSnapshot.generation);
+	if (deferredRender) render();
+}
+document.addEventListener("pointerdown", (e) => { activePointers.add(e.pointerId); }, true);
+document.addEventListener("pointerup", (e) => {
+	// Native click follows pointerup; keep its target mounted until that dispatch finishes.
+	setTimeout(() => { activePointers.delete(e.pointerId); flushDeferred(); }, 0);
+}, true);
+document.addEventListener("pointercancel", (e) => { activePointers.delete(e.pointerId); flushDeferred(); }, true);
+window.addEventListener("blur", () => { activePointers.clear(); flushDeferred(); });
 document.addEventListener("focusout", (e) => {
 	if (e.target.tagName !== "SELECT") return;
-	// Check after focus settles so moving between selects does not replace either control.
-	queueMicrotask(() => {
-		if (deferredSnapshot) installSnapshot(deferredSnapshot.snapshot, deferredSnapshot.generation);
-		if (deferredRender && !document.querySelector("select:focus")) render();
-	});
+	// Keyboard blur still flushes once focus settles, including select-to-select moves.
+	queueMicrotask(flushDeferred);
 });
 document.addEventListener("change", (e) => {
 	if (decisionPending && e.target.dataset.act === "cat") { render(); return; }

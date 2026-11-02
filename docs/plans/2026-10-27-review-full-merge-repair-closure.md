@@ -2957,3 +2957,49 @@ All five confirmed findings are repaired and locally exercised. No unimplemented
 ### Verdict
 
 **Ready with fixes applied and local verification, subject to the explicit platform/deployment limits.** This closes the five-finding repair queue, not an unconditional approval of every hunk or deployment platform.
+
+
+## Complete merge review and repair - a69be69e6 / 20261102
+
+### Scope and authority
+
+Run `20261102-complete-a69be69e6-2c2c5535` reviewed the complete merge `8322aa1d6808711a6e46bfbe67d8a788ca8cbd1e` and subsequent changes through `a69be69e6ddf026e7c17771f4204a3b6acccf440`, against first parent `98dfe28cbeec4e1f2f61516e227420b2407dcdf9`: 1,263 changed paths, 195,529 changed lines, 72,765 executable non-test changed lines. This is a bounded, risk-selected review, not exhaustive approval of every hunk, deleted-file side effect, or external caller.
+
+The current invoking request explicitly asks to update this closure and fix all findings. `mode.apply_local=true` is based on that current request, not an old completed request or a bare skill invocation. The pre-apply checkout was clean at `a69be69e6`. One canonical owner integrated, verified and committed the repair paths; the parent remained read-only and no nested agents were launched.
+
+Thirteen fresh reviewers returned within the collection bound: correctness, project-standards, testing, maintainability, agent-native, security, performance, api-contract, data-migration, reliability, adversarial, julik-frontend-races and deployment-verification. No reviewer failed or timed out. The two large-file extraction suggestions were dropped because size alone established neither a P1 defect nor a worthwhile demonstrated maintenance benefit; they were not recycled as risks. Five raw candidates became three admitted P2 findings; no confidence suppression, malformed result, mode-aware demotion, or pre-existing finding survived.
+
+Cross-model pass: not run; host serving family unattested. Local adversarial reviewer covers the lens, no external code egress. Graph discovery/coverage was unavailable (WeakMap errors), no LSP capability was exposed, and exact source/text/history fallback does not establish exhaustive dynamic/external references. Standards discovery was limited to the supplied active global and root AGENTS rules; no extra context search or settlement suppression was claimed.
+
+### Validation and applied findings
+
+A single three-finding validator batch returned in 5m34s, within its 15-minute bound: confirmed 3, rejected 0, unresolved 0, malformed 0, failed 0, shortcut-skipped 0. Independent protected-subject classification matched the validator: #1 null (release-history rule), #2 null (false-pass regression assertions), #3 concurrency (observable event ordering). Exact statuses and reasons remain in `validator-verdicts.json` and the final synthesized/applied artifacts. The validator's unmeasured-production-incidence qualification for #2/#3 is preserved; synthetic local reproduction below establishes reachability, not production frequency.
+
+- **#1 P2, confidence 100, project-standards:** `packages/durable/CHANGELOG.md:216`. Kept the entire existing 37,181-byte current changelog prefix unchanged and appended a clearly labeled legacy archive containing exactly the 13,650 released bytes from baseline `## [0.99.2]` to EOF. The legacy suffix SHA-256 is `3cd4123a44960d79a65873e4178c6ffef45ecaa5cf1e275142381961215fc1b0`. Current 1.x releases, initial-release wording, links and Unreleased content are unchanged. The archive explains the intentional upstream reset in `eaa8b0d06`; repository release `005af57d88` establishes recorded legacy releases, not verified npm publication. No new feature-branch release entry was added. This is docs integrity, not a runtime change.
+- **#2 P2, confidence 75, testing:** `packages/coding-agent/test/suite/regressions/11227-recovery-omits-tool-results.test.ts:65`. The existing regression now requires exactly one faux response callback, both retained user messages (`check status`, `continue`), and final assistant text `done`, while retaining both negative assertions for the truncated call/result. No production recovery contract changed. The original test passed; throwaway no-dispatch and empty-captured-context variants failed the new positive assertions, respectively 0 versus 1 callback and [] versus the expected two inputs. The strengthened existing file passed. An actual standalone faux session smoke returned one call, both inputs, `done`, and no truncated pair. Production incidence of the hypothetical failures remains unmeasured.
+- **#3 P2, confidence 75, julik-frontend-races, protected concurrency:** `scripts/issues/ui.html:241` and existing `ui.test.mjs`. Capture-phase pointer ownership now defers snapshot installation and DOM rebuild through pointerup until the following click dispatch; pointercancel and window blur release ownership, while keyboard select blur still flushes after focus settles. Existing generation, pending-mutation, decision and reload guards remain. All five new regression cases failed before the product edit and pass after it; the final existing UI test file has 37 passing tests. Native Chrome 150 proof served the actual HTML on a unique private loopback port: with a poll response deferred under select focus, real mouseDown detached the original button before mouseUp and posted nothing before the fix; after the fix the original button stayed connected and the first native click emitted exactly one `/api/decide` for issue 10, priority p0. Native retriage also posted exactly once, and keyboard Tab flushed deferred work. `browser-proof.json`, `pointer-red.webp`, and `pointer-green.webp` preserve the evidence. The native bulk dialog smoke did not produce a receipt under the harness dialog policy and is not claimed as browser proof; its behavior is covered by the existing Node UI test. This ordering-sensitive change merits diff attention; a local browser run is not universal platform safety proof.
+
+### Current verification
+
+- Modified tests: final `node --test scripts/issues/ui.test.mjs` passed 37/37; the isolated faux regression file passed 1/1. Counts overlap with root and are not summed. The two negative fault probes were removed.
+- Actual runtime: standalone source-loaded faux recovery session produced `{"calls":1,"users":["check status","continue"],"answer":"done","truncatedPairOmitted":true}`. Native pointer failing-before/passing-after and keyboard smoke used the actual current HTML, not HTMLElement.click or a fake-DOM callback as sole evidence. Managed tabs and the private service were closed; both owned temporary smoke programs were removed.
+- Full `npm run check`: 1,985 files, **No fixes applied**, zero errors/warnings/infos, exit 0; pinned/runtime dependency, TS import, entry graph, install lock, TypeScript and browser-smoke gates passed. The normal pre-commit hook runs the same checks without bypass.
+- Authoritative isolated root suite: `rtk proxy env PATH="/tmp/pi-fixall-6a243f805/suite-bin:$PATH" PI_ENV_DAEMON=/tmp/compound-engineering-501/ce-code-review/20261101-complete-d51fe70e9-974bc22d/cargo-target/debug/pi-env ./test.sh`, repository root, timeout 1800. Current job **bg_1353: 13,545 passed, 0 failed, 945 skipped**, exit 0, 964.09 seconds; complete output `artifact://17950`. No Rust changes or protected-target writes. Counts include both modified test files; no suite/test exclusions or timeouts were weakened.
+
+### Deployment and residual acceptance
+
+No additional confirmed defect survived the fresh review. Operational schema-2 deployment still requires an identified owner, unchanged prefix/database identity, WAL-consistent whole-database backup, actual restore rehearsal, and migration-only exact-row/index/allocator checks before scheduling. A schema-1-only binary rejects schema 2; never lower its recorded version or change prefixes as rollback. Reconcile post-backup writes and external effects; observe real sleeping-task restart and Workers alarm/eviction delivery after rollout. The deployment artifact carries exact proposed queries and monitoring gates; these were not run on production.
+
+The admitted assurance gap remains controlled failure/retry specifically after actual v2 copy, DROP, rename and index creation; successful upgrade and generic rollback tests do not discharge it, and it is not a claimed current corruption bug. Native Windows/Nix, production Workers, actual release-daemon/packed-consumer matrix and interrupted publication, deployed provider gateways and external SDK acceptance remain outside observed proof. Root fixture tests and configured guards are not release/deployment receipts.
+
+### Integrity and disposition
+
+All 749 protected target hashes match the supplied manifest; no `packages/env/daemon/target/**` file was modified. `my-merge=cb3bee033ba853041609b874303dc625d5d30479` and `crystal=8322aa1d6808711a6e46bfbe67d8a788ca8cbd1e` remain unchanged. This ledger's original 594,402 bytes are preserved with SHA-256 `81a8ef81ea0b117e91b1c8c925eb9dedb92b12ddbca637453bc5a936cdd812a1`. The explicit normal-hook local commit scope is this ledger, the Durable changelog, the recovery regression, and the issues UI HTML/test. No push, PR or ticket.
+
+### Actionable Findings
+
+All three confirmed P2 findings are applied and verified. No unimplemented concrete fix or unresolved validation gate remains; operational acceptance limits are not relabeled repaired defects.
+
+### Verdict
+
+**Ready with fixes applied and current local verification, subject to the disclosed operational/platform acceptance limits.** This closes this three-finding queue, not every-hunk or deployment-platform approval.
