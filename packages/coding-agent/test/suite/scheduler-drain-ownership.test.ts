@@ -1069,25 +1069,27 @@ it.each(["scheduled", "compaction"] as const)(
 	},
 );
 
-it("resumes only the reserved compaction remainder after shutdown fails", async () => {
+it("retains unaccepted compaction input in order after shutdown fails", async () => {
 	const entered = Promise.withResolvers<void>();
-	const canceledText = "cancel queued permission";
-	const retainedText = "retained queued remainder";
+	const release = Promise.withResolvers<void>();
+	const first = "pending queued input";
+	const rest = "reserved queued remainder";
+	let gated = false;
 	const ui = await createSchedulingMode({
 		extensionFactories: [
 			(pi) => {
-				pi.on("before_agent_start", async (event, context) => {
-					if (event.messageType !== "user" || event.prompt !== canceledText) return;
-					const confirmation = context.ui.confirm("Queued permission", "Continue?");
+				pi.on("input", async (event) => {
+					if (event.text !== first || gated) return;
+					gated = true;
 					entered.resolve();
-					await confirmation;
+					await release.promise;
 				});
 			},
 		],
 	});
 	const requests: string[] = [];
-	ui.harness.setResponses([
-		(context) => {
+	ui.harness.setResponses(
+		Array.from({ length: 3 }, () => (context) => {
 			requests.push(
 				context.messages
 					.filter((message) => message.role === "user")
@@ -1095,8 +1097,8 @@ it("resumes only the reserved compaction remainder after shutdown fails", async 
 					.at(-1)!,
 			);
 			return fauxAssistantMessage("retained response");
-		},
-	]);
+		}),
+	);
 	const failure = vi.spyOn(ui.harness.session, "flushPendingPersistence").mockImplementationOnce(() => {
 		throw new Error("recoverable persistence failure");
 	});
@@ -1104,20 +1106,70 @@ it("resumes only the reserved compaction remainder after shutdown fails", async 
 	let delivery: Promise<void> | undefined;
 	try {
 		await ui.mode.init();
-		ui.internal.queueCompactionMessage(canceledText, "followUp");
-		ui.internal.queueCompactionMessage(retainedText, "followUp");
+		ui.internal.queueCompactionMessage(first, "followUp");
+		ui.internal.queueCompactionMessage(rest, "followUp");
 		delivery = ui.internal.flushCompactionQueue();
 		await entered.promise;
+		ui.internal.queueCompactionMessage("newer queued input", "followUp");
 		await shutdownMode.shutdown();
+		release.resolve();
 		await delivery;
-		await vi.waitFor(() => expect(requests).toEqual([retainedText]));
+		await vi.waitFor(() => expect(requests).toEqual([first, rest, "newer queued input"]));
 		await ui.harness.session.waitForIdle();
 		expect(ui.harness.session.messages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
 			"original context",
-			retainedText,
+			first,
+			rest,
+			"newer queued input",
 		]);
 		expect(ui.internal.getAllQueuedMessages()).toEqual({ steering: [], followUp: [] });
 	} finally {
+		release.resolve();
+		failure.mockRestore();
+		await delivery?.catch(() => {});
+		await ui.cleanup();
+	}
+});
+
+it("does not replay accepted compaction input after shutdown fails", async () => {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const ui = await createSchedulingMode();
+	let firstRequests = 0;
+	ui.harness.setResponses([
+		async () => {
+			firstRequests++;
+			entered.resolve();
+			await release.promise;
+			return fauxAssistantMessage("aborted response", { stopReason: "aborted" });
+		},
+		() => {
+			firstRequests++;
+			return fauxAssistantMessage("duplicate response");
+		},
+	]);
+	const failure = vi.spyOn(ui.harness.session, "flushPendingPersistence").mockImplementationOnce(() => {
+		throw new Error("recoverable persistence failure");
+	});
+	let delivery: Promise<void> | undefined;
+	try {
+		await ui.mode.init();
+		ui.internal.queueCompactionMessage("accepted queued input", "followUp");
+		delivery = ui.internal.flushCompactionQueue();
+		await entered.promise;
+		const shutdown = (ui.mode as unknown as { shutdown(): Promise<void> }).shutdown();
+		release.resolve();
+		await shutdown;
+		await delivery;
+		await ui.harness.session.waitForIdle();
+		expect(firstRequests).toBe(1);
+		expect(ui.harness.session.messages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
+			"original context",
+			"accepted queued input",
+		]);
+		expect(ui.internal.getAllQueuedMessages()).toEqual({ steering: [], followUp: [] });
+	} finally {
+		release.resolve();
 		failure.mockRestore();
 		await delivery?.catch(() => {});
 		await ui.cleanup();

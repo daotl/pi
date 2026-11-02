@@ -2907,3 +2907,53 @@ Read-only `ce-code-review` completed for the five-path product/test/documentatio
 Two informational testing gaps remain: caller cancellation specifically during a pending response body with the new default active, and timeout-then-success under a fresh retry deadline. Existing caller-cancellation/retry coverage and source inspection support those unchanged shared-helper semantics; no current defect was established. The changed default has failing-before/passing-after regression coverage plus native-fetch smoke. No persistent configuration-shape test was added for the Durable gate: actual isolated CLI collection proved exclusion before credential reads and explicit opt-in instead. These limits are recorded here and in the review artifacts rather than reported as repaired defects.
 
 
+
+## Complete merge review and repair - f7248273f / 20261102
+
+Scope: `98dfe28cbeec4e1f2f61516e227420b2407dcdf9` through `f7248273f25c610224a92f5c5d449fd1ee521f25`, including merge `8322aa1d` and every follow-up. The 1263-path manifest and 47-deletion metadata inventory define scope, not exhaustive all-hunk approval. Pre-review tree was clean; no empty checkpoint commit. Current invoking user explicitly requested fixes and this closure update. Run artifacts: `/tmp/compound-engineering-501/ce-code-review/20261102-complete-f7248273f-6b47cb11`.
+
+### Applied
+
+| # | Severity | Location | Repair and observed proof |
+|---|---|---|---|
+| 1 | P1 | `packages/chord/src/host.ts:1441` (+test) | Preserve the self direct-child fast path; non-self bindings require matching route authorization on warm children too. Reuse the authorized child, retaining binding/revocation/lifecycle fences. Two test-first cold/warm regressions failed before repair; all 20 principal tests passed. Actual public host/root/ctx.get smoke denied cold/warm guests, forwarded allowed identity and reused one connection. |
+| 2 | P2 | `nix/package.nix:153` | Require the exact host addon unconditionally, including the Linux X11 suffix. The old embedded Node command falsely accepted a missing directory. Repaired command rejected missing directory and empty directory and loaded the real host addon. Native Nix is unavailable; no Nix build is claimed. |
+| 3 | P2 | `packages/coding-agent/src/modes/interactive/interactive-mode.ts:5005` (+test) | Capture the still-unaccepted submission before abort; restore it ahead of the reserved remainder and newer input after shutdown fails. Do not replay accepted submissions. Test-first input-hook regression lost the first message before repair; all 88 scheduler tests passed. Actual InteractiveMode in a private tmux terminal rendered all three recovered user messages and faux responses exactly once in order after injected persistence failure. |
+| 4 | P2 | `packages/env/test/ssh.test.ts:434` | Accept the disposable host key and deploy initially within the tamper test before stat. Focused test failed ENOENT before repair; focused case passed afterward and full SSH file passed 16, skipped 5. Real installed OpenSSH 10.2p1 allowed fresh trust/deployment/reuse/tamper replacement and authenticated daemon hello. No runtime permission blocker occurred. |
+| 5 | P2 | `scripts/check-model-catalog-compat.mjs:144` (+test) | Keep compiler chat constraints; additionally invoke the extracted release's provider image/classifier operation dispatch with no credentials, a pre-aborted signal and denied fetch, rejecting absent operations/API implementations. Negative classifier/image fixtures returned false success before repair; all 11 fixtures passed afterward, retaining both npm pack output shapes. Fixtures use real OpenRouter dispatch, not global API membership or echo mocks. Actual runtime smoke reached implemented operations and rejected provider-specific API mismatches. Latest npm release/publication was not queried. |
+
+Auth (#1), concurrency/ordering (#3) and public-contract (#5) repairs remain review-sensitive despite green local proof. No universal safety certification is implied. Public signatures are unchanged; no duplicate helper/policy or dead scaffold was introduced. Stage5c self-review covered only the owned diff against f7248273f. No Rust change/build, dependency metadata, lockfile or feature-branch changelog change.
+
+### Validation and coverage
+
+One independent validator inspected all five candidates in 8m24s inside its 15-minute bound: five confirmed, zero rejected/unresolved/malformed/failed, zero shortcut skips. All original `validation_status: confirmed` and exact `validation_reason` strings remain in synthesized/applied artifacts; all explicitly state incidence was unmeasured under the source-only validator assignment. Later local reproductions prove the constructed triggers, not production incidence. Independent protected-subject classification: #1 authorization-authentication, #2 null, #3 concurrency, #4 null, #5 public-contract; no reclassification.
+
+Thirteen personas selected; twelve full artifacts collected. Maintainability exceeded the 20-minute collection bound and was canceled without an artifact. Reliability returned after 22m53s, late rather than timely. Risk-selected source coverage spans runtime, storage, providers, agent interfaces, interactive paths and release guards; no all-hunk clearance. Five candidates, not the earlier collection-note typo of six. Zero malformed findings/returns, suppressions, semantic duplicates, quote demotions or soft-bucket demotions; first-evidence backfilled count stays five. No extra reviewer/validator/helper agent launched by this report leaf.
+
+Cross-model pass: not run; host serving family unattested. Local adversarial reviewer covers the lens, no external code egress. Graph navigation failed with supplied WeakMap errors; xd://lsp is not mounted in this leaf. Exact source/caller fallback makes no exhaustive external/dynamic/deletion-liveness claim. Criteria discovery was limited to supplied active global/root instructions; no exhaustive nested-policy-absence claim. No unique implementation plan was selected; settlement suppression was not evaluated. Historical reports were not used as new evidence.
+
+### Verification
+
+- Authoritative credential-isolated root command: `rtk proxy env PATH="/tmp/pi-fixall-6a243f805/suite-bin:$PATH" PI_ENV_DAEMON=/tmp/compound-engineering-501/ce-code-review/20261101-complete-d51fe70e9-974bc22d/cargo-target/debug/pi-env ./test.sh`, repository root, timeout 1800. Current run **bg_1346: 13540 passed, 0 failed, 945 skipped**, exit 0, 566.05 seconds. Full output: `artifact://17766`. No Rust changes required a new external daemon build.
+- Final `npm run check`: **1985 files, No fixes applied**, exit 0, zero errors/warnings/infos; all dependency/import/entry-graph/install-lock/TypeScript/browser-smoke gates passed. Initial check formatted only two owned test files; final suite and check cover their formatted contents.
+- Modified test files all ran: principal 20 passed; scheduler 88 passed; SSH focused 1 passed and full file 16 passed/5 skipped; catalog fixture loop 11 passed. Counts overlap with root and are not summed. Every substantiated candidate had a failing-before/passing-after behavioral check.
+
+The Nix command smoke and actual local terminal/SSH/provider smokes above are current-round observations. Temporary smoke programs were removed. Native Windows acceptance, native Nix derivation, production Cloudflare deployment, latest registry-release/publication and upstream paid-provider acceptance remain unexecuted; no real provider credentials or paid tokens were used. Tests, assertions, exclusions and timeouts were not weakened.
+
+### Deployment Notes
+
+Before actual SQLite schema-2 rollout, stop the sole writer, keep the exact deployed prefix/database identity, capture a WAL-consistent whole-database snapshot and rehearse restoration with the actual rollback executable. On a migration-only clone before workload recovery, require integrity_check=ok, schema=2, no tasks_v2, exact seven-column task/opaque JSON equality in both EXCEPT directions, the five built-in indexes, allocator metadata and unrelated-table preservation. Audit host-added schema objects and measure production-sized time/disk/WAL headroom. A schema-1 binary rejects schema 2; code-only downgrade or changing prefix is not rollback. Restore the snapshot and separately account for later writes and external side effects. Monitor real request completion, sleeping-task wake/alarm and eviction recovery. This checklist is not an observed production pass.
+
+The admitted testing gap remains targeted rollback injection specifically inside the v1-to-v2 rebuild after its destructive step, not evidence that atomic rollback is broken. Production-sized backup/restore and Workers deployment are not discharged by a local suite.
+
+### Integrity and disposition
+
+All 749 protected target hashes match; `my-merge=cb3bee033ba853041609b874303dc625d5d30479` and `crystal=8322aa1d6808711a6e46bfbe67d8a788ca8cbd1e` are unchanged. Original ledger prefix: 585495 bytes, SHA-256 `f5495a092efdf76fa4fc683fdf27f99eefbe57fe9726c3f98d6a53f015c72b4a`; append-only preservation verified. Nine owned repository paths, including this ledger, are the explicit normal-hook local commit scope. No push, PR or ticket.
+
+### Actionable Findings
+
+All five confirmed findings are repaired and locally exercised. No unimplemented actionable finding remains from this round. Operational/platform acceptance limits remain disclosed, not relabeled fixed defects.
+
+### Verdict
+
+**Ready with fixes applied and local verification, subject to the explicit platform/deployment limits.** This closes the five-finding repair queue, not an unconditional approval of every hunk or deployment platform.

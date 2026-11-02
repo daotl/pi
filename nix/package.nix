@@ -150,14 +150,10 @@ stdenv.mkDerivation {
     # Load host-platform TUI helpers directly so missing native dependencies
     # fail the build rather than silently disabling clipboard support.
     ${nodejs}/bin/node -e \
-      "const fs = require('node:fs');
-       const path = require('node:path');
+      "const path = require('node:path');
        const dir = '$out/lib/pi/node_modules/@earendil-works/pi-tui/native/' + process.platform + '/prebuilds/' + process.platform + '-' + process.arch;
-       if (fs.existsSync(dir)) {
-         for (const file of fs.readdirSync(dir)) {
-           if (file.endsWith('.node')) require(path.join(dir, file));
-         }
-       }"
+       const addon = process.platform + '-platform' + (process.platform === 'linux' ? '-x11' : String()) + '.node';
+       require(path.join(dir, addon));"
     ${nodejs}/bin/node -e \
       "require('$out/lib/pi/node_modules/@silvia-odwyer/photon-node')"
     runHook postInstallCheck

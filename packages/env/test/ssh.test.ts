@@ -431,6 +431,8 @@ describe.skipIf(sshd === undefined)("SSH bootstrap", () => {
 	}, 60_000);
 
 	it("reuses a verified daemon and replaces a tampered one", async () => {
+		await acceptHostKey(target, (await scanHostKey(target)).lines);
+		(await connectSsh({ ...target, binary: daemon })).connection.close();
 		const file = join(home, ".pi/mobile/tools", deployedName);
 		const before = statSync(file).mtimeMs;
 		(await connectSsh({ ...target, binary: daemon })).connection.close();

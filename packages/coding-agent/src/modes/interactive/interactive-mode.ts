@@ -5002,10 +5002,15 @@ export class InteractiveMode {
 		this.isShuttingDown = true;
 		this.cancelScheduledPreflights();
 		const delivery = this.compactionQueueDeliveryPending;
-		delivery?.submitting?.controller.abort();
+		const submitting = delivery?.submitting;
+		submitting?.controller.abort();
 		if (delivery) {
 			// Retire the canceled preflight, but retain unsubmitted messages if shutdown fails.
-			this.compactionQueuedMessages = [...delivery.messages, ...this.compactionQueuedMessages];
+			this.compactionQueuedMessages = [
+				...(submitting ? [submitting.message] : []),
+				...delivery.messages,
+				...this.compactionQueuedMessages,
+			];
 			this.compactionQueueDeliveryPending = undefined;
 			this.updatePendingMessagesDisplay();
 		}

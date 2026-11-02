@@ -10,7 +10,7 @@ const packageName = "@earendil-works/pi-ai";
 const packed = { name: packageName, filename: "pi-ai.tgz" };
 const command = fileURLToPath(new URL("./check-model-catalog-compat.mjs", import.meta.url));
 
-function runFixture(t, packOutput) {
+function runFixture(t, packOutput, additionalModels = []) {
 	const root = mkdtempSync(join(tmpdir(), "pi-catalog-compat-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const bin = join(root, "bin");
@@ -32,6 +32,8 @@ if (tool === "npm") {
 	if (args[0] === "xf") {
 		const release = join(target, "release");
 		mkdirSync(join(release, "packages/ai/scripts"), { recursive: true });
+		mkdirSync(join(release, "packages/ai/src/providers"), { recursive: true });
+		writeFileSync(join(release, "packages/ai/src/providers/all.ts"), ${JSON.stringify(`export { builtinProviders } from ${JSON.stringify(fileURLToPath(new URL("../packages/ai/src/providers/all.ts", import.meta.url)))};`)});
 		mkdirSync(join(release, "node_modules/typescript/bin"), { recursive: true });
 		writeFileSync(join(release, "node_modules/typescript/package.json"), '{"type":"module"}');
 		writeFileSync(join(release, "package.json"), '{"type":"module"}');
@@ -44,6 +46,7 @@ if (tool === "npm") {
 		mkdirSync(data, { recursive: true });
 		writeFileSync(join(data, ".manifest.json"), '{"generatedAt":"2026-10-21T12:12:47.000Z"}');
 		writeFileSync(join(data, "test-provider.json"), '{"openai-completions":{"chat:model-a":{"type":"chat","id":"model-a","contextWindow":1000}}}');
+		writeFileSync(join(data, "openrouter.json"), '{}');
 	}
 } else assert.equal(tool, "git");
 `;
@@ -53,7 +56,7 @@ if (tool === "npm") {
 		chmodSync(path, 0o755);
 	}
 	const catalog = join(root, "catalog.json");
-	writeFileSync(catalog, JSON.stringify({ "test-provider": [{ type: "chat", id: "model-a", contextWindow: 2000 }] }));
+	writeFileSync(catalog, JSON.stringify({ "test-provider": [{ type: "chat", id: "model-a", contextWindow: 2000 }], openrouter: additionalModels }));
 	const log = join(root, "calls.jsonl");
 	const receipt = join(root, "receipt.json");
 	const result = spawnSync(process.execPath, [command, "--catalog", catalog], {
@@ -68,7 +71,7 @@ for (const [shape, output] of [["npm 10/11 array", [packed]], ["npm 12 package-k
 		const { result, receipt } = runFixture(t, output);
 		assert.equal(result.status, 0, result.stderr);
 		assert.deepEqual(JSON.parse(readFileSync(receipt, "utf8")), {
-			catalog: { "test-provider": [{ type: "chat", id: "model-a", contextWindow: 2000 }] },
+			catalog: { "test-provider": [{ type: "chat", id: "model-a", contextWindow: 2000 }], openrouter: [] },
 			options: { generatedAt: "2026-10-21T12:12:47.000Z" },
 		});
 	});
@@ -89,3 +92,20 @@ for (const [label, output] of [
 		assert.equal(calls.some(([tool, action]) => tool === "tar" && action === "xzf"), false);
 	});
 }
+
+for (const type of ["classifier", "image"]) {
+	test(`rejects an unsupported ${type} API in the released provider`, (t) => {
+		const api = type === "classifier" ? "openai-decisions" : "unsupported-image-api";
+		const { result } = runFixture(t, [packed], [{ type, id: "operation-probe", provider: "openrouter", api }]);
+		assert.equal(result.status, 1);
+		assert.match(result.stderr, /no (classifier|image generation) implementation/);
+	});
+}
+
+test("accepts implemented classifier and image operations without credentials or network", (t) => {
+	const { result } = runFixture(t, [packed], [
+		{ type: "classifier", id: "operation-probe", provider: "openrouter", api: "typesafe-system-one" },
+		{ type: "image", id: "operation-probe", provider: "openrouter", api: "openrouter-images" },
+	]);
+	assert.equal(result.status, 0, result.stderr);
+});

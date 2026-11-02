@@ -12,8 +12,9 @@
 //
 // Check: build the model list a released client would end up with (its built-in
 // models, overlaid by the new catalog), and compile the release's pi-ai source
-// against it. pi-ai's types tie each provider to the APIs it implements, so a
-// model with an API its provider lacks is a type error.
+// against it for chat API constraints. Also exercise the released providers'
+// image/classifier dispatch without credentials or network: those API maps are
+// not constrained by the chat model generic.
 //
 // Only the latest release on npm is checked. If it is older than
 // MINIMUM_PI_VERSION, no released pi receives the catalog, and the check is skipped.
@@ -120,7 +121,7 @@ function main() {
 		console.log("Type-checking the release's pi-ai with the merged models...");
 		const { generatedAt } = JSON.parse(readFileSync(join(temporaryDir, "package/dist/providers/data/.manifest.json"), "utf8"));
 		// Call the release's exported hydrator: older releases ignore the new option,
-		// while newer ones require it. Neither uses this type-check-only data at runtime.
+		// while newer ones require it. This data is isolated from the checkout.
 		const hydrator = pathToFileURL(join(releaseDir, "packages/ai/scripts/hydrate-model-catalog.ts")).href;
 		run(process.execPath, ["--input-type=module", "--eval",
 			`import { hydrateModelCatalog } from ${JSON.stringify(hydrator)}; hydrateModelCatalog(${JSON.stringify(join(releaseDir, "packages/ai"))}, ${JSON.stringify(mergedPath)}, ${JSON.stringify({ generatedAt })});`,
@@ -140,6 +141,31 @@ function main() {
 				].join("\n"),
 			);
 		}
+		console.log("Checking the release's image and classifier operation dispatch...");
+		const probe = join(temporaryDir, "probe-operations.mjs");
+		const providers = pathToFileURL(join(releaseDir, "packages/ai/src/providers/all.ts")).href;
+		writeFileSync(probe, `
+import { readFileSync } from "node:fs";
+import { builtinProviders } from ${JSON.stringify(providers)};
+process.env.PI_DISABLE_CLOUD_PROVIDERS = "0";
+globalThis.fetch = async () => { throw new Error("Catalog compatibility probe forbids network"); };
+const providers = new Map(builtinProviders().map((provider) => [provider.id, provider]));
+const catalog = JSON.parse(readFileSync(${JSON.stringify(mergedPath)}, "utf8"));
+for (const [id, models] of Object.entries(catalog)) {
+	for (const model of models) {
+		if (model.type !== "image" && model.type !== "classifier") continue;
+		const provider = providers.get(id);
+		const operation = model.type === "image" ? "generateImages" : "classify";
+		if (typeof provider?.[operation] !== "function") throw new Error(id + " has no " + operation + " operation for " + model.id);
+		const context = model.type === "image" ? { input: [] } : { state: {}, questions: {} };
+		const result = await provider[operation](model, context, { signal: AbortSignal.abort(), fetch: globalThis.fetch });
+		if (/has no (?:classifier|image generation) implementation/.test(result.errorMessage ?? "")) {
+			throw new Error(id + ":" + model.type + ":" + model.id + ": " + result.errorMessage);
+		}
+	}
+}
+`);
+		run(process.execPath, [probe], releaseDir);
 		console.log(`The model catalog is compatible with pi ${release}.`);
 	} finally {
 		rmSync(temporaryDir, { recursive: true, force: true });

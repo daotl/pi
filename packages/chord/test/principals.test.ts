@@ -177,6 +177,59 @@ describe("principals", () => {
 		}
 	});
 
+	for (const warm of [false, true]) {
+		it(`authorizes denied and allowed non-self holds ${warm ? "after warming the child" : "on a cold route"}`, async () => {
+			const Access = remote(`t.route-access-${warm}`, {
+				version: 1,
+				input: Type.Object({ id: Type.String() }),
+				host: hostNamed("worker"),
+				variants: { main: { methods: { who: method(undefined, Type.String()) } } },
+			});
+			const server = createHost<string>({ self: "host", name: "server" });
+			const [down, up] = memoryLinkPair();
+			const worker = createHost<string>({
+				self: "worker",
+				name: "worker",
+				upstream: { link: up, principal: "host" },
+			});
+			worker.serve(Access, (_input, principal) => ({ variant: "main", who: () => principal }));
+			let resolutions = 0;
+			server.route("worker", {
+				authorize: (principal) => principal !== "denied",
+				principal: () => "worker",
+				resolve: async () => {
+					resolutions++;
+					return down;
+				},
+			});
+			try {
+				if (warm) await server.get(Access, { id: "warm" });
+				await assert.rejects(server.get(Access, { id: "direct" }, { principal: "denied" }), (error) =>
+					isChordError(error, "forbidden"),
+				);
+				await assert.rejects(
+					server.root(async (ctx) => ctx.get(Access, { id: "ingress" }), { principal: "denied" }),
+					(error) => isChordError(error, "forbidden"),
+				);
+				const allowed = await server.get(Access, { id: "direct" }, { principal: "allowed" });
+				assert.equal(await allowed.who(), "allowed");
+				assert.equal(
+					await server.root(async (ctx) => (await ctx.get(Access, { id: "ingress" })).who(ctx), {
+						principal: "allowed",
+					}),
+					"allowed",
+				);
+				await assert.rejects(server.get(Access, { id: "after" }, { principal: "denied" }), (error) =>
+					isChordError(error, "forbidden"),
+				);
+				assert.equal(resolutions, 1, "authorized warm holds reuse the child");
+			} finally {
+				await server.close();
+				await worker.close();
+			}
+		});
+	}
+
 	it("factories, methods and contexts see the app's principal type", async () => {
 		const host = createHost<Principal>({ self: { kind: "host" }, principalKey });
 		const facet = defineFacet<Principal>((api) => {

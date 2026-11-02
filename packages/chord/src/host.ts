@@ -1438,7 +1438,8 @@ export class HostImpl implements Host, HostCore {
 		};
 		const direct = this.#childNamed(binding.at);
 		if (this.upstream !== undefined) this.upstream.hold(binding, false);
-		else if (direct !== undefined) bindWhenSynced(direct.whenSynced().then(() => direct));
+		else if (direct !== undefined && binding.principal === undefined)
+			bindWhenSynced(direct.whenSynced().then(() => direct));
 		else {
 			const route = this.#routeFor(binding.at);
 			if (route === undefined) binding.gone(new ChordError("unavailable", `no route to ${binding.at}`));
@@ -1474,7 +1475,7 @@ export class HostImpl implements Host, HostCore {
 		if (!(await route.authorize(principal, hostName))) throw refuse();
 		if (this.#closing) throw this.#closedReason;
 		if (!still()) throw revoked();
-		const link = await route.resolve(hostName);
+		const link = this.#childNamed(hostName)?.link ?? (await route.resolve(hostName));
 		if (this.#closing) {
 			if (![...this.connections].some((connection) => connection.link === link)) link.close("host closed");
 			throw this.#closedReason;
