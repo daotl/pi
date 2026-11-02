@@ -912,6 +912,13 @@ Examples that call OpenAI need `OPENAI_API_KEY`; most use the faux provider othe
 
 Benchmarks: `npm run bench:storage`, `npm run bench:storage:memory`, `npm run bench:tool-output`, and `npm run bench:nested-tools`.
 
+## Testing
+
+Run the credential-isolated repository suite with `./test.sh` from the repository root. Package `npm test` runs both Node document-retention modes, followed by Workers tests; a focused `npm test -- <test-file>` runs that file in both Node modes.
+
+Live provider tests (`test/*-e2e.test.ts`) are excluded before collection unless `PI_E2E_TESTS=1`. To opt in from this package, run `PI_E2E_TESTS=1 npm test -- test/provider-session-cache-e2e.test.ts test/system-order-cache-e2e.test.ts`. These tests use real providers and may refresh and save OAuth credentials in `~/.pi/agent/auth.json`; they can incur provider charges.
+
+
 ## License
 
 MIT

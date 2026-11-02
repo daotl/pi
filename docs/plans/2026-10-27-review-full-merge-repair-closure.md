@@ -2881,3 +2881,29 @@ Eight fixes are applied and verified. #6 and #8 remain explicitly disputed polic
 ### Verdict
 
 **Ready with fixes applied, subject to the two documented policy disagreements and deployment gates.** The accepted source-repair queue is closed by exercised local proof; this is not unconditional whole-merge or native-platform acceptance.
+
+## Remaining policy findings implemented on explicit request
+
+The user's subsequent `fix all` and `then commit` explicitly select implementation of the two previously disputed proposals. This supersedes their non-application above without rewriting the historical review or its validation records. Baseline: `c161a33ae064b58877fe653bf329ae7903487b75`.
+
+- **#6, Decisions deadline:** OpenAI Decisions now supplies a 60,000-ms timeout per HTTP attempt, including reading the response body. Explicit `timeoutMs` overrides it and caller cancellation still aborts requests and retry waits. Existing retries remain unchanged, so the whole call can exceed 60 seconds. The default is adapter-specific; System One behavior is unchanged. The public README documents these semantics.
+- **#8, Durable live-provider opt-in:** Node Vitest excludes `test/**/*-e2e.test.ts` before module collection unless `PI_E2E_TESTS=1`. Existing Workers exclusion, document-retention setup, both Node retention runs and Workers phase remain unchanged. The package README documents opting in, credential refresh/save and possible provider charges. No real credentials or paid provider requests were used to verify it.
+
+### Verification
+
+- Test-first Decisions regression failed before implementation: the default stalled-body request remained pending at 60,000 ms. After implementation, Decisions and System One files passed **45 tests**; cases cover the default deadline, an explicit 25-ms override and existing caller cancellation/retry behavior.
+- Actual HTTP smoke used a loopback server sending headers and an unfinished JSON body with a space every 500 ms. With no caller timeout or signal and `maxRetries: 0`, the real fetch returned `stopReason: error`, empty answers and `Request timed out after 60000ms` after **60,011 ms**. This proves the default per-attempt deadline, not a whole-call 60-second SLA.
+- Actual isolated Durable CLI smoke used synthetic HOME/auth, tracked auth reads and denied network. Default collection excluded both cache E2E files before any auth read; explicit `PI_E2E_TESTS=1` collected both, read only synthetic credentials, and skipped both without modifying auth bytes. This configuration change uses runtime collection proof rather than a test that merely asserts configuration/source wiring.
+- Full `npm run check`: **1985 files, No fixes applied**, zero errors/warnings/infos; all configured gates passed.
+- Authoritative credential-isolated root `./test.sh` using the existing external daemon and worker-cap PATH shim: **13534 passed, 0 failed, 945 skipped**, exit 0, 651.26 seconds. Full output: `artifact://17498`. The four fewer skips are the two live files excluded from each of the two Node retention modes, not weakened behavioral assertions.
+- All **749** protected target hashes match. `my-merge` and `crystal` retain their preserved refs. The pre-append ledger prefix is **580845 bytes**, SHA-256 `a2ea2e566dd26f7753621f5b9f4b42caadeee977eeebc84339cf0aed2c935047`; it must remain unchanged. No Cargo build, dependency metadata, lockfile, released changelog, push or PR is part of this follow-up.
+
+The two previously unapplied source proposals are now implemented and locally exercised. Native-platform and deployment limits recorded above remain unchanged; no unconditional whole-merge certification is implied.
+
+### Follow-up review receipt
+
+Read-only `ce-code-review` completed for the five-path product/test/documentation diff against `c161a33ae`, run `20261102-remaining-policies-1b04a793`, with no retained findings or actionable repairs. Six source-review artifacts were retained; the testing reviewer was cancelled without an artifact, and standards/API-contract results were delayed beyond the collection bound. Cross-model review did not run because the serving family was unattested; local adversarial review covered that lens. These coverage limits do not certify a complete timely independent test review.
+
+Two informational testing gaps remain: caller cancellation specifically during a pending response body with the new default active, and timeout-then-success under a fresh retry deadline. Existing caller-cancellation/retry coverage and source inspection support those unchanged shared-helper semantics; no current defect was established. The changed default has failing-before/passing-after regression coverage plus native-fetch smoke. No persistent configuration-shape test was added for the Durable gate: actual isolated CLI collection proved exclusion before credential reads and explicit opt-in instead. These limits are recorded here and in the review artifacts rather than reported as repaired defects.
+
+

@@ -331,6 +331,49 @@ describe("OpenAI Decisions", () => {
 		expect(result.stopReason).toBe("aborted");
 	});
 
+	it.each([
+		{ timeoutMs: undefined, deadline: 60_000 },
+		{ timeoutMs: 25, deadline: 25 },
+	])("bounds an unfinished response body at $deadline ms", async ({ timeoutMs, deadline }) => {
+		vi.useFakeTimers();
+		const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+			const controller = new AbortController();
+			setTimeout(() => controller.abort(new DOMException("Timed out", "TimeoutError")), milliseconds);
+			return controller.signal;
+		});
+		try {
+			let result: Awaited<ReturnType<typeof classify>> | undefined;
+			const request = classify(model, context, {
+				apiKey: "secret",
+				maxRetries: 0,
+				timeoutMs,
+				fetch: async (_input, init) =>
+					new Response(
+						new ReadableStream({
+							start(controller) {
+								controller.enqueue(new TextEncoder().encode("{"));
+								init?.signal?.addEventListener("abort", () => controller.error(init.signal?.reason), {
+									once: true,
+								});
+							},
+						}),
+					),
+			}).then((value) => {
+				result = value;
+			});
+			await vi.advanceTimersByTimeAsync(deadline - 1);
+			expect(result).toBeUndefined();
+			await vi.advanceTimersByTimeAsync(1);
+			expect(result?.stopReason).toBe("error");
+			expect(result?.answers).toEqual({});
+			expect(result?.errorMessage).toContain(`Request timed out after ${deadline}ms`);
+			await request;
+		} finally {
+			timeout.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
 	it("does not retry malformed response JSON", async () => {
 		const fetch = vi.fn(async () => new Response("{invalid"));
 		const result = await classify(model, context, { apiKey: "secret", fetch, maxRetries: 1 });

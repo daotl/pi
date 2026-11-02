@@ -153,7 +153,7 @@ function errorMessage(error: unknown): string {
 	return formatProviderError(normalized, `${LABEL} error`);
 }
 
-/** Classification through OpenAI's Decisions API. */
+/** Classification through OpenAI's Decisions API, with a 60-second timeout per attempt by default. */
 export const classify: ClassifierFunction<ClassifierOptions> = async (model, context, options) => {
 	const output: ClassifierResult = {
 		api: model.api,
@@ -176,7 +176,7 @@ export const classify: ClassifierFunction<ClassifierOptions> = async (model, con
 				input: wireInput(context),
 				questions: Object.entries(context.questions).map(([id, question]) => wireQuestion(id, question)),
 			},
-			options,
+			{ ...options, timeoutMs: options?.timeoutMs ?? 60_000 },
 			NO_RETRY_STATUSES,
 		);
 		if (!isRecord(body)) throw new Error(`${LABEL} returned an unexpected response`);

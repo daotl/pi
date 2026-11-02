@@ -967,6 +967,8 @@ The `openai-decisions` API calls OpenAI's [Decisions API](https://developers.ope
 
 The endpoint needs an OpenAI API key; Sign in with ChatGPT credentials are rejected, so the `openai` provider hides `gpt-6-luna` from `getAvailableOfType('classifier')` while it uses OAuth. The API rejects inputs above 922K tokens, but requests that run longer than about five seconds, currently above roughly 600K input tokens, fail with a gateway timeout (504).
 
+Decisions requests default to a 60-second timeout per HTTP attempt, including response-body consumption. Set `ClassifierOptions.timeoutMs` to override it; `signal` still cancels requests and retry waits. Retries retain the existing `maxRetries` policy (default 2), so the whole call can take longer than 60 seconds. This default does not change System One classifier deadlines.
+
 ### Chat models on llama.cpp
 
 llama.cpp also serves decision models such as Julia-1 or Kev natively through `/v1/systemone`. Since llama.cpp 0.6.0, `GET /models` lists `decisions` in a model's `architecture.output_modalities` for these models. They use the `typesafe-system-one` API with the server's `/v1` URL as `baseUrl` (for example `http://127.0.0.1:8080/v1`); it needs an `apiKey`, which llama.cpp ignores unless it was started with `--api-key`. The `llama-cpp-classify` API is the fallback for chat models.
