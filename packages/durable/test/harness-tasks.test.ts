@@ -1343,6 +1343,64 @@ describe("task close", () => {
 		expect(phases).toEqual(["one"]);
 	});
 
+	it("keeps a reservation pending when close seals during ownership loading", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let hold = false;
+		class OwnershipStorage extends ControlledStorage {
+			override async conversation(id: Parameters<MemoryStorage["conversation"]>[0], ctx: Context) {
+				if (hold) {
+					hold = false;
+					entered.resolve();
+					await release.promise;
+				}
+				return super.conversation(id, ctx);
+			}
+		}
+		let runs = 0;
+		const Work = oneStep("test.close-ownership-load", async (_task, runtime, ctx) => {
+			runs++;
+			await runtime.commit(() => completed(null), ctx);
+		});
+		const storage = new OwnershipStorage();
+		const { harness, root } = await openRoot([Work], { storage, settings: { restartLimit: 1 } });
+		const commitEntered = Promise.withResolvers<void>();
+		const commitRelease = Promise.withResolvers<void>();
+		let id: TaskId | undefined;
+		const creating = root.commit(async (tx) => {
+			id = await tx.createTask(Work, null, { ownership: { kind: "conversation" } });
+			commitEntered.resolve();
+			await commitRelease.promise;
+		}, context);
+		await commitEntered.promise;
+		hold = true;
+		harness.resume();
+		commitRelease.resolve();
+		await creating;
+		await entered.promise;
+		const closing = harness.close(context);
+		try {
+			await flush();
+			release.resolve();
+			await closing;
+			expect(runs).toBe(0);
+			expect(await storage.reopen().task(id!, context)).toMatchObject({ state: { status: "pending" } });
+			const reopened = await openTasks(storage.reopen(), [Work], { settings: { restartLimit: 1 } });
+			try {
+				expect(await reopened.harness.getTask(id!, context)).toMatchObject({ state: { status: "pending" } });
+				expect((await reopened.harness.getTask(id!, context))?.restarts ?? 0).toBe(0);
+				reopened.harness.resume();
+				expect((await reopened.harness.waitForTask(id!, context)).state.outcome).toEqual(completed(null).outcome);
+				expect(runs).toBe(1);
+			} finally {
+				await reopened.harness.close(context);
+			}
+		} finally {
+			release.resolve();
+			await closing;
+		}
+	});
+
 	it("joins a reservation that settles while closing without starting its handler", async () => {
 		let ran = false;
 		const Never = oneStep("test.close-reservation", async () => {

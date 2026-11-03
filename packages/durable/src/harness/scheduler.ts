@@ -1698,6 +1698,8 @@ export class TaskScheduler {
 					return;
 				}
 				await this.#loadScopes(false);
+				// Close may have joined the current invocation set while ownership was loading.
+				if (this.#closing) return;
 				// Every pass picks up sleeps whose time has come: a pass started by any change may be the first to run after
 				// a deadline, and the wake it schedules no longer keeps a timer for a due sleep.
 				this.#wakeDue();

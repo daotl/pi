@@ -616,3 +616,99 @@ Runtime artifacts: `pico-prefix-proof.json`, `attachment-resolution.json`, `brow
 
 The exact decoded Round 3 report was appended before repair, preserving the original 58,536-byte prefix (SHA-256 `1ee18fefc26d4c5e2d6f285ea5d0a9edf7a442a761d3603d73c8bdfd648a5746`). After this round is committed, a fresh full-range review is still required; this is not a zero-finding round.
 
+
+## Code Review Results
+
+**轮次：** Round 4，`20261104-055830-r4-e100eb9f`。
+
+**Scope：** 固定第一父提交 `98dfe28cbeec4e1f2f61516e227420b2407dcdf9` -> `18ce83b032d67b1deadf650076ceba04ed875d8a`，覆盖 merge `8322aa1d` 及此后全部修复，不是仅审查最新提交。分支 `fix/full-merge-review-8322aa1d`；分发时为已提交的干净工作树，无排除的未跟踪文件。共 1,274 个变更路径、201,787 行变更、74,157 行非测试可执行代码变更、47 个删除路径。
+
+**Intent：** 集成 upstream 1.4.0，同时保留 Crystal 历史及 edit/delete/restore/shred/id0 语义，维护计费、多模态和摘要预算，以及 Harness、experimental、client 和已发布接口契约。只报告该固定范围内当前仍存在的问题。
+
+**Mode：** `markdown report-only`，`depth:full`，`apply_local:false`。本轮报告不实施修复；父线程负责追加历史报告、修复、运行验证及本地提交。不 push，不创建 PR。
+
+**Reviewers：** 五个正确性分区分别覆盖 models、native、history、execution、surface；security 检查信任与认证边界；reliability 检查异步生命周期；api-contract 检查已发布接口；data-migration 检查真实 schema 和旧格式转换；testing 检查验证护栏；performance 检查复杂度边界；maintainability 检查结构集成；agent-native-reviewer 检查程序化能力可达性；frontend-races 检查 DOM 时序；deployment-verification-agent 检查破坏性迁移及回滚要求。跨模型认证失败后，另由本地 adversarial 视角完成替代审查；这不构成跨模型独立佐证。
+
+### P2 -- Moderate
+
+| # | File | Issue | Reviewer | Confidence |
+|---|------|-------|----------|------------|
+| 1 | `packages/durable/src/harness/scheduler.ts:567` | 正常关闭可能遗留 `running` 任务，重开后被误计为崩溃并停驻 | reliability；独立验证器确认 | 75 |
+
+- **#1：影响与触发顺序。** reservation 通过 `#closing` 检查后，在 `#loadScopes(false)` 等待 ownership 读取；此时 close 使 `join()` 获取仍为空的 invocation 快照。reservation 随后继续，在没有再次检查关闭状态的情况下注册 invocation 并提交 `running`；`join()` 因原快照为空而跳过写回 `pending`。handler 虽不会在关闭后执行，持久化状态却仍是 `running`。下一次打开会增加 restart count，`restartLimit: 1` 时立即以 `restart_limit` 停驻健康任务，违反“正常 close 不计为 crash”的明确契约。
+- **证据。** `scheduler.ts:567-570` 是固定关闭快照及空快照返回；`:1691-1700` 是检查后异步加载；`:1759-1771` 是等待后写入 `running` 并注册 invocation；`:423-427` 是重开时增加 restart count。`packages/durable/src/harness/types.ts:585-587` 明确排除正常 close。现有 `packages/durable/test/harness-tasks.test.ts:1346-1364` 覆盖的是 invocation 已注册、reservation 已到达 Storage 后的关闭，不是 ownership 读取中的窗口。
+- **修复响应。** 在 reservation 内 `#loadScopes()` 及其他相关异步等待返回后、写入 `running` 或创建 invocation 前重新检查 `#closing`；或先等待已准入的 reservation 完成，再获取关闭快照。补充确定性回归：暂停 ownership 读取，在此期间 close，随后重开并设置 `restartLimit: 1`，确认任务仍为 `pending` 且没有增加 restart count。
+- **确认程度。** `validation_status: confirmed`，`protected_subject: concurrency`，severity P2、confidence 75 和原操作路由均保持不变。独立验证器从 `resume()`、conversation commit 和 publication reconciliation 的排队顺序确认该窗口可达；未测量实际发生频率，也未执行复现或测试。验证器原始理由如下，机器产物亦完整保留：
+
+> The precondition is close during an admitted reservation's awaited ownership load, reachable when resume() queues a reservation behind conversation.commit() but ahead of the reconciliation its publication schedules (harness.ts:142-143,297-299; scheduler.ts:737-749,1656-1700): join() snapshots no invocation and skips write-back (567-570), while the reservation subsequently registers and commits running without another closing check (1759-1771; session.ts:766-821), so reopening increments its restart count and parks it at restartLimit:1 (scheduler.ts:423-427,1724), a consequence introduced by a30c2a81d and 440a5fcdb relative to the fixed base; incidence was not measured and no tests were run.
+
+### Actionable Findings
+
+| # | File | Issue | Route | Notes |
+|---|------|-------|-------|-------|
+| 1 | `packages/durable/src/harness/scheduler.ts:567` | P2：关闭与 reservation 的竞态导致重开误计崩溃 | `gated_auto -> downstream-resolver` | `suggested_fix` 已提供；confidence 75；`requires_verification:true`。父线程修复并补充 ownership-load 期间关闭的回归；本轮未应用。 |
+
+### Deployment Notes
+
+部署审查未另行确认产品缺陷。以下是上线门槛，不是已执行成功的结果；完整查询与操作说明保留于本轮 `deployment-verification-agent.md` 和 `advisory-outputs.json`。
+
+- **迁移前停止全部 owner。** 记录实际 backend、数据库/会话路径、schema prefix、版本及回滚版本；Node adapter 要求 `>=22.19.0`。停止新请求并关闭所有存储 owner，不允许旧、新 writer 滚动重叠。保持 prefix 不变，迁移前盘点额外索引和 trigger，并在代表性副本上测量空间、迁移时间和真实入口的 open/close/reopen。
+- **先备份并演练恢复。** SQLite 使用一致性备份并要求 `PRAGMA integrity_check;` 返回 `ok`；不能只复制仍在使用的主文件而忽略 WAL。单文件 JSONL 在可能改写的 opener 前备份；Durable JSONL 备份整个目录及 task/document sidecar。恢复演练完成前不开放生产写入。
+- **Durable SQLite schema 1 -> 2。** 迁移在事务内重建 `tasks`、复制七列并重建五个索引。迁移前后、恢复流量前比较 metadata、record IDs、各表行数、task status/version 和 payload；`tasks` 及其他未预期改变的表做双向 `EXCEPT`，差异应为 0。要求 schema version 2、投影无新增不一致、五个预期索引齐全、无 `tasks_v2` 残留。实际配置有 prefix 时所有查询须一致替换；`foreign_key_check` 不能替代应用层一致性检查。
+- **不要混用格式契约。** AgentHarness legacy JSONL v3 首次非空 commit 才发布 v4/storageVersion 1，ID 重映射是预期行为；验证只 open/close 不改原字节、首次写入保留调用者数据、重开不重复增加 usage adjustment。Crystal SessionManager 是另一条 v3 路径，旧 v1/v2 加载和当前历史修改可能改写文件。Agent SQLite session backend 也不是 Durable schema，不能套用 Durable numeric-ID 查询。
+- **Canary 与回滚。** 在副本上对比分支/root、保留历史、summary/compaction、label/configuration 和 usage。确认 sleeping task 能 close/reopen 后按期完成；Workers host 必须实际设置 alarm 并在 eviction 后调用 `resume()`。SQLite v2 不能仅换旧代码降级；Durable JSONL 格式仍为 1 也不代表旧代码理解 sleeping 状态；Harness v4 没有已确认的逆向转换。回滚应停止 owner、保存故障现场、整体恢复一致性备份及匹配旧 runtime，不手改 schema version，且须处理备份后写入和外部副作用。
+- **监控重点。** 发布后在 +5m、+1h、+4h、+24h 检查 migration/open failure、`SQLITE_BUSY`、JSONL corruption、SessionManager append quarantine、`session_failed`、`migration_failed`、`task_parked`、`task_outdated` 及逾期工作。出现新 corruption、保留数据不匹配、迁移失败或无解释的 canary 停滞应停止 rollout。本轮没有执行 SQL、迁移、备份恢复或部署验证。
+
+### Coverage
+
+- **发现与验证计数。** 1 个实际候选，保留 1 个 P2，全部进入同一个确定性验证批次，没有 cap 遗漏。confirmed 1，rejected 0，unresolved 0，malformed 0，failed 0，shortcut-skipped 0。#1 在读取 verdict 前独立归类为 concurrency，与验证器一致；无保护类别重分类、无降级验证门槛。
+- **筛选计数。** pre-existing 0；置信度抑制 0，各 anchor 均无抑制；soft-bucket demotion 0；malformed finding/return 均为 0；`first_evidence` 从原始证据补全 1 项。没有语义重复、settled-decision 冲突或 review-policy 改级/剔除。单来源 reliability P2 因明确违反 graceful-close 契约且有具体后果而保留，不因视角数量降为一般风险。
+- **路径账本不等于逐 hunk 通过。** 五个分区的记录如下。“语义审查”是风险导向的选定链路检查，不能解读为读完该路径每一行；“证据不足”仍是未覆盖边界。
+
+| 分区 | 语义审查路径 | 证据不足路径 |
+|---|---:|---:|
+| correctness-models | 131 | 103 |
+| correctness-native | 53 | 180 |
+| correctness-history | 61 | 1 |
+| correctness-execution | 159 | 101 |
+| correctness-surface | 69 | 416 |
+
+- **Windows 二进制边界。** 以上 1,270 条路径账目之外，另有 4 个不可计数的二进制路径分配给 native：`packages/chord/native/prebuilds/win32-arm64/windows-job.node`、`packages/chord/native/prebuilds/win32-arm64/windows-launcher.exe`、`packages/chord/native/prebuilds/win32-x64/windows-job.node`、`packages/chord/native/prebuilds/win32-x64/windows-launcher.exe`。已检查源码、构建/分发连接和 CI 先测 shipped prebuild 再重建的顺序；未验证 Windows 运行行为或二进制与源码的精确等价，不能据此宣告二进制缺陷或平台通过。
+- **跨模型结果。** 原样保留结果行：
+
+  `adversarial lens: in-process fallback (cross-model peer not run: OAuth session expired and could not be refreshed)`
+
+  请求为 `claude-opus-5-5` / `high`，但 provider-capable dispatch 因 OAuth 失败，`receipt_supported:false`，actual model/effort 均为 `unverified`，`independence_verified:false`。没有外部 peer artifact 并入，没有跨模型 corroboration，也没有验证快捷跳过；本地 adversarial 仅替代该审查视角。peer job 目录已由分发上下文删除，无待收集 peer。
+- **收集情况。** 15 个已选本地视角及所需 fallback 均取得终态；每个 reviewer 在 20 分钟上限内，部分超过 8 分钟目标，failed/timed-out/bound-exceeded 均为 0。综合阶段加载 14 份结构化 reviewer artifact 及两份非结构化 advisory。程序化能力审查在所检查链路内没有确认重大 parity 回退，不代表对全部外部 SDK 消费者完成认证。
+- **其余边界。** 仓库图停留在 `2026-10-09T02:02:57Z` 且未 watch；存续源码的词法搜索不能证明所有动态或外部消费者都兼容删除路径。升级后的 vendored Marked 未完成全实现独立审查；已检查 viewer 集成、顺序、tokenizer assertion 和生成资产说明，未确认当前 parser 缺陷。
+- **浏览器验证缺口。** `scripts/issues/ui.test.mjs:54-55` 使用 VM document 和手动 timer，`:121-131` 合成 Space activation，`:95-119` 模拟 Selection/Range。源码检查已跟踪 `scripts/issues/ui.html:66-309` 的 generation、mutation、deferred render、pointer/focus/selection 保护，未建立具体当前故障；这些模拟仍不能证明原生浏览器的 Space/pointer activation 和选择文本在刷新时完整保留。未执行真实浏览器或 workerd。
+- **审查独立性与执行限制。** 历史报告正文未作为本轮 finding seed；审查基于固定 base 到当前 reviewed head。既有 active AGENTS/global 约束继续适用。所有 reviewer、验证器和 report leaf 均未执行测试、build、check、安装、provider/network 请求或浏览器；本轮 applied 0，无源码修改、无修复提交。此前绿色结果不能证明当前 #1 或本轮全部范围通过。
+- **产物。** 目录：`/tmp/compound-engineering-501/ce-code-review/20261104-055830-r4-e100eb9f`。已写入最终 `findings.json`、`actionable-findings.json`、`advisory-outputs.json`、`validation-summary.json`、`metadata.json`；保留综合、原始 reviewer 和 validator 证据。report stage 已结束，`run-log.py summarize` 返回 cost status `complete`。本 markdown 由父线程持久化为 `report.md` 并追加到 `docs/plans/2026-10-30-c08a2fb-image-billing-code-review.md`，保留历史；本 leaf 未替父线程写入该历史文档。
+
+---
+
+### Verdict
+
+> **Not ready。** 本轮新增并独立确认 1 个 P2：`packages/durable/src/harness/scheduler.ts:567` 的正常关闭竞态会把健康任务误算为崩溃，达到 restart limit 后停驻。未应用修复，也未运行回归；不满足“全部有效发现修复、验证并本地提交，再以固定 base 开始零新增轮次”的完成条件。
+>
+> **处理顺序：** 父线程先修复 #1 并验证 ownership-load 期间关闭及重开的确定性回归，再按约定本地提交并启动下一轮。跨模型审查失败、部分语义覆盖和 Windows 二进制运行边界仍须保持披露；本轮不是逐 hunk 无缺陷证明。
+
+**Actionable Findings recap**
+
+1. **#1 / P2** — `packages/durable/src/harness/scheduler.ts:567`：正常 close 与已准入 reservation 竞态，重开后误计 crash 并可能 `restart_limit` 停驻。**响应：代码修复 + 回归验证**；`autofix_class:gated_auto`，owner `downstream-resolver`，`suggested_fix:present`，confidence 75，`validation_status:confirmed`，发生频率未测量。阻断异步等待后的关闭穿越，或在快照前等待 reservation；本轮未应用。
+
+操作清单：`/tmp/compound-engineering-501/ce-code-review/20261104-055830-r4-e100eb9f/actionable-findings.json`。
+
+
+## Round 4 repair disposition
+
+**Coverage arithmetic correction:** the five correctness rows above sum to **1,274 paths** (473 semantic / 801 insufficient), not 1,270. The four Windows binaries are already included in native's 180 insufficient paths; they are not four additional paths outside that ledger. This corrects only the report's prose arithmetic, not scope, reviewer assignment, findings or validation.
+
+The single confirmed finding is repaired in `packages/durable/src/harness/scheduler.ts`: recheck `#closing` immediately after awaited ownership loading and before any reservation is created. No per-task loop return was retained; an early return after some registrations would not provide a complete shutdown-batch discipline, and was removed before final proof. The existing graceful-close/restart contract is documented in the Durable README. No public signature, platform path, or storage format changed.
+
+A deterministic regression in the existing `harness-tasks.test.ts` gates actual storage ownership lookup behind an admitted task-creation commit, closes while it is held, releases the lookup, reopens at `restartLimit: 1`, and verifies pending state, zero restarts, no pre-close handler execution and exactly one successful reopened run. Valid red observed persisted `running` instead of `pending`. Two earlier fixture mistakes—unawaited `tx.createTask` and reading closed MemoryStorage—were corrected before that valid red and are not defect proof. After repair, all three task/lifecycle/retention files passed **65 tests in each of two retention modes**. A standalone source-runtime smoke observed `{afterGracefulClose:"pending", restarts:0, reopenedRuns:1, outcome:"completed"}`; its temporary source was removed.
+
+`npm run check` completed with exit 0, 1,986 files and **No fixes applied**, including TypeScript and browser-smoke. `npm run build:offline` exited 0 and produced the 76-file, 9.4-MiB coding-agent bundle. Durable command receipts are `check-exit.json`, `build-exit.json` and `shutdown-smoke.json` in the Round 4 directory. The authoritative isolated root suite completed **13,744 passed / 0 failed / 945 skipped**, exit 0, 349.70 seconds (`suite.log`, `suite-exit.json`, `artifact://579`). Rust and native binaries were unchanged and not newly executed. Existing Windows/Workers/deployment evidence limits remain.
+
+The exact Round 4 report was appended before repair, preserving the original 94,759-byte prefix (SHA-256 `f8eccd8d69d050fdad233d6f7bcd40c20657f8e5abecb13300ad5b61d01d9e4e`). This round found a new confirmed defect, so a fresh full-range review is required after the verified local commit; it is not convergence.
+
