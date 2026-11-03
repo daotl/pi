@@ -1,4 +1,9 @@
-import { createAssistantMessageEventStream, fauxAssistantMessage, type Model } from "@earendil-works/pi-ai";
+import {
+	createAssistantMessageEventStream,
+	fauxAssistantMessage,
+	type Message,
+	type Model,
+} from "@earendil-works/pi-ai";
 import type { ToolResultMessage } from "@earendil-works/pi-ai/compat";
 import { describe, expect, it } from "vitest";
 import { generateBranchSummary, generateSummaryWithUsage } from "../src/core/compaction/index.ts";
@@ -6,9 +11,13 @@ import { computeFileLists, createFileOps, extractFileOpsFromMessage } from "../s
 import type { SessionEntry } from "../src/core/session-manager.ts";
 
 describe("compaction file operations", () => {
-	it.each(["compact", "branch"] as const)(
-		"tracks authorized nested tool-result files through %s requests",
-		async (operation) => {
+	it.each(
+		(["compact", "branch"] as const).flatMap((operation) =>
+			(["error", "aborted", "user", "assistant"] as const).map((boundary) => ({ operation, boundary })),
+		),
+	)(
+		"scopes nested file ownership across $boundary boundaries in $operation requests",
+		async ({ operation, boundary }) => {
 			const model: Model<"openai-completions"> = {
 				id: "offline",
 				name: "Offline",
@@ -38,14 +47,46 @@ describe("compaction file operations", () => {
 					complete: true,
 				},
 			};
-			const history = [
-				{ role: "user" as const, content: "do work", timestamp: 0 },
+			const history: Message[] = [
+				{ role: "user", content: "do work", timestamp: 0 },
 				{
 					...fauxAssistantMessage(""),
-					content: [{ type: "toolCall" as const, id: "code", name: "codemode", arguments: { code: "work" } }],
-					stopReason: "toolUse" as const,
+					content: [
+						{ type: "toolCall", id: "code", name: "codemode", arguments: { code: "work" } },
+						{ type: "toolCall", id: "sibling", name: "codemode", arguments: { code: "more work" } },
+					],
+					stopReason: "toolUse",
 				},
 				result,
+				{ role: "system", content: "updated instructions", timestamp: 3 },
+				{
+					...result,
+					toolCallId: "sibling",
+					nestedCalls: {
+						calls: [{ id: "sibling/read", name: "read", arguments: { path: "sibling.txt" }, status: "ok" }],
+						complete: true,
+					},
+				},
+				boundary === "user"
+					? { role: "user", content: "new request", timestamp: 4 }
+					: {
+							...fauxAssistantMessage("next assistant"),
+							content:
+								boundary === "assistant"
+									? [{ type: "text", text: "next assistant" }]
+									: [{ type: "toolCall", id: "code", name: "codemode", arguments: { code: "interrupted" } }],
+							stopReason: boundary === "assistant" ? "stop" : boundary,
+						},
+				{
+					...result,
+					nestedCalls: {
+						calls: [
+							{ id: "stale/read", name: "read", arguments: { path: "unowned-read.txt" }, status: "ok" },
+							{ id: "stale/write", name: "write", arguments: { path: "unowned-write.txt" }, status: "ok" },
+						],
+						complete: true,
+					},
+				},
 			];
 			const stream = () => {
 				const value = createAssistantMessageEventStream();
@@ -72,7 +113,7 @@ describe("compaction file operations", () => {
 					() => true,
 				);
 				expect(computeFileLists(summary.fileOps)).toEqual({
-					readFiles: ["notes.txt"],
+					readFiles: ["notes.txt", "sibling.txt"],
 					modifiedFiles: ["changed.txt"],
 				});
 			} else {
@@ -89,9 +130,12 @@ describe("compaction file operations", () => {
 					requestHistoryPolicy: () => true,
 					signal: new AbortController().signal,
 				});
-				expect(summary.readFiles).toEqual(["notes.txt"]);
+				expect(summary.readFiles).toEqual(["notes.txt", "sibling.txt"]);
 				expect(summary.modifiedFiles).toEqual(["changed.txt"]);
 				expect(summary.summary).toContain("notes.txt");
+				expect(summary.summary).toContain("sibling.txt");
+				expect(summary.summary).not.toContain("unowned-read.txt");
+				expect(summary.summary).not.toContain("unowned-write.txt");
 				expect(summary.summary).toContain("changed.txt");
 			}
 		},

@@ -492,6 +492,143 @@ describe("review: prepare isolation and contracts", () => {
 		}
 	});
 
+	it("restores resource listeners before replaying gated events and restarting old tasks after a failed replacement", async () => {
+		const errors: unknown[] = [];
+		const host = createHost({ self: { kind: "host" }, onError: (error) => errors.push(error) });
+		const replacing = latch();
+		const failReplacement = latch();
+		const ports: { emit(event: string): void }[] = [];
+		const dependents: { emit(event: string): void }[] = [];
+		const stableEvents = emitter<string>();
+		const seen: string[] = [];
+		const resources: string[] = [];
+		const tasks: string[] = [];
+		let stableSubscriptions = 0;
+		let stableUnsubscriptions = 0;
+		let taskRuns = 0;
+		const stableSource = {
+			subscribe: (listener: (event: string) => void) => {
+				assert.equal(++stableSubscriptions, 1, "an unaffected single-subscriber source must stay subscribed");
+				const stop = stableEvents.subscribe(listener);
+				return () => {
+					stableUnsubscriptions++;
+					stop();
+				};
+			},
+		};
+		const facet = (rev: number): Facet => ({
+			name: "db",
+			setup: (api) =>
+				api.serve(Db, (_input, _principal, self) => {
+					const port = self.resource("port", {
+						version: rev,
+						exclusive: true,
+						open: async () => {
+							if (rev === 2) {
+								replacing.open();
+								await failReplacement.promise;
+								throw new Error("replacement port fails");
+							}
+							const events = emitter<string>();
+							ports.push(events);
+							resources.push("open port");
+							return events;
+						},
+						close: () => void resources.push("close port"),
+					});
+					const dependent = self.resource("dependent", {
+						version: 1,
+						deps: [port],
+						open: () => {
+							const events = emitter<string>();
+							dependents.push(events);
+							resources.push("open dependent");
+							return { events, port: port.value };
+						},
+						close: () => void resources.push("close dependent"),
+					});
+					const stable = self.resource("stable", {
+						version: 1,
+						open: () => {
+							resources.push("open stable");
+							return stableSource;
+						},
+						close: () => void resources.push("close stable"),
+					});
+					self.on("port", port, (event) => void seen.push(`${rev}:port:${event}`));
+					self.on(
+						"dependent",
+						dependent,
+						(value) => value.events,
+						(event) => {
+							seen.push(`${rev}:dependent:${event}`);
+						},
+					);
+					self.on("stable", stable, (event) => void seen.push(`${rev}:stable:${event}`));
+					self.task(async (ctx) => {
+						tasks.push(`start ${rev}`);
+						if (++taskRuns > 1) {
+							port.value.emit("restarted task");
+							dependent.value.events.emit("restarted task");
+						}
+						const stopped = Promise.withResolvers<void>();
+						ctx.signal.addEventListener("abort", () => stopped.resolve(), { once: true });
+						await stopped.promise;
+						tasks.push(`stop ${rev}`);
+					});
+					return { read: () => ({ rev, restoredDependency: dependent.value.port === port.value }) };
+				}),
+		});
+		let reloading: Promise<unknown> | undefined;
+		try {
+			host.install(facet(1));
+			const ref = await host.get(Db, {});
+			resources.length = 0;
+			const version = host.codeVersion;
+			ports[0]!.emit("before");
+			dependents[0]!.emit("before");
+			stableEvents.emit("before");
+			await ticks();
+			const before = ["1:port:before", "1:dependent:before", "1:stable:before"];
+			assert.deepEqual(seen, before);
+			reloading = host.reload([facet(2)]);
+			reloading.catch(() => {});
+			await replacing.promise;
+			stableEvents.emit("gated");
+			await ticks();
+			assert.deepEqual(seen, before, "events stay queued while replacement owns the gate");
+			assert.deepEqual(tasks, ["start 1", "stop 1"]);
+			failReplacement.open();
+			await assert.rejects(reloading, /replacement port fails/);
+			assert.equal(host.codeVersion, version);
+			assert.deepEqual(await ref.read(), { rev: 1, restoredDependency: true });
+			assert.deepEqual(resources, ["close dependent", "close port", "open port", "open dependent"]);
+			assert.deepEqual(tasks, ["start 1", "stop 1", "start 1"]);
+			ports[1]!.emit("after");
+			dependents[1]!.emit("after");
+			ports[0]!.emit("stale");
+			dependents[0]!.emit("stale");
+			stableEvents.emit("after");
+			await ticks();
+			assert.deepEqual(seen, [
+				...before,
+				"1:stable:gated",
+				"1:port:restarted task",
+				"1:dependent:restarted task",
+				"1:port:after",
+				"1:dependent:after",
+				"1:stable:after",
+			]);
+			assert.equal(stableSubscriptions, 1);
+			assert.equal(stableUnsubscriptions, 0);
+			assert.deepEqual(errors, []);
+		} finally {
+			failReplacement.open();
+			await reloading?.catch(() => {});
+			await host.close();
+		}
+	});
+
 	it("#10 retirement closes dropped resources before releasing dropped holds", async () => {
 		const host = createHost({ self: { kind: "host" }, onError: () => {} });
 		const log: string[] = [];

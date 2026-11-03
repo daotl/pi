@@ -46,6 +46,12 @@ const MAX_HANDLES: usize = 4096;
 /// Replies with larger payloads queue behind command output instead of going first.
 const CONTROL_PAYLOAD: usize = 64 * 1024;
 
+#[cfg(all(test, unix))]
+thread_local! {
+    // Kept thread-local so a pathname replacement fixture cannot affect another request or test.
+    static AFTER_WRITE_METADATA: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+}
+
 struct FileHandle {
     file: File,
     path: String,
@@ -436,16 +442,28 @@ fn respond(server: &Server, id: u32, request: Frame, control: Arc<Control>) {
             match request.json["op"].as_str() {
                 Some("write") => {
                     let path = field(&request.json, "path")?;
-                    if std::fs::metadata(path)
-                        .is_ok_and(|metadata| !metadata.is_file() && !metadata.is_dir())
-                    {
-                        return Ok(Some(special::Operation::WriteOpen {
-                            path: path.to_string(),
-                            append: flag(&request.json, "append"),
-                            content: std::mem::take(&mut request.payload),
-                            keep: flag(&request.json, "keep"),
-                        }));
-                    }
+                    #[cfg(test)]
+                    let _ = std::fs::metadata(path);
+                    #[cfg(test)]
+                    AFTER_WRITE_METADATA.with(|hook| {
+                        if let Some(hook) = hook.borrow_mut().take() {
+                            hook();
+                        }
+                    });
+                    // A regular or missing pathname may become a FIFO before open. Prepare on this worker,
+                    // then transfer every Unix writer open to a cancellable helper.
+                    fs::prepare_write(
+                        path,
+                        flag(&request.json, "append"),
+                        request.json["parents"].as_bool().unwrap_or(true),
+                        &control,
+                    )?;
+                    return Ok(Some(special::Operation::WriteOpen {
+                        path: path.to_string(),
+                        append: flag(&request.json, "append"),
+                        content: std::mem::take(&mut request.payload),
+                        keep: flag(&request.json, "keep"),
+                    }));
                 }
                 Some("writeChunk") => {
                     let handle = server.file(&request.json)?;
@@ -730,6 +748,100 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_write_destinations_cancel_without_readers_or_file_worker_starvation() {
+        const CHILD: &str = "PI_ENV_REPLACED_WRITER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::replaced_write_destinations_cancel_without_readers_or_file_worker_starvation", "--nocapture"])
+                .env(CHILD, "1").spawn().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "isolated writer replacement regression failed: {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("isolated writer replacement regression timed out");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        special::install_interrupt().unwrap();
+        for (existing, append) in [(true, false), (false, false), (true, true), (false, true)] {
+            let root = sys::mkdtemp(&format!("{}/pi-env-writer-replace-", sys::tmpdir())).unwrap();
+            let output = Arc::new(Output::default());
+            let server = Arc::new(Server {
+                output: output.clone(), tmpdir: root.clone(), handles: Mutex::default(),
+                next_handle: AtomicU64::new(1), controls: Mutex::default(),
+                groups: Arc::default(), terminals: Arc::default(), special: Mutex::new(None),
+            });
+            *server.special.lock().unwrap() = Some(special::start(Arc::downgrade(&server)));
+            let (mut replies, mut wire) = std::os::unix::net::UnixStream::pair().unwrap();
+            replies.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let writer_output = output.clone();
+            let writer = thread::spawn(move || writer_output.run(&mut wire));
+            let jobs = start_workers();
+            let (reached, ready) = mpsc::channel();
+            let controls: Vec<_> = (0..WORKERS).map(|_| Arc::new(Control::default())).collect();
+            for (index, control) in controls.iter().enumerate() {
+                let path = std::path::Path::new(&root).join(format!("destination-{index}"));
+                if existing { std::fs::write(&path, b"original").unwrap(); }
+                let worker = server.clone();
+                let control = control.clone();
+                let reached = reached.clone();
+                jobs.send(Box::new(move || {
+                    let replaced_path = path.clone();
+                    let before_open = reached.clone();
+                    AFTER_WRITE_METADATA.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                        if existing { std::fs::remove_file(&replaced_path).unwrap(); }
+                        use std::os::unix::ffi::OsStrExt;
+                        let raw = std::ffi::CString::new(replaced_path.as_os_str().as_bytes()).unwrap();
+                        // SAFETY: the fixture exclusively owns this private pathname.
+                        assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+                        fs::BEFORE_WRITE_OPEN.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                            // The fallback already passed its final abort check. Cancel only after this seam;
+                            // otherwise an early abort could hide an uninterruptible ordinary-worker open.
+                            before_open.send(index).unwrap();
+                        })));
+                    })));
+                    respond(&worker, index as u32, Frame::with_payload(REQUEST, index as u32, json!({
+                        "op": "write", "path": path, "append": append,
+                    }), b"replacement".to_vec()), control);
+                    fs::BEFORE_WRITE_OPEN.with(|hook| { hook.borrow_mut().take(); });
+                    // A safely routed request relinquishes its ordinary worker before rendezvous completes.
+                    reached.send(index).unwrap();
+                })).unwrap();
+            }
+            for _ in 0..WORKERS { ready.recv_timeout(Duration::from_secs(3)).unwrap(); }
+            for control in &controls { control.cancel(false); }
+            let (available, ordinary) = mpsc::channel();
+            let ordinary_server = server.clone();
+            let ordinary_path = std::path::Path::new(&root).join("ordinary");
+            std::fs::write(&ordinary_path, b"available").unwrap();
+            jobs.send(Box::new(move || {
+                available.send(ordinary_server.dispatch(100, &json!({ "op": "lstat", "path": ordinary_path }), vec![], &Control::default())).unwrap();
+            })).unwrap();
+            assert!(ordinary.recv_timeout(Duration::from_secs(3))
+                .expect("replacement FIFOs must not strand ordinary file workers").is_ok());
+            for _ in 0..WORKERS {
+                let cancelled = frame::read_frame(&mut replies)
+                    .expect("a replaced writer must cancel without introducing a FIFO reader").unwrap();
+                assert_eq!(cancelled.kind, ERROR);
+                assert_eq!(cancelled.json["code"], "aborted");
+            }
+            drop(jobs);
+            output.close();
+            writer.join().unwrap();
+            drop(server);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
 
 
     #[test]

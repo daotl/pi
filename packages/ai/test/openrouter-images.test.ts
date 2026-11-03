@@ -5,6 +5,7 @@ import type { ImageModel, ImagesContext } from "../src/types.ts";
 const mockState = vi.hoisted(() => ({
 	lastParams: undefined as unknown,
 	lastRequestOptions: undefined as unknown,
+	usage: {} as Record<string, unknown>,
 }));
 
 vi.mock("openai", () => {
@@ -25,11 +26,7 @@ vi.mock("openai", () => {
 					}
 					const response = {
 						id: "img-1",
-						usage: {
-							prompt_tokens: 12,
-							completion_tokens: 34,
-							prompt_tokens_details: { cached_tokens: 0 },
-						},
+						usage: mockState.usage,
 						choices: [
 							{
 								message: {
@@ -62,6 +59,11 @@ describe("openrouter images", () => {
 	beforeEach(() => {
 		mockState.lastParams = undefined;
 		mockState.lastRequestOptions = undefined;
+		mockState.usage = {
+			prompt_tokens: 12,
+			completion_tokens: 34,
+			prompt_tokens_details: { cached_tokens: 0 },
+		};
 	});
 
 	it("returns text plus images in final output", async () => {
@@ -95,6 +97,107 @@ describe("openrouter images", () => {
 		expect(params.stream).toBe(false);
 		expect(params.modalities).toEqual(["image", "text"]);
 		expect(params.messages?.[0]?.content?.[0]).toMatchObject({ type: "text", text: "Generate a dog" });
+	});
+
+	it("records paid image billing even when catalog token rates are zero", async () => {
+		mockState.usage = { ...mockState.usage, cost: 0.125, is_byok: false, cost_details: null };
+		const model: ImageModel<"openrouter-images"> = {
+			type: "image",
+			id: "black-forest-labs/flux.2-pro",
+			name: "FLUX.2 Pro",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text"],
+			output: ["image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		};
+		const result = await generateImages(
+			model,
+			{ input: [{ type: "text", text: "Generate a dog" }] },
+			{ apiKey: "test" },
+		);
+		expect(result.stopReason).toBe("stop");
+		expect(result.usage).toMatchObject({
+			input: 12,
+			output: 34,
+			totalTokens: 46,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.125, totalFromProvider: true },
+		});
+	});
+
+	it.each([
+		{ upstream_inference_cost: 0.9, upstream_inference_prompt_cost: 0.6, upstream_inference_completions_cost: 0.3 },
+		{ upstream_inference_cost: null, upstream_inference_prompt_cost: 0.6, upstream_inference_completions_cost: 0.3 },
+	])("includes upstream BYOK image charges: %j", async (details) => {
+		mockState.usage = { ...mockState.usage, cost: 0.1, is_byok: true, cost_details: details };
+		const model: ImageModel<"openrouter-images"> = {
+			type: "image",
+			id: "black-forest-labs/flux.2-pro",
+			name: "FLUX.2 Pro",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text"],
+			output: ["image"],
+			cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+		};
+		const result = await generateImages(
+			model,
+			{ input: [{ type: "text", text: "Generate a dog" }] },
+			{ apiKey: "test" },
+		);
+		expect(result.stopReason).toBe("stop");
+		expect(result.usage?.cost.total).toBeCloseTo(1);
+		expect(result.usage?.cost.totalFromProvider).toBe(true);
+		expect(result.usage?.cost.input).toBeCloseTo(0.000012);
+		expect(result.usage?.cost.output).toBeCloseTo(0.000068);
+	});
+
+	it.each([
+		{},
+		{ cost: null, is_byok: false },
+		{ cost: -1, is_byok: false },
+		{ cost: Number.POSITIVE_INFINITY, is_byok: false },
+		{ cost: "0.5", is_byok: false },
+		{ cost: 0.1 },
+		{ cost: 0.1, is_byok: true, cost_details: null },
+	])("uses tier-aware catalog estimates for missing or invalid image billing: %j", async (accounting) => {
+		mockState.usage = {
+			...mockState.usage,
+			prompt_tokens_details: { cached_tokens: 6, cache_write_tokens: 2 },
+			...accounting,
+		};
+		const model: ImageModel<"openrouter-images"> = {
+			type: "image",
+			id: "black-forest-labs/flux.2-pro",
+			name: "FLUX.2 Pro",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text"],
+			output: ["image"],
+			cost: {
+				input: 1,
+				output: 1,
+				cacheRead: 1,
+				cacheWrite: 1,
+				tiers: [{ inputTokensAbove: 10, input: 2, output: 4, cacheRead: 1, cacheWrite: 3 }],
+			},
+		};
+		const result = await generateImages(
+			model,
+			{ input: [{ type: "text", text: "Generate a dog" }] },
+			{ apiKey: "test" },
+		);
+		expect(result.stopReason).toBe("stop");
+		expect(result.usage).toMatchObject({ input: 6, output: 34, cacheRead: 4, cacheWrite: 2, totalTokens: 46 });
+		expect(result.usage?.cost.input).toBeCloseTo(0.000012);
+		expect(result.usage?.cost.output).toBeCloseTo(0.000136);
+		expect(result.usage?.cost.cacheRead).toBeCloseTo(0.000004);
+		expect(result.usage?.cost.cacheWrite).toBeCloseTo(0.000006);
+		expect(result.usage?.cost.total).toBeCloseTo(0.000158);
+		expect(result.usage?.cost.totalFromProvider).toBe(false);
 	});
 
 	it("passes through abort signal and returns aborted result", async () => {

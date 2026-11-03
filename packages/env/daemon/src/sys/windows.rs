@@ -588,7 +588,8 @@ impl Job {
     /// rather than waiting on the leader or assuming that requesting termination completed it.
     pub fn terminate_and_wait(&self) -> io::Result<()> {
         // SAFETY: this job owns its handle for the entire call, including concurrent shutdown.
-        if unsafe { TerminateJobObject(self.handle.as_raw_handle(), 1) } == 0 {
+        // Use the public kill-without-abort status. Already-exited leaders keep the status saved by exec.
+        if unsafe { TerminateJobObject(self.handle.as_raw_handle(), 137) } == 0 {
             return Err(io::Error::last_os_error());
         }
         loop {

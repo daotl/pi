@@ -2,6 +2,7 @@ import { setKeybindings, type TUI } from "@earendil-works/pi-tui";
 import { beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import { McpManagerView } from "../src/extensions/mcp/ui.ts";
+import { AuthUrlComponent } from "../src/modes/interactive/components/auth-url.ts";
 import { LoginDialogComponent } from "../src/modes/interactive/components/login-dialog.ts";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
@@ -46,6 +47,54 @@ describe("sign-in URL copy key", () => {
 		dialog.showDeviceCode({ userCode: "ABCD", verificationUri: "https://example.invalid/device" });
 		dialog.handleInput(CTRL_X);
 		expect(copyToClipboard).not.toHaveBeenCalled();
+	});
+
+	test("keeps the latest copy success when an older copy fails", async () => {
+		let rejectFirst!: (error: Error) => void;
+		let resolveSecond!: () => void;
+		const firstCopy = new Promise<void>((_resolve, reject) => {
+			rejectFirst = reject;
+		});
+		const secondCopy = new Promise<void>((resolve) => {
+			resolveSecond = resolve;
+		});
+		copyToClipboard.mockImplementationOnce(() => firstCopy).mockImplementationOnce(() => secondCopy);
+		const component = new AuthUrlComponent(tui, URL);
+
+		const firstOperation = component.copy();
+		const secondOperation = component.copy();
+		resolveSecond();
+		await secondOperation;
+		expect(rendered(component)).toContain("Copied URL to clipboard");
+
+		rejectFirst(new Error("first copy failed"));
+		await firstOperation;
+		expect(rendered(component)).toContain("Copied URL to clipboard");
+		expect(rendered(component)).not.toContain("first copy failed");
+	});
+
+	test("keeps the latest copy failure when an older copy succeeds", async () => {
+		const firstCopy = Promise.withResolvers<void>();
+		const secondCopy = Promise.withResolvers<void>();
+		copyToClipboard.mockImplementationOnce(() => firstCopy.promise).mockImplementationOnce(() => secondCopy.promise);
+		const component = new AuthUrlComponent(tui, URL);
+		const firstOperation = component.copy();
+		const secondOperation = component.copy();
+		try {
+			secondCopy.reject(new Error("latest copy failed"));
+			await secondOperation;
+			expect(rendered(component)).toContain("latest copy failed");
+			expect(rendered(component)).not.toContain("Copied URL to clipboard");
+
+			firstCopy.resolve();
+			await firstOperation;
+			expect(rendered(component)).toContain("latest copy failed");
+			expect(rendered(component)).not.toContain("Copied URL to clipboard");
+		} finally {
+			firstCopy.resolve();
+			secondCopy.resolve();
+			await Promise.allSettled([firstOperation, secondOperation]);
+		}
 	});
 
 	test("MCP sign-in screen copies the authorization URL", async () => {

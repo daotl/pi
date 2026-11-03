@@ -32,6 +32,11 @@ import type { ToolDefinition, ToolLoadout, ToolLoadoutChanges, ToolNamespace } f
 import type { ModelRegistry } from "../../core/model-registry.ts";
 import { SETTINGS_DEFAULTS } from "../../core/settings-defaults.ts";
 import type { CodemodeMode } from "../../core/settings-manager.ts";
+import {
+	TOOL_USAGE_BINDER,
+	type ToolUsageBinding,
+	type ToolUsageRecorderFactory,
+} from "../../core/tool-usage-binding.ts";
 import { wrapToolDefinition } from "../../core/tools/tool-definition-wrapper.ts";
 import { loadCodemodeExecutor } from "./execute.lazy.ts";
 import { codemodeRenderers } from "./renderer.ts";
@@ -382,7 +387,24 @@ function getScriptReach(code: unknown): "all" | readonly string[] {
 export function createCodemodeToolDefinition(
 	options: CodemodeToolOptions = {},
 ): ToolDefinition<typeof codemodeSchema, CodemodeToolDetails | undefined> {
-	return {
+	const createExecute =
+		(
+			createRecorder?: ToolUsageRecorderFactory,
+		): ToolDefinition<typeof codemodeSchema, CodemodeToolDetails | undefined>["execute"] =>
+		async (toolCallId, params, signal, onUpdate, ctx) => {
+			const recordUsage = createRecorder?.();
+			return (await loadCodemodeExecutor()).executeCodemode(
+				toolCallId,
+				params,
+				signal,
+				onUpdate,
+				ctx,
+				options,
+				recordUsage,
+			);
+		};
+	const definition: ToolDefinition<typeof codemodeSchema, CodemodeToolDetails | undefined> & ToolUsageBinding = {
+		[TOOL_USAGE_BINDER]: (createRecorder, original) => ({ ...original, execute: createExecute(createRecorder) }),
 		name: CODEMODE_TOOL_NAME,
 		label: CODEMODE_TOOL_NAME,
 		// Replaced with the declarations of the callable tools when the tool is activated.
@@ -397,10 +419,10 @@ export function createCodemodeToolDefinition(
 		// Capable models write the script as raw text instead of a JSON-escaped string.
 		constrainedSampling: { type: "grammar", variants: { openai_lark: CODEMODE_SOURCE_GRAMMAR } },
 		// The sandbox (worker, QuickJS wasm) loads on the first call, not at startup.
-		execute: async (toolCallId, params, signal, onUpdate, ctx) =>
-			(await loadCodemodeExecutor()).executeCodemode(toolCallId, params, signal, onUpdate, ctx, options),
+		execute: createExecute(),
 		...codemodeRenderers,
 	};
+	return definition;
 }
 
 /**

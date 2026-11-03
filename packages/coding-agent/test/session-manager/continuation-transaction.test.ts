@@ -93,6 +93,74 @@ describe("assistant continuation storage transactions", () => {
 		};
 	}
 
+	it.each([false, true])("keeps a historical usage receipt off the selected branch (persisted: %s)", (persisted) => {
+		const session = persisted ? SessionManager.create(dir, dir) : SessionManager.inMemory(dir);
+		const root = session.appendMessage(userMsg("original question"));
+		const owner = session.appendMessage(response("original answer", 3));
+		session.branch(root);
+		const selected = session.appendMessage(userMsg("new branch"));
+		const projection = structuredClone(session.buildSessionProjection());
+		const branch = structuredClone(session.getBranch());
+		const totals = getUsageTotals(session.getEntries());
+		const usage = response("", 5).usage;
+		const receipt = session.appendUsageAt(owner, "codemode", "scorer", "judge", usage);
+		const check = (current: SessionManager) => {
+			expect(current.getLeafId()).toBe(selected);
+			expect(current.getEntry(receipt.id)).toEqual(receipt);
+			expect(receipt.parentId).toBe(owner);
+			expect(current.getBranch()).toEqual(branch);
+			expect(current.buildSessionProjection()).toEqual(projection);
+			expect(getUsageTotals(current.getEntries())).toEqual({
+				...totals,
+				input: totals.input + usage.input,
+				output: totals.output + usage.output,
+				cacheRead: totals.cacheRead + usage.cacheRead,
+				cacheWrite: totals.cacheWrite + usage.cacheWrite,
+				cost: totals.cost + usage.cost.total,
+			});
+		};
+		check(session);
+		if (persisted) check(SessionManager.open(session.getSessionFile()!, dir, dir));
+		const entries = structuredClone(session.getEntries());
+		const revision = session.getContextRevision();
+		const file = session.getSessionFile();
+		const bytes = file && persisted ? fs.readFileSync(file) : undefined;
+		expect(() => session.appendUsageAt("unknown", "codemode", "scorer", "judge", usage)).toThrow(
+			"Unknown usage parent",
+		);
+		expect(session.getEntries()).toEqual(entries);
+		expect(session.getContextRevision()).toBe(revision);
+		expect(session.getLeafId()).toBe(selected);
+		if (file && bytes) expect(fs.readFileSync(file)).toEqual(bytes);
+	});
+
+	it.each(["write", "fsync", "rename"] as const)("does not publish historical usage when %s fails", (stage) => {
+		const session = SessionManager.create(dir, dir);
+		const root = session.appendMessage(userMsg("original question"));
+		const owner = session.appendMessage(response("original answer", 3));
+		session.branch(root);
+		const selected = session.appendMessage(userMsg("new branch"));
+		const file = session.getSessionFile()!;
+		const bytes = fs.readFileSync(file);
+		const entries = structuredClone(session.getEntries());
+		const projection = structuredClone(session.buildSessionProjection());
+		const revision = session.getContextRevision();
+		const failure = new Error(`historical receipt ${stage} failed`);
+		const fail = () => {
+			throw failure;
+		};
+		if (stage === "write") vi.mocked(fs.writeFileSync).mockImplementationOnce(fail);
+		else if (stage === "fsync") vi.mocked(fs.fsyncSync).mockImplementationOnce(fail);
+		else vi.mocked(fs.renameSync).mockImplementationOnce(fail);
+		expect(() => session.appendUsageAt(owner, "codemode", "scorer", "judge", response("", 5).usage)).toThrow(failure);
+		expect(session.getEntries()).toEqual(entries);
+		expect(session.getContextRevision()).toBe(revision);
+		expect(session.getLeafId()).toBe(selected);
+		expect(session.buildSessionProjection()).toEqual(projection);
+		expect(fs.readFileSync(file)).toEqual(bytes);
+		expect(SessionManager.open(file, dir, dir).getEntries()).toEqual(entries);
+	});
+
 	it("replaces the canonical position, remaps only cloned references, and charges the new response once", () => {
 		const f = fixture();
 		const held = f.session.getEntries();

@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "@earendil-works/chord";
@@ -10,14 +10,21 @@ import {
 	fauxAssistantMessage,
 	fauxText,
 	fauxToolCall,
+	type ImageContent,
 	type MutableModels,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 import { MemoryStorage, ToolResultEntry, UsageDoc } from "@earendil-works/pi-durable";
 import { createCodemodeExtension, createCodemodeTool, createModelTools } from "@earendil-works/pi-durable/codemode";
+import { createNodePhotonImages } from "@earendil-works/pi-durable/images/node";
+import { PhotonImage } from "@silvia-odwyer/photon/photon_rs.js";
 import { describe, expect, it } from "vitest";
 import type { ExecutionEnv } from "../src/env/index.ts";
 import { NodeExecutionEnv } from "../src/env/node.ts";
+import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
+import { imageDimensions } from "../src/tools/image.ts";
+import { DEFAULT_IMAGE_LIMITS, type ImageLimits, type ImageProcessor } from "../src/tools/image-processor.ts";
 import { createReadTool } from "../src/tools/read.ts";
 import { allEntries, chatSetup, openChat } from "./chat-support.ts";
 import { addTool } from "./harness-support.ts";
@@ -36,8 +43,19 @@ const USAGE = {
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
 /** A chat whose models also have a classifier and an image model of a test provider, and the code mode extension. */
-function modelsChat(standalone = false) {
-	const setup = chatSetup();
+function modelsChat(
+	standalone = false,
+	options: { image?: ImageContent; images?: ImageProcessor; resize?: Partial<ImageLimits> } = {},
+) {
+	const setup = chatSetup(
+		options.resize === undefined
+			? {}
+			: {
+					models: [
+						{ id: "faux-1", input: ["text", "image"], inputLimits: { images: { resize: options.resize } } },
+					],
+				},
+	);
 	const calls = { classify: 0, images: 0, inFlight: 0, maxInFlight: 0 };
 	const classified: ClassifierContext[] = [];
 	// \`atFour\`: hold classifier calls until four run, then a little longer, so a fifth would show up.
@@ -113,7 +131,7 @@ function modelsChat(standalone = false) {
 							api: model.api,
 							provider: model.provider,
 							model: model.id,
-							output: [{ type: "image", data: PNG, mimeType: "image/png" }],
+							output: [options.image ?? { type: "image", data: PNG, mimeType: "image/png" }],
 							stopReason: "stop",
 							timestamp: 0,
 						};
@@ -123,12 +141,13 @@ function modelsChat(standalone = false) {
 		}),
 	);
 	const sandbox = new CodemodeSandbox();
+	const toolOptions = { sandbox, ...(options.images === undefined ? {} : { images: options.images }) };
 	setup.registry.install(
 		standalone
-			? { name: "scripts", tools: [createCodemodeTool({ sandbox }), ...createModelTools()] }
-			: createCodemodeExtension({ sandbox }),
+			? { name: "scripts", tools: [createCodemodeTool(toolOptions), ...createModelTools()] }
+			: createCodemodeExtension(toolOptions),
 	);
-	return { setup, calls, classified, gate };
+	return { setup, calls, classified, gate, sandbox };
 }
 
 async function run(chat: ReturnType<typeof modelsChat>, code: string, env?: ExecutionEnv) {
@@ -147,6 +166,78 @@ async function run(chat: ReturnType<typeof modelsChat>, code: string, env?: Exec
 	const usage = await harness.snapshot(UsageDoc, root.id, context);
 	await harness.close(context);
 	return { text, message, usage };
+}
+
+/** Show an actual generated PNG, then send its persisted result both immediately and after a SQLite reopen. */
+async function generatedImageTurn(images: ImageProcessor | undefined, resize: Partial<ImageLimits>) {
+	const rgba = new Uint8Array(64 * 48 * 4);
+	let seed = 1;
+	for (let index = 0; index < rgba.length; index++) {
+		seed = (seed * 1103515245 + 12345) >>> 0;
+		rgba[index] = index % 4 === 3 ? 255 : seed >>> 24;
+	}
+	const fixture = new PhotonImage(rgba, 64, 48);
+	let original: ImageContent;
+	try {
+		original = { type: "image", data: Buffer.from(fixture.get_bytes()).toString("base64"), mimeType: "image/png" };
+	} finally {
+		fixture.free();
+	}
+	const chat = modelsChat(false, { image: original, ...(images === undefined ? {} : { images }), resize });
+	const requests: TranscriptContext[] = [];
+	const answer = (request: TranscriptContext) => {
+		requests.push(structuredClone(request));
+		return fauxAssistantMessage("done");
+	};
+	chat.setup.faux.setResponses([
+		fauxAssistantMessage(
+			[
+				fauxToolCall("codemode", {
+					code: `const model = await models.getModelOfType("image", "test", "painter");
+					const result = await models.generateImages(model, { input: [{ type: "text", text: "noise" }] });
+					image(result.output[0]);`,
+				}),
+			],
+			{ stopReason: "toolUse" },
+		),
+		answer,
+	]);
+	const directory = await mkdtemp(join(tmpdir(), "pi-codemode-generated-images-"));
+	class ImageFiles extends NodeExecutionEnv {
+		override async createTempDir(prefix: string | undefined, _ctx: Context) {
+			return { ok: true as const, value: await mkdtemp(join(directory, prefix ?? "tmp-")) };
+		}
+	}
+	const env = new ImageFiles({ cwd: directory });
+	const path = join(directory, "session.sqlite");
+	let opened = await openChat(await openNodeSqliteStorage(path), chat.setup, { env });
+	try {
+		await (await opened.root.submit({ type: "input", content: "draw" }, context)).wait(context);
+		const entry = (await allEntries(opened.root)).find((candidate) => ToolResultEntry.is(candidate))!;
+		const stored = entry.model![0]!;
+		if (stored.role !== "toolResult") throw new Error("Expected generated image tool result");
+		const text = stored.content.flatMap((item) => (item.type === "text" ? [item.text] : [])).join("\n");
+		const saved = /\[Image saved to (.+?) \(image\/png, \d+ bytes\)\]/.exec(text);
+		expect(saved).not.toBeNull();
+		const savedBytes = await readFile(saved![1]!);
+		await opened.harness.close(context);
+		chat.setup.faux.setResponses([answer]);
+		opened = await openChat(await openNodeSqliteStorage(path), chat.setup, { env });
+		await (await opened.root.submit({ type: "input", content: "describe it again" }, context)).wait(context);
+		const reopened = (await allEntries(opened.root)).find((candidate) => ToolResultEntry.is(candidate))!;
+		return {
+			original,
+			stored,
+			reopened: reopened.model![0]!,
+			diagnostics: entry.data.diagnostics,
+			requests,
+			savedBytes,
+		};
+	} finally {
+		await opened.harness.close(context);
+		await chat.sandbox.close();
+		await rm(directory, { recursive: true, force: true });
+	}
 }
 
 describe("code mode models.*", () => {
@@ -179,6 +270,61 @@ describe("code mode models.*", () => {
 			{ name: "models.generateImages", status: "ok" },
 		]);
 	});
+
+	it.each([{ maxWidth: 8, maxHeight: 6 }, { maxBytes: 1024 }])(
+		"prepares generated images for model limits %j before persistence and replay",
+		async (resize) => {
+			const images = await createNodePhotonImages({ worker: false });
+			const result = await generatedImageTurn(images, resize);
+			const limits = { ...DEFAULT_IMAGE_LIMITS, ...resize };
+			expect(result.savedBytes.toString("base64")).toBe(result.original.data);
+			expect(result.reopened).toEqual(result.stored);
+			expect(result.requests).toHaveLength(2);
+			const replayed = result.requests.flatMap((request) =>
+				request.messages.filter((message) => message.role === "toolResult" && message.toolName === "codemode"),
+			);
+			expect(replayed).toHaveLength(2);
+			for (const message of [result.stored, ...replayed]) {
+				if (message.role !== "toolResult") throw new Error("Expected image tool result");
+				const attachments = message.content.filter((item) => item.type === "image");
+				expect(attachments).toHaveLength(1);
+				const image = attachments[0]!;
+				expect(image.data).not.toBe(result.original.data);
+				expect(image.data.length).toBeLessThanOrEqual(limits.maxBytes);
+				const dimensions = imageDimensions(Buffer.from(image.data, "base64"), image.mimeType)!;
+				expect(dimensions).toBeDefined();
+				expect(dimensions.width).toBeLessThanOrEqual(limits.maxWidth);
+				expect(dimensions.height).toBeLessThanOrEqual(limits.maxHeight);
+			}
+		},
+	);
+
+	it.each([{ maxWidth: 8, maxHeight: 6 }, { maxBytes: 1024 }])(
+		"keeps generated originals but diagnoses incompatible attachments without a processor for %j",
+		async (resize) => {
+			// Initialize Photon only to build the fixture; the code mode extension receives no processor.
+			await createNodePhotonImages({ worker: false });
+			const result = await generatedImageTurn(undefined, resize);
+			expect(result.savedBytes.toString("base64")).toBe(result.original.data);
+			expect(result.reopened).toEqual(result.stored);
+			expect(result.requests).toHaveLength(2);
+			for (const message of [result.stored, ...result.requests.flatMap((request) => request.messages)]) {
+				if (message.role !== "toolResult" || message.toolName !== "codemode") continue;
+				expect(message.content.filter((item) => item.type === "image")).toEqual([]);
+				expect(message.content.flatMap((item) => (item.type === "text" ? [item.text] : [])).join("\n")).toContain(
+					"no image processor",
+				);
+			}
+			expect(result.diagnostics).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						code: "unsupported_image",
+						message: expect.stringContaining("no image processor"),
+					}),
+				]),
+			);
+		},
+	);
 
 	it("shows a read PNG and passes the same image through code mode to a classifier", async () => {
 		const chat = modelsChat();

@@ -129,7 +129,13 @@ Default enabled tools are `read`, `bash`, `edit`, and `write`, unless `defaultTo
 
 <a id="mcp-tools"></a>
 
-`--tools` selects the tools declared to the model. It does not remove MCP tools, whose reach is set by their [exposure](mcp.md#control-tool-exposure): `pi --tools read,codemode` keeps every MCP tool callable from codemode scripts. An MCP tool that no entry names or matches is never declared directly, whatever its exposure; only `tool_search`, if listed, can load it. Once an entry starts with `mcp__`, `--tools` filters MCP tools too, so this keeps only the tools of the `radius` server:
+`--tools` selects the tools declared to the model. When no entry starts with `mcp__`, MCP tools stay registered, but their [exposure](mcp.md#control-tool-exposure) controls how they can be reached:
+
+- `codemode` and `deferred` tools remain callable from codemode scripts. For example, `pi --tools read,codemode` keeps these tools available to scripts without declaring them to the model. If `tool_search` is also listed, it can load them for direct model calls.
+- `direct` tools must be named or matched by `--tools`, for example with `'mcp__docs__*'`, before either the model or codemode scripts can call them. `tool_search` cannot load an unlisted direct tool; give it `codemode` or `deferred` exposure to make it available indirectly instead.
+- `hidden` tools remain unreachable, even when named or matched.
+
+Once an entry starts with `mcp__`, `--tools` filters MCP registration too, so this keeps only the tools of the `radius` server:
 
 ```sh
 pi --tools read,bash,codemode,'mcp__radius__*'

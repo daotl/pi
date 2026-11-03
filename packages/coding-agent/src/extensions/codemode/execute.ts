@@ -27,6 +27,7 @@ import {
 import { getCodemodeWorkerSpecifier, getQuickJSWasmPath } from "../../config.ts";
 import type { ExtensionToolContext, ToolNamespace } from "../../core/extensions/types.ts";
 import type { SessionEntry } from "../../core/session-manager.ts";
+import type { ToolUsageRecorder } from "../../core/tool-usage-binding.ts";
 import { formatSize } from "../../core/tools/truncate.ts";
 import { combineUsage } from "../../core/usage-totals.ts";
 import { writeOutputFile } from "../../utils/output-files.ts";
@@ -501,19 +502,22 @@ export async function executeCodemode(
 	onUpdate: ((result: AgentToolResult<CodemodeToolDetails>) => void) | undefined,
 	ctx: ExtensionToolContext | undefined,
 	options: CodemodeToolOptions = {},
+	recordUsage?: ToolUsageRecorder,
 ): Promise<AgentToolResult<CodemodeToolDetails>> {
 	const startedAt = performance.now();
 	const { code, options: sourceOptions } = parseCodemodeSource(input.code);
 	const calls: CodemodeNestedCall[] = [];
-	// Usage of the script's `models.*` calls. Nested tool calls report theirs through the session.
+	// Session-bound models publish independent receipts, including after the script has settled.
+	// Only standalone execution returns model charges on the tool result; never charge both paths.
 	let modelUsage: Usage | undefined;
 	// Images returned by `models.generateImages()`, to notice a script that never shows them.
 	let generatedImages = 0;
 	const addGeneratedImages = (count: number) => {
 		generatedImages += count;
 	};
-	const addModelUsage = (usage: Usage) => {
-		modelUsage = modelUsage ? combineUsage(modelUsage, usage) : usage;
+	const addModelUsage = (model: AnyModel, usage: Usage) => {
+		if (recordUsage) recordUsage("codemode", model.provider, model.id, usage);
+		else modelUsage = modelUsage ? combineUsage(modelUsage, usage) : usage;
 	};
 
 	const snapshot = (): CodemodeToolDetails => ({ calls: calls.map((call) => ({ ...call })) });
@@ -749,7 +753,7 @@ function createModelGlobals(
 	toolCallId: string,
 	calls: CodemodeNestedCall[],
 	publish: () => void,
-	addUsage: (usage: Usage) => void,
+	addUsage: (model: AnyModel, usage: Usage) => void,
 	addGeneratedImages: (count: number) => void,
 ): CodemodeTool[] {
 	const limit = createLimiter(MAX_CONCURRENT_MODEL_CALLS);
@@ -764,6 +768,7 @@ function createModelGlobals(
 		type: TType,
 		[model, context]: unknown[],
 		checkContext: (context: unknown) => TContext,
+		signal: AbortSignal,
 		run: (resolved: ModelTypeMap[TType], context: TContext) => Promise<TResult>,
 	): Promise<TResult> => {
 		const listHint = `List the ${type} models you can use with models.getAvailableOfType("${type}").`;
@@ -803,13 +808,22 @@ function createModelGlobals(
 		calls.push(record);
 		publish();
 		const startedAt = performance.now();
-		const result = await limit(() => run(resolved, checked));
+		let result: TResult;
+		try {
+			result = await limit(() => run(resolved, checked));
+		} catch (error) {
+			record.durationMs = performance.now() - startedAt;
+			record.status = signal.aborted ? "cancelled" : "error";
+			record.error = truncateText(error instanceof Error ? error.message : String(error), ERROR_PREVIEW_CHARS);
+			publish();
+			throw error;
+		}
 		record.durationMs = performance.now() - startedAt;
 		record.status = result.stopReason === "stop" ? "ok" : result.stopReason === "aborted" ? "cancelled" : "error";
 		if (result.errorMessage) record.error = truncateText(result.errorMessage, ERROR_PREVIEW_CHARS);
 		if (result.usage) {
 			record.cost = result.usage.cost.total;
-			addUsage(result.usage);
+			addUsage(resolved, result.usage);
 		}
 		publish();
 		return result;
@@ -835,8 +849,13 @@ function createModelGlobals(
 			return model === undefined ? undefined : toModelInfo(model);
 		},
 		"models.classify": (args, { signal }) =>
-			runModelCall("models.classify", "classifier", args as unknown[], checkClassifierContext, (resolved, context) =>
-				models.classify(resolved, context, { signal }),
+			runModelCall(
+				"models.classify",
+				"classifier",
+				args as unknown[],
+				checkClassifierContext,
+				signal,
+				(resolved, context) => models.classify(resolved, context, { signal }),
 			),
 		"models.generateImages": (args, { signal }) =>
 			runModelCall(
@@ -844,6 +863,7 @@ function createModelGlobals(
 				"image",
 				args as unknown[],
 				checkImagesContext,
+				signal,
 				async (resolved, context) => {
 					const result = await models.generateImages(resolved, context, { signal });
 					addGeneratedImages(result.output.filter((block) => block.type === "image").length);

@@ -1,5 +1,17 @@
-import { describe, expect, it } from "vitest";
-import { type FileEntry, migrateSessionEntries } from "../../src/core/session-manager.ts";
+import type * as Crypto from "crypto";
+import { randomUUID } from "crypto";
+import { describe, expect, it, vi } from "vitest";
+import {
+	buildSessionContext,
+	type FileEntry,
+	migrateSessionEntries,
+	type SessionEntry,
+} from "../../src/core/session-manager.ts";
+
+vi.mock("crypto", async (importOriginal) => {
+	const actual = await importOriginal<typeof Crypto>();
+	return { ...actual, randomUUID: vi.fn(actual.randomUUID) };
+});
 
 describe("migrateSessionEntries", () => {
 	it("should add id/parentId to v1 entries", () => {
@@ -38,6 +50,41 @@ describe("migrateSessionEntries", () => {
 		expect(msg2.id).toBeDefined();
 		expect(msg2.id.length).toBe(8);
 		expect(msg2.parentId).toBe(msg1.id);
+	});
+
+	it("reserves migrated IDs before generating the next entry", () => {
+		const entries = [
+			{ type: "session", id: "legacy", timestamp: "2025-01-01T00:00:00Z", cwd: "/tmp" },
+			{
+				type: "message",
+				timestamp: "2025-01-01T00:00:01Z",
+				message: { role: "user", content: "first", timestamp: 1 },
+			},
+			{
+				type: "message",
+				timestamp: "2025-01-01T00:00:02Z",
+				message: { role: "user", content: "second", timestamp: 2 },
+			},
+		] as FileEntry[];
+		const uuid = vi.mocked(randomUUID);
+		uuid
+			.mockReturnValueOnce("aaaaaaaa-0000-4000-8000-000000000000")
+			.mockReturnValueOnce("aaaaaaaa-0000-4000-8000-000000000000")
+			.mockReturnValueOnce("bbbbbbbb-0000-4000-8000-000000000000");
+		try {
+			migrateSessionEntries(entries);
+			const messages = entries.filter((entry): entry is SessionEntry => entry.type !== "session");
+			expect(messages.map((entry) => [entry.id, entry.parentId])).toEqual([
+				["aaaaaaaa", null],
+				["bbbbbbbb", "aaaaaaaa"],
+			]);
+			expect(buildSessionContext(messages).messages).toEqual([
+				{ role: "user", content: "first", timestamp: 1 },
+				{ role: "user", content: "second", timestamp: 2 },
+			]);
+		} finally {
+			uuid.mockReset();
+		}
 	});
 
 	it("should be idempotent (skip already migrated)", () => {

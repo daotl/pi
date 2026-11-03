@@ -12,6 +12,7 @@ import { Text } from "../src/components/text.ts";
 import type { Terminal } from "../src/terminal.ts";
 import {
 	deleteKittyImage,
+	encodeITerm2,
 	encodeKitty,
 	renderImage,
 	resetCapabilitiesCache,
@@ -1219,6 +1220,102 @@ describe("TUI overlays over native-reflow content", () => {
 			setCellDimensions({ widthPx: 9, heightPx: 18 });
 		}
 	});
+
+	for (const separator of ["", "\x1b[4C"]) {
+		for (const chunked of [false, true]) {
+			it(`paints and deletes both ${chunked ? "cropped chunked" : "single"} Kitty images in one ${separator ? "CUF-separated" : "adjacent"} overlay row`, async () => {
+				setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+				setCellDimensions({ widthPx: 10, heightPx: 20 });
+				const png =
+					"iVBORw0KGgoAAAANSUhEUgAAAAMAAABaCAYAAAB9qeyAAAAAGUlEQVR4nGP4z8DwH4YZRjmjnFHOKGcgOQB2mRoDbjkRtQAAAABJRU5ErkJggg==";
+				const sequences = [6401, 6402].map((imageId) => {
+					const sequence = encodeKitty(png, { columns: 3, rows: chunked ? 3 : 1, imageId, moveCursor: false });
+					if (!chunked) return sequence;
+					const headerEnd = sequence.indexOf(";");
+					return `${sequence.slice(0, headerEnd)},m=1;${png.slice(0, 32)}\x1b\\\x1b_Gm=0;${png.slice(32)}\x1b\\`;
+				});
+				const terminal = new LoggingVirtualTerminal(24, 4);
+				const tui = new TuiMainScreen(terminal);
+				tui.addChild(new Text("base zero\nbase one\nbase two\nbase three", 0, 0));
+				const component = new TestComponent();
+				const line = `\x1b[3mab\x1b[23m${sequences[0]}${separator}${sequences[1]}\x1b[3Ctail`;
+				component.lines = [line, "", ""];
+				const cachedLines = component.lines;
+				const model = new KittyPlacementModel();
+				try {
+					tui.start();
+					await terminal.waitForRender();
+					const before = terminal.getViewport();
+					terminal.clearWrites();
+					const overlay = tui.showOverlay(component, { width: 14, row: 1, col: 3, maxHeight: 1 });
+					await terminal.waitForRender();
+					model.apply(terminal.getWrites());
+					assert.deepStrictEqual([...model.placements.keys()].sort(), [6401, 6402], "both images must be painted");
+					for (const imageId of [6401, 6402]) {
+						const placement = model.placements.get(imageId)!;
+						assert.strictEqual(placement.payload, png, "each image retains all of its upload chunks");
+						assert.strictEqual(placement.controls.r, "1", "each placement stays within the overlay height");
+						if (chunked) assert.strictEqual(placement.controls.h, "30");
+					}
+					assert.strictEqual(
+						terminal.getViewport()[1].slice(3, separator ? 16 : 12),
+						separator ? "ab       tail" : "ab   tail",
+					);
+					assert.notStrictEqual(getCellItalic(terminal, 1, 3), 0);
+					assert.strictEqual(component.lines, cachedLines);
+					assert.deepStrictEqual(component.lines, [line, "", ""]);
+					terminal.clearWrites();
+					overlay.hide();
+					await terminal.waitForRender();
+					model.apply(terminal.getWrites());
+					for (const imageId of [6401, 6402]) {
+						assert.ok(
+							terminal.getWrites().includes(deleteKittyImage(imageId)),
+							`hide must delete image ${imageId}`,
+						);
+					}
+					assert.strictEqual(model.placements.size, 0, "no graphics may survive hiding the overlay");
+					assert.deepStrictEqual(terminal.getViewport(), before);
+				} finally {
+					tui.stop();
+					resetCapabilitiesCache();
+					setCellDimensions({ widthPx: 9, heightPx: 18 });
+				}
+			});
+		}
+	}
+
+	for (const mixed of [false, true]) {
+		it(`preserves each payload in a ${mixed ? "mixed Kitty/iTerm2" : "two-iTerm2"} overlay row`, async () => {
+			setCapabilities({ images: "iterm2", trueColor: true, hyperlinks: true });
+			const first = mixed
+				? encodeKitty("Zmlyc3Q=", { columns: 1, rows: 1, imageId: 6501, moveCursor: false })
+				: encodeITerm2("Zmlyc3Q=", { width: 1, height: 1 });
+			const second = encodeITerm2("c2Vjb25k", { width: 1, height: 1 });
+			const terminal = new LoggingVirtualTerminal(24, 4);
+			const tui = new TuiMainScreen(terminal);
+			tui.addChild(new Text("base zero\nbase one\nbase two\nbase three", 0, 0));
+			const component = new TestComponent();
+			component.lines = [`${first}\x1b[4C${second}`];
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				const before = terminal.getViewport();
+				terminal.clearWrites();
+				const overlay = tui.showOverlay(component, { width: 14, row: 1, col: 3 });
+				await terminal.waitForRender();
+				const writes = terminal.getWrites();
+				assert.strictEqual(writes.split(first).length - 1, 1, "first image emits exactly once");
+				assert.strictEqual(writes.split(second).length - 1, 1, "second image retains its own payload");
+				overlay.hide();
+				await terminal.waitForRender();
+				assert.deepStrictEqual(terminal.getViewport(), before);
+			} finally {
+				tui.stop();
+				resetCapabilitiesCache();
+			}
+		});
+	}
 
 	for (const api of ["encodeKitty", "renderImage"] as const) {
 		for (const chunked of [false, true]) {

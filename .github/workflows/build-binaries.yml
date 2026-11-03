@@ -301,17 +301,19 @@ jobs:
             exit 1
           fi
 
-  # The pi-env daemon for every remote system @earendil-works/pi-env supports; the npm package ships them all.
-  env-daemons:
-    uses: ./.github/workflows/env-daemons.yml
+  # Build every pi-env artifact and run the existing release-daemon conformance matrix before publishing the npm
+  # package. The called workflow also produces the artifacts downloaded by publish-npm.
+  env:
+    uses: ./.github/workflows/env.yml
     permissions:
+      actions: read
       contents: read
     with:
       ref: ${{ github.event.inputs.source_ref || github.event.inputs.tag || github.ref_name }}
 
   publish-npm:
     runs-on: ubuntu-latest
-    needs: [stage-github-release, env-daemons]
+    needs: [stage-github-release, env]
     environment: npm-publish
     permissions:
       contents: read

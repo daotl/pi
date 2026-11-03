@@ -20,8 +20,12 @@ test("WASM checking ignores a tracked working-tree deletion and checks remaining
 		git("init");
 		git("add", "removed.ts", "kept.ts", "biome.json");
 		rmSync(join(root, "removed.ts"));
-		const loader = `Object.defineProperty(process, "platform", { value: "android" }); await import(${JSON.stringify(scanner)});`;
-		const result = spawnSync(process.execPath, ["--input-type=module", "-e", loader], { cwd: root, encoding: "utf8" });
+		writeFileSync(join(root, "android.mjs"), 'Object.defineProperty(process, "platform", { value: "android" });\n');
+		writeFileSync(join(root, "check.mjs"), `import ${JSON.stringify(scanner)};\n`);
+		const result = spawnSync(process.execPath, ["--import", join(root, "android.mjs"), join(root, "check.mjs")], {
+			cwd: root,
+			encoding: "utf8",
+		});
 		assert.equal(result.status, 0, result.stderr || result.stdout);
 		assert.match(result.stdout, /checked 1 files; 0 diagnostics/);
 		assert.equal(readFileSync(join(root, "kept.ts"), "utf8"), "export const kept = 1;\n");

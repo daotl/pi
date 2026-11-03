@@ -63,11 +63,15 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
 	}
 }
 
-/** Collect only replayable calls and nested results whose codemode parent survived request policy. */
+/** Collect replayable calls, attributing nested results only to the current assistant's codemode calls. */
 export function extractRequestFileOps(messages: Message[], fileOps: FileOperations): void {
 	const codemodeCalls = new Set<string>();
 	for (const message of messages) {
-		if (message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted") {
+		if (message.role === "user") {
+			codemodeCalls.clear();
+		} else if (message.role === "assistant") {
+			codemodeCalls.clear();
+			if (message.stopReason === "error" || message.stopReason === "aborted") continue;
 			extractFileOpsFromMessage(message, fileOps);
 			for (const block of message.content) {
 				if (block.type === "toolCall" && block.name === CODEMODE_TOOL_NAME) codemodeCalls.add(block.id);

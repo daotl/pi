@@ -11,6 +11,7 @@ export class AuthUrlComponent extends Container {
 	readonly url: string;
 	private readonly tui: TUI;
 	private readonly hint: Text;
+	private copyGeneration = 0;
 
 	constructor(tui: TUI, url: string) {
 		super();
@@ -29,10 +30,13 @@ export class AuthUrlComponent extends Container {
 	}
 
 	async copy(): Promise<void> {
+		const generation = ++this.copyGeneration;
 		try {
 			await copyToClipboard(this.url);
+			if (generation !== this.copyGeneration) return;
 			this.setHint(theme.fg("success", "Copied URL to clipboard"));
 		} catch (error) {
+			if (generation !== this.copyGeneration) return;
 			this.setHint(theme.fg("error", error instanceof Error ? error.message : String(error)));
 		}
 	}

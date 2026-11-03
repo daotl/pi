@@ -412,7 +412,9 @@ describe("RemoteExecutionEnv against NodeExecutionEnv", () => {
 				const listing = await env.listFiles(".", undefined, context);
 				expect(listing.ok && listing.value.entries).toContainEqual({ path: "ordinary", kind: "file" });
 				for (const controller of controllers) controller.abort();
-				expect(await Promise.all(reads)).toEqual(controllers.map(() => "aborted"));
+				const settledReads = await Promise.all(reads);
+				expect(settledReads.filter((code) => code === "aborted")).toHaveLength(16);
+				expect(settledReads.filter((code) => code === "EMFILE")).toHaveLength(24);
 				for (const kind of ["text", "binary", "lines"] as const) {
 					const controller = new AbortController();
 					const opening = Promise.withResolvers<void>();

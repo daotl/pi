@@ -1,3 +1,4 @@
+import { AI_TELEMETRY_SCHEMA } from "@earendil-works/pi-ai/models";
 import type {
 	ExactTelemetryAttributes,
 	SchemaTelemetrySpan,
@@ -39,83 +40,7 @@ export type {
 	TypedSpanStarter,
 } from "@earendil-works/pi-telemetry";
 
-export const AI_TELEMETRY_SCHEMA = {
-	version: 1,
-	spans: {
-		"pi.ai.request": {
-			description: "One logical request to an AI provider",
-			parents: { kind: "any" },
-			startAttributes: {
-				"pi.ai.operation": {
-					type: "string",
-					required: true,
-					values: ["stream", "fetch_deferred", "cancel_deferred", "generate_images"],
-					description: "Logical provider operation",
-				},
-				"pi.ai.provider": {
-					type: "string",
-					required: true,
-					description: "Selected provider id",
-				},
-				"pi.ai.model": {
-					type: "string",
-					required: true,
-					description: "Requested model id",
-				},
-				"pi.ai.api": {
-					type: "string",
-					required: true,
-					description: "Provider API id",
-				},
-				"pi.ai.streaming": {
-					type: "boolean",
-					required: true,
-					description: "Whether this operation returns a stream",
-				},
-				"pi.ai.deferred": {
-					type: "boolean",
-					required: false,
-					description: "Whether the operation requests or participates in deferred execution",
-				},
-			},
-			endAttributes: {
-				"pi.ai.response.model": { type: "string", description: "Concrete response model" },
-				"pi.ai.response.id": {
-					type: "string",
-					cardinality: "high",
-					description: "Provider response id",
-				},
-				"pi.ai.response.stop_reason": {
-					type: "string",
-					values: ["stop", "length", "tool_use", "error", "aborted", "deferred"],
-					description: "Normalized terminal response reason",
-				},
-				"pi.ai.http.status_code": { type: "number", description: "Final HTTP status" },
-				"pi.ai.usage.input_tokens": { type: "number", description: "Reported input tokens" },
-				"pi.ai.usage.output_tokens": { type: "number", description: "Reported output tokens" },
-				"pi.ai.usage.cache_read_tokens": { type: "number", description: "Reported cache-read tokens" },
-				"pi.ai.usage.cache_write_tokens": {
-					type: "number",
-					description: "Reported cache-write tokens",
-				},
-				"pi.ai.usage.reasoning_tokens": { type: "number", description: "Reported reasoning tokens" },
-				"pi.ai.usage.total_tokens": { type: "number", description: "Reported total tokens" },
-				"pi.ai.usage.cost": { type: "number", description: "Reported total cost" },
-				"pi.ai.stream.chunk_count": { type: "number", description: "Streamed update chunk count" },
-				"pi.ai.stream.time_to_first_chunk_ms": {
-					type: "number",
-					description: "Elapsed milliseconds to first update chunk",
-				},
-				"pi.ai.error.type": {
-					type: "string",
-					cardinality: "low",
-					description: "Provider or transport error class",
-				},
-			},
-			status: { default: "ok", errorWhen: "The operation throws or returns an error result" },
-		},
-	},
-} as const satisfies TelemetrySchemaDefinition;
+export { AI_TELEMETRY_SCHEMA };
 
 export type AiSpanName = TelemetrySchemaSpanName<typeof AI_TELEMETRY_SCHEMA>;
 export type AiSpanStartAttributes<Name extends AiSpanName> = TelemetrySchemaSpanStartAttributes<
@@ -591,7 +516,7 @@ export const HARNESS_TELEMETRY_SCHEMA = {
 	},
 } as const satisfies TelemetrySchemaDefinition;
 
-/** Combined typed span vocabulary for agent-owned AI-request and harness telemetry. */
+/** Combined typed span vocabulary for model-owned AI telemetry and agent-owned harness telemetry. */
 export const AGENT_TELEMETRY_SCHEMAS = [AI_TELEMETRY_SCHEMA, HARNESS_TELEMETRY_SCHEMA] as const;
 
 export type HarnessSpanName = TelemetrySchemaSpanName<typeof HARNESS_TELEMETRY_SCHEMA>;

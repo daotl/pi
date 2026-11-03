@@ -1447,63 +1447,89 @@ export abstract class TuiBase extends Container implements TUI {
 				for (let i = 0; i < overlayLines.length; i++) {
 					const line = overlayLines[i];
 					if (!isImageLine(line)) continue;
-					const metadata = getKittyImageMetadata(line);
-					const kittyStart = line.indexOf("\x1b_G");
-					const imageStart = kittyStart !== -1 ? kittyStart : line.indexOf("\x1b]1337;File=");
-					let anchorOffset = 0;
-					if (kittyStart === -1) {
-						// iTerm2 emits on the final reserved row, moving up to the image's top.
-						for (let offset = 0; offset < imageStart; ) {
-							const ansi = extractAnsiCode(line, offset);
-							if (ansi) {
-								const moveUp = /^\x1b\[(\d*)A$/.exec(ansi.code);
-								if (moveUp) anchorOffset += Number(moveUp[1] || 1);
-								offset += ansi.length;
-							} else offset++;
+					// A row may contain several placements, each followed by its own upload
+					// continuation chunks. Keep their geometry and cropping independent.
+					const imageSpans: Array<{ start: number; end: number; kitty: boolean; geometryIndex: number }> = [];
+					let geometry = "";
+					let geometryStart = 0;
+					for (let offset = 0; offset < line.length; ) {
+						const ansi = extractAnsiCode(line, offset);
+						if (!ansi) {
+							offset++;
+							continue;
 						}
-						anchorOffset = Math.min(anchorOffset, i);
+						const kitty = ansi.code.startsWith("\x1b_G");
+						let end = offset + ansi.length;
+						if (kitty || ansi.code.startsWith("\x1b]1337;File=")) {
+							let chunk = ansi;
+							while (kitty && /(?:^|,)m=1(?:,|;)/.test(chunk.code.slice(3, chunk.code.indexOf(";") + 1))) {
+								const continuation = extractAnsiCode(line, end);
+								if (!continuation?.code.startsWith("\x1b_G")) break;
+								end += continuation.length;
+								chunk = continuation;
+							}
+							geometry += line.slice(geometryStart, offset);
+							imageSpans.push({ start: offset, end, kitty, geometryIndex: geometry.length });
+							geometryStart = end;
+						}
+						offset = end;
 					}
-					const imageRow = row + i - anchorOffset;
-					const imageRows = getKittyImagePlacementRows(line) ?? anchorOffset + 1;
-					const visibleRows = Math.min(imageRows, overlayLines.length - i + anchorOffset, termHeight - imageRow);
-					const imageCursor = { index: imageStart, row: 0, col: 0 };
-					terminalLineRows(line.slice(0, imageStart), termWidth - col, imageCursor);
-					const imageCol = col + imageCursor.col;
-					const itermColumns =
-						kittyStart === -1
+					for (const { start: imageStart, end: imageEnd, kitty, geometryIndex } of imageSpans) {
+						const imageLine = line.slice(imageStart, imageEnd);
+						const metadata = getKittyImageMetadata(imageLine);
+						let anchorOffset = 0;
+						if (!kitty) {
+							// iTerm2 emits on the final reserved row, moving up to the image's top.
+							for (let offset = 0; offset < imageStart; ) {
+								const ansi = extractAnsiCode(line, offset);
+								if (ansi) {
+									const moveUp = /^\x1b\[(\d*)A$/.exec(ansi.code);
+									if (moveUp) anchorOffset += Number(moveUp[1] || 1);
+									offset += ansi.length;
+								} else offset++;
+							}
+							anchorOffset = Math.min(anchorOffset, i);
+						}
+						const imageRow = row + i - anchorOffset;
+						const imageRows = getKittyImagePlacementRows(imageLine) ?? anchorOffset + 1;
+						const visibleRows = Math.min(
+							imageRows,
+							overlayLines.length - i + anchorOffset,
+							termHeight - imageRow,
+						);
+						const imageCursor = { index: geometryIndex, row: 0, col: 0 };
+						terminalLineRows(geometry.slice(0, geometryIndex), termWidth - col, imageCursor);
+						const imageCol = col + imageCursor.col;
+						const itermColumns = !kitty
 							? /;width=(\d+)(?:;|$)/.exec(line.slice(imageStart, line.indexOf(":", imageStart)))
 							: null;
-					const kittyColumns =
-						kittyStart === -1
-							? undefined
-							: /(?:^|,)c=(\d+)(?:,|$)/.exec(line.slice(kittyStart + 3, line.indexOf(";", kittyStart)))?.[1];
-					const imageColumns = kittyColumns
-						? Number(kittyColumns)
-						: (metadata?.columns ?? (itermColumns ? Number(itermColumns[1]) : w));
-					const covered = this.renderedOverlayLayouts.some(
-						(overlay) =>
-							overlay.entry.focusOrder > entry.focusOrder &&
-							overlay.col < imageCol + imageColumns &&
-							overlay.col + overlay.width > imageCol &&
-							overlay.row < imageRow + visibleRows &&
-							overlay.row + overlay.height > imageRow,
-					);
-					if (visibleRows > 0 && !covered) {
-						const clipped = kittyStart === -1 ? line : cropKittyImageLine(line, 0, visibleRows);
-						// Unknown source geometry cannot safely replay a placement beyond the
-						// overlay's declared height. Never emit the original taller placement.
-						if (
-							kittyStart === -1 ||
-							imageRows <= visibleRows ||
-							getKittyImagePlacementRows(clipped) === visibleRows
-						) {
-							this.renderedOverlayImages.push({
-								row: imageRow,
-								rows: visibleRows,
-								anchorRow: row + i,
-								col: imageCol,
-								line: clipped,
-							});
+						const kittyColumns = kitty
+							? /(?:^|,)c=(\d+)(?:,|$)/.exec(imageLine.slice(3, imageLine.indexOf(";")))?.[1]
+							: undefined;
+						const imageColumns = kittyColumns
+							? Number(kittyColumns)
+							: (metadata?.columns ?? (itermColumns ? Number(itermColumns[1]) : w));
+						const covered = this.renderedOverlayLayouts.some(
+							(overlay) =>
+								overlay.entry.focusOrder > entry.focusOrder &&
+								overlay.col < imageCol + imageColumns &&
+								overlay.col + overlay.width > imageCol &&
+								overlay.row < imageRow + visibleRows &&
+								overlay.row + overlay.height > imageRow,
+						);
+						if (visibleRows > 0 && !covered) {
+							const clipped = kitty ? cropKittyImageLine(imageLine, 0, visibleRows) : imageLine;
+							// Unknown source geometry cannot safely replay a placement beyond the
+							// overlay's declared height. Never emit the original taller placement.
+							if (!kitty || imageRows <= visibleRows || getKittyImagePlacementRows(clipped) === visibleRows) {
+								this.renderedOverlayImages.push({
+									row: imageRow,
+									rows: visibleRows,
+									anchorRow: row + i,
+									col: imageCol,
+									line: anchorOffset > 0 ? `\x1b[${anchorOffset}A${clipped}` : clipped,
+								});
+							}
 						}
 					}
 					let text = "";

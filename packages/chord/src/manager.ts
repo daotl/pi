@@ -536,7 +536,16 @@ export function childControl(channel: NodeJS.Process = process): {
 	channel.on("message", (message: unknown) => {
 		const control = (message as { chord2control?: ControlMessage } | null)?.chord2control;
 		if (control?.type === "init") resolveInit(control.value);
-		if (control?.type === "shutdown") for (const handler of shutdown) void handler();
+		if (control?.type === "shutdown") {
+			for (const handler of [...shutdown]) {
+				try {
+					const result = handler();
+					if (result !== undefined) void result.catch(fatal);
+				} catch (error) {
+					fatal(error);
+				}
+			}
+		}
 	});
 	const fatal = (error: unknown): void =>
 		send({

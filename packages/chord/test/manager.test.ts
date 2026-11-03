@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { type ChildProcess, fork, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,7 @@ import { describe, it, onTestFinished, vi } from "vitest";
 import { createHost, ipcLink, isChordError } from "../src/index.ts";
 import {
 	type ControlMessage,
+	childControl,
 	createHostManager,
 	type Driver,
 	forkDriver,
@@ -774,5 +776,52 @@ describe("manager failure boundaries", () => {
 		controls[0]!({ type: "status", activeCalls: 5 });
 		assert.equal(manager.liveness.activeCalls, 0);
 		await manager.stop();
+	});
+});
+
+describe("child control shutdown", () => {
+	it("launches every handler and reports each failure without waiting for unrelated handlers", async () => {
+		const sent: ControlMessage[] = [];
+		const channel = new EventEmitter() as EventEmitter & {
+			connected: boolean;
+			send: NodeJS.Process["send"];
+		};
+		channel.connected = true;
+		channel.send = (message: unknown) => {
+			const control = (message as { chord2control?: ControlMessage } | null)?.chord2control;
+			if (control !== undefined) sent.push(control);
+			return true;
+		};
+		const control = childControl(channel as unknown as NodeJS.Process);
+		const delayedStarted = Promise.withResolvers<void>();
+		const finishDelayed = Promise.withResolvers<void>();
+		let delayedFinished = false;
+		control.onShutdown(async () => {
+			await Promise.resolve();
+			throw new Error("async shutdown failed");
+		});
+		control.onShutdown(async () => {
+			delayedStarted.resolve();
+			await finishDelayed.promise;
+			delayedFinished = true;
+		});
+		control.onShutdown(() => {
+			throw new Error("sync shutdown failed");
+		});
+		channel.emit("message", { chord2control: { type: "shutdown" } satisfies ControlMessage });
+		await delayedStarted.promise;
+		await Promise.resolve();
+		assert.deepEqual(sent.map((message) => (message.type === "fatal" ? message.message : message.type)).sort(), [
+			"async shutdown failed",
+			"sync shutdown failed",
+		]);
+		assert.equal(delayedFinished, false);
+		finishDelayed.resolve();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(delayedFinished, true);
+		assert.deepEqual(sent.map((message) => (message.type === "fatal" ? message.message : message.type)).sort(), [
+			"async shutdown failed",
+			"sync shutdown failed",
+		]);
 	});
 });

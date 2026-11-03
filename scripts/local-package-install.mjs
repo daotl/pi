@@ -128,8 +128,9 @@ function verifyLocalResolutions(directory, artifactSet, directPackageName) {
 		if (typeof installed.resolved !== "string" || !installed.resolved.startsWith("file:")) {
 			throw new Error(`${name} did not resolve from a local artifact: ${String(installed.resolved)}`);
 		}
-		const resolvedPath = new URL(installed.resolved, pathToFileURL(`${directory}/`));
-		if (resolvedPath.protocol !== "file:" || resolvedPath.pathname !== pathToFileURL(artifact.tarballPath).pathname) {
+		// npm lockfile file: resolutions are raw filesystem paths, not URL-encoded paths.
+		const resolvedPath = resolve(directory, installed.resolved.slice("file:".length));
+		if (resolvedPath !== resolve(artifact.tarballPath)) {
 			throw new Error(`${name} resolved from the wrong local artifact: ${installed.resolved}`);
 		}
 		resolvedNames.add(name);

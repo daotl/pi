@@ -1,4 +1,6 @@
-import { accessSync, copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs";
+import { accessSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import {
@@ -15,19 +17,33 @@ import {
 } from "@earendil-works/pi-ai";
 import type { ToolResultMessage, Usage } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ExtensionAPI } from "../../src/core/extensions/types.ts";
-import type { CustomEntry } from "../../src/core/session-manager.ts";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ExtensionAPI, ToolDefinition } from "../../src/core/extensions/types.ts";
+import { type CustomEntry, SessionManager } from "../../src/core/session-manager.ts";
 import { createReadTool } from "../../src/core/tools/read.ts";
 import { createToolDefinitionFromAgentTool } from "../../src/core/tools/tool-definition-wrapper.ts";
+import { getUsageCostBreakdown, getUsageTotals } from "../../src/core/usage-totals.ts";
 import { readCodemodeStore } from "../../src/extensions/codemode/execute.ts";
 import { createCodemodeExtension } from "../../src/extensions/codemode/index.ts";
 import {
 	CODEMODE_STORE_ENTRY_TYPE,
 	type CodemodeToolDetails,
+	type codemodeSchema,
 	createCodemodeTool,
+	createCodemodeToolDefinition,
 } from "../../src/extensions/codemode/tool.ts";
+import { createTestExtensionsResult, createTestResourceLoader } from "../utilities.ts";
 import { createHarness, getToolResult, type Harness, type HarnessOptions } from "./harness.ts";
+
+vi.mock("fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof fs>();
+	return {
+		...actual,
+		writeFileSync: vi.fn(actual.writeFileSync),
+		fsyncSync: vi.fn(actual.fsyncSync),
+		renameSync: vi.fn(actual.renameSync),
+	};
+});
 
 const TINY_PNG_BASE64 =
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
@@ -770,8 +786,16 @@ describe("codemode options and store", () => {
 describe("codemode models", () => {
 	const harnesses: Harness[] = [];
 
+	beforeEach(async () => {
+		const actual = await vi.importActual<typeof fs>("fs");
+		vi.mocked(fs.writeFileSync).mockReset().mockImplementation(actual.writeFileSync);
+		vi.mocked(fs.fsyncSync).mockReset().mockImplementation(actual.fsyncSync);
+		vi.mocked(fs.renameSync).mockReset().mockImplementation(actual.renameSync);
+	});
+
 	afterEach(() => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
+		vi.restoreAllMocks();
 	});
 
 	const scorerModel: ClassifierModel<"test-classifier"> = {
@@ -799,6 +823,9 @@ describe("codemode models", () => {
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	};
 
+	const imageRejection = `painter rejected ${"x".repeat(600)}`;
+	const classifierRejection = `classifier rejected ${"x".repeat(600)}`;
+
 	interface ClassifyObservation {
 		baseUrl: string;
 		apiKey: string | undefined;
@@ -811,10 +838,25 @@ describe("codemode models", () => {
 		input: ImagesContext["input"];
 	}
 
-	async function setup(classifierRelease?: Promise<void>) {
+	async function setup(
+		options: {
+			classifierRelease?: Promise<void>;
+			imageRelease?: Promise<void>;
+			onModelCall?: (signal: AbortSignal | undefined) => void;
+			codemodeDefinition?: ToolDefinition<typeof codemodeSchema, CodemodeToolDetails | undefined>;
+			harnessOptions?: HarnessOptions;
+		} = {},
+	) {
+		const codemodeDefinition = options.codemodeDefinition;
 		const harness = await createHarness({
+			...options.harnessOptions,
 			initialActiveToolNames: ["codemode"],
-			extensionFactories: [createCodemodeExtension()],
+			extensionFactories: [
+				codemodeDefinition
+					? (pi) => pi.registerTool({ ...codemodeDefinition, defaultActive: false })
+					: createCodemodeExtension(),
+				...(options.harnessOptions?.extensionFactories ?? []),
+			],
 		});
 		harnesses.push(harness);
 		const observed: ClassifyObservation[] = [];
@@ -826,8 +868,10 @@ describe("codemode models", () => {
 			models: [scorerModel, painterModel],
 			images: {
 				"test-images": {
-					generateImages: async (model, context, options): Promise<AssistantImages> => {
-						imageRequests.push({ baseUrl: model.baseUrl, apiKey: options?.apiKey, input: context.input });
+					generateImages: async (model, context, providerOptions): Promise<AssistantImages> => {
+						imageRequests.push({ baseUrl: model.baseUrl, apiKey: providerOptions?.apiKey, input: context.input });
+						options.onModelCall?.(providerOptions?.signal);
+						await options.imageRelease;
 						const prompt = context.input.find((block) => block.type === "text")?.text;
 						const base = { api: model.api, provider: model.provider, model: model.id, timestamp: 0 };
 						if (prompt === "explode") {
@@ -847,13 +891,14 @@ describe("codemode models", () => {
 			},
 			classifiers: {
 				"test-classifier": {
-					classify: async (model, context, options): Promise<ClassifierResult> => {
+					classify: async (model, context, providerOptions): Promise<ClassifierResult> => {
 						active++;
 						maxActive = Math.max(maxActive, active);
-						await classifierRelease;
+						options.onModelCall?.(providerOptions?.signal);
+						await options.classifierRelease;
 						active--;
 						const text = context.state.text;
-						observed.push({ baseUrl: model.baseUrl, apiKey: options?.apiKey, text });
+						observed.push({ baseUrl: model.baseUrl, apiKey: providerOptions?.apiKey, text });
 						if (text === "explode") {
 							return {
 								api: model.api,
@@ -917,7 +962,7 @@ describe("codemode models", () => {
 
 	it("lists models and classifies with catalog auth, ignoring script-supplied fields", async () => {
 		const release = Promise.withResolvers<void>();
-		const { harness, observed, maxActive } = await setup(release.promise);
+		const { harness, observed, maxActive } = await setup({ classifierRelease: release.promise });
 		const pending = run(
 			harness,
 			`
@@ -966,10 +1011,17 @@ describe("codemode models", () => {
 		expect(details.calls.map((call) => [call.name, call.args, call.status, call.cost])).toEqual(
 			Array.from({ length: 6 }, () => ["models.classify", "scorer/judge", "ok", 0.001]),
 		);
-		// The classifications' usage becomes the codemode result's usage.
-		expect(result.usage?.input).toBe(1800);
-		expect(result.usage?.cost.total).toBeCloseTo(0.006, 10);
+		// Each classification has its own durable, model-attributed receipt. The aggregate tool
+		// result must not bill those same calls again.
+		expect(result.usage).toBeUndefined();
+		const receipts = harness.sessionManager.getEntries().filter((entry) => entry.type === "usage");
+		expect(receipts).toHaveLength(6);
+		expect(receipts.every((entry) => entry.provider === "scorer" && entry.model === "judge")).toBe(true);
+		expect(receipts.reduce((total, entry) => total + entry.usage.totalTokens, 0)).toBe(1800);
 		expect(harness.session.getSessionStats().cost).toBeCloseTo(0.006, 10);
+		expect(
+			getUsageCostBreakdown(harness.sessionManager.getEntries()).filter((entry) => entry.key.startsWith("scorer/")),
+		).toEqual([{ key: "scorer/judge", cost: 0.006, tokens: 1800 }]);
 	});
 
 	it("generates images with catalog auth and attaches them through image()", async () => {
@@ -1025,9 +1077,650 @@ describe("codemode models", () => {
 			["models.generateImages", "scorer/painter", "ok", 0.04, undefined],
 			["models.generateImages", "scorer/painter", "error", undefined, "painter exploded"],
 		]);
-		expect(result.usage?.cost.total).toBeCloseTo(0.04, 10);
+		expect(result.usage).toBeUndefined();
 		expect(harness.session.getSessionStats().cost).toBeCloseTo(0.04, 10);
+		expect(
+			getUsageCostBreakdown(harness.sessionManager.getEntries()).find((entry) => entry.key === "scorer/painter"),
+		).toEqual({ key: "scorer/painter", cost: 0.04, tokens: 100 });
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "usage")).toEqual([
+			expect.objectContaining({ provider: "scorer", model: "painter", usage: usage(100, 0.04) }),
+		]);
 	});
+
+	it("keeps nested tool usage on the result without duplicating independent model receipts", async () => {
+		const { harness } = await setup({
+			harnessOptions: {
+				extensionFactories: [
+					(pi) =>
+						pi.registerTool({
+							name: "billed",
+							label: "Billed",
+							description: "Run a billed nested tool",
+							parameters: Type.Object({}),
+							exposure: "codemode",
+							execute: async () => ({
+								content: [{ type: "text", text: "ran" }],
+								details: {},
+								usage: usage(100, 0.25),
+							}),
+						}),
+				],
+			},
+		});
+		const result = await run(
+			harness,
+			`
+			await tools.billed({});
+			await models.classify({ provider: "scorer", id: "judge" }, { state: { text: "good" }, questions: ${questions} });
+			await models.generateImages({ provider: "scorer", id: "painter" }, { input: [{ type: "text", text: "a fox" }] });
+		`,
+		);
+		expect(result.isError).toBe(false);
+		expect(result.usage).toEqual(usage(100, 0.25));
+		expect(harness.session.getSessionStats().cost).toBeCloseTo(0.291, 10);
+		expect(
+			getUsageCostBreakdown(harness.sessionManager.getEntries()).filter(
+				(entry) => entry.key === "Tools/summaries" || entry.key.startsWith("scorer/"),
+			),
+		).toEqual([
+			{ key: "Tools/summaries", cost: 0.25, tokens: 100 },
+			{ key: "scorer/painter", cost: 0.04, tokens: 100 },
+			{ key: "scorer/judge", cost: 0.001, tokens: 300 },
+		]);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "usage")).toHaveLength(2);
+	});
+
+	it("publishes rejected model calls and preserves script error handling", async () => {
+		const { harness } = await setup();
+		vi.spyOn(harness.session.modelRuntime, "generateImages").mockRejectedValue(new Error(imageRejection));
+		vi.spyOn(harness.session.modelRuntime, "classify").mockRejectedValue(new Error(classifierRejection));
+		const result = await run(
+			harness,
+			`
+			const imageModel = await models.getModelOfType("image", "scorer", "painter");
+			const classifierModel = await models.getModelOfType("classifier", "scorer", "judge");
+			const attempt = async (fn) => { try { await fn(); return "ok"; } catch (error) { return error.message; } };
+			const imageError = await attempt(() => models.generateImages(imageModel, { input: [{ type: "text", text: "reject" }] }));
+			const classifierError = await attempt(() => models.classify(classifierModel, { state: { text: "reject" }, questions: ${questions} }));
+			return { imageError, classifierError, continued: true };
+		`,
+		);
+		expect(result.isError).toBe(false);
+		expect(JSON.parse(resultText(result))).toEqual({
+			imageError: imageRejection,
+			classifierError: classifierRejection,
+			continued: true,
+		});
+		const updates = harness
+			.eventsOfType("tool_execution_update")
+			.filter((event) => event.toolName === "codemode")
+			.flatMap((event) => {
+				const details = event.partialResult.details as CodemodeToolDetails | undefined;
+				return details?.calls ?? [];
+			});
+		for (const name of ["models.generateImages", "models.classify"]) {
+			const transitions = updates.filter((call) => call.name === name);
+			const statuses = transitions
+				.map((call) => call.status)
+				.filter((status, index, all) => index === 0 || status !== all[index - 1]);
+			expect(statuses).toEqual(["running", "error"]);
+			expect(transitions.find((call) => call.status === "error")).toEqual(
+				expect.objectContaining({
+					durationMs: expect.any(Number),
+					error: `${(name === "models.generateImages" ? imageRejection : classifierRejection).slice(0, 497)}...`,
+				}),
+			);
+		}
+		let details = result.details as unknown as CodemodeToolDetails;
+		expect(details.calls).toEqual([
+			expect.objectContaining({
+				name: "models.generateImages",
+				status: "error",
+				durationMs: expect.any(Number),
+				error: `${imageRejection.slice(0, 497)}...`,
+			}),
+			expect.objectContaining({
+				name: "models.classify",
+				status: "error",
+				durationMs: expect.any(Number),
+				error: `${classifierRejection.slice(0, 497)}...`,
+			}),
+		]);
+
+		const failed = await run(
+			harness,
+			`const model = await models.getModelOfType("image", "scorer", "painter");
+			await models.generateImages(model, { input: [{ type: "text", text: "reject" }] });`,
+		);
+		expect(failed.isError).toBe(true);
+		expect(resultText(failed)).toContain("Script error:\nError: painter rejected");
+		expect(resultText(failed)).toContain(
+			"Tool calls made before the failure (they are not undone): models.generateImages (error)",
+		);
+		details = failed.details as unknown as CodemodeToolDetails;
+		expect(details.calls).toEqual([
+			expect.objectContaining({
+				name: "models.generateImages",
+				status: "error",
+				durationMs: expect.any(Number),
+				error: `${imageRejection.slice(0, 497)}...`,
+			}),
+		]);
+	});
+
+	for (const operation of ["classify", "generateImages"] as const) {
+		it(`publishes cancelled ${operation} rejections without replacing the script abort`, async () => {
+			const { harness } = await setup();
+			let callSignal: AbortSignal | undefined;
+			const release = Promise.withResolvers<void>();
+			const rejection = `${operation} cancelled ${"x".repeat(600)}`;
+			vi.spyOn(harness.session.modelRuntime, operation).mockImplementation(
+				async (_model: unknown, _context: unknown, options?: { signal?: AbortSignal }) => {
+					const signal = options?.signal;
+					if (!signal) throw new Error("Expected the sandbox call signal");
+					callSignal = signal;
+					signal.addEventListener("abort", () => release.resolve(), { once: true });
+					await release.promise;
+					throw new Error(rejection);
+				},
+			);
+			const code =
+				operation === "classify"
+					? `const model = await models.getModelOfType("classifier", "scorer", "judge");
+					await models.classify(model, { state: { text: "pending" }, questions: ${questions} });`
+					: `const model = await models.getModelOfType("image", "scorer", "painter");
+					await models.generateImages(model, { input: [{ type: "text", text: "pending" }] });`;
+			const pending = run(harness, code);
+			try {
+				await vi.waitFor(() => expect(callSignal?.aborted).toBe(false));
+				const abort = harness.session.abort();
+				const [result] = await Promise.all([pending, abort]);
+				expect(callSignal?.aborted).toBe(true);
+				expect(result.isError).toBe(true);
+				expect(resultText(result)).toContain("Script aborted");
+				expect(resultText(result)).not.toContain(`Error: ${operation} cancelled`);
+				expect(harness.eventsOfType("agent_settled")).toEqual([{ type: "agent_settled", aborted: true }]);
+				const expectedCall = expect.objectContaining({
+					name: `models.${operation}`,
+					status: "cancelled",
+					durationMs: expect.any(Number),
+					error: `${rejection.slice(0, 497)}...`,
+				});
+				expect((result.details as unknown as CodemodeToolDetails).calls).toEqual([expectedCall]);
+				const updates = harness
+					.eventsOfType("tool_execution_update")
+					.filter((event) => event.toolName === "codemode")
+					.flatMap((event) => (event.partialResult.details as CodemodeToolDetails | undefined)?.calls ?? []);
+				expect(
+					updates
+						.map((call) => call.status)
+						.filter((status, index, all) => index === 0 || status !== all[index - 1]),
+				).toEqual(["running", "cancelled"]);
+				expect(updates.at(-1)).toEqual(expectedCall);
+			} finally {
+				release.resolve();
+				await Promise.allSettled([pending, harness.session.abort()]);
+			}
+		});
+	}
+
+	for (const operation of ["classify", "generateImages"] as const) {
+		for (const termination of ["return", "abort"] as const) {
+			it(`persists late ${operation} usage exactly once after script ${termination} and reopen`, async () => {
+				const cwd = mkdtempSync(join(tmpdir(), "pi-codemode-late-usage-"));
+				const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+				const release = Promise.withResolvers<void>();
+				const started = Promise.withResolvers<void>();
+				let callSignal: AbortSignal | undefined;
+				const { harness } = await setup({
+					classifierRelease: operation === "classify" ? release.promise : undefined,
+					imageRelease: operation === "generateImages" ? release.promise : undefined,
+					onModelCall: (signal) => {
+						callSignal = signal;
+						started.resolve();
+					},
+					harnessOptions: {
+						cwd,
+						sessionManager: manager,
+						extensionFactories: [
+							(pi) =>
+								pi.registerTool({
+									name: "wait_for_dispatch",
+									label: "Wait for dispatch",
+									description: "Wait until the model provider has started",
+									parameters: Type.Object({}),
+									exposure: "codemode",
+									execute: async () => {
+										await started.promise;
+										return { content: [{ type: "text", text: "dispatched" }], details: {} };
+									},
+								}),
+						],
+					},
+				});
+				const call =
+					operation === "classify"
+						? `models.classify({ provider: "scorer", id: "judge" }, { state: { text: "good" }, questions: ${questions} })`
+						: 'models.generateImages({ provider: "scorer", id: "painter" }, { input: [{ type: "text", text: "a fox" }] })';
+				const code =
+					termination === "return"
+						? `${call}; await tools.wait_for_dispatch({}); return "finished";`
+						: `await ${call};`;
+				let settled = false;
+				const pending = run(harness, code).then((result) => {
+					settled = true;
+					return result;
+				});
+				let abort: Promise<void> | undefined;
+				try {
+					await vi.waitFor(() => expect(callSignal).toBeDefined());
+					if (termination === "abort") abort = harness.session.abort();
+					// Completion must not join a provider that ignores its cancellation signal.
+					await vi.waitFor(() => expect(settled).toBe(true));
+					const result = await pending;
+					await abort;
+					expect(callSignal?.aborted).toBe(true);
+					expect(result.isError).toBe(termination === "abort");
+					expect(resultText(result)).toContain(termination === "abort" ? "Script aborted" : "finished");
+					expect(harness.session.getSessionStats().cost).toBe(0);
+					const sessionFile = manager.getSessionFile();
+					if (!sessionFile) throw new Error("Expected a persisted session");
+					const messageCount = harness.session.messages.length;
+					const beforeUsage = getUsageTotals(manager.getEntries());
+					release.resolve();
+					const expectedUsage = operation === "classify" ? usage(300, 0.001) : usage(100, 0.04);
+					await vi.waitFor(() => {
+						expect(harness.session.getSessionStats().cost).toBe(expectedUsage.cost.total);
+						expect(getUsageTotals(manager.getEntries()).input - beforeUsage.input).toBe(expectedUsage.input);
+					});
+					expect(harness.session.messages).toHaveLength(messageCount);
+					expect(result.usage).toBeUndefined();
+					const model = operation === "classify" ? scorerModel : painterModel;
+					for (const current of [manager, SessionManager.open(sessionFile)]) {
+						const receipts = current.getEntries().filter((entry) => entry.type === "usage");
+						expect(receipts).toHaveLength(1);
+						expect(receipts[0]).toMatchObject({
+							provider: model.provider,
+							model: model.id,
+							usage: expectedUsage,
+						});
+						expect(getUsageTotals(current.getEntries())).toEqual({
+							input: beforeUsage.input + expectedUsage.input,
+							output: beforeUsage.output,
+							cacheRead: beforeUsage.cacheRead,
+							cacheWrite: beforeUsage.cacheWrite,
+							cost: beforeUsage.cost + expectedUsage.cost.total,
+						});
+						expect(
+							getUsageCostBreakdown(current.getEntries()).filter((entry) => entry.key.startsWith("scorer/")),
+						).toEqual([
+							{
+								key: `${model.provider}/${model.id}`,
+								cost: expectedUsage.cost.total,
+								tokens: expectedUsage.totalTokens,
+							},
+						]);
+					}
+					expect(harness.eventsOfType("entry_appended").filter((event) => event.entry.type === "usage")).toEqual([
+						{
+							type: "entry_appended",
+							entry: expect.objectContaining({
+								provider: model.provider,
+								model: model.id,
+								usage: expectedUsage,
+							}),
+						},
+					]);
+				} finally {
+					release.resolve();
+					await Promise.allSettled([pending, abort, harness.session.abort()]);
+					rmSync(cwd, { recursive: true, force: true });
+				}
+			});
+		}
+	}
+
+	for (const operation of ["classify", "generateImages"] as const) {
+		it(`keeps late ${operation} receipts on the original manager after definition reuse and branch replacement`, async () => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-codemode-rebound-usage-"));
+			const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+			const release = Promise.withResolvers<void>();
+			const started = Promise.withResolvers<void>();
+			const definition = createCodemodeToolDefinition({ models: true });
+			const { harness: original } = await setup({
+				codemodeDefinition: definition,
+				classifierRelease: operation === "classify" ? release.promise : undefined,
+				imageRelease: operation === "generateImages" ? release.promise : undefined,
+				onModelCall: () => started.resolve(),
+				harnessOptions: { cwd, sessionManager: manager },
+			});
+			const call =
+				operation === "classify"
+					? `models.classify({ provider: "scorer", id: "judge" }, { state: { text: "good" }, questions: ${questions} })`
+					: 'models.generateImages({ provider: "scorer", id: "painter" }, { input: [{ type: "text", text: "a fox" }] })';
+			const pending = run(original, `await ${call};`);
+			try {
+				await started.promise;
+				const dispatchParent = manager.getLeafId();
+				await original.session.abort();
+				expect((await pending).isError).toBe(true);
+				const sessionFile = manager.getSessionFile();
+				if (!sessionFile) throw new Error("Expected the original session file");
+				const branchPoint = manager.getBranch().find((entry) => entry.type === "message");
+				if (!branchPoint) throw new Error("Expected an original prompt");
+				manager.branch(branchPoint.id);
+				const replacementLeaf = manager.appendCustomEntry("replacement-branch", {});
+				original.session.dispose();
+				// Rebinding the exact same definition must not redirect the old executor's callback.
+				const { harness: replacement } = await setup({ codemodeDefinition: definition });
+				expect((await run(replacement, `await ${call};`)).isError).toBe(false);
+				const expected = operation === "classify" ? usage(300, 0.001) : usage(100, 0.04);
+				expect(replacement.session.getSessionStats().cost).toBe(expected.cost.total);
+				const replacementEventCount = replacement.eventsOfType("entry_appended").length;
+				// Even a listener accidentally retained by a host must not receive disposed-owner events.
+				original.session.subscribe((event) => original.events.push(event));
+				release.resolve();
+				await vi.waitFor(() => expect(getUsageTotals(manager.getEntries()).cost).toBe(expected.cost.total));
+				const model = operation === "classify" ? scorerModel : painterModel;
+				for (const current of [manager, SessionManager.open(sessionFile)]) {
+					expect(current.getEntries().filter((entry) => entry.type === "usage")).toEqual([
+						expect.objectContaining({
+							parentId: dispatchParent,
+							provider: model.provider,
+							model: model.id,
+							usage: expected,
+						}),
+					]);
+					expect(current.getLeafId()).toBe(replacementLeaf);
+					expect(current.getBranch().some((entry) => entry.type === "usage")).toBe(false);
+				}
+				expect(replacement.session.getSessionStats().cost).toBe(expected.cost.total);
+				expect(replacement.sessionManager.getEntries().filter((entry) => entry.type === "usage")).toHaveLength(1);
+				expect(replacement.eventsOfType("entry_appended")).toHaveLength(replacementEventCount);
+				expect(original.eventsOfType("entry_appended").filter((event) => event.entry.type === "usage")).toEqual([]);
+			} finally {
+				release.resolve();
+				await Promise.allSettled([pending, original.session.abort()]);
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+	}
+
+	for (const operation of ["classify", "generateImages"] as const) {
+		it(`persists late ${operation} usage after reload without notifying the replacement runtime`, async () => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-codemode-reloaded-usage-"));
+			const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+			const release = Promise.withResolvers<void>();
+			const started = Promise.withResolvers<void>();
+			const factories = [createCodemodeExtension()];
+			let extensions = await createTestExtensionsResult(factories, cwd);
+			const resourceLoader = {
+				...createTestResourceLoader(),
+				getExtensions: () => extensions,
+				reload: async () => {
+					extensions = await createTestExtensionsResult(factories, cwd);
+				},
+			};
+			const { harness } = await setup({
+				classifierRelease: operation === "classify" ? release.promise : undefined,
+				imageRelease: operation === "generateImages" ? release.promise : undefined,
+				onModelCall: () => started.resolve(),
+				harnessOptions: { cwd, sessionManager: manager, resourceLoader },
+			});
+			const call =
+				operation === "classify"
+					? `models.classify({ provider: "scorer", id: "judge" }, { state: { text: "good" }, questions: ${questions} })`
+					: 'models.generateImages({ provider: "scorer", id: "painter" }, { input: [{ type: "text", text: "a fox" }] })';
+			const pending = run(harness, `await ${call};`);
+			try {
+				await started.promise;
+				await harness.session.abort();
+				expect((await pending).isError).toBe(true);
+				const sessionFile = manager.getSessionFile();
+				if (!sessionFile) throw new Error("Expected the original session file");
+				const originalRunner = harness.session.extensionRunner;
+				await harness.session.reload();
+				expect(harness.session.extensionRunner).not.toBe(originalRunner);
+				const expected = operation === "classify" ? usage(300, 0.001) : usage(100, 0.04);
+				const model = operation === "classify" ? scorerModel : painterModel;
+				release.resolve();
+				await vi.waitFor(() => expect(getUsageTotals(manager.getEntries()).cost).toBe(expected.cost.total));
+				for (const current of [manager, SessionManager.open(sessionFile)]) {
+					expect(current.getEntries().filter((entry) => entry.type === "usage")).toEqual([
+						expect.objectContaining({ provider: model.provider, model: model.id, usage: expected }),
+					]);
+				}
+				expect(harness.eventsOfType("entry_appended").filter((event) => event.entry.type === "usage")).toEqual([]);
+			} finally {
+				release.resolve();
+				await Promise.allSettled([pending, harness.session.abort()]);
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+	}
+
+	for (const operation of ["classify", "generateImages"] as const) {
+		it(`preserves same-file replacement history when late ${operation} usage arrives before an atomic rewrite`, async () => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-codemode-same-file-usage-"));
+			const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+			const release = Promise.withResolvers<void>();
+			const started = Promise.withResolvers<void>();
+			let callSignal: AbortSignal | undefined;
+			const {
+				harness: original,
+				observed,
+				imageRequests,
+			} = await setup({
+				classifierRelease: operation === "classify" ? release.promise : undefined,
+				imageRelease: operation === "generateImages" ? release.promise : undefined,
+				onModelCall: (signal) => {
+					callSignal = signal;
+					started.resolve();
+				},
+				harnessOptions: { cwd, sessionManager: manager },
+			});
+			const call =
+				operation === "classify"
+					? `models.classify({ provider: "scorer", id: "judge" }, { state: { text: "good" }, questions: ${questions} })`
+					: 'models.generateImages({ provider: "scorer", id: "painter" }, { input: [{ type: "text", text: "a fox" }] })';
+			let settled = false;
+			const pending = run(original, `await ${call};`).then((result) => {
+				settled = true;
+				return result;
+			});
+			try {
+				await started.promise;
+				const dispatchParent = manager.getLeafId();
+				const abort = original.session.abort();
+				await vi.waitFor(() => expect(settled).toBe(true));
+				await abort;
+				expect((await pending).isError).toBe(true);
+				expect(callSignal?.aborted).toBe(true);
+				original.session.dispose();
+				const file = manager.getSessionFile()!;
+				const reopened = SessionManager.open(file, undefined, cwd);
+				expect(reopened).not.toBe(manager);
+				const { harness: replacement } = await setup({ harnessOptions: { cwd, sessionManager: reopened } });
+				const root = reopened.getBranch().find((entry) => entry.type === "message")!;
+				reopened.branch(root.id);
+				replacement.setResponses([fauxAssistantMessage("new runtime answer")]);
+				await replacement.session.prompt("new runtime question");
+				const newHistory = structuredClone(reopened.getEntries());
+				const selected = reopened.getLeafId();
+				const projection = structuredClone(reopened.buildSessionProjection());
+				const branch = structuredClone(reopened.getBranch());
+				const replacementEvents = replacement.eventsOfType("entry_appended").length;
+				original.session.subscribe((event) => original.events.push(event));
+				const expected = operation === "classify" ? usage(300, 0.001) : usage(100, 0.04);
+				const model = operation === "classify" ? scorerModel : painterModel;
+				release.resolve();
+				await vi.waitFor(() => {
+					const receipts = readFileSync(file, "utf8")
+						.trim()
+						.split("\n")
+						.map((line) => JSON.parse(line))
+						.filter((entry) => entry.type === "usage");
+					expect(receipts).toHaveLength(1);
+				});
+				const check = (current: SessionManager) => {
+					for (const entry of newHistory) expect(current.getEntry(entry.id)).toEqual(entry);
+					expect(current.getLeafId()).toBe(selected);
+					expect(current.getBranch()).toEqual(branch);
+					expect(current.buildSessionProjection()).toEqual(projection);
+					expect(current.getEntries().filter((entry) => entry.type === "usage")).toEqual([
+						expect.objectContaining({
+							parentId: dispatchParent,
+							provider: model.provider,
+							model: model.id,
+							usage: expected,
+						}),
+					]);
+					expect(
+						getUsageCostBreakdown(current.getEntries()).filter((entry) => entry.key.startsWith("scorer/")),
+					).toEqual([
+						{ key: `${model.provider}/${model.id}`, cost: expected.cost.total, tokens: expected.totalTokens },
+					]);
+				};
+				check(reopened);
+				check(SessionManager.open(file, undefined, cwd));
+				const receipt = reopened.getEntries().find((entry) => entry.type === "usage")!;
+				// A subsequent full-file commit must start from the receipt-bearing active manager.
+				reopened.editMessages((draft) => {
+					draft.appendCustomEntry("after-receipt-rewrite", { retained: true });
+				});
+				for (const current of [reopened, SessionManager.open(file, undefined, cwd)]) {
+					for (const entry of newHistory) expect(current.getEntry(entry.id)).toEqual(entry);
+					expect(current.getEntries().filter((entry) => entry.type === "usage")).toEqual([receipt]);
+					expect(current.getLeafId()).toBe(reopened.getLeafId());
+				}
+				expect(operation === "classify" ? observed : imageRequests).toHaveLength(1);
+				expect(replacement.eventsOfType("entry_appended")).toHaveLength(replacementEvents);
+				expect(original.eventsOfType("entry_appended").filter((event) => event.entry.type === "usage")).toEqual([]);
+			} finally {
+				release.resolve();
+				await Promise.allSettled([pending, original.session.abort()]);
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+	}
+
+	for (const operation of ["classify", "generateImages"] as const) {
+		for (const replacement of [false, true]) {
+			it.each(["write", "fsync", "rename"] as const)(
+				`retries delivered late ${operation} usage after one actual %s failure (same-file replacement: ${replacement})`,
+				async (stage) => {
+					const cwd = mkdtempSync(join(tmpdir(), "pi-codemode-retry-usage-"));
+					const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+					const release = Promise.withResolvers<void>();
+					const started = Promise.withResolvers<void>();
+					const failed = Promise.withResolvers<void>();
+					let providerCalls = 0;
+					const {
+						harness: original,
+						observed,
+						imageRequests,
+					} = await setup({
+						classifierRelease: operation === "classify" ? release.promise : undefined,
+						imageRelease: operation === "generateImages" ? release.promise : undefined,
+						onModelCall: () => {
+							providerCalls++;
+							started.resolve();
+						},
+						harnessOptions: { cwd, sessionManager: manager },
+					});
+					const call =
+						operation === "classify"
+							? `models.classify({ provider: "scorer", id: "judge" }, { state: { text: "good" }, questions: ${questions} })`
+							: 'models.generateImages({ provider: "scorer", id: "painter" }, { input: [{ type: "text", text: "a fox" }] })';
+					let settled = false;
+					const pending = run(original, `await ${call};`).then((result) => {
+						settled = true;
+						return result;
+					});
+					try {
+						await started.promise;
+						const dispatchParent = manager.getLeafId();
+						const abort = original.session.abort();
+						await vi.waitFor(() => expect(settled).toBe(true));
+						await abort;
+						const result = await pending;
+						expect(result.isError).toBe(true);
+						expect(result.usage).toBeUndefined();
+						const file = manager.getSessionFile()!;
+						const bytes = readFileSync(file);
+						const entries = structuredClone(manager.getEntries());
+						const selected = manager.getLeafId();
+						const projection = structuredClone(manager.buildSessionProjection());
+						const failure = new Error(`injected actual receipt ${stage} failure`);
+						const fail = vi.fn(() => {
+							failed.resolve();
+							throw failure;
+						});
+						if (stage === "write") vi.mocked(fs.writeFileSync).mockImplementationOnce(fail);
+						else if (stage === "fsync") vi.mocked(fs.fsyncSync).mockImplementationOnce(fail);
+						else vi.mocked(fs.renameSync).mockImplementationOnce(fail);
+						release.resolve();
+						await failed.promise;
+						expect(fail).toHaveBeenCalledTimes(1);
+						expect(operation === "classify" ? observed : imageRequests).toHaveLength(1);
+						expect(manager.getEntries()).toEqual(entries);
+						expect(manager.getLeafId()).toBe(selected);
+						expect(manager.buildSessionProjection()).toEqual(projection);
+						expect(readFileSync(file)).toEqual(bytes);
+						let current = original;
+						if (replacement) {
+							original.session.dispose();
+							original.session.subscribe((event) => original.events.push(event));
+							const reopened = SessionManager.open(file, undefined, cwd);
+							({ harness: current } = await setup({ harnessOptions: { cwd, sessionManager: reopened } }));
+						}
+						// Retry persistence of the delivered receipt, never the paid model call.
+						current.session.flushPendingPersistence();
+						current.session.flushPendingUsage();
+						current.session.flushPendingPersistence();
+						const expected = operation === "classify" ? usage(300, 0.001) : usage(100, 0.04);
+						const model = operation === "classify" ? scorerModel : painterModel;
+						for (const owner of [current.sessionManager, SessionManager.open(file, undefined, cwd)]) {
+							for (const entry of entries) expect(owner.getEntry(entry.id)).toEqual(entry);
+							expect(owner.getLeafId()).toBe(selected);
+							expect(owner.buildSessionProjection()).toEqual(projection);
+							expect(owner.getEntries().filter((entry) => entry.type === "usage")).toEqual([
+								expect.objectContaining({
+									parentId: dispatchParent,
+									provider: model.provider,
+									model: model.id,
+									usage: expected,
+								}),
+							]);
+							expect(
+								getUsageCostBreakdown(owner.getEntries()).filter((entry) => entry.key.startsWith("scorer/")),
+							).toEqual([
+								{
+									key: `${model.provider}/${model.id}`,
+									cost: expected.cost.total,
+									tokens: expected.totalTokens,
+								},
+							]);
+						}
+						expect(providerCalls).toBe(1);
+						expect(operation === "classify" ? observed : imageRequests).toHaveLength(1);
+						expect(
+							current.eventsOfType("entry_appended").filter((event) => event.entry.type === "usage"),
+						).toEqual([]);
+						if (replacement) {
+							expect(
+								original.eventsOfType("entry_appended").filter((event) => event.entry.type === "usage"),
+							).toEqual([]);
+						}
+					} finally {
+						release.resolve();
+						await Promise.allSettled([pending, original.session.abort()]);
+						rmSync(cwd, { recursive: true, force: true });
+					}
+				},
+			);
+		}
+	}
 
 	it("notes generated images that the script did not show", async () => {
 		const { harness } = await setup();

@@ -13,7 +13,6 @@
 ### Fixed
 
 - Fixed `Agent.continue(prefill)` to not throw a prefill echo mismatch when the model response itself ended in an error or abort (e.g., a connection error during the continuation). The echo check now only runs for successful responses.
-- Fixed `streamProxy()` re-parsing the accumulated tool-call arguments on every delta and keeping their raw text on the partial content block ([#9265](https://github.com/earendil-works/pi/issues/9265))
 
 ## [1.4.0] - 2026-10-21
 

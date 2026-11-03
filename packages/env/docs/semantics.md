@@ -36,9 +36,12 @@ env conformance suite and `test/differential.test.ts` check each rule below.
   file is read up to its size at open; other files to their end. `readBinaryFile` and `readTextFile` check for
   cancellation after each reply, including a single-chunk binary read and unknown-size EOF, and close the file
   before returning an abort.
-- Unix FIFO writer opens use a separate bounded, interruptible helper pool; connected special-file writes are
-  nonblocking and cancellable. Waiting writers do not occupy ordinary file workers or reader-open helpers.
-  The original descriptor preserves reader/writer rendezvous and append behavior; chunks stay ordered per handle.
+- Every Unix writer open uses a separate bounded, interruptible helper pool, even when metadata identifies a regular
+  or missing destination: pathname replacement with a FIFO cannot trap an ordinary worker. Parent creation and
+  write/append flags are preserved. Connected special-file writes are nonblocking and cancellable. Waiting writers
+  do not occupy ordinary file workers or reader-open helpers. Saturated reader/writer rendezvous pools reject new
+  opens with `EMFILE`; successful descriptors preserve rendezvous and append behavior without reopening. Chunks stay
+  ordered per handle.
 - The remote line reader scans decoded fragments once and joins only when returning a line, including a final
   unterminated line. UTF-8 decoding and cancellation checkpoints remain streaming.
 - `listFiles` has no `NodeExecutionEnv` counterpart: the daemon implements it for remote and local environments
@@ -69,6 +72,8 @@ env conformance suite and `test/differential.test.ts` check each rule below.
   still applies meanwhile. The pipes are closed when the command settles, even if a descendant keeps them open.
 - An abort settles as `aborted`, including an abort raised by the final output callback after the daemon exited. A callback error takes precedence, and a daemon timeout remains `timeout`. Abort and timeout failures preserve any spill path. `cleanup()` kills dispatched commands without aborting, so they settle with exit code 137. Commands still resolving their working directory or waiting for connection startup are cancelled with `aborted` and never dispatched; cleanup does not wait for or close the shared connection, so other environments remain usable.
 - A process killed by a signal reports `128 + signal`.
+- On Windows, terminating a running command's Job uses status 137. Normal leader exit retains its original status
+  while remaining descendants are terminated and joined.
 - Spill: once the output crosses `spill.afterBytes` or `spill.afterLines` (counted over raw chunks in arrival order, as
   Node counts), the complete raw output goes to `pi-output-<uuid>.log` in a fresh `tmp-` directory.
 

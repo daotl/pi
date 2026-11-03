@@ -68,8 +68,10 @@ export function createTranscriptServiceFacet(lane: AgentLane): Facet {
 					let stream: TranscriptStream | undefined;
 					const state = self.state("transcript", TranscriptStateSchema, {
 						init: () => {
-							stream = hydrateStream(watch.value.opened.snapshot);
-							const snapshot = structuredClone(watch.value.opened.snapshot);
+							const snapshot = copyJson(watch.value.opened.snapshot, {
+								omitUndefinedProperties: true,
+							}) as unknown as LaneSnapshot;
+							stream = hydrateStream(snapshot);
 							const operation = snapshot.operation;
 							const frameState = operation?.streamingFrameState;
 							if (operation) delete operation.streamingFrameState;
@@ -118,6 +120,7 @@ export function createTranscriptServiceFacet(lane: AgentLane): Facet {
 							try {
 								await previous;
 								let forwarded: TranscriptEvent | undefined;
+								let laneEvent: Exclude<LaneWatchEvent, { type: "message_update" }> | undefined;
 								if (
 									(event.type === "message_start" || event.type === "message_update") &&
 									event.frame !== undefined &&
@@ -181,7 +184,8 @@ export function createTranscriptServiceFacet(lane: AgentLane): Facet {
 										};
 									}
 								} else {
-									forwarded = toLaneWatchEvent(event);
+									laneEvent = toLaneWatchEvent(event);
+									forwarded = laneEvent;
 									if (event.type === "message_end" || event.type === "run_end" || event.type === "run_suspend")
 										stream = undefined;
 								}
@@ -192,12 +196,9 @@ export function createTranscriptServiceFacet(lane: AgentLane): Facet {
 								const streamingMessage = stream?.reducer.message;
 								let needsRebase = false;
 								state.change(ctx, (draft) => {
-									if (event.type !== "message_start" && event.type !== "message_update") {
+									if (laneEvent !== undefined) {
 										needsRebase =
-											reduceLaneSnapshot(draft.snapshot as unknown as LaneSnapshot, event) === "rebase";
-									} else if (forwarded?.type !== "assistant_frame" && event.type === "message_start") {
-										needsRebase =
-											reduceLaneSnapshot(draft.snapshot as unknown as LaneSnapshot, event) === "rebase";
+											reduceLaneSnapshot(draft.snapshot as unknown as LaneSnapshot, laneEvent) === "rebase";
 									}
 									const operation = draft.snapshot?.operation;
 									if (
@@ -260,9 +261,10 @@ export function createTranscriptServiceFacet(lane: AgentLane): Facet {
 									}
 								});
 								if (needsRebase) {
-									const snapshot = await watch.value.opened.resnapshot(
-										withAbortSignal(ctx.signal, BACKGROUND_CONTEXT),
-									);
+									const snapshot = copyJson(
+										await watch.value.opened.resnapshot(withAbortSignal(ctx.signal, BACKGROUND_CONTEXT)),
+										{ omitUndefinedProperties: true },
+									) as unknown as LaneSnapshot;
 									stream = hydrateStream(snapshot);
 									const operation = snapshot.operation;
 									const frameState = operation?.streamingFrameState;
@@ -270,22 +272,15 @@ export function createTranscriptServiceFacet(lane: AgentLane): Facet {
 									const reset: TranscriptEvent = {
 										type: "assistant_reset",
 										stream: nextStream,
-										message:
-											operation?.streamingMessage === undefined
-												? null
-												: (copyJson(operation.streamingMessage, {
-														omitUndefinedProperties: true,
-													}) as JsonRepresentation<AssistantMessage>),
+										message: (operation?.streamingMessage ??
+											null) as JsonRepresentation<AssistantMessage> | null,
 									};
 									const sequence = state.value.sequence + 1;
 									const retention = retainReplay(reset, sequence);
 									state.change(ctx, (draft) => {
-										const captured = structuredClone(snapshot);
-										const operation = captured.operation;
-										const frameState = operation?.streamingFrameState;
 										if (operation) delete operation.streamingFrameState;
-										draft.snapshot = captured as LaneTranscriptSnapshot;
-										draft.stream = frameState && operation ? { ...frameState, runId: operation.id } : null;
+										draft.snapshot = snapshot as LaneTranscriptSnapshot;
+										draft.stream = nextStream;
 										draft.sequence = sequence;
 										if (retention.retain) draft.events.push({ sequence, event: reset });
 										if (retention.evicted > 0)
@@ -320,12 +315,13 @@ function toLaneWatchEvent(event: HarnessEvent): Exclude<LaneWatchEvent, { type: 
 		case "config_update":
 			if (event.property !== "model" && event.property !== "thinkingLevel" && event.property !== "activeTools")
 				return undefined;
-			return event as Exclude<LaneWatchEvent, { type: "message_update" }>;
+			break;
 		case "message_update":
 			return undefined;
 		default:
-			return event as Exclude<LaneWatchEvent, { type: "message_update" }>;
+			break;
 	}
+	return copyJson(event, { omitUndefinedProperties: true }) as Exclude<LaneWatchEvent, { type: "message_update" }>;
 }
 
 function hydrateStream(snapshot: LaneSnapshot): TranscriptStream | undefined {

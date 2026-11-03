@@ -4,7 +4,7 @@
  * patterns end to end.
  */
 import type { Context, Draft } from "@earendil-works/chord";
-import { type AssistantMessage, type Models, type ToolCall, Type } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type Models, type ToolCall, Type, type Usage } from "@earendil-works/pi-ai";
 import {
 	type ConversationId,
 	configure,
@@ -21,6 +21,7 @@ import {
 	hook,
 	LiveDoc,
 	type LiveState,
+	MemoryStorage,
 	type Session,
 	type Storage,
 	section,
@@ -28,12 +29,16 @@ import {
 	type ToolExecutionApi,
 	ToolTask,
 	type Tx,
+	UsageDoc,
 	type UserInput,
 	wrapTool,
 } from "@earendil-works/pi-durable";
 import { expect, expectTypeOf, it } from "vitest";
 import type { ExecutionEnv } from "../src/env/index.ts";
+import { recordUsage } from "../src/harness/usage.ts";
 import { CodingTools, createBashTool, createEditTool, createReadTool } from "../src/tools/index.ts";
+import { chatSetup, openChat } from "./chat-support.ts";
+import { context as callContext } from "./session-support.ts";
 
 // ─── Names the spec leaves to the application ────────────────────────────────
 
@@ -379,4 +384,91 @@ function examples() {
 it("compiles the spec's usage examples", () => {
 	expectTypeOf(examples).returns.toHaveProperty("sequences");
 	expect(examples).toBeTypeOf("function");
+});
+
+function charge(totalFromProvider: boolean | undefined): Usage {
+	return {
+		input: 1,
+		output: 2,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 3,
+		cost: {
+			input: 0.1,
+			output: 0.2,
+			cacheRead: 0,
+			cacheWrite: 0,
+			total: 0.3,
+			...(totalFromProvider === undefined ? {} : { totalFromProvider }),
+		},
+	};
+}
+
+const provenanceCases = [
+	{ first: true, second: true, reported: true },
+	{ first: true, second: false, reported: false },
+	{ first: false, second: true, reported: false },
+	{ first: true, second: undefined, reported: false },
+	{ first: undefined, second: true, reported: false },
+];
+
+it.each(provenanceCases)(
+	"keeps conversation billing provenance for $first then $second",
+	async ({ first, second, reported }) => {
+		const { harness, root } = await openChat(new MemoryStorage(), chatSetup());
+		try {
+			for (const bucket of ["models", "tools"] as const) {
+				await root.commit((tx) => recordUsage(tx, root.id, bucket, "charged", charge(first)), callContext);
+				await root.commit((tx) => recordUsage(tx, root.id, bucket, "charged", charge(second)), callContext);
+			}
+			const totals = (await harness.snapshot(UsageDoc, root.id, callContext))!;
+			for (const bucket of ["models", "tools"] as const) {
+				expect(totals[bucket].charged?.totalTokens).toBe(6);
+				expect(totals[bucket].charged?.cost.total).toBeCloseTo(0.6);
+				expect(totals[bucket].charged?.cost.totalFromProvider).toBe(reported);
+			}
+		} finally {
+			await harness.close(callContext);
+		}
+	},
+);
+
+it.each(provenanceCases)(
+	"keeps session billing provenance across conversations for $first then $second",
+	async ({ first, second, reported }) => {
+		const { harness, root } = await openChat(new MemoryStorage(), chatSetup());
+		try {
+			const child = await root.commit(
+				async (tx) => (await tx.createConversation({ ownership: { kind: "ownerless" } })).id,
+				callContext,
+			);
+			for (const bucket of ["models", "tools"] as const) {
+				await root.commit((tx) => recordUsage(tx, root.id, bucket, "charged", charge(first)), callContext);
+				await root.commit((tx) => recordUsage(tx, child, bucket, "charged", charge(second)), callContext);
+			}
+			const totals = await harness.usage(callContext);
+			for (const bucket of ["models", "tools"] as const) {
+				expect(totals[bucket].charged?.totalTokens).toBe(6);
+				expect(totals[bucket].charged?.cost.total).toBeCloseTo(0.6);
+				expect(totals[bucket].charged?.cost.totalFromProvider).toBe(reported);
+			}
+		} finally {
+			await harness.close(callContext);
+		}
+	},
+);
+
+it("does not turn reported billing into an estimate when other conversations have no charges", async () => {
+	const { harness, root } = await openChat(new MemoryStorage(), chatSetup());
+	try {
+		expect(await harness.usage(callContext)).toEqual({ models: {}, tools: {} });
+		const child = await root.commit(
+			async (tx) => (await tx.createConversation({ ownership: { kind: "ownerless" } })).id,
+			callContext,
+		);
+		await root.commit((tx) => recordUsage(tx, child, "models", "charged", charge(true)), callContext);
+		expect((await harness.usage(callContext)).models.charged?.cost.totalFromProvider).toBe(true);
+	} finally {
+		await harness.close(callContext);
+	}
 });

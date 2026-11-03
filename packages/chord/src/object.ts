@@ -1611,6 +1611,22 @@ export class ObjectImpl {
 		});
 	}
 
+	/** Drops only subscriptions backed by a resource whose native value is about to be closed. */
+	stopResourceListeners(resource: ResourceImpl): void {
+		const errors: unknown[] = [];
+		for (const [key, subscription] of this.#subscriptions) {
+			if (subscription.origin !== resource) continue;
+			this.#subscriptions.delete(key);
+			try {
+				subscription.unsubscribe();
+			} catch (error) {
+				errors.push(error);
+			}
+		}
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) throw new AggregateError(errors, `${this.address}: resource listener cleanup failed`);
+	}
+
 	stopListeners(): void {
 		for (const subscription of this.#subscriptions.values()) subscription.unsubscribe();
 		this.#subscriptions.clear();

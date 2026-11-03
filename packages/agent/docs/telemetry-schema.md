@@ -8,22 +8,20 @@ Schema version: 1
 
 ### `pi.ai.request`
 
-One logical request to an AI provider
+One logical model request, including authentication and provider setup.
 
 - Parents: root or any caller span
 - Default status: `ok`
-- Error when: The operation throws or returns an error result
+- Error when: Stop reason is error: provider_error with at most 500 error-message characters. Aborted stays ok.
 
 #### Start attributes
 
 | Name | Type | Required | Values | Notes | Description |
 |---|---|---:|---|---|---|
-| `pi.ai.operation` | `string` | yes | stream, fetch_deferred, cancel_deferred, generate_images |  | Logical provider operation |
-| `pi.ai.provider` | `string` | yes |  |  | Selected provider id |
-| `pi.ai.model` | `string` | yes |  |  | Requested model id |
-| `pi.ai.api` | `string` | yes |  |  | Provider API id |
-| `pi.ai.streaming` | `boolean` | yes |  |  | Whether this operation returns a stream |
-| `pi.ai.deferred` | `boolean` | no |  |  | Whether the operation requests or participates in deferred execution |
+| `provider` | `string` | yes |  |  | Provider identifier. |
+| `api` | `string` | yes |  |  | API identifier. |
+| `model` | `string` | yes |  |  | Requested model identifier. |
+| `reasoning` | `string` | no |  |  | Scalar requested reasoning level. |
 
 #### End attributes
 
@@ -31,24 +29,86 @@ All end attributes are optional completion enrichment.
 
 | Name | Type | Values | Notes | Description |
 |---|---|---|---|---|
-| `pi.ai.response.model` | `string` |  |  | Concrete response model |
-| `pi.ai.response.id` | `string` |  | high cardinality | Provider response id |
-| `pi.ai.response.stop_reason` | `string` | stop, length, tool_use, error, aborted, deferred |  | Normalized terminal response reason |
-| `pi.ai.http.status_code` | `number` |  |  | Final HTTP status |
-| `pi.ai.usage.input_tokens` | `number` |  |  | Reported input tokens |
-| `pi.ai.usage.output_tokens` | `number` |  |  | Reported output tokens |
-| `pi.ai.usage.cache_read_tokens` | `number` |  |  | Reported cache-read tokens |
-| `pi.ai.usage.cache_write_tokens` | `number` |  |  | Reported cache-write tokens |
-| `pi.ai.usage.reasoning_tokens` | `number` |  |  | Reported reasoning tokens |
-| `pi.ai.usage.total_tokens` | `number` |  |  | Reported total tokens |
-| `pi.ai.usage.cost` | `number` |  |  | Reported total cost |
-| `pi.ai.stream.chunk_count` | `number` |  |  | Streamed update chunk count |
-| `pi.ai.stream.time_to_first_chunk_ms` | `number` |  |  | Elapsed milliseconds to first update chunk |
-| `pi.ai.error.type` | `string` |  | low cardinality | Provider or transport error class |
+| `stop` | `string` | pending, stop, length, toolUse, error, aborted, deferred |  | Normalized stop reason. |
+| `usage.input` | `number` |  |  | Uncached input tokens. |
+| `usage.output` | `number` |  |  | Output tokens. |
+| `usage.cache_read` | `number` |  |  | Cache-read tokens. |
+| `usage.cache_write` | `number` |  |  | Cache-write tokens. |
+| `cost.total` | `number` |  |  | Total request cost in USD. |
+| `response.id` | `string` |  | high cardinality | Provider response identifier. |
 
 #### Events
 
-No declared span events.
+##### `pi.ai.first_chunk`
+
+First normalized stream event delivered.
+
+| Name | Type | Required | Values | Notes | Description |
+|---|---|---:|---|---|---|
+| _none_ | | | | | |
+
+##### `pi.ai.block`
+
+A completed content block; content is never recorded.
+
+| Name | Type | Required | Values | Notes | Description |
+|---|---|---:|---|---|---|
+| `type` | `string` | yes | text, thinking, tool_call |  | Block kind. |
+| `index` | `number` | yes |  |  | Content block index. |
+| `chars` | `number` | yes |  |  | UTF-16 character count. |
+| `tool` | `string` | no |  |  | Tool name, for tool-call blocks only. |
+
+### `pi.ai.poll`
+
+One deferred-response poll, not the deferred request's lifetime.
+
+- Parents: root or any caller span
+- Default status: `ok`
+- Error when: Stop reason is error: provider_error with at most 500 error-message characters. Aborted stays ok.
+
+#### Start attributes
+
+| Name | Type | Required | Values | Notes | Description |
+|---|---|---:|---|---|---|
+| `provider` | `string` | yes |  |  | Provider identifier. |
+| `api` | `string` | yes |  |  | API identifier. |
+| `model` | `string` | yes |  |  | Requested model identifier. |
+| `reasoning` | `string` | no |  |  | Scalar requested reasoning level. |
+
+#### End attributes
+
+All end attributes are optional completion enrichment.
+
+| Name | Type | Values | Notes | Description |
+|---|---|---|---|---|
+| `stop` | `string` | pending, stop, length, toolUse, error, aborted, deferred |  | Normalized stop reason. |
+| `usage.input` | `number` |  |  | Uncached input tokens. |
+| `usage.output` | `number` |  |  | Output tokens. |
+| `usage.cache_read` | `number` |  |  | Cache-read tokens. |
+| `usage.cache_write` | `number` |  |  | Cache-write tokens. |
+| `cost.total` | `number` |  |  | Total request cost in USD. |
+| `response.id` | `string` |  | high cardinality | Provider response identifier. |
+
+#### Events
+
+##### `pi.ai.first_chunk`
+
+First normalized stream event delivered.
+
+| Name | Type | Required | Values | Notes | Description |
+|---|---|---:|---|---|---|
+| _none_ | | | | | |
+
+##### `pi.ai.block`
+
+A completed content block; content is never recorded.
+
+| Name | Type | Required | Values | Notes | Description |
+|---|---|---:|---|---|---|
+| `type` | `string` | yes | text, thinking, tool_call |  | Block kind. |
+| `index` | `number` | yes |  |  | Content block index. |
+| `chars` | `number` | yes |  |  | UTF-16 character count. |
+| `tool` | `string` | no |  |  | Tool name, for tool-call blocks only. |
 
 ## Harness schema
 

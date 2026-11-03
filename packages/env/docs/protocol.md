@@ -60,10 +60,17 @@ Remote path resolution and `listFiles` feature detection use the operation's sig
 
 File operations run on a fixed pool of worker threads; `exec`, `pty` and `watch` run on their own threads. `ptyWrite`,
 `ptyResize` and `ptyForeground` are answered in arrival order by the thread that reads frames, so keystrokes never
-swap. Chunk writes to one handle run in arrival order. Results, errors, pings and `watch` events are sent before queued
+swap. PTY input admission never waits for a reader: each terminal retains at most 4 MiB of admitted input (including
+the writer's current buffer) and 1024 queued buffers, rejecting excess with `EAGAIN`. Chunk writes to one handle run
+in arrival order. Results, errors, pings and `watch` events are sent before queued
 command output, and results with payloads above 64 KiB queue behind output too, so a slow link delays bulk data, not
 replies. Output of a command without an output window waits while more than 4 MiB of output is unsent, which slows the
 command as a full pipe would.
+
+On Unix, read-mode and all writer opens use interruptible helper pools, outside ordinary file workers. Metadata
+cannot select an uninterruptible writer path. Successful descriptors transfer unchanged, retaining rendezvous and
+open flags. Reader and writer rendezvous pools have 16 slots each; saturated pools fail new opens with `EMFILE`
+instead of queuing behind unmatched FIFOs. Cancelling a waiting open interrupts its owning helper.
 
 ## Liveness
 
@@ -151,8 +158,13 @@ Windows yet (`ENOTSUP`).
 
 While a `pty` request runs, `ptyWrite { target }` writes its payload to the terminal's input, and
 `ptyResize { target, cols, rows }` changes its size (the program gets `SIGWINCH`); `target` is the id of the `pty`
-request. Both return `{}` at once; input is queued and written in order, waiting while the program does not read it.
-Once the terminal has ended, they fail with `EBADF`.
+request. Both acknowledge admission at once; input is written in order, waiting while the program does not read it.
+`ptyWrite` rejects input exceeding the terminal's remaining 4 MiB budget or 1024-buffer queue with `EAGAIN` rather
+than blocking the shared frame reader. The budget includes the current write buffer until fully written. A rejected
+payload is not admitted; earlier successful writes remain admitted. Once the terminal has ended, both fail with
+`EBADF`. The TypeScript `RemoteTerminal.write` returns `Promise<void>`: callers must await writes sequentially to
+observe admission errors. It dispatches one chunk at a time and rejects concurrent calls with `EAGAIN`, without
+building a client-side input queue; a multi-chunk call may admit a prefix before rejection.
 
 `ptyForeground { target }` reports the terminal's foreground process group when it is not the program's own:
 `{ foreground: { pid, name } }`, where `pid` is the group's id and `name` its leader's process name (`null` if unknown),

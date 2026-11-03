@@ -14,6 +14,7 @@ import {
 	type HarnessEvent,
 	type LaneSnapshot,
 	type LaneTranscriptSnapshot,
+	type LaneWatchEvent,
 	MemorySessionRepo,
 	type WatchHandle,
 } from "@earendil-works/pi-agent-core";
@@ -26,6 +27,8 @@ import {
 } from "@earendil-works/pi-ai";
 import { createRoutedLinkPair } from "@earendil-works/pi-server";
 import { describe, expect, test, vi } from "vitest";
+import { NodeExecutionEnv } from "../../agent/src/harness/env/nodejs.ts";
+import { createBashTool } from "../../agent/src/harness/tools/bash.ts";
 import { Transcript, TranscriptReplay, type TranscriptState } from "../src/experimental/services/transcript.ts";
 import { createTranscriptServiceFacet } from "../src/experimental/services/transcript-provider.ts";
 
@@ -55,6 +58,166 @@ function laneSnapshot(tipId: string | null = null): LaneSnapshot {
 		faulted: false,
 	};
 }
+
+test("delivers actual bash progress and absent-details completions through routed replay", async () => {
+	const repo = new MemorySessionRepo();
+	const session = await repo.create({}, BACKGROUND_CONTEXT);
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const { harness } = await AgentHarness.create(
+		{
+			session,
+			models,
+			model: faux.getModel(),
+			tools: [createBashTool()],
+			toolContext: { env: new NodeExecutionEnv({ cwd: process.cwd() }) },
+		},
+		BACKGROUND_CONTEXT,
+	);
+	const lane = await harness.lane("main", BACKGROUND_CONTEXT);
+	const host = createHost({ name: "session", self: null });
+	const [downstream, upstream] = createRoutedLinkPair();
+	host.accept(downstream, { principal: null });
+	const client = createHost({
+		name: "viewer",
+		self: null,
+		kind: "client",
+		upstream: { link: upstream, principal: null },
+	});
+	let stop: (() => void) | undefined;
+	try {
+		await host.load([createTranscriptServiceFacet(lane)]);
+		const transcript = await client.get(Transcript, {});
+		const replay = new TranscriptReplay();
+		const events: LaneWatchEvent[] = [];
+		stop = transcript.state.subscribe((state) => {
+			events.push(...replay.read(state));
+		});
+		faux.setResponses([
+			fauxAssistantMessage(
+				[
+					{ type: "toolCall", id: "bash-call", name: "bash", arguments: { command: "printf transcript-output" } },
+					{ type: "toolCall", id: "missing-call", name: "unavailable", arguments: {} },
+				],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("done"),
+		]);
+		const result = await lane.prompt("run the tools", undefined, BACKGROUND_CONTEXT);
+		if (!result.ok) throw result.error;
+		await vi.waitFor(() => expect(events).toContainEqual(expect.objectContaining({ type: "run_end" })));
+		expect(events).toContainEqual(
+			expect.objectContaining({ type: "tool_update", toolCallId: "bash-call", partialResult: { content: [] } }),
+		);
+		expect(events).toContainEqual(
+			expect.objectContaining({
+				type: "tool_end",
+				toolCallId: "bash-call",
+				result: { content: [{ type: "text", text: "transcript-output" }] },
+				isError: false,
+			}),
+		);
+		expect(events).toContainEqual(
+			expect.objectContaining({ type: "tool_end", toolCallId: "missing-call", isError: true }),
+		);
+		for (const id of ["bash-call", "missing-call"]) {
+			const completed = events.find((event) => event.type === "tool_end" && event.toolCallId === id);
+			if (completed?.type !== "tool_end") throw new Error("Expected replayed completion");
+			expect(completed.result).not.toHaveProperty("details");
+		}
+		const captured = await lane.watch(BACKGROUND_CONTEXT);
+		try {
+			expect(transcript.state.value.snapshot).toEqual(
+				copyJson(captured.snapshot, { omitUndefinedProperties: true }),
+			);
+		} finally {
+			captured.unsubscribe();
+		}
+	} finally {
+		stop?.();
+		await client.close();
+		await host.close();
+		await harness.close(BACKGROUND_CONTEXT);
+		await session.close(BACKGROUND_CONTEXT);
+		await repo.close(BACKGROUND_CONTEXT);
+	}
+});
+
+test.each(["initial", "resnapshot"] as const)(
+	"publishes %s outcome-ready tools without absent details over routed links",
+	async (capture) => {
+		const ready = laneSnapshot("ready-tip");
+		ready.operation = {
+			id: "run",
+			kind: "run",
+			startedAt: 1,
+			fromTipId: null,
+			status: "open",
+			runningTools: [
+				{
+					status: "settled",
+					toolCallId: "missing-call",
+					toolName: "unavailable",
+					args: {},
+					result: { content: [{ type: "text", text: "unavailable" }], details: undefined },
+					isError: true,
+				},
+			],
+		};
+		let listener: EventListener | undefined;
+		const host = createHost({ name: "session", self: null });
+		const [downstream, upstream] = createRoutedLinkPair();
+		host.accept(downstream, { principal: null });
+		const client = createHost({
+			name: "viewer",
+			self: null,
+			kind: "client",
+			upstream: { link: upstream, principal: null },
+		});
+		try {
+			await host.load([
+				createTranscriptServiceFacet({
+					watch: async () => ({
+						snapshot: capture === "initial" ? ready : laneSnapshot(),
+						start(next: EventListener) {
+							listener = next;
+						},
+						unsubscribe() {},
+						resnapshot: async () => ready,
+					}),
+				} as unknown as AgentLane),
+			]);
+			const transcript = await client.get(Transcript, {});
+			const replay = new TranscriptReplay();
+			replay.read(transcript.state.value);
+			if (capture === "resnapshot") {
+				await listener!(
+					{
+						type: "navigation_end",
+						lane: "main",
+						runId: "navigation",
+						status: "completed",
+						fromTipId: null,
+						tipId: "ready-tip",
+						endedAt: 2,
+					},
+					BACKGROUND_CONTEXT,
+				);
+			}
+			await vi.waitFor(() =>
+				expect(transcript.state.value.snapshot).toEqual(copyJson(ready, { omitUndefinedProperties: true })),
+			);
+			expect(transcript.state.value.snapshot?.operation?.runningTools[0]?.result).not.toHaveProperty("details");
+			await listener!({ type: "queue_update", lane: "main", queues: [] }, BACKGROUND_CONTEXT);
+			await vi.waitFor(() => expect(transcript.state.value.events.at(-1)?.event.type).toBe("queue_update"));
+			expect(replay.read(transcript.state.value)).toContainEqual({ type: "queue_update", lane: "main", queues: [] });
+		} finally {
+			await client.close();
+			await host.close();
+		}
+	},
+);
 
 describe("Transcript service", () => {
 	test("keeps hydrated multi-block messages aligned through corrections and nested tool arguments", async () => {

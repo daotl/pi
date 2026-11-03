@@ -1,6 +1,6 @@
 // Runs the node loader outside vitest: its module runner bypasses the Node resolve hooks the loader installs.
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { createHost, local, method } from "../../src/index.ts";
@@ -23,6 +23,8 @@ const facetSource = `
 import { Type } from "typebox";
 import { defineFacet, local, method } from ${JSON.stringify(chord)};
 import { greeting } from "./greeting.ts";
+
+await Promise.resolve();
 
 const Hello = local("t.hello", {
 	version: 1,
@@ -60,21 +62,39 @@ try {
 	});
 	mkdirSync(`${plugins}a`, { recursive: true });
 	mkdirSync(`${plugins}b`, { recursive: true });
-	writeFileSync(`${plugins}b/state.ts`, "export const state = {};\n");
+	writeFileSync(`${plugins}b/state.ts`, "export const state = { installed: false };\n");
 	writeFileSync(
 		`${plugins}b/facet.ts`,
-		`import { defineFacet } from ${JSON.stringify(chord)};\nimport { state } from "./state.ts";\nexport const own = state;\nexport default defineFacet(() => {});\n`,
+		`import { defineFacet } from ${JSON.stringify(chord)};\nimport { state } from "./state.ts";\nexport const own = state;\nexport default defineFacet(() => { state.installed = true; });\n`,
 	);
 	writeFileSync(
 		`${plugins}a/facet.ts`,
-		`import { Type } from "typebox";\nimport { defineFacet, local, method } from ${JSON.stringify(chord)};\nimport { state } from "../b/state.ts";\n` +
+		`import { Type } from "typebox";\nimport { defineFacet, local, method } from ${JSON.stringify(chord)};\nimport { state } from "../b/state.ts";\nimport { own } from "../b/facet.ts";\n` +
 			`const Shared = local("t.shared", { version: 1, input: Type.Object({}), members: { same: method(undefined, Type.Boolean()) } });\n` +
-			`export default defineFacet((host) => host.serve(Shared, () => ({ same: async () => (await import(new URL("../b/facet.ts", import.meta.url).href)).own === state })));\n`,
+			`export default defineFacet((host) => host.serve(Shared, () => ({ same: () => own === state && state.installed })));\n`,
 	);
 	const ordered = createHost({ self: { kind: "host" }, loader: nodeLoader, onError: () => {} });
 	await ordered.load([`${plugins}a/facet.ts`, `${plugins}b/facet.ts`]);
 	assert.equal(await ordered.hold(Shared, {}).same(), true);
 	await ordered.close();
+
+	const dataSource = `import { appendFileSync } from "node:fs";\nimport { defineFacet } from ${JSON.stringify(chord)};\nawait Promise.resolve();\nappendFileSync(${JSON.stringify(`${dir}data-loads`)}, "x");\nexport default defineFacet(() => {});\n`;
+	const dataUrl = new URL(`data:text/javascript,${encodeURIComponent(dataSource)}`);
+	const dataHost = createHost({ self: { kind: "host" }, loader: nodeLoader, onError: () => {} });
+	await dataHost.load([dataUrl]);
+	assert.equal(readFileSync(`${dir}data-loads`, "utf8"), "x");
+	await dataHost.reload([dataUrl]);
+	assert.equal(readFileSync(`${dir}data-loads`, "utf8"), "xx");
+	await dataHost.close();
+
+	const literalDataSource = `import { appendFileSync } from "node:fs";\nimport { defineFacet } from ${JSON.stringify(chord)};\nconst text = ({ text: "x" })?.text === "x" ? "x" : "wrong";\nappendFileSync(${JSON.stringify(`${dir}literal-data-loads`)}, text);\nexport default defineFacet(() => {});\n`;
+	const literalDataUrl = new URL(`data:text/javascript,${literalDataSource}`);
+	const literalDataHost = createHost({ self: { kind: "host" }, loader: nodeLoader, onError: () => {} });
+	await literalDataHost.load([literalDataUrl]);
+	assert.equal(readFileSync(`${dir}literal-data-loads`, "utf8"), "x");
+	await literalDataHost.reload([literalDataUrl]);
+	assert.equal(readFileSync(`${dir}literal-data-loads`, "utf8"), "xx");
+	await literalDataHost.close();
 } finally {
 	rmSync(dir, { recursive: true, force: true });
 	rmSync(plugins, { recursive: true, force: true });

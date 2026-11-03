@@ -375,6 +375,7 @@ function migrateV1ToV2(entries: StoredFileEntry[]): void {
 		if (entry.type === "leaf") continue;
 
 		entry.id = generateId(ids);
+		ids.add(entry.id);
 		entry.parentId = prevId;
 		prevId = entry.id;
 
@@ -1732,6 +1733,23 @@ export class SessionManager {
 			...(note ? { note } : {}),
 		};
 		this._appendEntry(entry);
+		return entry;
+	}
+
+	/** Persist a late charge on its dispatch lineage without changing the selected branch. */
+	appendUsageAt(parentId: string | null, kind: string, provider: string, model: string, usage: Usage): UsageEntry {
+		if (parentId !== null && !this.byId.has(parentId)) throw new Error(`Unknown usage parent: ${parentId}`);
+		const entry: UsageEntry = {
+			type: "usage",
+			id: generateId(this.byId),
+			parentId,
+			timestamp: new Date().toISOString(),
+			kind,
+			provider,
+			model,
+			usage,
+		};
+		this._commitEntries([...this.fileEntries, entry], this.leafId);
 		return entry;
 	}
 

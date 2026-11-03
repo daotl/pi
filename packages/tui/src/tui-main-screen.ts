@@ -118,7 +118,16 @@ function parseKittyImageHeader(line: string): KittyImageHeader | undefined {
 }
 
 function extractKittyImageIds(line: string): number[] {
-	return parseKittyImageHeader(line)?.ids ?? [];
+	const ids: number[] = [];
+	for (const match of line.matchAll(/\x1b_G([^;\x1b]*);/g)) {
+		for (const control of match[1].split(",")) {
+			const [key, value] = control.split("=", 2);
+			if (key !== "i" || value === undefined) continue;
+			const id = Number(value);
+			if (Number.isInteger(id) && id > 0 && id <= 0xffffffff) ids.push(id);
+		}
+	}
+	return ids;
 }
 
 function extractKittyImageRows(line: string): number {
@@ -780,12 +789,17 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			const kittyStart = line.indexOf(KITTY_SEQUENCE_PREFIX);
 			const imageStart = kittyStart !== -1 ? kittyStart : line.indexOf("\x1b]1337;File=");
 			let imageEnd = imageStart;
-			while (imageEnd < line.length) {
+			let continuation = false;
+			do {
 				const ansi = extractAnsiCode(line, imageEnd);
 				if (!ansi || (!ansi.code.startsWith(KITTY_SEQUENCE_PREFIX) && !ansi.code.startsWith("\x1b]1337;File=")))
 					break;
 				imageEnd += ansi.length;
-			}
+				const controlsEnd = ansi.code.indexOf(";");
+				continuation =
+					ansi.code.startsWith(KITTY_SEQUENCE_PREFIX) &&
+					/(?:^|,)m=1(?:,|$)/.test(ansi.code.slice(KITTY_SEQUENCE_PREFIX.length, controlsEnd));
+			} while (continuation);
 			// Keep protocol anchor movement (iTerm2 moves up from its final reserved
 			// row), but never repaint printable prefixes over the composed text layer.
 			output.append(`\x1b[${col + 1}G\x1b7`);

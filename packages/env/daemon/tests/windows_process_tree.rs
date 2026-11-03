@@ -301,6 +301,31 @@ fn cancellation_joins_only_its_own_process_tree() {
 }
 
 #[test]
+fn kill_without_abort_joins_only_its_tree_and_reports_137() {
+    let mut daemon = Daemon::start();
+    let mut first = Tree::new();
+    let mut second = Tree::new();
+    daemon.exec(1, &first);
+    daemon.exec(2, &second);
+    first.ready();
+    second.ready();
+    frame::write_frame(
+        daemon.input.as_mut().unwrap(),
+        &frame::Frame::new(frame::CANCEL, 1, json!({ "mode": "kill" })),
+    ).unwrap();
+    let (kind, result) = daemon.reply(1);
+    assert_eq!(kind, frame::RESULT);
+    assert_eq!(result["exitCode"], 137);
+    first.assert_stopped(0);
+    second.assert_running();
+    fs::write(second.directory.join("release"), "").unwrap();
+    let (kind, result) = daemon.reply(2);
+    assert_eq!(kind, frame::RESULT);
+    assert_eq!(result["exitCode"], 23);
+    second.assert_stopped(0);
+}
+
+#[test]
 fn connection_eof_joins_all_descendants_before_daemon_exit() {
     let mut daemon = Daemon::start();
     let mut first = Tree::new();

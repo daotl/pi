@@ -16,8 +16,8 @@
 // image/classifier dispatch without credentials or network: those API maps are
 // not constrained by the chat model generic.
 //
-// Only the latest release on npm is checked. If it is older than
-// MINIMUM_PI_VERSION, no released pi receives the catalog, and the check is skipped.
+// Every published release at or above MINIMUM_PI_VERSION is checked. If no
+// published release qualifies, no released pi receives the catalog and the check is skipped.
 //
 // Usage: node scripts/check-model-catalog-compat.mjs [--catalog <file>]
 //   --catalog <file>  catalog to check (default: .artifacts/model-catalog/models.all.json,
@@ -77,74 +77,90 @@ function main() {
 	const { values } = parseArgs({ options: { catalog: { type: "string" } } });
 	const catalogPath = resolve(values.catalog ?? join(root, ".artifacts/model-catalog/models.all.json"));
 
-	const release = run("npm", ["view", PI_AI_PACKAGE, "version"], root).trim();
-	if (compareModelCatalogPiVersions(release, MINIMUM_PI_VERSION) < 0) {
-		console.log(
-			`Skipped: the latest release ${release} is older than MINIMUM_PI_VERSION ${MINIMUM_PI_VERSION}, so no released pi receives this catalog.`,
-		);
+	const published = JSON.parse(run("npm", ["view", PI_AI_PACKAGE, "versions", "--json"], root));
+	if (
+		!Array.isArray(published) ||
+		published.some(
+			(version) => typeof version !== "string" || version.length === 0 || version.trim() !== version,
+		)
+	) {
+		throw new Error(`npm view returned an unexpected version list for ${PI_AI_PACKAGE}`);
+	}
+	const releases = published
+		.filter((version) => compareModelCatalogPiVersions(version, MINIMUM_PI_VERSION) >= 0)
+		.sort(compareModelCatalogPiVersions);
+	if (releases.length === 0) {
+		console.log(`Skipped: no published release is at or above MINIMUM_PI_VERSION ${MINIMUM_PI_VERSION}.`);
 		return;
 	}
 
-	const temporaryDir = mkdtempSync(join(tmpdir(), "pi-model-catalog-compat-"));
-	const releaseDir = join(temporaryDir, "release");
-	try {
-		console.log(`Checking the model catalog against pi ${release}...`);
-		// The release's source code.
-		const archive = join(temporaryDir, "release.tar");
-		run("git", ["archive", "--prefix=release/", "--output", archive, `v${release}`], root);
-		run("tar", ["xf", archive, "-C", temporaryDir], root);
-
-		// The built-in models users have: the data shipped in the published package.
-		const parsed = JSON.parse(
-			run("npm", ["pack", `${PI_AI_PACKAGE}@${release}`, "--pack-destination", temporaryDir, "--json"], root),
-		);
-		const packed = Array.isArray(parsed) ? (parsed.length === 1 ? parsed[0] : undefined) : parsed?.[PI_AI_PACKAGE];
-		if (packed?.name !== PI_AI_PACKAGE || typeof packed.filename !== "string" || packed.filename.trim().length === 0 ||
-			!/^[^/\\]+\.tgz$/.test(packed.filename)) {
-			throw new Error(`npm pack returned an unexpected result for ${PI_AI_PACKAGE}`);
-		}
-		const { filename } = packed;
-		run("tar", ["xzf", join(temporaryDir, filename), "-C", temporaryDir, "package/dist/providers/data"], root);
-		const builtin = readBuiltinModels(join(temporaryDir, "package/dist/providers/data"));
-		const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
-		const mergedPath = join(temporaryDir, "models.all.json");
-		writeFileSync(mergedPath, JSON.stringify(mergeReleaseCatalog(builtin, catalog)));
-
-		console.log("Installing the release's dependencies...");
-		run("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund"], releaseDir);
-		// pi-ai's types depend on the declarations of its workspace dependencies.
-		const { dependencies } = JSON.parse(readFileSync(join(releaseDir, "packages/ai/package.json"), "utf8"));
-		for (const name of Object.keys(dependencies).filter((name) => name.startsWith("@earendil-works/"))) {
-			run("npm", ["run", "build", "--workspace", name], releaseDir);
-		}
-
-		console.log("Type-checking the release's pi-ai with the merged models...");
-		const { generatedAt } = JSON.parse(readFileSync(join(temporaryDir, "package/dist/providers/data/.manifest.json"), "utf8"));
-		// Call the release's exported hydrator: older releases ignore the new option,
-		// while newer ones require it. This data is isolated from the checkout.
-		const hydrator = pathToFileURL(join(releaseDir, "packages/ai/scripts/hydrate-model-catalog.ts")).href;
-		run(process.execPath, ["--input-type=module", "--eval",
-			`import { hydrateModelCatalog } from ${JSON.stringify(hydrator)}; hydrateModelCatalog(${JSON.stringify(join(releaseDir, "packages/ai"))}, ${JSON.stringify(mergedPath)}, ${JSON.stringify({ generatedAt })});`,
-		], releaseDir);
+	for (const release of releases) {
+		const temporaryDir = mkdtempSync(join(tmpdir(), `pi-model-catalog-compat-${release}-`));
+		const releaseDir = join(temporaryDir, "release");
 		try {
-			run(process.execPath, ["node_modules/typescript/bin/tsc", "-p", "packages/ai/tsconfig.build.json", "--noEmit"], releaseDir);
-		} catch (error) {
-			throw new Error(
-				[
-					error.message,
-					"",
-					`The model catalog does not type-check against pi ${release}'s pi-ai (errors above).`,
-					`pi.dev serves it to released pi >= ${MINIMUM_PI_VERSION}, so those clients would receive models`,
-					"their code cannot handle, e.g. a model whose api its provider does not implement.",
-					"If the change is intended, set MINIMUM_PI_VERSION in scripts/model-catalog-minimum-version.mjs",
-					"to the next release in the same commit.",
-				].join("\n"),
+			console.log(`Checking the model catalog against pi ${release}...`);
+			// The release's source code.
+			const archive = join(temporaryDir, "release.tar");
+			run("git", ["archive", "--prefix=release/", "--output", archive, `v${release}`], root);
+			run("tar", ["xf", archive, "-C", temporaryDir], root);
+
+			// The built-in models users have: the data shipped in the published package.
+			const parsed = JSON.parse(
+				run("npm", ["pack", `${PI_AI_PACKAGE}@${release}`, "--pack-destination", temporaryDir, "--json"], root),
 			);
-		}
-		console.log("Checking the release's image and classifier operation dispatch...");
-		const probe = join(temporaryDir, "probe-operations.mjs");
-		const providers = pathToFileURL(join(releaseDir, "packages/ai/src/providers/all.ts")).href;
-		writeFileSync(probe, `
+			const packed = Array.isArray(parsed) ? (parsed.length === 1 ? parsed[0] : undefined) : parsed?.[PI_AI_PACKAGE];
+			if (
+				packed?.name !== PI_AI_PACKAGE ||
+				typeof packed.filename !== "string" ||
+				packed.filename.trim().length === 0 ||
+				!/^[^/\\]+\.tgz$/.test(packed.filename)
+			) {
+				throw new Error(`npm pack returned an unexpected result for ${PI_AI_PACKAGE}`);
+			}
+			const { filename } = packed;
+			run("tar", ["xzf", join(temporaryDir, filename), "-C", temporaryDir, "package/dist/providers/data"], root);
+			const builtin = readBuiltinModels(join(temporaryDir, "package/dist/providers/data"));
+			const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
+			const mergedPath = join(temporaryDir, "models.all.json");
+			writeFileSync(mergedPath, JSON.stringify(mergeReleaseCatalog(builtin, catalog)));
+
+			console.log("Installing the release's dependencies...");
+			run("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund"], releaseDir);
+			// pi-ai's types depend on the declarations of its workspace dependencies.
+			const { dependencies } = JSON.parse(readFileSync(join(releaseDir, "packages/ai/package.json"), "utf8"));
+			for (const name of Object.keys(dependencies).filter((name) => name.startsWith("@earendil-works/"))) {
+				run("npm", ["run", "build", "--workspace", name], releaseDir);
+			}
+
+			console.log("Type-checking the release's pi-ai with the merged models...");
+			const { generatedAt } = JSON.parse(
+				readFileSync(join(temporaryDir, "package/dist/providers/data/.manifest.json"), "utf8"),
+			);
+			// Call the release's exported hydrator: older releases ignore the new option,
+			// while newer ones require it. This data is isolated from the checkout.
+			const hydrator = pathToFileURL(join(releaseDir, "packages/ai/scripts/hydrate-model-catalog.ts")).href;
+			run(process.execPath, ["--input-type=module", "--eval",
+				`import { hydrateModelCatalog } from ${JSON.stringify(hydrator)}; hydrateModelCatalog(${JSON.stringify(join(releaseDir, "packages/ai"))}, ${JSON.stringify(mergedPath)}, ${JSON.stringify({ generatedAt })});`,
+			], releaseDir);
+			try {
+				run(process.execPath, ["node_modules/typescript/bin/tsc", "-p", "packages/ai/tsconfig.build.json", "--noEmit"], releaseDir);
+			} catch (error) {
+				throw new Error(
+					[
+						error.message,
+						"",
+						`The model catalog does not type-check against pi ${release}'s pi-ai (errors above).`,
+						`pi.dev serves it to released pi >= ${MINIMUM_PI_VERSION}, so those clients would receive models`,
+						"their code cannot handle, e.g. a model whose api its provider does not implement.",
+						"If the change is intended, set MINIMUM_PI_VERSION in scripts/model-catalog-minimum-version.mjs",
+						"to the next release in the same commit.",
+					].join("\n"),
+				);
+			}
+			console.log("Checking the release's image and classifier operation dispatch...");
+			const probe = join(temporaryDir, "probe-operations.mjs");
+			const providers = pathToFileURL(join(releaseDir, "packages/ai/src/providers/all.ts")).href;
+			writeFileSync(probe, `
 import { readFileSync } from "node:fs";
 import { builtinProviders } from ${JSON.stringify(providers)};
 process.env.PI_DISABLE_CLOUD_PROVIDERS = "0";
@@ -165,10 +181,11 @@ for (const [id, models] of Object.entries(catalog)) {
 	}
 }
 `);
-		run(process.execPath, [probe], releaseDir);
-		console.log(`The model catalog is compatible with pi ${release}.`);
-	} finally {
-		rmSync(temporaryDir, { recursive: true, force: true });
+			run(process.execPath, [probe], releaseDir);
+			console.log(`The model catalog is compatible with pi ${release}.`);
+		} finally {
+			rmSync(temporaryDir, { recursive: true, force: true });
+		}
 	}
 }
 

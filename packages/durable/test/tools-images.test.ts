@@ -521,7 +521,7 @@ describe("toBase64", () => {
 	it("encodes a 3 MiB image within a 128 MB heap", () => {
 		const source = new URL("../src/tools/image-processor.ts", import.meta.url).href;
 		const script = `
-			const { toBase64 } = await import(${JSON.stringify(source)});
+			import { toBase64 } from ${JSON.stringify(source)};
 			const bytes = Uint8Array.from({ length: 3147295 }, (_, index) => (index * 37) % 256);
 			if (toBase64(bytes) !== Buffer.from(bytes).toString("base64")) throw new Error("mismatch");
 		`;

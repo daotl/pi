@@ -10,7 +10,7 @@ const packageName = "@earendil-works/pi-ai";
 const packed = { name: packageName, filename: "pi-ai.tgz" };
 const command = fileURLToPath(new URL("./check-model-catalog-compat.mjs", import.meta.url));
 
-function runFixture(t, packOutput, additionalModels = []) {
+function runFixture(t, packOutput, additionalModels = [], options = {}) {
 	const root = mkdtempSync(join(tmpdir(), "pi-catalog-compat-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const bin = join(root, "bin");
@@ -24,8 +24,10 @@ const args = process.argv.slice(2);
 const tool = basename(process.argv[1]);
 appendFileSync(process.env.FIXTURE_LOG, JSON.stringify([tool, ...args]) + "\\n");
 if (tool === "npm") {
-	if (args[0] === "view") console.log("99.0.0");
-	else if (args[0] === "pack") console.log(process.env.FIXTURE_PACK);
+	if (args[0] === "view") {
+		if (args[2] === "versions") console.log(process.env.FIXTURE_VERSIONS);
+		else console.log("99.0.0");
+	} else if (args[0] === "pack") console.log(process.env.FIXTURE_PACK);
 	else assert.deepEqual(args, ["ci", "--ignore-scripts", "--no-audit", "--no-fund"]);
 } else if (tool === "tar") {
 	const target = args[args.indexOf("-C") + 1];
@@ -39,7 +41,7 @@ if (tool === "npm") {
 		writeFileSync(join(release, "package.json"), '{"type":"module"}');
 		writeFileSync(join(release, "packages/ai/package.json"), '{"dependencies":{}}');
 		writeFileSync(join(release, "packages/ai/scripts/hydrate-model-catalog.ts"), ${JSON.stringify('import assert from "node:assert/strict";\nimport { readFileSync, writeFileSync } from "node:fs";\nexport function hydrateModelCatalog(root, path, options) { const catalog = JSON.parse(readFileSync(path, "utf8")); assert.equal(catalog["test-provider"][0].contextWindow, 2000); assert.equal(options.generatedAt, "2026-10-21T12:12:47.000Z"); writeFileSync(process.env.FIXTURE_RECEIPT, JSON.stringify({ catalog, options })); }\n')});
-		writeFileSync(join(release, "node_modules/typescript/bin/tsc"), 'import { accessSync } from "node:fs"; accessSync(process.env.FIXTURE_RECEIPT);');
+		writeFileSync(join(release, "node_modules/typescript/bin/tsc"), 'import { accessSync } from "node:fs"; accessSync(process.env.FIXTURE_RECEIPT); if (process.env.FIXTURE_REJECT_RELEASE && process.cwd().includes(process.env.FIXTURE_REJECT_RELEASE)) throw new Error("unsupported catalog");');
 	} else {
 		assert.equal(args[0], "xzf");
 		const data = join(target, "package/dist/providers/data");
@@ -61,7 +63,15 @@ if (tool === "npm") {
 	const receipt = join(root, "receipt.json");
 	const result = spawnSync(process.execPath, [command, "--catalog", catalog], {
 		encoding: "utf8",
-		env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FIXTURE_LOG: log, FIXTURE_RECEIPT: receipt, FIXTURE_PACK: JSON.stringify(packOutput) },
+		env: {
+			...process.env,
+			PATH: `${bin}:${process.env.PATH}`,
+			FIXTURE_LOG: log,
+			FIXTURE_RECEIPT: receipt,
+			FIXTURE_PACK: JSON.stringify(packOutput),
+			FIXTURE_VERSIONS: JSON.stringify(options.versions ?? ["99.0.0"]),
+			FIXTURE_REJECT_RELEASE: options.rejectRelease,
+		},
 	});
 	return { result, receipt, calls: readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line)) };
 }
@@ -76,6 +86,33 @@ for (const [shape, output] of [["npm 10/11 array", [packed]], ["npm 12 package-k
 		});
 	});
 }
+
+test("checks every published release at or above the minimum version", (t) => {
+	const { result, calls } = runFixture(t, [packed], [], { versions: ["99.0.0", "1.2.0", "1.2.1"] });
+	assert.equal(result.status, 0, result.stderr);
+	assert.deepEqual(
+		calls.filter(([tool, action]) => tool === "npm" && action === "pack").map((call) => call[2]),
+		[`${packageName}@1.2.1`, `${packageName}@99.0.0`],
+	);
+});
+
+for (const version of [" ", " 99.0.0 "]) {
+	test(`rejects malformed published version ${JSON.stringify(version)} before compatibility checks`, (t) => {
+		const { result, calls } = runFixture(t, [packed], [], { versions: ["1.2.1", version] });
+		assert.equal(result.status, 1);
+		assert.match(result.stderr, /npm view returned an unexpected version list/);
+		assert.equal(calls.some(([tool, action]) => tool === "npm" && action === "pack"), false);
+	});
+}
+
+test("rejects a catalog supported only by the newest release", (t) => {
+	const { result } = runFixture(t, [packed], [], {
+		versions: ["1.2.1", "99.0.0"],
+		rejectRelease: "1.2.1",
+	});
+	assert.equal(result.status, 1);
+	assert.match(result.stderr, /does not type-check against pi 1\.2\.1's pi-ai/);
+});
 
 for (const [label, output] of [
 	["missing package key", { other: packed }],

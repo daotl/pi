@@ -1,4 +1,4 @@
-import type { Connection, Json } from "./connection.ts";
+import { type Connection, RemoteError } from "./connection.ts";
 
 /** Input larger than this goes to the daemon in several writes; frames are at most 16 MiB. */
 const WRITE_CHUNK = 1024 * 1024;
@@ -35,6 +35,7 @@ export class RemoteTerminal {
 	readonly #id: number;
 	readonly #session: number;
 	readonly #abort: AbortController;
+	#writing = false;
 
 	constructor(
 		connection: Connection,
@@ -52,17 +53,36 @@ export class RemoteTerminal {
 		this.#abort = abort;
 	}
 
-	/** Send input; once the terminal has ended, input is dropped. */
-	write(data: Uint8Array | string): void {
-		const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-		for (let offset = 0; offset < bytes.length; offset += WRITE_CHUNK) {
-			this.#request("ptyWrite", {}, bytes.subarray(offset, offset + WRITE_CHUNK));
+	/**
+	 * Await admission of input, in chunks, not consumption by the program. Rejects with EAGAIN if the daemon's
+	 * input budget is full or another write is in progress; await each write before sending more input.
+	 * Earlier chunks may already have been admitted when a later chunk fails. Ended terminals reject with EBADF.
+	 */
+	async write(data: Uint8Array | string): Promise<void> {
+		if (this.#writing) throw new RemoteError({ code: "EAGAIN", message: "a terminal write is already in progress" });
+		this.#writing = true;
+		try {
+			const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+			for (let offset = 0; offset < bytes.length; offset += WRITE_CHUNK) {
+				await this.#connection.request(
+					"ptyWrite",
+					{ target: this.#id },
+					{
+						session: this.#session,
+						payload: bytes.subarray(offset, offset + WRITE_CHUNK),
+					},
+				);
+			}
+		} finally {
+			this.#writing = false;
 		}
 	}
 
 	/** Change the size; the program receives `SIGWINCH`. */
 	resize(cols: number, rows: number): void {
-		this.#request("ptyResize", { cols, rows });
+		this.#connection
+			.request("ptyResize", { cols, rows, target: this.#id }, { session: this.#session })
+			.catch(() => {});
 	}
 
 	/** Kill the program and everything in its session. */
@@ -79,13 +99,6 @@ export class RemoteTerminal {
 		const foreground = reply.json.foreground as { pid: number; name: string | null } | null;
 		if (!foreground) return undefined;
 		return { pid: foreground.pid, ...(foreground.name ? { name: foreground.name } : {}) };
-	}
-
-	#request(op: string, json: Json, payload?: Uint8Array): void {
-		this.#connection
-			.request(op, { ...json, target: this.#id }, { session: this.#session, ...(payload ? { payload } : {}) })
-			// A terminal that ended or a lost connection: `exited` reports it.
-			.catch(() => {});
 	}
 }
 
@@ -133,6 +146,7 @@ export function openTerminal(connection: Connection, options: TerminalOptions): 
 		.then(
 			(reply) => {
 				if (callbackFailed) throw callbackError;
+				if (abort.signal.aborted) throw new RemoteError({ code: "aborted", message: "aborted" });
 				return Number(reply.json.exitCode);
 			},
 			(error: unknown) => {

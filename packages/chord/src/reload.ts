@@ -729,6 +729,7 @@ export class Reload {
 			const { object } = candidate;
 			const replaced = new Set(candidate.replaced);
 			for (const old of object.openOrder.filter((resource) => replaced.has(resource)).reverse()) {
+				object.stopResourceListeners(old);
 				// Owned by the rollback before closing: a failing close must still be restored.
 				this.closed.push([object, old]);
 				await old.close(object.openOrder);
@@ -813,6 +814,12 @@ export class Reload {
 		}
 		for (const { object } of this.gated) {
 			if (object.gate === undefined) continue;
+			// Reopened resources retain their identity, but not their native event source. Rebind before replay or tasks.
+			try {
+				object.stageListeners(object.decls).activate();
+			} catch (error) {
+				report(error);
+			}
 			object.openGate();
 			object.startTasks();
 		}

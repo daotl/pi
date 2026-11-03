@@ -11,6 +11,12 @@ use std::sync::atomic::Ordering;
 
 pub type Outcome<T> = Result<T, Failure>;
 
+#[cfg(all(test, unix))]
+thread_local! {
+    // A private, per-worker seam: tests can replace a pathname after routing and cancellation checks, before open.
+    pub(crate) static BEFORE_WRITE_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+}
+
 /// `{ name, kind, size, mtimeSec, mtimeNsec, dev, ino }` of lstat or fstat metadata.
 pub fn info(path: &str, metadata: &Metadata) -> Value {
     let file_type = metadata.file_type();
@@ -104,9 +110,9 @@ pub fn mkdir(path: &str, recursive: bool) -> Outcome<Value> {
         .map_err(|error| Failure::io(&error, "mkdir", path))
 }
 
-/// `writeFile`/`appendFile`: create missing parents like Node's recursive `mkdir`, then write. Returns the open file
-/// for further chunks.
-pub fn write(path: &str, append: bool, parents: bool, content: &[u8], control: &Control) -> Outcome<File> {
+/// Create missing parents and check cancellation before opening a write destination.
+/// Unix request routing calls this before handing every writer open to the interruptible helper pool.
+pub fn prepare_write(path: &str, append: bool, parents: bool, control: &Control) -> Outcome<()> {
     let control = if append { None } else { Some(control) };
     check_write(control)?;
     if let Some(parent) = Path::new(path)
@@ -118,11 +124,20 @@ pub fn write(path: &str, append: bool, parents: bool, content: &[u8], control: &
             .map_err(|error| Failure::io(&error, "mkdir", &parent.to_string_lossy()))?;
     }
     check_write(control)?;
-    let mode = if append {
-        sys::OpenMode::Append
-    } else {
-        sys::OpenMode::Write
-    };
+    #[cfg(all(test, unix))]
+    BEFORE_WRITE_OPEN.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    Ok(())
+}
+
+/// `writeFile`/`appendFile`; Unix wire requests use the stream reactor to open and write instead.
+pub fn write(path: &str, append: bool, parents: bool, content: &[u8], control: &Control) -> Outcome<File> {
+    prepare_write(path, append, parents, control)?;
+    let control = if append { None } else { Some(control) };
+    let mode = if append { sys::OpenMode::Append } else { sys::OpenMode::Write };
     let file = sys::open(path, mode).map_err(|error| Failure::io(&error, "open", path))?;
     write_chunk(&file, path, content, control)?;
     Ok(file)

@@ -18,7 +18,7 @@ function writePackage(directory, manifest, files) {
 	}
 }
 
-function createArtifactSet(t) {
+function createArtifactSet(t, artifactDirectoryName = "artifacts") {
 	const temporaryRoot = mkdtempSync(join(tmpdir(), "pi-local-package-install-test-"));
 	t.after(() => rmSync(temporaryRoot, { recursive: true, force: true }));
 	const root = join(temporaryRoot, "fixture with spaces");
@@ -82,7 +82,7 @@ function createArtifactSet(t) {
 		},
 	);
 	return {
-		artifactSet: produceArtifactSet({ build: false, outDir: join(root, "artifacts"), repoRoot, source: null }),
+		artifactSet: produceArtifactSet({ build: false, outDir: join(root, artifactDirectoryName), repoRoot, source: null }),
 		root,
 	};
 }
@@ -176,6 +176,44 @@ test("installs a package as the only direct dependency", (t) => {
 	);
 });
 
+for (const artifactDirectoryName of ["artifacts # literal", "artifacts ? literal", "artifacts %23 %3F %25 %zz"]) {
+	test(`consumer smoke preserves literal filesystem characters in ${artifactDirectoryName}`, {
+		skip: process.platform === "win32" && artifactDirectoryName.includes("?"),
+	}, (t) => {
+		const { artifactSet, root } = createArtifactSet(t, artifactDirectoryName);
+		const consumerDirectory = join(root, "literal-path-consumer");
+		mkdirSync(consumerDirectory);
+		writeFileSync(join(consumerDirectory, "package.json"), '{"private":true,"type":"module"}\n');
+		wireConsumer({ artifactSet, consumerDirectory, packageNames: ["@pi-package-test/target"] });
+		execFileSync("npm", ["install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund"], {
+			cwd: consumerDirectory,
+			stdio: "pipe",
+			timeout: 300_000,
+		});
+
+		const marker = execFileSync(process.execPath, ["--input-type=module", "--eval", 'import { marker } from "@pi-package-test/target"; console.log(marker);'], {
+			cwd: consumerDirectory,
+			encoding: "utf8",
+		});
+		assert.equal(marker.trim(), "local artifact");
+		assert.doesNotThrow(() => smokeTestNpmConsumer({ artifactSet, directory: consumerDirectory, packageName: "@pi-package-test/target" }));
+
+		const lockPath = join(consumerDirectory, "package-lock.json");
+		const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+		const target = lock.packages["node_modules/@pi-package-test/target"];
+		target.resolved = `file:${artifactSet.getPackage("@pi-package-test/target").tarballPath}`;
+		writeFileSync(lockPath, JSON.stringify(lock));
+		assert.doesNotThrow(() => smokeTestNpmConsumer({ artifactSet, directory: consumerDirectory, packageName: "@pi-package-test/target" }));
+
+		target.resolved = `file:${artifactSet.getPackage("@pi-package-test/second").tarballPath}`;
+		writeFileSync(lockPath, JSON.stringify(lock));
+		assert.throws(
+			() => smokeTestNpmConsumer({ artifactSet, directory: consumerDirectory, packageName: "@pi-package-test/target" }),
+			/@pi-package-test\/target resolved from the wrong local artifact/,
+		);
+	});
+}
+
 test("wires and installs a pnpm consumer without registry fallbacks", (t) => {
 	const { artifactSet, root } = createArtifactSet(t);
 	const consumerDirectory = join(root, "pnpm-consumer");
@@ -206,7 +244,7 @@ test("wires and installs a pnpm consumer without registry fallbacks", (t) => {
 		stdio: "pipe",
 		timeout: 300_000,
 	});
-	const marker = execFileSync(process.execPath, ["--input-type=module", "--eval", 'import("@pi-package-test/target").then(({ marker }) => console.log(marker))'], {
+	const marker = execFileSync(process.execPath, ["--input-type=module", "--eval", 'import { marker } from "@pi-package-test/target"; console.log(marker);'], {
 		cwd: consumerDirectory,
 		encoding: "utf8",
 	});

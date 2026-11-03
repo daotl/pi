@@ -11,7 +11,8 @@ use crate::frame::{EVENT, Frame};
 use crate::output::Output;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
 /// After the program exits, output still arriving is collected until this much silence.
@@ -19,10 +20,24 @@ use std::sync::{Arc, Mutex};
 const EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 /// Largest terminal size accepted, in cells.
 const MAX_CELLS: u64 = 4096;
+/// Includes the buffer currently being written, not just messages still in the channel.
+const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
+
+struct Input {
+    bytes: Vec<u8>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl Drop for Input {
+    fn drop(&mut self) {
+        self.queued.fetch_sub(self.bytes.len(), Ordering::SeqCst);
+    }
+}
 
 /// What `ptyWrite`, `ptyResize` and `ptyForeground` reach: the terminal of one running `pty` request.
 pub struct Terminal {
-    input: Sender<Vec<u8>>,
+    input: SyncSender<Input>,
+    queued: Arc<AtomicUsize>,
     #[cfg(unix)]
     master: Arc<std::fs::File>,
     /// The program's process id, which is also its process group's (it leads the terminal's session).
@@ -108,13 +123,20 @@ fn find(terminals: &Terminals, json: &Value) -> Result<Arc<Terminal>, Failure> {
         .ok_or_else(|| Failure::new("EBADF", "no running terminal with this id"))
 }
 
-/// Queue input for the terminal; it is written in the order it arrives, without holding up other requests.
+/// Admit input without blocking the frame reader; report EAGAIN when this terminal's bounded queue is full.
 pub fn write(terminals: &Terminals, json: &Value, payload: Vec<u8>) -> Result<Value, Failure> {
     let terminal = find(terminals, json)?;
-    terminal
-        .input
-        .send(payload)
-        .map_err(|_| Failure::new("EBADF", "the terminal has ended"))?;
+    if payload.is_empty() {
+        return Ok(json!({}));
+    }
+    terminal.queued.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
+        queued.checked_add(payload.len()).filter(|total| *total <= MAX_INPUT_BYTES)
+    }).map_err(|_| Failure::new("EAGAIN", "terminal input queue is full"))?;
+    let input = Input { bytes: payload, queued: terminal.queued.clone() };
+    terminal.input.try_send(input).map_err(|error| match error {
+        TrySendError::Full(_) => Failure::new("EAGAIN", "terminal input queue is full"),
+        TrySendError::Disconnected(_) => Failure::new("EBADF", "the terminal has ended"),
+    })?;
     Ok(json!({}))
 }
 
@@ -176,7 +198,7 @@ pub fn run(
     groups: &Groups,
     terminals: &Terminals,
 ) -> Result<Value, Failure> {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -204,11 +226,13 @@ pub fn run(
     let master = Arc::new(master);
     let pid = child.id();
     ownership.pids.insert(pid);
-    let (input, inputs) = mpsc::channel::<Vec<u8>>();
+    let (input, inputs) = mpsc::sync_channel::<Input>(1024);
+    let queued = Arc::new(AtomicUsize::new(0));
     terminals.lock().unwrap().insert(
         id,
         Arc::new(Terminal {
             input,
+            queued,
             master: master.clone(),
             pid,
         }),
@@ -243,8 +267,8 @@ pub fn run(
         let master = master.clone();
         let stop = stop.clone();
         thread::spawn(move || {
-            for bytes in inputs {
-                if !unix::write_all(&master, &bytes, &stop) {
+            for input in inputs {
+                if !unix::write_all(&master, &input.bytes, &stop) {
                     return;
                 }
             }
@@ -611,5 +635,39 @@ mod unix {
             }
         }
         true
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_budget_includes_the_active_buffer_and_refunds_rejected_sends() {
+        let (input, receiver) = std::sync::mpsc::sync_channel(1);
+        let queued = Arc::new(AtomicUsize::new(0));
+        let terminals: Terminals = Arc::default();
+        terminals.lock().unwrap().insert(1, Arc::new(Terminal {
+            input,
+            queued: queued.clone(),
+            master: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            pid: 0,
+        }));
+        let target = json!({ "target": 1 });
+        write(&terminals, &target, vec![0; MAX_INPUT_BYTES]).unwrap();
+        let active = receiver.recv().unwrap();
+        assert_eq!(queued.load(Ordering::SeqCst), MAX_INPUT_BYTES);
+        assert_eq!(write(&terminals, &target, vec![1]).unwrap_err().code, "EAGAIN");
+        drop(active);
+        assert_eq!(queued.load(Ordering::SeqCst), 0);
+
+        write(&terminals, &target, vec![1]).unwrap();
+        // The byte budget has room, but the bounded message queue does not. Its reservation is refunded.
+        assert_eq!(write(&terminals, &target, vec![2]).unwrap_err().code, "EAGAIN");
+        assert_eq!(queued.load(Ordering::SeqCst), 1);
+        drop(receiver);
+        assert_eq!(queued.load(Ordering::SeqCst), 0);
+        assert_eq!(write(&terminals, &target, vec![3]).unwrap_err().code, "EBADF");
+        assert_eq!(queued.load(Ordering::SeqCst), 0);
     }
 }

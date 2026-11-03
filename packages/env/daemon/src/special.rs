@@ -1,4 +1,4 @@
-//! Unix stream I/O must not retain ordinary file workers while waiting for rendezvous or bytes.
+//! Unix opens stay interruptible; only nonblocking stream I/O runs on the reactor itself.
 
 use crate::{Control, Failure, FileHandle, Server, finish_response, sys};
 use serde_json::json;
@@ -51,7 +51,7 @@ pub fn is_stream(file: &File) -> bool {
 
 extern "C" fn interrupt_open(_signal: libc::c_int) {}
 
-/// This standalone daemon reserves SIGUSR2 solely to interrupt its bounded read-open helpers. Install before any
+/// This standalone daemon reserves SIGUSR2 solely to interrupt its bounded open helpers. Install before any
 /// worker threads, never replace a handler inherited from an embedding environment, and never use SA_RESTART.
 /// The no-op handler is async-signal-safe. Command children reset their signal dispositions before exec.
 pub fn install_interrupt() -> io::Result<()> {
@@ -110,6 +110,10 @@ struct Opened {
 enum Event {
     Request(Request),
     Opened { opened: Opened, slow: bool },
+    Written {
+        request: Request,
+        result: Result<(), Failure>,
+    },
 }
 
 pub struct Sender(SyncSender<Event>);
@@ -265,7 +269,111 @@ impl Openers {
     }
 }
 
+/// Retain opened ordinary descriptors while a fixed pool writes their initial payloads. Admission never waits
+/// on a worker; the reactor's shared MAX_HANDLES budget includes queued, running, and completed writes.
+struct RegularWriters {
+    sender: SyncSender<Request>,
+    active: usize,
+}
+
+impl RegularWriters {
+    fn start(completed: SyncSender<Event>) -> Self {
+        let (sender, receiver) = mpsc::sync_channel::<Request>(crate::MAX_HANDLES);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for _ in 0..crate::WORKERS {
+            let receiver = receiver.clone();
+            let completed = completed.clone();
+            std::thread::spawn(move || loop {
+                let request = match receiver.lock().unwrap().recv() {
+                    Ok(request) => request,
+                    Err(_) => return,
+                };
+                let result = request.write_regular();
+                if completed.send(Event::Written { request, result }).is_err() {
+                    return;
+                }
+            });
+        }
+        Self { sender, active: 0 }
+    }
+
+    fn submit(&mut self, server: &Server, request: Request) {
+        if request.control.aborted.load(Ordering::SeqCst) {
+            request.finish(server, Err(Failure::new("aborted", "aborted")));
+            return;
+        }
+        match self.sender.try_send(request) {
+            Ok(()) => self.active += 1,
+            Err(error) => {
+                let (request, failure) = match error {
+                    mpsc::TrySendError::Full(request) => (
+                        request,
+                        Failure::new("EMFILE", "too many pending ordinary writes"),
+                    ),
+                    mpsc::TrySendError::Disconnected(request) => (
+                        request,
+                        Failure::new("EIO", "ordinary writer pool is unavailable"),
+                    ),
+                };
+                request.finish(server, Err(failure));
+            }
+        }
+    }
+}
+
 impl Request {
+    fn write_regular(&self) -> Result<(), Failure> {
+        let Operation::Write {
+            handle,
+            content,
+            written,
+            ..
+        } = &self.operation
+        else {
+            unreachable!();
+        };
+        debug_assert!(!handle.stream);
+        if self.control.aborted.load(Ordering::SeqCst) {
+            return Err(Failure::new("aborted", "aborted"));
+        }
+        if handle.failed.load(Ordering::SeqCst) {
+            return Err(Failure::new("EBADF", "an earlier write failed"));
+        }
+        #[cfg(test)]
+        if *written < content.len() {
+            tests::before_ordinary_write(handle);
+        }
+        crate::fs::write_chunk(
+            &handle.file,
+            &handle.path,
+            &content[*written..],
+            Some(&self.control),
+        )
+    }
+
+    fn finish(
+        self,
+        server: &Server,
+        mut result: Result<(serde_json::Value, Vec<u8>), Failure>,
+    ) {
+        if let Operation::Write {
+            handle,
+            keep,
+            initial,
+            ..
+        } = self.operation
+        {
+            if result.is_err() {
+                handle.failed.store(true, Ordering::SeqCst);
+            } else if keep && initial {
+                result = server
+                    .insert(crate::Handle::File(handle))
+                    .map(|id| (json!({ "handle": id }), Vec::new()));
+            }
+        }
+        finish_response(server, self.id, false, result);
+    }
+
     fn attempt_write(&mut self) -> Option<Result<(serde_json::Value, Vec<u8>), Failure>> {
         let Operation::Write {
             handle,
@@ -312,10 +420,7 @@ impl Request {
         match result {
             Ok(None) => None,
             Ok(Some(value)) => Some(Ok(value)),
-            Err(error) => {
-                handle.failed.store(true, Ordering::SeqCst);
-                Some(Err(error))
-            }
+            Err(error) => Some(Err(error)),
         }
     }
     fn attempt_read(
@@ -404,9 +509,9 @@ fn complete_open(server: &Server, opened: Opened) -> Option<Request> {
                 ..
             } => {
                 let handle = Arc::new(FileHandle {
+                    stream: is_stream(&file),
                     file,
                     path,
-                    stream: true,
                     failed: AtomicBool::new(false),
                     serial: Mutex::default(),
                 });
@@ -428,7 +533,9 @@ fn complete_open(server: &Server, opened: Opened) -> Option<Request> {
 
 /// Metadata selects only a queue, never how to open. Quick opens that unexpectedly block are interrupted and
 /// deferred after one reactor pass, freeing their pool even if a regular pathname became a FIFO. A successful
-/// descriptor always transfers unchanged. Slow and quick helpers, queues, and cancellation scans remain bounded.
+/// descriptor always transfers unchanged. Saturated slow reader and writer pools reject excess opens with EMFILE;
+/// quick opens may wait for their pool, but never occupy ordinary file workers while waiting for rendezvous.
+/// Opened ordinary writers transfer to a bounded worker pool; their payloads never run on this reactor.
 pub fn start(server: Weak<Server>) -> Sender {
     // Both arrivals and helper completions wake this bounded receiver. In particular, an ordinary open must
     // not wait for a cancellation poll merely because no further request arrives.
@@ -438,7 +545,8 @@ pub fn start(server: Weak<Server>) -> Sender {
         let mut quick = Openers::start(events.clone(), false);
         let mut slow = Openers::start(events.clone(), true);
         // Writer rendezvous never occupies a read-open helper: a later reader must be able to release it.
-        let mut writers = Openers::start(events, true);
+        let mut writers = Openers::start(events.clone(), true);
+        let mut regular = RegularWriters::start(events);
         let mut pending = Vec::<Request>::new();
         let mut quick_queue = VecDeque::<Request>::new();
         let mut slow_queue = VecDeque::<Request>::new();
@@ -496,12 +604,19 @@ pub fn start(server: Weak<Server>) -> Sender {
                         };
                         pool.active -= 1;
                         if let Some(request) = complete_open(&server, opened) {
-                            match request.operation {
+                            match &request.operation {
+                                Operation::Write { handle, .. } if !handle.stream => {
+                                    regular.submit(&server, request);
+                                }
                                 Operation::Write { .. } => pending.push(request),
                                 Operation::WriteOpen { .. } => write_queue.push_back(request),
                                 _ => slow_queue.push_back(request),
                             }
                         }
+                    }
+                    Event::Written { request, result } => {
+                        regular.active -= 1;
+                        request.finish(&server, result.map(|()| (json!({}), Vec::new())));
                     }
                 }
             }
@@ -513,6 +628,7 @@ pub fn start(server: Weak<Server>) -> Sender {
                     + quick.active
                     + slow.active
                     + writers.active
+                    + regular.active
                     >= crate::MAX_HANDLES
                 {
                     finish_response(
@@ -527,13 +643,16 @@ pub fn start(server: Weak<Server>) -> Sender {
                     Operation::Open { slow: true, .. } => slow_queue.push_back(request),
                     Operation::Open { slow: false, .. } => quick_queue.push_back(request),
                     Operation::WriteOpen { .. } => write_queue.push_back(request),
+                    Operation::Write { handle, .. } if !handle.stream => {
+                        regular.submit(&server, request);
+                    }
                     Operation::Read { .. } | Operation::Write { .. } => pending.push(request),
                 }
             }
-            for (queue, pool) in [
-                (&mut quick_queue, &mut quick),
-                (&mut slow_queue, &mut slow),
-                (&mut write_queue, &mut writers),
+            for (queue, pool, quick_pool) in [
+                (&mut quick_queue, &mut quick, true),
+                (&mut slow_queue, &mut slow, false),
+                (&mut write_queue, &mut writers, false),
             ] {
                 let count = queue.len();
                 for _ in 0..count {
@@ -547,8 +666,15 @@ pub fn start(server: Weak<Server>) -> Sender {
                         );
                     } else if pool.active < crate::WORKERS {
                         pool.submit(request);
-                    } else {
+                    } else if quick_pool {
                         queue.push_back(request);
+                    } else {
+                        finish_response(
+                            &server,
+                            request.id,
+                            false,
+                            Err(Failure::new("EMFILE", "too many pending FIFO opens")),
+                        );
                     }
                 }
             }
@@ -566,21 +692,9 @@ pub fn start(server: Weak<Server>) -> Sender {
                 } else {
                     pending[index].attempt_read(&mut scratch)
                 };
-                if let Some(mut result) = result {
+                if let Some(result) = result {
                     let request = pending.remove(index);
-                    if let Operation::Write {
-                        handle,
-                        keep: true,
-                        initial: true,
-                        ..
-                    } = request.operation
-                        && result.is_ok()
-                    {
-                        result = server
-                            .insert(crate::Handle::File(handle))
-                            .map(|id| (json!({ "handle": id }), Vec::new()));
-                    }
-                    finish_response(&server, request.id, false, result);
+                    request.finish(&server, result);
                 } else {
                     index += 1;
                 }
@@ -593,6 +707,153 @@ pub fn start(server: Weak<Server>) -> Sender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct OrdinaryWriteGate {
+        path: String,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    static ORDINARY_WRITE_GATE: Mutex<Option<OrdinaryWriteGate>> = Mutex::new(None);
+
+    pub(super) fn before_ordinary_write(handle: &FileHandle) {
+        let gate = {
+            let mut gate = ORDINARY_WRITE_GATE.lock().unwrap();
+            if !handle.stream && gate.as_ref().is_some_and(|gate| gate.path == handle.path) {
+                gate.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            assert!(handle.file.metadata().unwrap().is_file());
+            gate.entered.send(()).unwrap();
+            // Dropping the test's sender also releases the descriptor boundary during panic unwinding.
+            let _ = gate.release.recv();
+        }
+    }
+
+    #[test]
+    fn blocked_ordinary_initial_write_does_not_block_stream_progress_or_cancellation() {
+        const CHILD: &str = "PI_ENV_ORDINARY_WRITE_REACTOR_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "special::tests::blocked_ordinary_initial_write_does_not_block_stream_progress_or_cancellation", "--nocapture"])
+                .env(CHILD, "1").spawn().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "isolated ordinary writer regression failed: {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("isolated ordinary writer regression timed out");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        install_interrupt().unwrap();
+        let root = sys::mkdtemp(&format!("{}/pi-env-ordinary-writer-reactor-", sys::tmpdir())).unwrap();
+        let path = std::path::Path::new(&root).join("ordinary").to_string_lossy().into_owned();
+        let output = Arc::new(crate::Output::default());
+        let server = Arc::new(Server {
+            output: output.clone(), tmpdir: root.clone(), handles: Mutex::default(),
+            next_handle: std::sync::atomic::AtomicU64::new(1), controls: Mutex::default(),
+            groups: Arc::default(), terminals: Arc::default(), special: Mutex::new(None),
+        });
+        let sender = start(Arc::downgrade(&server));
+        *server.special.lock().unwrap() = Some(Sender(sender.0.clone()));
+        let (mut replies, mut wire) = std::os::unix::net::UnixStream::pair().unwrap();
+        replies.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let writer_output = output.clone();
+        let writer = std::thread::spawn(move || writer_output.run(&mut wire));
+        let stream = || {
+            let (reader, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            reader.set_nonblocking(true).unwrap();
+            let fd: std::os::fd::OwnedFd = reader.into();
+            let file = File::from(fd);
+            assert!(is_stream(&file));
+            (Arc::new(FileHandle {
+                file, path: "ordinary-write-regression-stream".into(), stream: true,
+                failed: AtomicBool::new(false), serial: Mutex::default(),
+            }), peer)
+        };
+        let (idle, idle_peer) = stream();
+        let cancelled = Arc::new(Control::default());
+        server.controls.lock().unwrap().insert(2, cancelled.clone());
+        assert!(sender.try_send(Request {
+            id: 2, control: cancelled.clone(),
+            operation: Operation::Read { handle: idle, offset: None, length: 1 },
+        }).is_ok());
+        let (readable, mut peer) = stream();
+        peer.write_all(b"bp").unwrap();
+        assert!(sender.try_send(Request {
+            id: 3, control: Arc::default(),
+            operation: Operation::Read { handle: readable.clone(), offset: None, length: 1 },
+        }).is_ok());
+        // A real stream completion proves the earlier idle read has reached this reactor before the gate.
+        let barrier = crate::frame::read_frame(&mut replies).unwrap().unwrap();
+        assert_eq!((barrier.id, barrier.kind, barrier.payload.as_slice()), (3, crate::frame::RESULT, b"b".as_slice()));
+        let (entered, ready) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        *ORDINARY_WRITE_GATE.lock().unwrap() = Some(OrdinaryWriteGate {
+            path: path.clone(), entered, release: held,
+        });
+        let ordinary_control = Arc::new(Control::default());
+        server.controls.lock().unwrap().insert(1, ordinary_control.clone());
+        crate::respond(&server, 1, crate::frame::Frame::with_payload(crate::frame::REQUEST, 1,
+            json!({ "op": "write", "path": path, "keep": true }), b"ordinary payload".to_vec()), ordinary_control);
+        ready.recv_timeout(Duration::from_secs(3)).expect("ordinary descriptor never reached its actual payload-write boundary");
+        cancelled.cancel(false);
+        assert!(sender.try_send(Request {
+            id: 4, control: Arc::default(),
+            operation: Operation::Read { handle: readable, offset: None, length: 1 },
+        }).is_ok());
+        // The gate stays closed until BOTH an existing read's cancellation and a new stream read settle.
+        // The timeout only guards deadlock; the entered/release handshake establishes the blocked syscall.
+        let mut frames = Vec::new();
+        let progress = (|| -> io::Result<()> {
+            for _ in 0..2 {
+                frames.push(crate::frame::read_frame(&mut replies)?
+                    .ok_or_else(|| io::Error::other("reactor output closed while ordinary write was held"))?);
+            }
+            Ok(())
+        })();
+        let ordinary_still_pending = server.controls.lock().unwrap().contains_key(&1);
+        let cancellation_settled = !server.controls.lock().unwrap().contains_key(&2);
+        release.send(()).unwrap();
+        let mut all = frames.len();
+        let mut ordinary_reply = None;
+        while all < 3 {
+            let reply = crate::frame::read_frame(&mut replies).unwrap().unwrap();
+            if reply.id == 1 { ordinary_reply = Some(reply); }
+            all += 1;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        server.handles.lock().unwrap().clear();
+        output.close();
+        writer.join().unwrap();
+        drop(idle_peer);
+        drop(peer);
+        drop(sender);
+        drop(server);
+        std::fs::remove_dir_all(root).unwrap();
+        progress.expect("blocked ordinary payload write prevented reactor cancellation and another stream read from progressing");
+        assert!(ordinary_still_pending, "ordinary write must remain held until the gate is released");
+        assert!(cancellation_settled, "cancelled stream control must settle before releasing the ordinary write");
+        let cancelled = frames.iter().find(|reply| reply.id == 2).expect("missing stream cancellation");
+        assert_eq!(cancelled.kind, crate::frame::ERROR);
+        assert_eq!(cancelled.json["code"], "aborted");
+        let read = frames.iter().find(|reply| reply.id == 4).expect("missing independent stream read");
+        assert_eq!(read.kind, crate::frame::RESULT);
+        assert_eq!(read.payload, b"p");
+        let ordinary = ordinary_reply.expect("ordinary write must settle after its gate is released");
+        assert_eq!(ordinary.kind, crate::frame::RESULT);
+        assert!(ordinary.json["handle"].as_u64().is_some(), "keep must retain the successfully opened ordinary descriptor");
+        assert_eq!(bytes, b"ordinary payload");
+    }
 
     #[test]
     fn serial_ordinary_opens_notify_the_arrival_receiver_without_another_request() {
@@ -848,6 +1109,99 @@ mod tests {
         drop(quick);
         drop(slow);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn saturated_distinct_fifo_pools_reject_a_fresh_pair_without_waiting_for_rendezvous() {
+        const CHILD: &str = "PI_ENV_FIFO_SATURATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "special::tests::saturated_distinct_fifo_pools_reject_a_fresh_pair_without_waiting_for_rendezvous", "--nocapture"])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "isolated FIFO saturation regression failed: {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("isolated FIFO saturation regression timed out");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        install_interrupt().unwrap();
+        for writing in [false, true] {
+            let root = sys::mkdtemp(&format!("{}/pi-env-fifo-saturation-", sys::tmpdir())).unwrap();
+            let output = Arc::new(crate::Output::default());
+            let server = Arc::new(Server {
+                output: output.clone(), tmpdir: root.clone(), handles: Mutex::default(),
+                next_handle: std::sync::atomic::AtomicU64::new(1), controls: Mutex::default(),
+                groups: Arc::default(), terminals: Arc::default(), special: Mutex::new(None),
+            });
+            let sender = start(Arc::downgrade(&server));
+            let (mut replies, mut wire) = std::os::unix::net::UnixStream::pair().unwrap();
+            replies.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let writer_output = output.clone();
+            let writer = std::thread::spawn(move || writer_output.run(&mut wire));
+            let fifo = |name: &str| {
+                let path = std::path::Path::new(&root).join(name);
+                let raw = CString::new(path.as_os_str().as_bytes()).unwrap();
+                // SAFETY: NUL-terminated path in this test's private directory.
+                assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+                path.to_string_lossy().into_owned()
+            };
+            let operation = |path, writing| if writing {
+                Operation::WriteOpen { path, append: false, content: b"input".to_vec(), keep: false }
+            } else {
+                Operation::Open { path, slow: true }
+            };
+            let controls: Vec<_> = (0..crate::WORKERS + 2).map(|_| Arc::new(Control::default())).collect();
+            for (id, control) in controls.iter().take(crate::WORKERS).enumerate() {
+                assert!(sender.try_send(Request {
+                    id: id as u32, control: control.clone(), operation: operation(fifo(&format!("unmatched-{id}")), writing),
+                }).is_ok());
+            }
+            let regular = std::path::Path::new(&root).join("ordinary");
+            std::fs::write(&regular, b"available").unwrap();
+            assert!(sender.try_send(Request {
+                id: 100, control: Arc::default(),
+                operation: Operation::Open { path: regular.to_string_lossy().into_owned(), slow: false },
+            }).is_ok());
+            // The completion wakes the actual reactor after all earlier FIFO arrivals consumed pool slots.
+            let barrier = crate::frame::read_frame(&mut replies).unwrap().unwrap();
+            assert_eq!(barrier.id, 100);
+            assert_eq!(barrier.kind, crate::frame::RESULT);
+            let fresh = fifo("fresh");
+            for (id, same_side) in [(200, true), (201, false)] {
+                assert!(sender.try_send(Request {
+                    id, control: controls[crate::WORKERS + usize::from(!same_side)].clone(),
+                    operation: operation(fresh.clone(), if same_side { writing } else { !writing }),
+                }).is_ok());
+            }
+            let refused = crate::frame::read_frame(&mut replies)
+                .expect("saturated rendezvous admission must settle without releasing unmatched FIFOs")
+                .unwrap();
+            assert_eq!(refused.id, 200);
+            assert_eq!(refused.kind, crate::frame::ERROR);
+            assert_eq!(refused.json["code"], "EMFILE");
+            for control in &controls { control.cancel(false); }
+            for _ in 0..crate::WORKERS + 1 {
+                let cancelled = crate::frame::read_frame(&mut replies).unwrap().unwrap();
+                assert_eq!(cancelled.kind, crate::frame::ERROR);
+                assert_eq!(cancelled.json["code"], "aborted");
+            }
+            server.handles.lock().unwrap().clear();
+            output.close();
+            writer.join().unwrap();
+            drop(sender);
+            drop(server);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     fn wait_registered(pool: &Openers, count: usize) {

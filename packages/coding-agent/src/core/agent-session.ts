@@ -186,6 +186,15 @@ import {
 	normalizeBuildSystemPromptOptions,
 	type SystemPromptSections,
 } from "./system-prompt.ts";
+import {
+	adoptToolUsageManager,
+	bindToolUsage,
+	createToolUsageRecorderFactory,
+	flushToolUsage,
+	releaseToolUsageManager,
+	setToolUsageNotification,
+	type ToolUsageManagerOwner,
+} from "./tool-usage-binding.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
@@ -615,6 +624,8 @@ export class AgentSession {
 
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
+	/** File persistence ownership survives runtime reload; notifications do not. */
+	private readonly _toolUsageOwner: ToolUsageManagerOwner;
 	private _turnIndex = 0;
 	private readonly _entryIdsByMessage = new WeakMap<object, string>();
 	private readonly _boundaryDispatchedMessages = new WeakSet<object>();
@@ -705,6 +716,7 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
+		this._toolUsageOwner = adoptToolUsageManager(this.sessionManager);
 		// Keep the session's summaries-block limit in sync with the configured value so
 		// the LLM context and TUI views agree on which summaries are visible.
 		this._summaryBlockMaxTokens = this.settingsManager.getSummaryBlockMaxTokens();
@@ -1808,6 +1820,7 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		releaseToolUsageManager(this._toolUsageOwner);
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -5013,6 +5026,7 @@ export class AgentSession {
 	}
 
 	private _flushPendingUsage(notify = true): void {
+		flushToolUsage(this._toolUsageOwner, notify);
 		while (this._pendingUsage.length > 0) {
 			const receipt = this._pendingUsage[0];
 			const entry =
@@ -6285,6 +6299,8 @@ export class AgentSession {
 		);
 		const previousActiveToolNames = this.getActiveToolNames();
 		const allowedTools = this._allowedTools;
+		const runner = this._extensionRunner;
+		const createUsageRecorder = createToolUsageRecorderFactory(this._toolUsageOwner);
 
 		const registeredTools = this._extensionRunner.getAllRegisteredTools();
 		const allCustomTools = [
@@ -6293,17 +6309,17 @@ export class AgentSession {
 				definition,
 				sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, { source: "sdk" }),
 			})),
-		].filter((tool) => this._isAllowedTool(tool.definition.name));
+		]
+			.filter((tool) => this._isAllowedTool(tool.definition.name))
+			.map((tool) => ({ ...tool, definition: bindToolUsage(tool.definition, createUsageRecorder) }));
+		const allBuiltInTools = Array.from(this._baseToolDefinitions.values())
+			.filter((definition) => this._isAllowedTool(definition.name))
+			.map((definition) => ({
+				definition: bindToolUsage(definition, createUsageRecorder),
+				sourceInfo: createSyntheticSourceInfo(`${BUILTIN_PATH_PREFIX}${definition.name}`, { source: "builtin" }),
+			}));
 		const definitionRegistry = new Map<string, ToolDefinitionEntry>(
-			Array.from(this._baseToolDefinitions.entries())
-				.filter(([name]) => this._isAllowedTool(name))
-				.map(([name, definition]) => [
-					name,
-					{
-						definition,
-						sourceInfo: createSyntheticSourceInfo(`${BUILTIN_PATH_PREFIX}${name}`, { source: "builtin" }),
-					},
-				]),
+			allBuiltInTools.map((tool) => [tool.definition.name, tool]),
 		);
 		for (const tool of allCustomTools) {
 			definitionRegistry.set(tool.definition.name, {
@@ -6328,19 +6344,8 @@ export class AgentSession {
 				})
 				.filter((entry): entry is readonly [string, string[]] => entry !== undefined),
 		);
-		const runner = this._extensionRunner;
 		const wrappedExtensionTools = wrapRegisteredTools(allCustomTools, runner);
-		const wrappedBuiltInTools = wrapRegisteredTools(
-			Array.from(this._baseToolDefinitions.values())
-				.filter((definition) => this._isAllowedTool(definition.name))
-				.map((definition) => ({
-					definition,
-					sourceInfo: createSyntheticSourceInfo(`${BUILTIN_PATH_PREFIX}${definition.name}`, {
-						source: "builtin",
-					}),
-				})),
-			runner,
-		);
+		const wrappedBuiltInTools = wrapRegisteredTools(allBuiltInTools, runner);
 
 		const toolRegistry = new Map(wrappedBuiltInTools.map((tool) => [tool.name, tool]));
 		for (const tool of wrappedExtensionTools as AgentTool[]) {
@@ -6436,6 +6441,7 @@ export class AgentSession {
 			}
 		}
 
+		setToolUsageNotification(this._toolUsageOwner, (entry) => this._emit({ type: "entry_appended", entry }));
 		this._extensionRunner = new ExtensionRunner(
 			extensionsResult.extensions,
 			extensionsResult.runtime,
@@ -6460,6 +6466,7 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		this._toolUsageOwner.notification = undefined;
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });

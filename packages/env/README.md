@@ -59,13 +59,16 @@ as `process.platform` and `process.arch` spell them.
 `openTerminal(connection, options)` runs a program, by default the user's login shell, in a pseudo-terminal of the
 daemon: raw output, input, resizing and its exit code, for interactive terminals. `localDaemon()` is the daemon for this
 machine, for terminals without SSH (`new Connection({ command: [localDaemon()] })`). Terminals are not supported on
-Windows yet.
+Windows yet. Await `terminal.write(data)` to observe admission errors (`EAGAIN` when its input queue is full);
+write calls must be awaited sequentially, and completion acknowledges queue admission, not program consumption.
+A failed multi-chunk write may have admitted a prefix. `close()` rejects `exited` with `aborted`, even when called
+from the final output callback; an output callback error takes precedence over that abort.
 
 Supported remote systems: Linux, macOS, Android (Termux) and Windows, on x86-64 and arm64. Windows execution requires Windows 10 / Server 2016 or newer with compatible nested-job policy. String commands run through Git Bash as `NodeExecutionEnv` runs them there; argv commands run directly.
 
 Each Windows command is created inside its own noninheritable kill-on-close Job. Normal completion, cancellation and connection shutdown terminate remaining descendants and wait for the Job's active-process count to reach zero. Unsupported process-attribute or ambient-job configurations fail with `spawn_error`; there is no taskkill-only fallback. Process creation through an external service/broker is outside Job inheritance; this is not a sandbox for malicious same-user code.
 
-On Unix, FIFO read opens use bounded daemon-owned helper queues, separate from ordinary file work. Cancellation interrupts the owning helper; queued requests can be cancelled without waiting for a worker. The standalone daemon reserves `SIGUSR2` for this purpose and refuses to replace a nondefault inherited handler. Actual blocking open preserves the writer rendezvous, including an empty writer; successful descriptors are transferred without reopening. Write-mode FIFO operations retain their existing blocking semantics.
+On Unix, every read-mode and writer open uses bounded daemon-owned interruptible helpers, separate from ordinary file work, so replacing a regular or missing destination with a FIFO cannot trap an ordinary worker. Waiting writers do not occupy reader-open helpers. Saturated FIFO reader or writer pools fail new opens with `EMFILE` instead of queuing an unmatched rendezvous indefinitely. The standalone daemon reserves `SIGUSR2` for interruption and refuses to replace a nondefault inherited handler. Actual blocking open preserves rendezvous, creation/truncation and append flags; successful descriptors are transferred without reopening.
 
 ## Development
 

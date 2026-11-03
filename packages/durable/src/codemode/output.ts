@@ -7,6 +7,14 @@
  */
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { CodemodeOutputItem, CodemodeResult } from "@earendil-works/pi-codemode/portable";
+import type { ToolDiagnostic } from "../harness/types.ts";
+import { imageDimensions } from "../tools/image.ts";
+import {
+	DEFAULT_IMAGE_LIMITS,
+	type ImageLimits,
+	type ImageProcessor,
+	INLINE_IMAGE_TYPES,
+} from "../tools/image-processor.ts";
 
 type Item = TextContent | ImageContent;
 
@@ -125,27 +133,58 @@ async function truncate(
 	};
 }
 
-/** Save each image to a file and put a text item with its path before it; an image shown twice is saved once. */
-async function saveImages(items: readonly Item[], write: OutputFile): Promise<Item[]> {
-	const labels = new Map<string, Promise<string>>();
-	const label = async ({ data, mimeType }: ImageContent, index: number): Promise<string> => {
+async function saveOriginalsAndPrepareImages(
+	items: readonly Item[],
+	write: OutputFile,
+	processor: ImageProcessor | undefined,
+	limits: ImageLimits,
+	diagnostics: ToolDiagnostic[],
+): Promise<Item[]> {
+	const images = new Map<string, Promise<Item[]>>();
+	const prepare = async ({ data, mimeType }: ImageContent, index: number): Promise<Item[]> => {
 		const bytes = Uint8Array.from(atob(data), (char) => char.charCodeAt(0));
 		const kind = `${mimeType}, ${bytes.length} bytes`;
-		// A failed write must not discard the result of a script whose calls already ran: it becomes part of the label.
 		const saved = await write(`image-${index}${IMAGE_EXTENSIONS[mimeType] ?? ".bin"}`, bytes);
-		return "path" in saved
-			? `[Image saved to ${saved.path} (${kind})]`
-			: `[Image (${kind}) could not be saved: ${saved.error}]`;
+		const label =
+			"path" in saved
+				? `[Image saved to ${saved.path} (${kind})]`
+				: `[Image (${kind}) could not be saved: ${saved.error}]`;
+		let image: { readonly data: string; readonly mimeType: string } | undefined;
+		if (processor !== undefined) image = await processor.prepare(bytes, mimeType, limits);
+		else {
+			const size = imageDimensions(bytes, mimeType);
+			if (
+				INLINE_IMAGE_TYPES.has(mimeType) &&
+				data.length <= limits.maxBytes &&
+				size !== undefined &&
+				size.width <= limits.maxWidth &&
+				size.height <= limits.maxHeight
+			)
+				image = { data, mimeType };
+		}
+		if (image === undefined) {
+			const message =
+				processor === undefined
+					? `Image (${kind}) cannot be sent within the model's image limits; no image processor is configured.`
+					: `Image (${kind}) cannot be prepared for the model.`;
+			diagnostics.push({ severity: "error", code: "unsupported_image", message });
+			return [{ type: "text", text: `${label}\n${message}` }];
+		}
+		return [
+			{ type: "text", text: label },
+			{ type: "image", data: image.data, mimeType: image.mimeType },
+		];
 	};
 	const result = await Promise.all(
-		items.map(async (item): Promise<Item[]> => {
-			if (item.type !== "image") return [item];
-			let pending = labels.get(item.data);
+		items.map((item): Promise<Item[]> => {
+			if (item.type !== "image") return Promise.resolve([item]);
+			const key = `${item.mimeType}:${item.data}`;
+			let pending = images.get(key);
 			if (pending === undefined) {
-				pending = label(item, labels.size + 1);
-				labels.set(item.data, pending);
+				pending = prepare(item, images.size + 1);
+				images.set(key, pending);
 			}
-			return [{ type: "text", text: await pending }, item];
+			return pending;
 		}),
 	);
 	return result.flat();
@@ -182,8 +221,10 @@ export async function formatResult(
 		readonly calls: readonly { name: string; status: string }[];
 		readonly limits: Limits;
 		readonly write: OutputFile;
+		readonly images?: ImageProcessor;
+		readonly imageLimits?: ImageLimits;
 	},
-): Promise<{ content: Item[]; fullOutputPath?: string }> {
+): Promise<{ content: Item[]; fullOutputPath?: string; diagnostics: ToolDiagnostic[] }> {
 	const output = [...result.output];
 	if (result.ok && result.value !== undefined) output.push({ type: "text", text: valueText(result.value) });
 	const items = formatItems(output);
@@ -197,10 +238,20 @@ export async function formatResult(
 	}
 	const truncated = await truncate(joinAdjacentText(items), options.maxOutputTokens, options.limits, options.write);
 	// After truncation, which joins the text items and moves images after them, so each path stays next to its image.
-	const content = joinAdjacentText(await saveImages(truncated.items, options.write));
+	const diagnostics: ToolDiagnostic[] = [];
+	const content = joinAdjacentText(
+		await saveOriginalsAndPrepareImages(
+			truncated.items,
+			options.write,
+			options.images,
+			options.imageLimits ?? DEFAULT_IMAGE_LIMITS,
+			diagnostics,
+		),
+	);
 	const header = `${result.ok ? "Script completed" : "Script failed"}\nWall time ${(options.wallMs / 1000).toFixed(1)} seconds\nOutput:\n`;
 	return {
 		content: [{ type: "text", text: header }, ...content],
+		diagnostics,
 		...(truncated.fullOutputPath === undefined ? {} : { fullOutputPath: truncated.fullOutputPath }),
 	};
 }

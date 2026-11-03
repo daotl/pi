@@ -61,6 +61,7 @@ import type {
 	ToolRegistration,
 } from "../harness/types.ts";
 import { rankDocuments } from "../search.ts";
+import { DEFAULT_IMAGE_LIMITS, type ImageProcessor } from "../tools/image-processor.ts";
 import type { JsonObject } from "../types.ts";
 import {
 	type CodemodeNamespace,
@@ -225,6 +226,8 @@ export type CodemodeToolOptions = {
 	readonly inlineBudget?: number;
 	/** Give scripts `models.*`: the model catalog, classifiers, and image generation. Default true. */
 	readonly models?: boolean;
+	/** Prepares inline image output for the conversation model; saved files retain their original bytes. */
+	readonly images?: ImageProcessor;
 	/** @internal Host functions scripts call as globals. */
 	readonly globals?: readonly CodemodeGlobal[];
 };
@@ -565,6 +568,9 @@ class CodemodeCall {
 	/** The script's own outcome, stored with its store writes in one transaction. */
 	private async complete(result: CodemodeResult): Promise<ToolExecutionResult> {
 		const details = this.details();
+		const ref = (await this.api.agent(this.context)).model;
+		const model = ref === undefined ? undefined : this.api.models.getModel(ref.provider, ref.modelId);
+		const resize = model?.inputLimits?.images?.resize;
 		const formatted = await formatResult(result, {
 			generatedImages: this.generatedImages,
 			wallMs: this.api.now() - this.start.startedAt,
@@ -572,11 +578,17 @@ class CodemodeCall {
 			calls: details.calls,
 			limits: OUTPUT_LIMITS,
 			write: this.outputFiles(),
+			images: this.options.images,
+			imageLimits: {
+				maxWidth: resize?.maxWidth ?? DEFAULT_IMAGE_LIMITS.maxWidth,
+				maxHeight: resize?.maxHeight ?? DEFAULT_IMAGE_LIMITS.maxHeight,
+				maxBytes: resize?.maxBytes ?? DEFAULT_IMAGE_LIMITS.maxBytes,
+			},
 		});
 		const tool: ToolExecutionResult = {
 			output: formatted.content,
 			isError: !result.ok,
-			diagnostics: [...this.diagnostics.values()].flat(),
+			diagnostics: [...this.diagnostics.values()].flat().concat(formatted.diagnostics),
 			details: {
 				...details,
 				...(formatted.fullOutputPath === undefined ? {} : { fullOutputPath: formatted.fullOutputPath }),
