@@ -12,13 +12,33 @@ const snapshot = (items) => ({ repo: "owner/repo", items, categories: [{ name: "
 
 function harness() {
 	const listeners = {}, requests = [], nodes = Object.fromEntries(["main", "cat", "status", "sync"].map((id) => [id, { innerHTML: "", value: "" }]));
-	let poll, focusedSelect = null, focused = null, mainVersion = 0, mainHtml = "";
-	const body = { tagName: "BODY" };
+	let poll, focusedSelect = null, focused = null, mainVersion = 0, mainHtml = "", selectedRange = null;
+	const body = { tagName: "BODY", nodeType: 1 };
+	Object.assign(nodes.main, { tagName: "MAIN", nodeType: 1, id: "main", parentNode: body, parentElement: body });
 	Object.defineProperty(nodes.main, "innerHTML", {
 		get: () => mainHtml,
-		set: (value) => { mainHtml = value; mainVersion++; },
+		set: (value) => {
+			// Replacing selected text nodes collapses a native range into their parent.
+			if (selectedRange?.intersectsNode(nodes.main)) {
+				selectedRange.startContainer = selectedRange.endContainer = nodes.main;
+				selectedRange.startOffset = selectedRange.endOffset = 0;
+				selectedRange.collapsed = true;
+			}
+			mainHtml = value; mainVersion++;
+		},
 	});
-	nodes.main.contains = (node) => !!node && node.mainVersion === mainVersion;
+	nodes.main.contains = (node) => node === nodes.main || (!!node && node.mainVersion === mainVersion);
+	const selection = {
+		get rangeCount() { return selectedRange ? 1 : 0; },
+		get isCollapsed() { return !selectedRange || selectedRange.collapsed; },
+		get anchorNode() { return selectedRange?.startContainer ?? null; },
+		get focusNode() { return selectedRange?.endContainer ?? null; },
+		get anchorOffset() { return selectedRange?.startOffset ?? 0; },
+		get focusOffset() { return selectedRange?.endOffset ?? 0; },
+		getRangeAt(index) { assert.equal(index, 0); assert.ok(selectedRange); return selectedRange; },
+		containsNode(node) { return selectedRange?.intersectsNode(node) ?? false; },
+		toString() { return this.isCollapsed ? "" : selectedRange.text; },
+	};
 	const timers = [];
 	const tabs = ["inbox", "decided", "all"].map((view) => ({ dataset: { view }, classList: { toggle() {} } }));
 	const focusedElement = () => nodes.main.contains(focused) ? focused : null;
@@ -31,8 +51,8 @@ function harness() {
 		}) ? target : null;
 	};
 	nodes.main.querySelector = focusedQuery;
-	const document = { hidden: false, get activeElement() { return focusedElement() ?? body; }, getElementById: (id) => nodes[id], addEventListener: (name, fn) => { listeners[name] = fn; }, querySelectorAll: (selector) => selector === ".tab" ? tabs : [], querySelector: focusedQuery };
-	runInNewContext(script, { document, queueMicrotask, setTimeout: (fn) => timers.push(fn), window: { open() {}, addEventListener() {} }, confirm: () => true, setInterval: (fn) => { poll = fn; }, fetch: (path, options) => new Promise((resolve) => { requests.push({ path, body: options && JSON.parse(options.body), resolve }); }) });
+	const document = { hidden: false, get activeElement() { return focusedElement() ?? body; }, getSelection: () => selection, getElementById: (id) => nodes[id], addEventListener: (name, fn) => { listeners[name] = fn; }, querySelectorAll: (selector) => selector === ".tab" ? tabs : [], querySelector: focusedQuery };
+	runInNewContext(script, { document, queueMicrotask, getSelection: () => selection, setTimeout: (fn) => timers.push(fn), window: { getSelection: () => selection, open() {}, addEventListener() {} }, confirm: () => true, setInterval: (fn) => { poll = fn; }, fetch: (path, options) => new Promise((resolve) => { requests.push({ path, body: options && JSON.parse(options.body), resolve }); }) });
 	const respond = async (request, value) => { request.resolve({ ok: true, json: async () => value }); await tick(); };
 	const key = (key, repeat = false) => listeners.keydown({ key, repeat, target: { tagName: "BODY" } });
 	const click = (dataset) => listeners.click({ target: { closest: (selector) => selector === "[data-act]" ? { dataset } : null } });
@@ -68,6 +88,36 @@ function harness() {
 	const changeCategory = (value) => { focusedSelect.value = value; listeners.change({ target: focusedSelect }); };
 	const pointer = (type, pointerId = 1) => listeners[type]?.({ pointerId });
 	const finishPointer = async (type) => { if (type) pointer(type); timers.splice(0).forEach((fn) => fn()); await tick(); };
+	const clickControl = (control) => {
+		assert.equal(control.isConnected, true, "Native click must still have its mounted target");
+		listeners.click({ target: control });
+	};
+	const selectText = (position = "inside") => {
+		const textNode = (inside, text) => {
+			const parent = inside ? nodes.main : body;
+			return { nodeType: 3, nodeName: "#text", textContent: text, parentNode: parent, parentElement: parent, ...(inside ? { mainVersion } : {}), get isConnected() { return inside ? nodes.main.contains(this) : true; } };
+		};
+		const startInside = position === "inside" || position === "leaving";
+		const endInside = position === "inside" || position === "entering";
+		if (startInside || endInside) assert.match(mainHtml, /summary/);
+		selectedRange = {
+			startContainer: textNode(startInside, startInside ? "summary" : "outside before"),
+			endContainer: textNode(endInside, endInside ? "body" : "outside after"),
+			startOffset: 1, endOffset: 3, collapsed: false, text: "selected issue text",
+			get commonAncestorContainer() { return position === "inside" ? nodes.main : body; },
+			intersectsNode(node) { return !this.collapsed && position !== "outside" && (node === nodes.main || nodes.main.contains(node)); },
+			toString() { return this.collapsed ? "" : this.text; },
+		};
+		listeners.selectionchange?.({ target: document });
+		return selectedRange;
+	};
+	const collapseSelection = async () => {
+		selectedRange.startContainer = selectedRange.endContainer;
+		selectedRange.startOffset = selectedRange.endOffset;
+		selectedRange.collapsed = true;
+		listeners.selectionchange?.({ target: document });
+		await tick();
+	};
 	// This models the event handoff only; a real browser must prove native Space activation.
 	let spaceTarget = null;
 	const spaceDown = () => {
@@ -80,7 +130,7 @@ function harness() {
 		if (target === spaceTarget && target.isConnected) listeners.click({ target });
 		spaceTarget = null;
 	};
-	return { nodes, requests, respond, key, click, pointer, finishPointer, focusCategory, blurCategory, changeCategory, focusControl, blurFocus, spaceDown, spaceUp, get activeElement() { return document.activeElement; }, poll: () => poll(), tab: (view) => tabs.find((tab) => tab.dataset.view === view).onclick(), category: (value) => { nodes.cat.value = value; listeners.change({ target: { id: "cat", value, dataset: {} } }); } };
+	return { nodes, requests, respond, key, click, clickControl, pointer, finishPointer, focusCategory, blurCategory, changeCategory, focusControl, blurFocus, spaceDown, spaceUp, selectText, collapseSelection, selection, get mainVersion() { return mainVersion; }, get activeElement() { return document.activeElement; }, poll: () => poll(), tab: (view) => tabs.find((tab) => tab.dataset.view === view).onclick(), category: (value) => { nodes.cat.value = value; listeners.change({ target: { id: "cat", value, dataset: {} } }); } };
 }
 
 for (const view of ["inbox", "decided", "all"]) {
@@ -481,4 +531,119 @@ test("an overlapping successful mutation cannot erase another operation's failur
 	await ui.respond(ui.requests[2]);
 	await ui.respond(ui.requests[3], snapshot([issue(10)]));
 	assert.match(ui.nodes.status.innerHTML, /Operation failed:.*disk full/);
+});
+
+for (const action of ["prio", "allnone"]) {
+	for (const focus of ["button focus", "select-to-button focus handoff"]) {
+		for (const completion of ["POST and state before release timer", "POST before and state after release timer", "POST and state after release timer"]) {
+			test(`a pointer ${action} with ${focus} completes ${completion} and permits subsequent decisions`, async () => {
+				const ui = harness();
+				await ui.respond(ui.requests[0], snapshot([issue(10)]));
+				if (focus === "select-to-button focus handoff") {
+					ui.poll();
+					ui.focusCategory(10);
+					await ui.respond(ui.requests[1], snapshot([issue(99)]));
+				}
+				ui.pointer("pointerdown");
+				let control;
+				const focusButton = () => { control = ui.focusControl("BUTTON", action === "prio" ? { act: action, n: "10", p: "p0" } : { act: action }); };
+				if (focus === "select-to-button focus handoff") await ui.blurCategory(focusButton);
+				else focusButton();
+				ui.pointer("pointerup");
+				await tick();
+				assert.equal(ui.activeElement, control, "Pointer activation leaves its button focused");
+				const mutationIndex = ui.requests.length;
+				ui.clickControl(control);
+				assert.equal(ui.requests.length, mutationIndex + 1);
+				assert.equal(ui.requests[mutationIndex].path, "/api/decide");
+				assert.deepEqual(ui.requests[mutationIndex].body, action === "prio" ? { number: 10, priority: "p0" } : { numbers: [10], priority: "none" });
+				assert.equal(control.isConnected, true, "The click target stays mounted through the pointer handoff");
+				const decided = issue(10); decided.decision = { priority: action === "prio" ? "p0" : "none" };
+				if (completion === "POST and state after release timer") {
+					await ui.finishPointer();
+					assert.match(ui.nodes.main.innerHTML, /data-act="prio" data-p="p0" data-n="10" disabled/, "Pending decisions must render disabled after the handoff even while the button had focus");
+				}
+				await ui.respond(ui.requests[mutationIndex]);
+				assert.equal(ui.requests[mutationIndex + 1].path, "/api/state");
+				if (completion === "POST before and state after release timer") {
+					await ui.finishPointer();
+					assert.match(ui.nodes.main.innerHTML, /data-act="prio" data-p="p0" data-n="10" disabled/);
+				}
+				await ui.respond(ui.requests[mutationIndex + 1], snapshot([decided, issue(20)]));
+				if (completion === "POST and state before release timer") {
+					assert.equal(control.isConnected, true, "An early authoritative response must still wait for the pointer handoff");
+					await ui.finishPointer();
+				}
+				assert.match(ui.nodes.main.innerHTML, /Issue 20/, "Authoritative decision state must install without clicking outside main");
+				assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 10|Issue 99|data-n="20" disabled/);
+				for (const number of [20, 30]) {
+					ui.pointer("pointerdown");
+					const next = ui.focusControl("BUTTON", { act: "prio", n: String(number), p: "p1" });
+					ui.pointer("pointerup");
+					const nextIndex = ui.requests.length;
+					ui.clickControl(next);
+					assert.equal(ui.requests.length, nextIndex + 1, "Each later focused pointer decision must submit");
+					assert.deepEqual(ui.requests[nextIndex].body, { number, priority: "p1" });
+					await ui.finishPointer();
+					await ui.respond(ui.requests[nextIndex]);
+					assert.equal(ui.requests[nextIndex + 1].path, "/api/state");
+					const updated = issue(number); updated.decision = { priority: "p1" };
+					await ui.respond(ui.requests[nextIndex + 1], snapshot([updated, issue(number + 10)]));
+					assert.match(ui.nodes.main.innerHTML, new RegExp(`Issue ${number + 10}`));
+					assert.doesNotMatch(ui.nodes.main.innerHTML, new RegExp(`data-n="${number + 10}" disabled`));
+				}
+			});
+		}
+	}
+}
+
+for (const arrival of ["during drag", "after drag"]) {
+	for (const position of ["inside", "entering", "leaving"]) {
+		for (const release of ["collapse", "outside selection"]) {
+			test(`a poll ${arrival} preserves a noncollapsed ${position} main selection until ${release}`, async () => {
+				const ui = harness();
+				await ui.respond(ui.requests[0], snapshot([issue(10)]));
+				ui.pointer("pointerdown");
+				const range = ui.selectText(position);
+				const start = range.startContainer, end = range.endContainer;
+				const version = ui.mainVersion, markup = ui.nodes.main.innerHTML;
+				if (arrival === "after drag") await ui.finishPointer("pointerup");
+				ui.poll();
+				assert.equal(ui.requests[1].path, "/api/state");
+				await ui.respond(ui.requests[1], snapshot([issue(20)]));
+				assert.equal(ui.mainVersion, version, "Polling must not replace DOM intersected by the selection");
+				if (arrival === "during drag") await ui.finishPointer("pointerup");
+				assert.equal(ui.mainVersion, version, "Pointer release must not end text-selection protection");
+				assert.equal(ui.nodes.main.innerHTML, markup);
+				assert.equal(ui.selection.getRangeAt(0), range);
+				assert.equal(range.startContainer, start);
+				assert.equal(range.endContainer, end);
+				assert.equal(range.startOffset, 1);
+				assert.equal(range.endOffset, 3);
+				assert.equal(start.isConnected, true);
+				assert.equal(end.isConnected, true);
+				assert.equal(ui.selection.isCollapsed, false);
+				assert.equal(ui.selection.toString(), "selected issue text", "Copyable selected text must survive the poll and drag end");
+				ui.poll();
+				await ui.respond(ui.requests[2], snapshot([issue(30)]));
+				assert.equal(ui.mainVersion, version, "Later polls remain deferred while the range intersects main");
+				if (release === "collapse") await ui.collapseSelection();
+				else { ui.selectText("outside"); await tick(); }
+				assert.match(ui.nodes.main.innerHTML, /Issue 30/, "selectionchange must flush the latest deferred snapshot");
+				assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 10|Issue 20/);
+			});
+		}
+	}
+}
+
+test("a noncollapsed selection outside main does not defer a poll", async () => {
+	const ui = harness();
+	await ui.respond(ui.requests[0], snapshot([issue(10)]));
+	const range = ui.selectText("outside");
+	ui.poll();
+	await ui.respond(ui.requests[1], snapshot([issue(20)]));
+	assert.match(ui.nodes.main.innerHTML, /Issue 20/);
+	assert.equal(ui.selection.getRangeAt(0), range);
+	assert.equal(ui.selection.isCollapsed, false);
+	assert.equal(ui.selection.toString(), "selected issue text");
 });

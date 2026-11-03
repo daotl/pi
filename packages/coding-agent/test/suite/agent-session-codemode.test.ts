@@ -2,6 +2,8 @@ import * as fs from "node:fs";
 import { accessSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantImages,
@@ -20,6 +22,11 @@ import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ToolDefinition } from "../../src/core/extensions/types.ts";
 import { type CustomEntry, SessionManager } from "../../src/core/session-manager.ts";
+import {
+	adoptToolUsageManager,
+	createToolUsageRecorderFactory,
+	releaseToolUsageManager,
+} from "../../src/core/tool-usage-binding.ts";
 import { createReadTool } from "../../src/core/tools/read.ts";
 import { createToolDefinitionFromAgentTool } from "../../src/core/tools/tool-definition-wrapper.ts";
 import { getUsageCostBreakdown, getUsageTotals } from "../../src/core/usage-totals.ts";
@@ -935,6 +942,39 @@ describe("codemode models", () => {
 	}
 
 	const questions = `{ approved: { type: "bool", instructions: "Approval?", criteria: { true: "yes", false: "no" } } }`;
+
+	it("strongly retains an in-flight in-memory receipt sink after its session owner is released", async () => {
+		setFlagsFromString("--expose-gc");
+		let collect: () => void;
+		try {
+			collect = runInNewContext("gc");
+		} finally {
+			setFlagsFromString("--no-expose-gc");
+		}
+		const { managerRef, sessionId, parentId, record } = (() => {
+			const manager = SessionManager.inMemory();
+			const parentId = manager.appendMessage({ role: "user", content: "paid dispatch", timestamp: 0 });
+			const owner = adoptToolUsageManager(manager);
+			const record = createToolUsageRecorderFactory(owner)();
+			releaseToolUsageManager(owner);
+			return { managerRef: new WeakRef(manager), sessionId: manager.getSessionId(), parentId, record };
+		})();
+		// A task boundary clears WeakRef's same-job keep-alive before exercising real collection.
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const nextTask = Promise.withResolvers<void>();
+			setImmediate(nextTask.resolve);
+			await nextTask.promise;
+			collect();
+		}
+		const retained = managerRef.deref();
+		expect(retained, "an unresolved paid call must retain its in-memory receipt destination").toBeDefined();
+		expect(() => record("codemode", "scorer", "judge", usage(300, 0.001))).not.toThrow();
+		expect(retained?.getSessionId()).toBe(sessionId);
+		expect(retained?.getEntries().filter((entry) => entry.type === "usage")).toEqual([
+			expect.objectContaining({ parentId, provider: "scorer", model: "judge", usage: usage(300, 0.001) }),
+		]);
+		expect(getUsageTotals(retained?.getEntries() ?? []).cost).toBe(0.001);
+	});
 
 	it("runs the model help examples without file-reading tools", async () => {
 		const { harness, observed, imageRequests } = await setup();

@@ -51,6 +51,7 @@ import {
 	type ModelTypeMap,
 	type MutableModels,
 	normalizeContext,
+	observeModelRequest,
 	type Provider,
 	type ProviderHeaders,
 	type ProviderRequestOptions,
@@ -739,7 +740,7 @@ export class ModelRuntime implements Models {
 				);
 				return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
 			},
-			undefined,
+			observeModelRequest(model, options, false),
 			options?.signal,
 		);
 	}
@@ -786,7 +787,7 @@ export class ModelRuntime implements Models {
 				const prepared = await this.prepareRequest(model, options);
 				return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
 			},
-			undefined,
+			observeModelRequest(model, options, false),
 			options?.signal,
 		);
 	}
@@ -810,7 +811,7 @@ export class ModelRuntime implements Models {
 				}
 				return prepared.provider.fetchDeferred(prepared.model, handle, prepared.options as DeferredFetchOptions);
 			},
-			undefined,
+			observeModelRequest(model, options, true),
 			options?.signal,
 		);
 	}

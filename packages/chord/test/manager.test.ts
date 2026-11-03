@@ -154,7 +154,7 @@ describe("processLock", () => {
 describe("host manager forced tree cleanup", () => {
 	it.skipIf(process.platform !== "win32")(
 		"invalid inherited CRT layout and parent loss before launch cannot run application code",
-		() => {
+		async () => {
 			const marker = scratch("invalid-native-start");
 			const job = createWindowsJob();
 			onTestFinished(() => {
@@ -170,13 +170,43 @@ describe("host manager forced tree cleanup", () => {
 			assert.equal(invalid.status, 125);
 			assert.throws(() => readFileSync(marker), { code: "ENOENT" });
 			job.close();
-			// Closing the sole owner models kernel handle close on parent loss before launcher OpenJobObject.
-			const lost = spawnSync(job.launcher, [process.execPath, "-e", script], {
-				env: { ...process.env, CHORD2_WINDOWS_JOB: job.name },
-				stdio: "ignore",
-			});
-			assert.equal(lost.status, 125);
-			assert.throws(() => readFileSync(marker), { code: "ENOENT" });
+			const markerEntry = fileURLToPath(new URL("./fixtures/job-marker.cjs", import.meta.url));
+			for (const ownerLive of [true, false]) {
+				const owner = createWindowsJob();
+				onTestFinished(() => owner.close());
+				if (!ownerLive) owner.close();
+				const child = fork(markerEntry, [marker], {
+					execPath: owner.launcher,
+					execArgv: [process.execPath],
+					env: { ...process.env, CHORD2_WINDOWS_JOB: owner.name },
+					detached: true,
+					stdio: ["ignore", "ignore", "inherit", "ipc"],
+				});
+				onTestFinished(() => terminate(child));
+				const exited = Promise.withResolvers<number | null>();
+				let acknowledgment: unknown;
+				child.once("error", exited.reject);
+				child.once("message", (message) => {
+					acknowledgment = message;
+				});
+				child.once("exit", (code) => exited.resolve(code));
+				if (ownerLive) {
+					assert.ok(child.pid);
+					assert.ok(owner.launched(child.pid) > 0);
+					assert.equal(await exited.promise, 0);
+					assert.equal(
+						acknowledgment,
+						"written",
+						"the genuine fork IPC channel delivers the marker acknowledgment",
+					);
+					assert.equal(readFileSync(marker, "utf8"), "ran");
+					rmSync(marker);
+					owner.close();
+				} else {
+					assert.equal(await exited.promise, 125);
+					assert.throws(() => readFileSync(marker), { code: "ENOENT" });
+				}
+			}
 		},
 	);
 

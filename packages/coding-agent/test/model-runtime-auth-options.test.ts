@@ -1,4 +1,7 @@
 import {
+	type AssistantMessage,
+	type AssistantMessageEvent,
+	type AuthResult,
 	type AuthType,
 	type CredentialStore,
 	createAssistantMessageEventStream,
@@ -6,6 +9,7 @@ import {
 	InMemoryCredentialStore,
 	type Model,
 } from "@earendil-works/pi-ai";
+import { InMemoryTelemetryContext } from "@earendil-works/pi-telemetry";
 import { describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
@@ -77,20 +81,36 @@ describe("ModelRuntime auth options", () => {
 					api: { stream: respond, streamSimple: respond, fetchDeferred: respond },
 				}),
 			);
+			const telemetry = new InMemoryTelemetryContext();
 			const controller = new AbortController();
-			const options = { signal: controller.signal };
-			const stream =
-				method === "streamDeferred"
-					? runtime.streamDeferred(
-							model,
-							{ api: model.api, provider: model.provider, modelId: model.id, id: "pending" },
-							options,
-						)
-					: runtime[method](model, { messages: [] }, options);
-			await started;
-			controller.abort(new Error("cancelled during auth"));
-			expect((await stream.result()).stopReason).toBe("aborted");
+			const result = await telemetry.startSpan({ name: "caller" }, async (parent) => {
+				const options = { signal: controller.signal, telemetry: parent };
+				const stream =
+					method === "streamDeferred"
+						? runtime.streamDeferred(
+								model,
+								{ api: model.api, provider: model.provider, modelId: model.id, id: "pending" },
+								options,
+							)
+						: runtime[method](model, { messages: [] }, options);
+				await started;
+				controller.abort(new Error("private-cancellation-reason"));
+				return stream.result();
+			});
+			expect(result.stopReason).toBe("aborted");
 			expect(respond).not.toHaveBeenCalled();
+			await vi.waitFor(() => expect(telemetry.getSpans().every((span) => span.settled)).toBe(true));
+			expect(telemetry.getSpans()).toHaveLength(2);
+			const [parent, span] = telemetry.getSpans();
+			expect(span.name).toBe(method === "streamDeferred" ? "pi.ai.poll" : "pi.ai.request");
+			expect(span.parentId).toBe(parent.id);
+			expect(span.status).toEqual({ status: "ok" });
+			expect(span.attributes.stop).toBe("aborted");
+			expect(span.events).toEqual([{ name: "pi.ai.first_chunk", attributes: {} }]);
+			expect(JSON.stringify(span)).not.toContain("private-cancellation-reason");
+			expect(
+				telemetry.getMetrics().find((metric) => metric.name === "pi.ai.request.duration")?.attributes.stop,
+			).toBe("aborted");
 		},
 	);
 
@@ -389,5 +409,257 @@ describe("ModelRuntime auth options", () => {
 			provider: { id: "extension-oauth", name: "Extension OAuth" },
 			method: { name: "Extension subscription", isSubscription: true },
 		});
+	});
+});
+
+describe("ModelRuntime request telemetry", () => {
+	const model: Model<"runtime-telemetry"> = {
+		...testModel("physical-model"),
+		provider: "runtime-telemetry-provider",
+		api: "runtime-telemetry",
+		baseUrl: "https://example.test/v1",
+		reasoning: true,
+	};
+	const handle = { api: model.api, provider: model.provider, modelId: model.id, id: "private-deferred-handle" };
+
+	function message(stopReason: AssistantMessage["stopReason"] = "stop"): AssistantMessage {
+		return {
+			role: "assistant",
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			content: [{ type: "text", text: "private-answer" }],
+			usage: {
+				input: 11,
+				output: 22,
+				cacheRead: 33,
+				cacheWrite: 44,
+				totalTokens: 110,
+				cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1 },
+			},
+			responseId: "response",
+			stopReason,
+			timestamp: 1,
+		};
+	}
+
+	async function setup(result = message(), resolve: () => Promise<AuthResult> = async () => ({ auth: {} })) {
+		const runtime = await ModelRuntime.create({
+			credentials: new InMemoryCredentialStore(),
+			modelsPath: null,
+			refreshOnCreate: false,
+			allowModelNetwork: false,
+		});
+		const streamEvents: AssistantMessageEvent[] = [
+			{ type: "start", partial: result },
+			{ type: "text_delta", contentIndex: 0, delta: "private-answer", partial: result },
+			{ type: "text_end", contentIndex: 0, content: "private-answer", partial: result },
+			{
+				type: "done",
+				reason: result.stopReason === "pending" || result.stopReason === "deferred" ? "deferred" : "stop",
+				message: result,
+			},
+		];
+		const respond = vi.fn(() => {
+			const stream = createAssistantMessageEventStream();
+			for (const event of streamEvents) stream.push(event);
+			stream.end(result);
+			return stream;
+		});
+		runtime.registerNativeProvider(
+			createProvider({
+				id: model.provider,
+				models: [model],
+				auth: { apiKey: { name: "Test", check: async () => ({ type: "api_key" }), resolve } },
+				api: { stream: respond, streamSimple: respond, fetchDeferred: respond },
+			}),
+		);
+		return { runtime, respond, streamEvents };
+	}
+
+	it.each([
+		["stream", true],
+		["streamSimple", true],
+		["streamDeferred", true],
+		["stream", false],
+		["streamSimple", false],
+		["streamDeferred", false],
+	] as const)("records %s telemetry with unchanged results (consume=%s)", async (method, consume) => {
+		const telemetry = new InMemoryTelemetryContext();
+		const result = message();
+		const { runtime, respond, streamEvents } = await setup(result);
+		await telemetry.startSpan({ name: "caller" }, async (parent) => {
+			const stream =
+				method === "streamDeferred"
+					? runtime.streamDeferred(model, handle, { telemetry: parent })
+					: runtime[method](model, { messages: [] }, { telemetry: parent, reasoning: "high" });
+			if (consume) {
+				const received: AssistantMessageEvent[] = [];
+				for await (const event of stream) received.push(event);
+				expect(received).toEqual(streamEvents);
+				for (const [index, event] of received.entries()) expect(event).toBe(streamEvents[index]);
+			}
+			expect(await stream.result()).toBe(result);
+		});
+		expect(respond).toHaveBeenCalledTimes(1);
+		await vi.waitFor(() => expect(telemetry.getSpans().every((span) => span.settled)).toBe(true));
+		expect(telemetry.getSpans()).toHaveLength(2);
+		const [parent, span] = telemetry.getSpans();
+		expect(span.name).toBe(method === "streamDeferred" ? "pi.ai.poll" : "pi.ai.request");
+		expect(span.parentId).toBe(parent.id);
+		expect(span.status).toEqual({ status: "ok" });
+		expect(span.attributes).toEqual({
+			provider: model.provider,
+			api: model.api,
+			model: model.id,
+			...(method === "streamDeferred" ? {} : { reasoning: "high" }),
+			stop: "stop",
+			"usage.input": 11,
+			"usage.output": 22,
+			"usage.cache_read": 33,
+			"usage.cache_write": 44,
+			"cost.total": 1,
+			"response.id": "response",
+		});
+		expect(span.events).toEqual([
+			{ name: "pi.ai.first_chunk", attributes: {} },
+			{ name: "pi.ai.block", attributes: { type: "text", index: 0, chars: 14 } },
+		]);
+		expect(JSON.stringify(span)).not.toMatch(/private-answer|private-deferred-handle/);
+		const metrics = telemetry.getMetrics();
+		expect(metrics).toHaveLength(7);
+		expect(
+			metrics
+				.filter((metric) => metric.name === "pi.ai.tokens")
+				.map(({ value, attributes }) => ({ value, attributes })),
+		).toEqual([
+			{ value: 11, attributes: { provider: model.provider, model: model.id, kind: "input" } },
+			{ value: 22, attributes: { provider: model.provider, model: model.id, kind: "output" } },
+			{ value: 33, attributes: { provider: model.provider, model: model.id, kind: "cache_read" } },
+			{ value: 44, attributes: { provider: model.provider, model: model.id, kind: "cache_write" } },
+		]);
+		expect(metrics.find((metric) => metric.name === "pi.ai.cost")).toMatchObject({
+			kind: "counter",
+			value: 1,
+			attributes: { provider: model.provider, model: model.id },
+		});
+		for (const metric of metrics.filter((metric) => metric.kind === "histogram")) {
+			expect(metric.value).toBeGreaterThanOrEqual(0);
+			expect(metric.context).toEqual(span.context);
+		}
+		expect(metrics.filter((metric) => metric.kind === "histogram").map((metric) => metric.name)).toEqual([
+			"pi.ai.first_chunk.duration",
+			"pi.ai.request.duration",
+		]);
+	});
+
+	it.each(["stream", "streamSimple", "streamDeferred"] as const)(
+		"records %s authentication failures before provider dispatch",
+		async (method) => {
+			const telemetry = new InMemoryTelemetryContext();
+			const { runtime, respond } = await setup(message(), async () => {
+				throw new Error("authentication failed");
+			});
+			const result = await telemetry.startSpan({ name: "caller" }, (parent) => {
+				const options = { telemetry: parent };
+				return (
+					method === "streamDeferred"
+						? runtime.streamDeferred(model, handle, options)
+						: runtime[method](model, { messages: [] }, options)
+				).result();
+			});
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toBe(`API key auth failed for provider ${model.provider}: authentication failed`);
+			expect(respond).not.toHaveBeenCalled();
+			await vi.waitFor(() => expect(telemetry.getSpans().every((span) => span.settled)).toBe(true));
+			expect(telemetry.getSpans()).toHaveLength(2);
+			const [parent, span] = telemetry.getSpans();
+			expect(span.name).toBe(method === "streamDeferred" ? "pi.ai.poll" : "pi.ai.request");
+			expect(span.parentId).toBe(parent.id);
+			expect(span.attributes.stop).toBe("error");
+			expect(span.status).toEqual({
+				status: "error",
+				error: { name: "provider_error", message: result.errorMessage },
+			});
+			expect(span.events).toEqual([{ name: "pi.ai.first_chunk", attributes: {} }]);
+			expect(JSON.stringify(span.attributes)).not.toContain("API key auth failed");
+			expect(JSON.stringify(span.events)).not.toContain("API key auth failed");
+			expect(
+				telemetry.getMetrics().find((metric) => metric.name === "pi.ai.request.duration")?.attributes.stop,
+			).toBe("error");
+		},
+	);
+
+	it.each(["pending", "deferred"] as const)(
+		"records each %s poll without counting provisional usage",
+		async (stopReason) => {
+			const telemetry = new InMemoryTelemetryContext();
+			const result = message(stopReason);
+			const { runtime, respond } = await setup(result);
+			await telemetry.startSpan({ name: "caller" }, async (parent) => {
+				expect(await runtime.fetchDeferred(model, handle, { telemetry: parent })).toBe(result);
+				expect(await runtime.fetchDeferred(model, handle, { telemetry: parent })).toBe(result);
+			});
+			expect(respond).toHaveBeenCalledTimes(2);
+			await vi.waitFor(() => expect(telemetry.getSpans().every((span) => span.settled)).toBe(true));
+			expect(telemetry.getSpans()).toHaveLength(3);
+			const [parent, ...polls] = telemetry.getSpans();
+			for (const poll of polls) {
+				expect(poll.name).toBe("pi.ai.poll");
+				expect(poll.parentId).toBe(parent.id);
+				expect(poll.attributes.stop).toBe(stopReason);
+			}
+			expect(telemetry.getMetrics().map((metric) => metric.name)).toEqual([
+				"pi.ai.first_chunk.duration",
+				"pi.ai.request.duration",
+				"pi.ai.first_chunk.duration",
+				"pi.ai.request.duration",
+			]);
+		},
+	);
+
+	it("records a virtual request exactly once against the routed physical model", async () => {
+		const telemetry = new InMemoryTelemetryContext();
+		const result = message();
+		const { runtime, respond } = await setup(result);
+		runtime.registerVirtualModel({
+			provider: "telemetry-router",
+			id: "auto",
+			name: "Auto",
+			thinkingLevels: ["high"],
+			route: () => ({ model, thinkingLevel: "high" }),
+		});
+		await runtime.refresh({ allowNetwork: false });
+		const virtual = runtime.getModel("telemetry-router", "auto");
+		expect(virtual).toBeDefined();
+		expect(
+			await telemetry.startSpan({ name: "caller" }, (parent) =>
+				runtime.completeSimple(virtual!, { messages: [] }, { telemetry: parent, reasoning: "high" }),
+			),
+		).toBe(result);
+		expect(respond).toHaveBeenCalledTimes(1);
+		await vi.waitFor(() => expect(telemetry.getSpans().every((span) => span.settled)).toBe(true));
+		expect(telemetry.getSpans()).toHaveLength(2);
+		const [parent, span] = telemetry.getSpans();
+		expect(span.name).toBe("pi.ai.request");
+		expect(span.parentId).toBe(parent.id);
+		expect(span.attributes).toMatchObject({
+			provider: model.provider,
+			api: model.api,
+			model: model.id,
+			reasoning: "high",
+		});
+		expect(telemetry.getMetrics()).toHaveLength(7);
+		expect(
+			telemetry
+				.getMetrics()
+				.every((metric) => metric.attributes.provider === model.provider && metric.attributes.model === model.id),
+		).toBe(true);
+		expect(
+			telemetry
+				.getMetrics()
+				.filter((metric) => metric.name === "pi.ai.cost")
+				.map((metric) => metric.value),
+		).toEqual([1]);
 	});
 });

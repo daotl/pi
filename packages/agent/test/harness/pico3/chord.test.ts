@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { createHost, memoryLinkPair, replicatedState } from "@earendil-works/chord";
-import { onTestFinished, test } from "vitest";
+import { applyImmutable } from "@earendil-works/chord/delta";
+import {
+	type AssistantMessage,
+	type AssistantMessageEvent,
+	fauxAssistantMessage,
+	type ToolCall,
+} from "@earendil-works/pi-ai";
+import { onTestFinished, test, vi } from "vitest";
 import {
 	attachChordView,
 	createPicoConversationService,
@@ -10,8 +17,8 @@ import {
 } from "../../../src/harness/pico3/chord.ts";
 import { Harness } from "../../../src/harness/pico3/harness.ts";
 import { MemoryStorage } from "../../../src/harness/pico3/memory.ts";
-import type { Envelope, JsonObject } from "../../../src/harness/pico3/types.ts";
-import { ctx, fake, open, sleep } from "./helpers.ts";
+import type { Envelope, JsonObject, Models } from "../../../src/harness/pico3/types.ts";
+import { ctx, fake, Gate, open, sleep, tool } from "./helpers.ts";
 
 test("conversation observation reports loaded and newly committed conversations off the Session line", async () => {
 	const env = await open({});
@@ -320,6 +327,184 @@ test("native Chord conversation objects retain keyed config and conversation sco
 	assert.equal(second.view.value.conversation.id, child.id);
 });
 
+test.each([16 * 1024, 64 * 1024])(
+	"native Chord streaming retains raw revisions without adding prefix scans beyond the %i-character source baseline",
+	async (prefixSize) => {
+		const marker = `native-raw-${prefixSize}:`;
+		const chunks = [
+			marker + "x".repeat(prefixSize - marker.length),
+			...Array.from({ length: 8 }, () => "y".repeat(256)),
+		];
+		const gates = chunks.map(() => new Gate());
+		const finish = new Gate();
+		const progress = chunks.map(() => Promise.withResolvers<void>());
+		const modelsFor = (streamGates: Gate[], streamFinish: Gate): Models => {
+			const fallback = fake({ respond: () => ({ text: "finished" }) });
+			let requests = 0;
+			return {
+				...fallback,
+				async *stream(model, request, context): AsyncIterable<AssistantMessageEvent> {
+					if (requests++ > 0) {
+						yield* fallback.stream(model, request, context);
+						return;
+					}
+					const partial: AssistantMessage = {
+						...fauxAssistantMessage(""),
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						content: [],
+					};
+					yield { type: "start", partial };
+					const call: ToolCall = { type: "toolCall", id: "native-raw-call", name: "write", arguments: {} };
+					partial.content = [call];
+					yield { type: "toolcall_start", contentIndex: 0, partial };
+					for (const [index, rawDelta] of chunks.entries()) {
+						await streamGates[index]!.wait(context);
+						call.raw = (call.raw ?? "") + rawDelta;
+						// JSON whitespace reaches the generation size flush; raw tokens are independent of JSON arguments.
+						yield { type: "toolcall_delta", contentIndex: 0, delta: " ".repeat(256), rawDelta, partial };
+					}
+					await streamFinish.wait(context);
+					call.arguments = { v: "ok" };
+					yield { type: "toolcall_end", contentIndex: 0, toolCall: call, partial };
+					yield { type: "done", reason: "toolUse", message: { ...partial, stopReason: "toolUse" } };
+				},
+			};
+		};
+		const countPrefixReads = async (run: () => Promise<void>) => {
+			const reads: number[] = [];
+			const slice = String.prototype.slice;
+			const spy = vi.spyOn(String.prototype, "slice").mockImplementation(function (
+				this: string,
+				start?: number,
+				end?: number,
+			) {
+				if (start === 0 && end !== undefined && end >= prefixSize && this.length > end && this.startsWith(marker))
+					reads.push(end);
+				return slice.call(this, start, end);
+			});
+			try {
+				await run();
+			} finally {
+				spy.mockRestore();
+			}
+			return { reads: reads.length, characters: reads.reduce((total, length) => total + length, 0) };
+		};
+		const lengths = chunks.map((_, index) => chunks.slice(0, index + 1).join("").length);
+		const sourceGates = chunks.map(() => new Gate());
+		const sourceFinish = new Gate();
+		const sourceProgress = chunks.map(() => Promise.withResolvers<void>());
+		const source = await open({ models: modelsFor(sourceGates, sourceFinish), tools: [tool("write")] });
+		onTestFinished(async () => {
+			for (const gate of sourceGates) gate.open();
+			sourceFinish.open();
+			await source.close();
+		});
+		const sourceWatch = await source.root.watch(ctx);
+		onTestFinished(() => sourceWatch.stop());
+		let sourceView = sourceWatch.view;
+		sourceWatch.start((envelope) => {
+			sourceView = applyImmutable(sourceView, envelope.ops);
+			const block = sourceView.turn?.message?.content[0];
+			if (block?.type !== "toolCall") return;
+			const index = lengths.indexOf(block.raw?.length ?? 0);
+			if (index >= 0) sourceProgress[index]!.resolve();
+		});
+		const sourcePrefixReads = await countPrefixReads(async () => {
+			const input = await source.root.send({ content: "stream raw tool tokens" }, ctx);
+			for (const [index, gate] of sourceGates.entries()) {
+				gate.open();
+				await sourceProgress[index]!.promise;
+				const block = sourceView.turn?.message?.content[0];
+				assert.ok(block?.type === "toolCall");
+				assert.equal(block.raw, chunks.slice(0, index + 1).join(""));
+			}
+			sourceFinish.open();
+			assert.equal((await input.wait(ctx)).status, "done");
+			await source.root.waitForIdle(ctx);
+			await sleep(0);
+		});
+		const env = await open({ models: modelsFor(gates, finish), tools: [tool("write")] });
+		const provider = createHost({ name: "harness", self: null });
+		const client = createHost({ name: "presentation", kind: "client", self: null });
+		onTestFinished(async () => {
+			for (const gate of gates) gate.open();
+			finish.open();
+			await client.close();
+			await provider.close();
+			await env.close();
+		});
+		await provider.install(createPicoHarnessFacet(env.h));
+		const [up, down] = memoryLinkPair();
+		provider.accept(down, { principal: null });
+		client.connect(up, { principal: null });
+		const ref = await client.get(PicoConversationService, { conversationId: env.root.id });
+		onTestFinished(() => ref.release());
+		const held = ref.view;
+		const raw = await env.root.watch(ctx);
+		onTestFinished(() => raw.stop());
+		const envelopes: Envelope[] = [];
+		raw.start((envelope) => envelopes.push(envelope));
+		const deliveries: PublishedConversationView[] = [];
+		let replica = held.value;
+		const replicas: PublishedConversationView[] = [];
+		onTestFinished(
+			held.events((event) => {
+				if (event.type === "snap") return;
+				replica = event.type === "ops" ? applyImmutable(replica, event.ops) : event.value;
+				replicas.push(replica);
+				const value = event.value;
+				deliveries.push(value);
+				const block = value.turn?.message?.content[0];
+				if (block?.type !== "toolCall") return;
+				const index = lengths.indexOf(block.raw?.length ?? 0);
+				if (index >= 0) progress[index]!.resolve();
+			}),
+		);
+		const retained: PublishedConversationView[] = [];
+		const nativePrefixReads = await countPrefixReads(async () => {
+			const input = await env.root.send({ content: "stream raw tool tokens" }, ctx);
+			for (const [index, gate] of gates.entries()) {
+				gate.open();
+				await progress[index]!.promise;
+				const value = held.value;
+				const block = value.turn?.message?.content[0];
+				assert.ok(block?.type === "toolCall");
+				assert.equal(block.raw, chunks.slice(0, index + 1).join(""));
+				assert.deepEqual(value.publication, { status: "live" });
+				retained.push(value);
+			}
+			finish.open();
+			assert.equal((await input.wait(ctx)).status, "done");
+			await env.root.waitForIdle(ctx);
+			await sleep(0);
+		});
+		assert.equal(ref.view, held);
+		for (const [index, value] of retained.entries()) {
+			const block = value.turn?.message?.content[0];
+			assert.ok(block?.type === "toolCall");
+			assert.equal(block.raw, chunks.slice(0, index + 1).join(""), "published revisions remain immutable");
+		}
+		assert.equal(deliveries.length, envelopes.length, "one native publication per Pico envelope");
+		assert.deepEqual(replicas, deliveries, "native event batches reproduce each published revision in order");
+		assert.deepEqual(
+			deliveries.map((value) => value.commit.events),
+			envelopes.map(({ events }) => events),
+		);
+		const fresh = await env.root.watch(ctx);
+		fresh.stop();
+		const { commit: _commit, publication, ...published } = held.value;
+		assert.deepEqual(published, fresh.view);
+		assert.deepEqual(publication, { status: "live" });
+		assert.deepEqual(
+			nativePrefixReads,
+			sourcePrefixReads,
+			"native publication must add zero prefix scans or scanned characters beyond the source-only baseline",
+		);
+	},
+);
+
 test("remote conversation validation rejects malformed messages and edits without committing history", async () => {
 	const harness = await Harness.open(new MemoryStorage(), { models: fake({ respond: () => ({ text: "ok" }) }) }, ctx);
 	const root = await harness.root(ctx);
@@ -524,13 +709,24 @@ test("a wide namespace commit keeps held Chord views live through the tracker ro
 	onTestFinished(() => host.close());
 	await host.install(createPicoHarnessFacet(harness));
 	const ref = await host.get(PicoConversationService, { conversationId: conversation.id });
+	onTestFinished(() => ref.release());
+	const held = ref.view;
+	const initial = held.value;
 	const raw = await conversation.watch(ctx);
 	onTestFinished(() => raw.stop());
 	const envelopes: Envelope[] = [];
 	raw.start((envelope) => envelopes.push(envelope));
 	const deliveries: PublishedConversationView[] = [];
-	onTestFinished(ref.view.subscribe((value) => deliveries.push(structuredClone(value))));
-	deliveries.length = 0;
+	let replica = initial;
+	const replicas: PublishedConversationView[] = [];
+	onTestFinished(
+		held.events((event) => {
+			if (event.type === "snap") return;
+			replica = event.type === "ops" ? applyImmutable(replica, event.ops) : event.value;
+			replicas.push(replica);
+			deliveries.push(event.value);
+		}),
+	);
 	await conversation.commit((tx) => {
 		const slice = tx.plugins(namespace);
 		for (let index = 0; index < 4200; index++) slice[`field${index}`] = 1;
@@ -553,6 +749,19 @@ test("a wide namespace commit keeps held Chord views live through the tracker ro
 	next.stop();
 	const { commit: _nextCommit, publication: _nextPublication, ...nextPublished } = ref.view.value;
 	assert.deepEqual(nextPublished, next.view);
+	assert.equal(ref.view, held);
+	assert.equal((initial.plugins[namespace.id] as Record<string, number>).field0, 0);
+	assert.equal((deliveries[0]!.plugins[namespace.id] as Record<string, number>).field0, 1);
+	assert.equal(deliveries.length, envelopes.length);
+	assert.deepEqual(replicas, deliveries, "native root fallback and later event batches remain ordered");
+	assert.deepEqual(
+		deliveries.map((value) => value.commit.events),
+		envelopes.map((envelope) => envelope.events),
+	);
+	assert.deepEqual(
+		deliveries.map((value) => value.publication),
+		deliveries.map(() => ({ status: "live" })),
+	);
 });
 
 test("linked Pico writes preserve reserved JSON data names without aliasing or prototype pollution", async () => {

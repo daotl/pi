@@ -8,16 +8,19 @@ import {
 	type MutableReplicatedState,
 	method,
 	opaque,
+	type Readable,
 	type ReplicatedState,
 	remote,
 	replicatedState,
+	type StateEvent,
 } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
-import type { Op, Path, Seg } from "@earendil-works/chord/delta";
+import { appendText, type Op, type Path, type Seg } from "@earendil-works/chord/delta";
 import { ModelCostRatesSchema, ModelThinkingLevelSchema } from "@earendil-works/pi-ai/providers/model-schema";
 import { Type } from "typebox";
 import type { ConversationHandle, Harness } from "./harness.ts";
 import type {
+	AnyKind,
 	ConversationSpec,
 	ConversationView,
 	Entry,
@@ -55,7 +58,7 @@ export interface PicoConversationService {
 export const PicoHarnessService = local("pi.harness", {
 	version: 1,
 	input: Type.Object({}),
-	members: { harness: opaque<Harness>("pi.harness@1") },
+	members: { harness: opaque<Harness<readonly AnyKind[]>>("pi.harness@1") },
 });
 
 const IdSchema = Type.Integer({ minimum: 0 });
@@ -321,7 +324,7 @@ export const PicoConversationService = remote("pi.conversation", {
 });
 
 /** Host the durable harness and its keyed conversations through native Chord objects. */
-export function createPicoHarnessFacet(harness: Harness) {
+export function createPicoHarnessFacet<Ks extends readonly AnyKind[]>(harness: Harness<Ks>) {
 	return {
 		name: "pi.harness",
 		...defineFacet(({ serve }) => {
@@ -337,14 +340,29 @@ export function createPicoHarnessFacet(harness: Harness) {
 					},
 					close: (bridge) => bridge.close(),
 				});
+				let revision = -1;
 				const view = self.state("view", PicoConversationService.def.variants.conversation.state.view, {
-					init: () => source.value.view.value,
+					init: () => {
+						const initial = source.value.revisions.value;
+						revision = initial.revision;
+						return initial.value;
+					},
 				});
 				self.on(
 					"view",
 					source,
-					(bridge) => bridge.view,
-					(value, ctx) => view.replace(ctx, value),
+					(bridge) => bridge.revisions,
+					(frame, ctx) => {
+						const ops = frame.ops;
+						if (ops === null) {
+							// Subscription can follow commits made after init, or a resource rebind.
+							if (view.value !== frame.value) view.replace(ctx, frame.value, { diff: false });
+						} else {
+							if (frame.revision <= revision) return;
+							view.change(ctx, (draft) => applyTracked(draft, ops));
+						}
+						revision = frame.revision;
+					},
 				);
 				const conversation = async (ctx: Ctx) => {
 					const context = withAbortSignal(ctx.signal, BACKGROUND_CONTEXT);
@@ -397,8 +415,8 @@ export function createPicoHarnessFacet(harness: Harness) {
 	};
 }
 
-export function createPicoConversationService<Cfg extends object>(
-	harness: Pick<Harness, "abortInput" | "entries">,
+export function createPicoConversationService<Cfg extends object, Ks extends readonly AnyKind[]>(
+	harness: Pick<Harness<Ks>, "abortInput" | "entries">,
 	conversation: ConversationHandle<Cfg>,
 	view: ReplicatedState<PublishedConversationView>,
 ): PicoConversationService {
@@ -416,8 +434,18 @@ export function createPicoConversationService<Cfg extends object>(
 	};
 }
 
+/** One immutable bridge publication; null ops marks an immediate attachment snapshot. */
+export interface ChordViewRevision {
+	readonly revision: number;
+	readonly value: PublishedConversationView;
+	/** Known publication ops, including commit events, in application order. */
+	readonly ops: readonly Op[] | null;
+}
+
 export interface ChordViewBridge {
 	readonly view: MutableReplicatedState<PublishedConversationView>;
+	/** Current snapshot followed synchronously by every ordered publication, without value re-diffing. */
+	readonly revisions: Readable<ChordViewRevision>;
 	readonly closed: boolean;
 	close(): void;
 }
@@ -460,6 +488,45 @@ function bridgeWatch(
 	const queue: Envelope[] = [];
 	let scheduled = false;
 	let closed = false;
+	let current: ChordViewRevision = Object.freeze({ revision: watch.revision, value: view.value, ops: null });
+	const listeners = new Set<(frame: ChordViewRevision) => void>();
+	const eventListeners = new Set<(event: StateEvent<ChordViewRevision>) => void>();
+	const notify = <T>(listener: (value: T) => void, value: T) => {
+		try {
+			listener(value);
+		} catch (error) {
+			queueMicrotask(() => {
+				throw error;
+			});
+		}
+	};
+	const publish = (revision: number, ops: readonly Op[]) => {
+		const frame: ChordViewRevision = Object.freeze({ revision, value: view.value, ops: Object.freeze(ops) });
+		current = frame;
+		const values = [...listeners];
+		const events = [...eventListeners];
+		for (const listener of values) if (listeners.has(listener)) notify(listener, frame);
+		for (const listener of events) {
+			if (eventListeners.has(listener)) notify(listener, { type: "reset", value: frame });
+		}
+	};
+	const snapshot = (): ChordViewRevision =>
+		Object.freeze({ revision: current.revision, value: current.value, ops: null });
+	const revisions: Readable<ChordViewRevision> = {
+		get value() {
+			return snapshot();
+		},
+		subscribe(listener) {
+			listeners.add(listener);
+			notify(listener, snapshot());
+			return () => listeners.delete(listener);
+		},
+		events(listener) {
+			eventListeners.add(listener);
+			notify(listener, { type: "snap", value: snapshot() });
+			return () => eventListeners.delete(listener);
+		},
+	};
 	const fail = (cause: unknown) => {
 		if (closed) return;
 		closed = true;
@@ -471,6 +538,10 @@ function bridgeWatch(
 				draft.publication = { status: "failed", error: error.message };
 				draft.commit.events = [];
 			});
+			publish(current.revision + 1, [
+				["s", ["publication"], { status: "failed", error: error.message }],
+				["s", ["commit", "events"], []],
+			]);
 		} catch (publicationError) {
 			// The failure callback still receives the publication failure when even the terminal update cannot publish.
 			cause = publicationError;
@@ -483,11 +554,26 @@ function bridgeWatch(
 		scheduled = false;
 		while (!closed && queue.length > 0) {
 			const envelope = queue.shift()!;
+			const previous = current.value;
 			try {
 				view.change(ctx, (draft) => {
 					applyTracked(draft, envelope.ops);
 					draft.commit.events = envelope.events as Draft<ViewEvent[]>;
 				});
+				const ops: Op[] = envelope.ops.map((op) =>
+					op[0] === "r"
+						? [
+								"r",
+								{
+									...(op[1] as JsonObject),
+									commit: previous.commit,
+									publication: previous.publication,
+								} as unknown as JsonValue,
+							]
+						: op,
+				);
+				ops.push(["s", ["commit", "events"], envelope.events as unknown as JsonValue]);
+				publish(envelope.revision, ops);
 			} catch (error) {
 				fail(error);
 			}
@@ -510,6 +596,7 @@ function bridgeWatch(
 	});
 	return {
 		view,
+		revisions,
 		get closed() {
 			return closed;
 		},
@@ -571,8 +658,10 @@ function applyTracked(root: Draft<PublishedConversationView>, ops: readonly Op[]
 		}
 		const record = parent as Record<PropertyKey, unknown>;
 		if (op[0] === "s") record[key] = op[2];
-		else if (op[0] === "a") record[key] = `${String(record[key])}${op[2]}`;
-		else record[key] = String(record[key]).slice(op[2]);
+		else if (op[0] === "a") {
+			if (Array.isArray(parent)) record[key] = `${String(record[key])}${op[2]}`;
+			else appendText(parent as Draft<Record<string, string>>, String(key), op[2]);
+		} else record[key] = String(record[key]).slice(op[2]);
 	}
 }
 

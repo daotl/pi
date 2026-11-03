@@ -146,29 +146,45 @@
       let treeNodeMap = null;
 
       /**
-       * Find the newest leaf node reachable from a given node.
-       * This allows clicking any node in a branch to show the full branch.
-       * Children are sorted by timestamp, so the newest is always last.
+       * Find the newest continuation reachable from a given node.
+       * Detached usage-only subtrees do not replace conversation, state, or policy tails.
+       * Deliberately selected usage-only nodes remain available for receipt inspection.
        */
       function findNewestLeaf(nodeId) {
         // Build tree node map lazily
         if (!treeNodeMap) {
           treeNodeMap = new Map();
-          const stack = [...buildTree()];
-          while (stack.length > 0) {
-            const node = stack.pop();
+          const nodes = [...buildTree()];
+          for (let i = 0; i < nodes.length; i++) {
+            const node = nodes[i];
             treeNodeMap.set(node.entry.id, node);
-            for (const child of node.children) stack.push(child);
+            for (const child of node.children) nodes.push(child);
+          }
+          // Reverse traversal computes subtree eligibility without recursive stack growth.
+          for (let i = nodes.length - 1; i >= 0; i--) {
+            const node = nodes[i];
+            node.hasContinuation = node.entry.type !== 'usage' ||
+              node.children.some(child => child.hasContinuation);
           }
         }
 
         const node = treeNodeMap.get(nodeId);
         if (!node) return nodeId;
 
-        // Follow the newest (last) child at each level
+        // Children are timestamp-sorted. Skip only subtrees consisting entirely of receipts.
+        const inspectUsageOnly = !node.hasContinuation;
         let current = node;
         while (current.children.length > 0) {
-          current = current.children[current.children.length - 1];
+          let next;
+          for (let i = current.children.length - 1; i >= 0; i--) {
+            const child = current.children[i];
+            if (inspectUsageOnly || child.hasContinuation) {
+              next = child;
+              break;
+            }
+          }
+          if (!next) break;
+          current = next;
         }
         return current.entry.id;
       }

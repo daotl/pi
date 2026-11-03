@@ -1,9 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
+import type { AssistantImages, ClassifierModel, ClassifierResult, ImageModel, Usage } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -12,6 +13,8 @@ import {
 } from "../../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
+import { getUsageCostBreakdown, getUsageTotals } from "../../src/core/usage-totals.ts";
+import { createCodemodeExtension } from "../../src/extensions/codemode/index.ts";
 import type {
 	AgentToolResult,
 	ExtensionAPI,
@@ -39,7 +42,7 @@ describe("AgentSessionRuntime characterization", () => {
 
 	async function createRuntimeForTest(
 		extensionFactory: ExtensionFactory,
-		options?: { cwd?: string; bootstrapModel?: boolean; bootstrapThinkingLevel?: boolean },
+		options?: { cwd?: string; bootstrapModel?: boolean; bootstrapThinkingLevel?: boolean; inMemory?: boolean },
 	) {
 		const tempDir =
 			options?.cwd ?? join(tmpdir(), `pi-runtime-suite-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -107,7 +110,7 @@ describe("AgentSessionRuntime characterization", () => {
 		const runtime = await createAgentSessionRuntime(createRuntime, {
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.create(tempDir),
+			sessionManager: options?.inMemory ? SessionManager.inMemory(tempDir) : SessionManager.create(tempDir),
 		});
 		await runtime.session.bindExtensions({});
 
@@ -556,6 +559,9 @@ describe("AgentSessionRuntime characterization", () => {
 								.join("")
 					: undefined,
 		}));
+		const originalManager = runtime.session.sessionManager;
+		const originalId = originalManager.getSessionId();
+		const originalEntries = structuredClone(originalManager.getEntries());
 		const leafId = runtime.session.sessionManager.getLeafId();
 		expect(leafId).toBeTruthy();
 		expect(runtime.session.sessionFile).toBeUndefined();
@@ -563,6 +569,10 @@ describe("AgentSessionRuntime characterization", () => {
 		const result = await runtime.fork(leafId!, { position: "at" });
 		expect(result).toEqual({ cancelled: false, selectedText: undefined });
 		expect(runtime.session.sessionFile).toBeUndefined();
+		expect(runtime.session.sessionManager).not.toBe(originalManager);
+		expect(runtime.session.sessionId).not.toBe(originalId);
+		expect(originalManager.getSessionId()).toBe(originalId);
+		expect(originalManager.getEntries()).toEqual(originalEntries);
 		expect(
 			runtime.session.messages.map((message) => ({
 				role: message.role,
@@ -578,6 +588,176 @@ describe("AgentSessionRuntime characterization", () => {
 			})),
 		).toEqual(beforeMessages);
 	});
+
+	for (const operation of ["classify", "generateImages"] as const) {
+		for (const position of ["before", "at"] as const) {
+			it(`retains the original in-memory ${operation} receipt sink after abort and fork ${position}`, async () => {
+				const started = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				let signal: AbortSignal | undefined;
+				let providerCalls = 0;
+				const expected: Usage = {
+					input: operation === "classify" ? 300 : 100,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: operation === "classify" ? 300 : 100,
+					cost: {
+						input: operation === "classify" ? 0.001 : 0.04,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						total: operation === "classify" ? 0.001 : 0.04,
+					},
+				};
+				const classifier: ClassifierModel<"test-classifier"> = {
+					type: "classifier",
+					id: "judge",
+					name: "Judge",
+					api: "test-classifier",
+					provider: "late-paid",
+					baseUrl: "https://classifier.test/v1",
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 1000,
+				};
+				const image: ImageModel<"test-images"> = {
+					type: "image",
+					id: "painter",
+					name: "Painter",
+					api: "test-images",
+					provider: "late-paid",
+					baseUrl: "https://images.test/v1",
+					input: ["text"],
+					output: ["image"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				};
+				const { runtime, faux } = await createRuntimeForTest(
+					(pi) => {
+						createCodemodeExtension()(pi);
+						pi.registerProvider("late-paid", {
+							apiKey: "offline-test-key",
+							models: [classifier, image],
+							classifiers: {
+								"test-classifier": {
+									classify: async (model, _context, options): Promise<ClassifierResult> => {
+										providerCalls++;
+										signal = options?.signal;
+										started.resolve();
+										await release.promise;
+										return {
+											api: model.api,
+											provider: model.provider,
+											model: model.id,
+											answers: { approved: { type: "bool", probability: 0.9 } },
+											usage: expected,
+											stopReason: "stop",
+											timestamp: 0,
+										};
+									},
+								},
+							},
+							images: {
+								"test-images": {
+									generateImages: async (model, _context, options): Promise<AssistantImages> => {
+										providerCalls++;
+										signal = options?.signal;
+										started.resolve();
+										await release.promise;
+										return {
+											api: model.api,
+											provider: model.provider,
+											model: model.id,
+											output: [],
+											usage: expected,
+											stopReason: "stop",
+											timestamp: 0,
+										};
+									},
+								},
+							},
+						});
+					},
+					{ inMemory: true },
+				);
+				const original = runtime.session;
+				const manager = original.sessionManager;
+				const originalId = manager.getSessionId();
+				original.setActiveToolsByName(["codemode"]);
+				const code =
+					operation === "classify"
+						? 'await models.classify({ provider: "late-paid", id: "judge" }, { state: { text: "good" }, questions: { approved: { type: "bool", instructions: "Approval?", criteria: { true: "yes", false: "no" } } } });'
+						: 'await models.generateImages({ provider: "late-paid", id: "painter" }, { input: [{ type: "text", text: "a fox" }] });';
+				faux.setResponses([fauxAssistantMessage(fauxToolCall("codemode", { code }), { stopReason: "toolUse" })]);
+				const pending = original.prompt("start paid work");
+				try {
+					await started.promise;
+					const dispatchParent = manager.getLeafId();
+					await original.abort();
+					await pending;
+					expect(signal?.aborted).toBe(true);
+					const originalEntries = structuredClone(manager.getEntries());
+					const originalLeaf = manager.getLeafId();
+					const originalProjection = structuredClone(manager.buildSessionProjection());
+					const forkEntry = position === "at" ? originalLeaf! : original.getUserMessagesForForking()[0]!.entryId;
+					await expect(runtime.fork(forkEntry, { position })).resolves.toMatchObject({ cancelled: false });
+					await runtime.session.bindExtensions({});
+					faux.setResponses([fauxAssistantMessage("fork-only answer")]);
+					await runtime.session.prompt("fork-only question");
+					const replacement = runtime.session.sessionManager;
+					const replacementId = replacement.getSessionId();
+					const replacementEntries = structuredClone(replacement.getEntries());
+					const replacementLeaf = replacement.getLeafId();
+					const replacementProjection = structuredClone(replacement.buildSessionProjection());
+					release.resolve();
+					await vi.waitFor(() =>
+						expect(manager.getEntries().filter((entry) => entry.type === "usage")).toHaveLength(1),
+					);
+					expect(replacement).not.toBe(manager);
+					expect(manager.getSessionId()).toBe(originalId);
+					expect(replacementId).not.toBe(originalId);
+					for (const entry of originalEntries) expect(manager.getEntry(entry.id)).toEqual(entry);
+					expect(manager.getLeafId()).toBe(originalLeaf);
+					expect(manager.buildSessionProjection()).toEqual(originalProjection);
+					expect(manager.getEntries().filter((entry) => entry.type === "usage")).toEqual([
+						expect.objectContaining({
+							parentId: dispatchParent,
+							provider: "late-paid",
+							model: operation === "classify" ? "judge" : "painter",
+							usage: expected,
+						}),
+					]);
+					// Repeated flushes must neither redeliver the charge nor make the fork inherit it.
+					for (let attempt = 0; attempt < 2; attempt++) {
+						original.flushPendingUsage();
+						runtime.session.flushPendingPersistence();
+						runtime.session.flushPendingUsage();
+					}
+					expect(providerCalls).toBe(1);
+					expect(getUsageTotals(manager.getEntries()).cost).toBe(expected.cost.total);
+					expect(
+						getUsageCostBreakdown(manager.getEntries()).filter((entry) => entry.key.startsWith("late-paid/")),
+					).toEqual([
+						{
+							key: `late-paid/${operation === "classify" ? "judge" : "painter"}`,
+							cost: expected.cost.total,
+							tokens: expected.totalTokens,
+						},
+					]);
+					expect(manager.getEntries().filter((entry) => entry.type === "usage")).toHaveLength(1);
+					expect(replacement.getSessionId()).toBe(replacementId);
+					expect(replacement.getEntries()).toEqual(replacementEntries);
+					expect(replacement.getLeafId()).toBe(replacementLeaf);
+					expect(replacement.buildSessionProjection()).toEqual(replacementProjection);
+					expect(replacement.getEntries().filter((entry) => entry.type === "usage")).toEqual([]);
+					expect(runtime.session.getSessionStats().cost).toBe(0);
+				} finally {
+					release.resolve();
+					await Promise.allSettled([pending, runtime.session.abort()]);
+				}
+			});
+		}
+	}
 
 	it("throws when forking with an invalid entry id", async () => {
 		const { runtime } = await createRuntimeForTest(() => {});

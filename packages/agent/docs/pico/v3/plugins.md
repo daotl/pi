@@ -475,6 +475,14 @@ slow. The bridge is a bounded ordered adapter: the kernel enqueues raw envelopes
 from its own view tracker; the adapter, off the line, applies one envelope's ops
 and sets `commit.events` inside one `view.change(ctx, callback)` transaction.
 One raw envelope = one change = one Chord sequence while the bridge is live.
+`ChordViewBridge.revisions` provides an immediate `ChordViewRevision` snapshot
+(`ops: null`), then ordered immutable frames with the revision, value and known
+publication ops, including `commit.events`. The native facet applies each frame
+in one state change instead of diffing complete values again. String appends use
+`appendText()` in both publication trackers; snapshot/rebind reconciliation does
+not perform structural diffing. Root replacements retain publication metadata
+and apply any trailing operations before publishing their commit events.
+
 The bridge consumes the raw watch's terminal notification. A projection failure,
 unexpected watch stop, or queue overflow closes the bridge and publishes
 `publication: { status: "failed", error }`, clearing `commit.events`; the last

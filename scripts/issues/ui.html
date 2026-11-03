@@ -77,10 +77,20 @@ const category = (it) => it.decision?.category || it.triage?.result?.category ||
 const WARN = new Set(["theoretical", "AI-written", "third-party", "upstream", "maybe fixed", "no repro"]);
 const BAD = new Set(["regression", "spam", "empty", "duplicate cluster"]);
 const hasProtectedFocus = () => !!(document.querySelector("select:focus") || $("main").querySelector("button:focus, a[href]:focus, summary:focus, input:focus, textarea:focus, [tabindex]:focus, [contenteditable]:focus"));
+const hasProtectedSelection = () => {
+	const selection = document.getSelection();
+	if (!selection || selection.isCollapsed) return false;
+	for (let i = 0; i < selection.rangeCount; i++) {
+		const range = selection.getRangeAt(i);
+		// Endpoint containment misses ranges that cross or surround main.
+		if (!range.collapsed && range.intersectsNode($("main"))) return true;
+	}
+	return false;
+};
 
 function installSnapshot(snapshot, generation) {
 	if (generation !== loadGeneration || pendingMutations) return false;
-	if (activePointers.size || hasProtectedFocus()) {
+	if (activePointers.size || (!decisionPending && (hasProtectedFocus() || hasProtectedSelection()))) {
 		deferredSnapshot = { snapshot, generation };
 		return false;
 	}
@@ -204,7 +214,7 @@ function renderStatus() {
 function render(deferForFocus = false) {
 	renderStatus();
 	if (!data) return;
-	if (activePointers.size || (deferForFocus && hasProtectedFocus())) {
+	if (activePointers.size || (deferForFocus && (hasProtectedFocus() || hasProtectedSelection()))) {
 		deferredRender = true;
 		return;
 	}
@@ -240,9 +250,12 @@ document.addEventListener("click", (e) => {
 	if (c) { selectedNumber = Number(c.dataset.n); document.querySelectorAll(".card").forEach((x) => x.classList.toggle("sel", x === c)); }
 });
 function flushDeferred() {
-	if (activePointers.size || pendingMutations || hasProtectedFocus()) return;
+	if (activePointers.size) return;
+	// A decision's disabled render owns the activation; ordinary focus must not strand it.
+	if (decisionPending && deferredRender) render();
+	if (pendingMutations) return;
 	if (deferredSnapshot) installSnapshot(deferredSnapshot.snapshot, deferredSnapshot.generation);
-	if (deferredRender) render();
+	if (deferredRender) render(true);
 }
 document.addEventListener("pointerdown", (e) => { activePointers.add(e.pointerId); }, true);
 document.addEventListener("pointerup", (e) => {
@@ -253,6 +266,9 @@ document.addEventListener("pointercancel", (e) => { activePointers.delete(e.poin
 window.addEventListener("blur", () => { activePointers.clear(); flushDeferred(); });
 document.addEventListener("focusout", () => {
 	// Wait for focus to settle; moves between protected controls must stay deferred.
+	queueMicrotask(flushDeferred);
+});
+document.addEventListener("selectionchange", () => {
 	queueMicrotask(flushDeferred);
 });
 document.addEventListener("change", (e) => {

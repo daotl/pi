@@ -354,13 +354,16 @@ export class AgentSessionRuntime {
 			return { cancelled: false, selectedText };
 		}
 
-		const sessionManager = this.session.sessionManager;
-		await this.teardownCurrent("fork", sessionManager.getSessionFile());
-		if (!targetLeafId) {
-			sessionManager.newSession({ parentSession: previousSessionFile });
-		} else {
-			sessionManager.createBranchedSession(targetLeafId);
-		}
+		const outgoingManager = this.session.sessionManager;
+		await this.teardownCurrent("fork", outgoingManager.getSessionFile());
+		// Fork a private snapshot: outstanding receipts must keep the outgoing identity
+		// and selection, even after its AgentSession has been disposed.
+		const sessionManager = SessionManager.inMemory(
+			this.cwd,
+			undefined,
+			targetLeafId ? structuredClone(outgoingManager.getEntries()) : undefined,
+		);
+		if (targetLeafId) sessionManager.createBranchedSession(targetLeafId);
 		this.apply(
 			await this.createRuntime({
 				cwd: this.cwd,

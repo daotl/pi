@@ -376,3 +376,243 @@ The four complete receipt/codemode/swipe/policy files passed 129 tests. Five adj
 
 The decoded Markdown report above preserves the original 38,907-byte report prefix (SHA-256 `a16eaaf32ecff4bae478e12246d499f9363a6e96f9ef014072a32eaba24ac8fc`). An initial JSON-wrapped append was corrected by programmatic decoding before further appends. Historical Not ready and intermediate validation receipts remain intact.
 
+
+## Code Review Results
+
+**轮次:** Round 3，`20261104-034547-r3-e61b4049`  
+**Scope:** 固定第一父提交 `98dfe28cbeec4e1f2f61516e227420b2407dcdf9` -> `1da23c158f319ac39829ef13c7da557183e0637a`，覆盖 merge `8322aa1d` 及截至该 HEAD 的全部修复提交。分支为 `fix/full-merge-review-8322aa1d`；共 1,272 个变更路径、200,114 行变更、73,994 行非测试可执行变更，包含 47 个删除文件。  
+**Intent:** 合入 upstream 1.4.0，同时保留 Crystal 历史、编辑、删除、恢复、shred、id0，以及 Harness、experimental/client、计费、多模态和摘要预算契约。  
+**Mode:** `markdown report-only`，`depth:full`，`grouping:auto`，`apply_local:false`。本报告未应用修复，未修改源码，未运行测试、构建、lint、浏览器验证或网络请求，未创建 commit、push 或 PR。
+
+**结论摘要:** 8 个候选全部进入同一验证批次，**7 个 confirmed，1 个 unresolved，0 个 rejected**。全部保持 P2、confidence 75。**#6 是受保护的 concurrency 验证门，既未确认，也未驳回，不进入修复队列。当前结论为 Not ready，不能宣称零新增或审查收敛。**
+
+**Reviewers:**
+- `correctness-models`、`correctness-native`、`correctness-history`、`correctness-execution`、`correctness-surface`: 分别检查模型、原生运行时、历史数据、执行链和用户界面，五个分区对全部变更路径完成一次归属。
+- `security`: 信任边界和认证；`reliability`: 异步生命周期；`api-contract`: 已发布消费者契约。
+- `data-migration`: SQLite 和旧格式转换；`testing`: 测试是否真正区分目标故障；`performance`: 增量更新、转换和 fanout 成本。
+- `maintainability`: 合并后的结构集成；`agent-native`: 工具和程序化能力可达性；`frontend-races`: DOM 更新和交互时序；`deployment`: 破坏性迁移和回滚。
+- `adversarial`: 外部跨模型调用认证失败后的进程内替代审查，**不构成已验证的跨模型独立佐证**。
+
+### Triage Groups
+
+| Group | Findings | Context | Preferred Resolution | Why |
+|---|---|---|---|---|
+| 延迟计费回执与会话分支，apply-queue | #3, #5 | 回执所属会话和导出导航各有独立缺陷 | 先修 #5，保留退出中内存会话的回执接收对象；再修 #3，避免默认导航落到纯计费叶节点 | 保存计费记录和保持对话选择都需要完成，两项不能互相替代 |
+| Issue UI 刷新与用户交互，apply-queue | #7, #8 | 刷新既要完成已提交决策，也不能销毁选中文本 | 先修 #7，区分决策完成与普通焦点延迟；再修 #8，加入 selection 保护或保留稳定 DOM | 两者共享刷新保护逻辑，但触发状态和回归断言不同 |
+
+#1、#2、#4 是独立修复项。#6 单独作为 verification gate，不授权按候选修复方案修改实现。
+
+### P2 -- Moderate
+
+| # | File | Issue | Reviewer | Confidence |
+|---|---|---|---|---|
+| 1 | `packages/agent/src/harness/pico3/chord.ts:347` | 原生 Pico 流式镜像反复比较完整增长字符串，产生额外二次成本 | performance | 75 |
+| 2 | `packages/chord/test/manager.test.ts:176` | Windows parent-loss 测试使用无效描述符布局，无法独立验证目标保护 | testing | 75 |
+| 3 | `packages/coding-agent/src/core/export-html/template.js:171` | 导出导航选中延迟回执叶节点，隐藏后续对话 | correctness-history | 75 |
+| 4 | `packages/coding-agent/src/core/model-runtime.ts:789` | 保留的 ModelRuntime 调用绕过已公开承诺的请求遥测 | correctness-models | 75 |
+| 5 | `packages/coding-agent/src/core/tool-usage-binding.ts:130` | 内存会话 fork 后，原会话的延迟付费回执失去接收对象 | correctness-history | 75 |
+| 6 | `packages/coding-agent/src/experimental/client-runtime.ts:252` | 未决: 旧 attach 失败清理是否能释放新 attach 的能力引用 | adversarial | 75 |
+| 7 | `scripts/issues/ui.html:243` | 获得焦点的决策按钮阻塞自身刷新，后续决策被持续忽略 | frontend-races | 75 |
+| 8 | `scripts/issues/ui.html:250` | 后台刷新替换文本节点，销毁用户已选中的 issue 文本 | frontend-races | 75 |
+
+**#1: 原生 Pico 镜像丢失已知 append 意图**
+
+- **影响与证据:** 新增的 value-only 订阅调用 `view.replace(ctx, value)`。`packages/chord/src/cell.ts:235-237` 在共享根结构时重新计算 diff，`packages/chord/src/delta/diff.ts:63-68` 会读取旧字符串前缀来判断追加。`generation.ts:367,390-391` 按 256 个 delta 字符或 100 ms 刷新，因此该额外镜像路径随流增长反复扫描前缀。按 512 KiB 流、每次 256 字符发布估算，累计前缀比较量约为 512 MiB；这是代码路径推算，**不是实测耗时或分配结果**。
+- **修复:** 从 bridge 传递有序 revision 和已有 envelope ops，在原生 cell 上增量应用；字符串追加使用 `appendText()`，保留 commit/publication 元数据及 root fallback。不能仅以最终 wire op 是 append 作为通过标准。
+- **验证要求:** 增加经过 native facet 的流式回归，观察不同长度下的前缀读取或分配增长；`packages/agent/test/harness/pico3/chord.test.ts:339-358` 已给出原生客户端连接路径。
+- **验证状态:** `validation_status: confirmed`。`validation_reason`: 独立验证确认发布、镜像和字符串 diff 的可达链路；生产发生率、实际分配和时延影响未测量。
+
+**#2: parent-loss 断言被另一个无效输入条件遮蔽**
+
+- **影响与证据:** `manager.test.ts:165-171` 先明确用 `stdio: "ignore"` 验证缺少 fork IPC slot 的启动会被拒绝，随后 `:173-179` 又用相同三描述符布局声称验证 owner 已关闭。`packages/chord/native/windows-launcher.c:37,80` 的布局检查本身即可阻止应用启动，因此即使 parent-loss 保护失效，该断言仍可能保持绿色。
+- **修复:** 保留 malformed-layout 用例；closed-owner 用例改用真实、有效的 fork IPC 描述符布局。增加同布局、live-owner 的成功对照，证明可写入 marker，再断言 closed-owner 返回 125 且不写 marker，并清理子进程和 Job。
+- **验证要求:** 在实际 Windows 支持环境执行这组区分性用例。现有 `manager.test.ts:281-314` 是 worker 已启动后杀掉 owner，不能替代启动前 owner 丢失场景。
+- **验证状态:** `validation_status: confirmed`。`validation_reason`: 新测试无法隔离其声称验证的前置条件；本轮仅检查测试和 launcher 源码，未执行 Windows 测试，运行时发生率未测量。**此项确认的是测试缺陷，不是已证实的 launcher 逃逸。**
+
+**#3: 延迟计费叶节点劫持 HTML 导出的默认分支导航**
+
+- **影响与证据:** `tool-usage-binding.ts:135-136` 和 `session-manager.ts:1768-1793` 将延迟回执追加到原始 dispatch 祖先，保留当前对话选中叶。导出包含这些条目；`template.js:101-105` 按时间排序子节点，`:170-173` 一直选择最新子节点，`:840-844,1648-1660` 随后只渲染该叶节点的祖先路径。点击早期消息时，较晚到达的纯计费回执会遮住原本更长的对话分支。
+- **修复:** 默认寻找对话后代时跳过 usage-only 终端子树；仍保留带真实后续对话的 usage 节点，也允许显式检查回执。可参考 `agent-session.ts:2425-2444` 的 live swipe 处理。
+- **验证要求:** 为导出树加入“祖先处追加更晚时间戳回执，另一子分支有完整对话”的用例。`agent-session-codemode.test.ts:1538-1565` 已构造相关数据形状。
+- **验证状态:** `validation_status: confirmed`。`validation_reason`: 独立验证确认回执形状可由现有代码产生，导出导航确实会选择它；导出界面实际发生率未测量。
+
+**#4: ModelRuntime 未兑现 Models 请求遥测契约**
+
+- **影响与证据:** `packages/ai/README.md:1137` 明确说明 `Models.stream()`、`streamSimple()` 创建 `pi.ai.request`，`streamDeferred()` 每次 poll 创建 `pi.ai.poll`，而直接 Provider 调用不做该层观测。`model-runtime.ts:732-744,782-815` 直接分派 Provider，并未传入 observer；`packages/ai/src/models.ts:962,984,1012` 的新增 observer 不会被此路径调用。`session-worker.ts:794-798` 和 Harness `runtime/drive/generation.ts:216-220` 证明保留消费者会携带 telemetry 走到这里。
+- **修复:** 在 ModelRuntime 的物理 `stream`、`streamSimple` 和 deferred poll 请求边界接入相同 observer；虚拟路由外层不重复观测，避免递归到物理请求时双计数。
+- **验证要求:** 经过 ModelRuntime 和保留 Harness 的 recording-telemetry 集成测试应检查 span、首块/首内容事件、token/cost 指标，以及 deferred poll。
+- **验证状态:** `validation_status: confirmed`，`protected_subject: public-contract`。`validation_reason`: 文档契约、绕过路径和携带 telemetry 的实际调用方均已由源码建立；运行时发生率未测量。
+
+**#5: 内存 fork 改写了尚有待结算调用的原会话身份**
+
+- **影响与证据:** 付费 classifier/image 调用可以在取消之后才完成；`extensions/codemode/execute.ts:813-826` 仍会记录其 usage。`agent-session-runtime.ts:357-368` 的内存 fork 复用原 `SessionManager` 并改变 session ID，但 recorder 保留 dispatch 时的 ledger identity。`tool-usage-binding.ts:125-131` 无文件可重开，只能取原 manager，随后因 identity 不符抛出 `Tool usage session is no longer available`；替代会话的 flush 又查询新 identity key。
+- **修复:** 内存 fork 应从保留条目构建独立 manager，再切换会话身份；原会话的回执接收对象需持续可达，直到其未完成 recorder 调用结算完毕，不能只依赖可能失效的弱引用。
+- **验证要求:** 增加内存会话 fork 后 provider 延迟完成的付费回执用例，同时检查原计费归属、替代会话状态和不重复计费。已有持久化 replacement 用例不能覆盖无文件接收对象。
+- **验证状态:** `validation_status: confirmed`，`protected_subject: data-loss`。`validation_reason`: 独立验证确认 teardown 的 abort 不排除延迟完成，旧身份与复用 manager 的新身份不匹配会丢失回执；内存 fork 场景的实际发生率未测量。
+
+**#6: Verification gate，不能据此直接修复**
+
+- **候选主张:** 若 A 的 capability acquisition 一直挂起，B 已完成 attach 并发布 `sessionRefs`，随后 A 失败，`client-runtime.ts:250-252` 的共享清理可能释放 B 的引用，使 B 的 getters 抛出 `No Session is attached`。
+- **尚缺证据:** 独立验证发现，替换 attachment 时 `packages/client/src/client.ts:200-202` 同步关闭 A 的 session link；`packages/chord/src/host.ts:1492-1495` 将其建立为 downstream link，`connection.ts:1660-1664` 及 `remote.ts:381-393,725-732` 会终止 pending references。现有单次、模拟取消 fixture 未证明上述精确时序能够穿过这些保护。
+- **下一步:** 在真实 host 上阻塞 A 的能力获取，完成 B，再令 A 失败，观察 B 的 getters 和已持有引用；或提供等价的调度证明，精确说明关闭 link、pending rejection、发布 B 和清理 A 的先后关系。只有证明真实可达后，才决定是否采用 operation generation、引用归属清理或完整客户端管理串行化。
+- **验证状态:** `validation_status: unresolved`，`protected_subject: concurrency`，`autofix_class: advisory`，`owner: human`，`requires_verification: true`，confidence 保持 75。`validation_reason`: 缺少能区分该候选与现有关闭/取消保护的真实重叠复现或等价调度证明，发生率未测量。**不能以未证伪为由确认，也不能以存在保护为由直接驳回。**
+
+**#7: 决策按钮焦点形成刷新死锁**
+
+- **影响与证据:** 在点击后保留按钮焦点的浏览器中，`ui.html:118` 设置 `decisionPending`，初始 disabled render 被 pointer guard 延迟；释放指针后，`:243` 又因 protected focus 拒绝刷新。权威快照在 `:83-90` 同样被延迟，而清除 `decisionPending` 的赋值仅在快照成功安装后发生。`:230` 因此持续忽略后续优先级决策，用户必须先点击保护控件之外的位置才能解开。
+- **修复:** 指针激活交接结束后，允许 pending decision 的 disabled render 和最新权威快照完成，不受普通焦点刷新延迟无限阻塞；仍保持原生激活过程和无关后台刷新的焦点保护。
+- **验证要求:** 用真实浏览器 pointer/focus 事件覆盖 POST/state 在 pointer-release timer 之前和之后完成的两种顺序。`ui.test.mjs:181-200` 的无焦点模拟点击不能建立该保证。
+- **验证状态:** `validation_status: confirmed`，`protected_subject: concurrency`。`validation_reason`: 状态赋值、焦点保护和事件处理链路在代码上形成死锁；原生浏览器中的发生率未测量。
+
+**#8: 指针释放不等于用户已结束文本选择**
+
+- **影响与证据:** `ui.html:161,180` 提供可选中的 summary/body 文本，`:293` 每 8 秒刷新；`:79,83-85,242-250` 只保护指针和控件焦点。非焦点文本的选区未被表示，响应在拖选期间到达会在 pointer release 后刷新，在拖选结束后到达则可直接刷新。`:223` 整体替换 `main.innerHTML`，即使数据未变化，也会删除已选中的文本节点。
+- **修复:** 后台替换和 deferred flush 应保护与 `#main` 相交的非折叠原生选区，在 `selectionchange` 确认选区收起或离开后再刷新；或保留未变化的文本 DOM。不能仅靠 pointerup 解除保护。
+- **验证要求:** 使用真实浏览器覆盖“响应在拖选期间到达”和“响应在拖选之后到达”，断言文本选区和复制内容保留。
+- **验证状态:** `validation_status: confirmed`，`protected_subject: concurrency`。`validation_reason`: 周期刷新、无 selection 保护和删除选中节点的路径已由代码建立；原生浏览器发生率未测量。
+
+### Actionable Findings
+
+以下 7 项均为 `validation_status: confirmed`、`requires_verification: true`。所有 `suggested_fix` 均已保留在运行产物中；执行修复和验证属于调用方，本轮未应用。
+
+| # | File | Issue | Route | Notes |
+|---|---|---|---|---|
+| 5 | `packages/coding-agent/src/core/tool-usage-binding.ts:130` | 内存 fork 丢失延迟付费回执 | `gated_auto -> downstream-resolver` | P2；先保留原 manager/接收对象生命周期，再验证延迟完成和计费归属 |
+| 3 | `packages/coding-agent/src/core/export-html/template.js:171` | 默认导出导航落到纯计费叶节点 | `gated_auto -> downstream-resolver` | P2；修正对话后代选择，保留显式回执检查 |
+| 4 | `packages/coding-agent/src/core/model-runtime.ts:789` | 保留 Models 实现缺少请求遥测 | `gated_auto -> downstream-resolver` | P2；在物理请求边界观测，避免虚拟路由双计数 |
+| 7 | `scripts/issues/ui.html:243` | 焦点阻止决策完成刷新 | `gated_auto -> downstream-resolver` | P2；先解决 pending decision 与焦点延迟的循环等待 |
+| 8 | `scripts/issues/ui.html:250` | 后台刷新销毁原生文本选区 | `gated_auto -> downstream-resolver` | P2；与 #7 联合检查刷新保护，但需要独立 selection 断言 |
+| 1 | `packages/agent/src/harness/pico3/chord.ts:347` | 原生流式镜像重复全前缀比较 | `gated_auto -> downstream-resolver` | P2；传递已有 ops，以前缀读取/分配回归检验增量成本 |
+| 2 | `packages/chord/test/manager.test.ts:176` | Windows parent-loss 测试不具区分性 | `gated_auto -> downstream-resolver` | P2；有效 IPC 布局加 live-owner 对照，并在 Windows 执行 |
+
+**#6 不在 actionable queue 中。** 它只保留调查和验证任务，不授权直接应用候选修复。
+
+### Deployment Notes
+
+以下是发布证据门，不是额外确认的代码缺陷。本轮未执行迁移、生产查询、备份恢复或 Workers 部署。
+
+- [ ] **确认真实部署边界:** 记录数据库路径或 Durable Object 身份、runtime/package 版本、prefix、JSONL 根目录及实际回滚版本；停止旧 worker、CLI、调度任务和直接 SQL 写入，证明独占所有权。进程内队列不能替代跨进程部署锁。
+- [ ] **先备份并实际恢复:** SQLite 使用一致性全库备份或经验证的存储快照，不能在 WAL 活跃时只复制主文件。将备份恢复到独立位置，用实际 rollback binary 打开并保存结果。转换前保存原始 v3 JSONL、权限和哈希，备份需限制访问。
+- [ ] **在代表性副本演练:** `packages/durable/src/storage/sqlite/migrations.ts:91-115` 在事务内复制七个 task 列、drop/rename 表并重建五个索引，不是分批 backfill。记录 DB/WAL/temp 空间峰值、锁等待、耗时和失败行为，盘点自定义索引、触发器、视图和外键。`SqliteStorage.open` 会触发迁移，不能把生产 open 当成只读预检。
+- [ ] **比较迁移前后数据:** 在静止数据库或一致快照上保存 `PRAGMA integrity_check`、`foreign_key_check`、完整 schema、各表行数、task 状态和全部 task 列。迁移后要求 schema version 为 2，`next_id`/`next_seq` 不变，task 和其他持久化数据双向 `EXCEPT` 差异均为 0，`tasks_v2` 不存在，五个内建索引齐全，自定义对象无意外丢失。所有 SQL 必须使用实际 prefix；改变 prefix 是换命名空间，不是迁移。
+- [ ] **验证失败原子性和实际 Workers 行为:** 在副本上分别于 copy、drop、rename、index 阶段注入失败，检查原 schema、数据和 allocator 完整保留且可重试。适用部署还需经过实际 Workers adapter 的 transaction、alarm、eviction/reopen 与完成流程；Node 结果不能替代。
+- [ ] **验证 JSONL 首写转换:** 无非空提交时原文件哈希不变；首次非空提交转为 format 4/storage version 1，调用方写入存在，重开后逻辑分支、保留树、配置、摘要/system checkpoint 和 usage 总量正确。ID 会重建，应比较逻辑关系而非旧短 ID。覆盖祖先/null leaf、独立回执、重放计费和折叠 `systemMessage`；发布失败应保留原字节和可见状态并可重试。
+- [ ] **明确回滚限制:** schema-1-only binary 会拒绝已提交的 schema 2，不能只回滚代码、手改版本号或换 prefix。需使用 schema-2-capable 回滚版本，或停写后恢复一致快照；同时核对快照后的 submissions、工具外部副作用和 provider 费用。旧 v3 writer 也不能被假定能写已转换的 JSONL。
+- [ ] **恢复流量后监控:** 首 5 分钟及 +1h、+4h、+24h 检查迁移/open 错误、`SQLITE_BUSY`、磁盘满、rollback/unsupported-schema、JSONL parse/publication 错误；检查 `session_failed`、`migration_failed`、`task_outdated`、`task_parked`。抽查 sleeping task 从 checkpoint 恢复而非重做外部动作，以及历史选择和 usage 恰好计入一次。
+
+只有拿到备份恢复、精确数据比较、资源测量、独占所有权及适用 Workers/JSONL 恢复证据后，才可解除相应发布门。完整操作依据保存在本轮 `deployment-verification-agent.md`。
+
+### Coverage
+
+**范围与语义覆盖**
+
+| Correctness 分区 | 已作语义检查的路径 | 证据不足的路径 |
+|---|---:|---:|
+| correctness-models | 117 | 150 |
+| correctness-native | 77 | 93 |
+| correctness-history | 22 | 88 |
+| correctness-execution | 43 | 259 |
+| correctness-surface | 110 | 313 |
+| 合计 | 369 | 903 |
+
+- 1,272 个路径均已编目且归属一次；**全范围编目不等于逐 hunk 审查通过**。369 个路径表示对变更行为作了有意义的语义检查，不表示每个文件或 hunk 完整放行；903 个路径没有足够证据支持该声明。这是 **partial semantic review**，不能据此宣称无其他缺陷。
+- 图索引停留在 `2026-10-09T02:02:57Z`，未启用 watch，且存在 native、新路径及排除项缺口。本轮使用当前源码和文本消费者搜索补充，不据旧图作无调用方或完整覆盖的结论。
+- 历史报告正文未作为发现种子。maintainability 搜索曾偶然暴露历史 ledger，审查者声明未保留其中发现或结论；correctness 分区 patch 已排除历史报告正文。
+- 四个 Windows 二进制路径已归属 native，但其行数不可统计，**二进制与源码等价性、真实加载、描述符交接和 Job-tree 行为均未验证**:
+  - `packages/chord/native/prebuilds/win32-arm64/windows-job.node`
+  - `packages/chord/native/prebuilds/win32-arm64/windows-launcher.exe`
+  - `packages/chord/native/prebuilds/win32-x64/windows-job.node`
+  - `packages/chord/native/prebuilds/win32-x64/windows-launcher.exe`
+
+**跨模型、审查者与验证**
+
+- adversarial lens: in-process fallback (cross-model peer not run: OAuth session expired and could not be refreshed)
+- 外部目标为 Claude，请求配置是 `claude-opus-5-5/high`，但没有可用 receipt；实际模型和 effort 未验证，`independence_verified:false`。未折入外部 artifact，未使用跨模型独立性提升 confidence。已知可认证的不同目标仅 Claude，没有可用替代接收方。
+- 15 个本地审查视角及必需的 adversarial fallback 均在每位 20 分钟界限内完成；最多同时 5 位。部分研究超过 8 分钟目标，但没有失败或超时审查者。配置的 midtier 不可用，相关审查者按已记录的 parent-inherit 路由运行，不能声称使用了不可用模型。
+- 8 个候选按稳定编号全部进入同一 validator batch，未因正常 cap 遗漏。结果为 **confirmed 7、rejected 0、unresolved 1、malformed 0、failed 0、shortcut-skipped 0、cap omissions 0**。没有独立跨模型佐证可授权跳过验证。
+- 独立保护分类为 #4 `public-contract`、#5 `data-loss`、#6/#7/#8 `concurrency`；#1/#2/#3 不属于八类保护主题。没有移除 validator 给予的保护，也没有 protected rejection 需要重分类。
+- #6 的 unresolved 原因是精确重叠时序是否能穿过真实 link/reference 关闭保护尚未建立，不是基础设施失败、超时、驳回或确认。它保留原 P2/75，并改为 report-only verification gate。
+- 7 个 confirmed 均基于源码、调用方和相关 fixture 检查；**没有执行复现，也没有测量生产发生率**。#1 未测量真实性能；#2 未运行 Windows；#7/#8 未运行原生浏览器。确认代码允许的缺陷，不代表已观测到生产事件。
+
+**合成和规则处理**
+
+- 读取了 14 份结构化审查 artifact/return 及 2 份非结构化 advisory artifact，8 项均完成 detail hydration。
+- `first_evidence` 回填 8 项；malformed return/finding 均为 0；精确及语义重复删除均为 0；pre-existing finding 为 0。
+- confidence suppression 为 0，各 anchor 无压低条目；mode-aware demotion 为 0。没有 repository review policy 导致的删除或改级，也没有纳入受保护文档清理建议。
+- 未发现 CE config/packs/solutions 或指定的独立标准来源；沿用既定标准路由，活动全局/root AGENTS 仍具约束力。
+- agent-native 定向能力检查未保留可行动缺口；该结论仅适用于已追踪的工具发现、codemode、MCP、SDK 和程序化服务路径，不是全部 UI/RPC 或删除导出消费者的完整保证。
+
+**仍需验证的风险与测试空缺**
+
+- SQLite schema 2 和 JSONL 首写转换的回滚、恢复后写入及外部副作用对账未演练；legacy JSONL 多遍读取所需独占所有权、崩溃/断电行为、生产规模锁/磁盘成本和真实 Workers 迁移仍未验证，不据此新增迁移缺陷。
+- `packages/durable/test/sqlite-migrations.test.ts:115-175` 的失败测试是在已达到 schema 2 后添加迁移，不能替代 v1->v2 task 重建各阶段的失败注入。需检查失败后 version 仍为 1、七列数据和 allocator 不变、原索引保留、无 `tasks_v2`，且重试成功。
+- Cloudflare image 入口缺少实际 workerd/Wrangler 初始化覆盖。Node `WebAssembly.compile` 和直接调用 `createPhotonImages` 不等价于经 `CompiledWasm` 规则导入 `createCloudflarePhotonImages`；应在目标 host 上准备真实小图。
+- 原生浏览器 Tab/focus 顺序和 Space keydown/keyup 与延迟刷新组合未执行，区别于 #7/#8 已选定缺陷。
+- Windows 支持 Node 版本的 addon/Job 生命周期、macOS/BSD 和 Linux/Android 锁与进程组清理、分布式 reload rollback/shutdown、路由 attachment 转换及真实终端模式恢复均未执行。这些是验证边界，不是新增运行时缺陷。
+
+**运行产物**
+
+运行目录: `/tmp/compound-engineering-501/ce-code-review/20261104-034547-r3-e61b4049`
+
+- `final-findings.json`: 最终 8 项及逐项验证原因、#6 门控路由。
+- `actionable-findings.json`: 7 项可行动修复，明确排除 #6。
+- `advisory-outputs.json`: 风险、测试空缺和部署建议。
+- `validator-verdicts.json`、`validator-outcome.json`: 完整独立验证结果。
+- `metadata.json`、`stages.jsonl`: 本轮元数据和阶段成本，summarize 返回 `status: complete`；这表示日志阶段完整，**不是代码验证或覆盖完整**。
+- `report.md` 由调用方持久化；向 `docs/plans/2026-10-30-c08a2fb-image-billing-code-review.md` 保留历史并追加本报告也由调用方负责。本报告 leaf 未写入上述两个 Markdown 目标。
+
+---
+
+### Verdict
+
+> **Not ready**
+>
+> **原因:** 当前审查 HEAD `1da23c158f319ac39829ef13c7da557183e0637a` 仍有 7 个已确认、尚未修复的 P2；另有 #6 concurrency 验证门未解除。#6 不能直接修复，也不能从结论中消失，需要真实 host 重叠复现或等价调度证明。全部候选均已验证处理，但本轮不是零新增；部分语义覆盖、未验证 Windows 二进制和发布证据门也不支持完整放行声明。
+>
+> **下一步:** 调用方修复并验证 7 个 confirmed，同时独立调查 #6；修复后继续以固定第一父 base 审查 merge 及全部修复，不能把报告完成或 actionable 不含 #6 当成收敛。
+>
+> **建议修复顺序:** #5 -> #3 -> #4 -> #7 -> #8 -> #1 -> #2。#6 是并行取证任务，不是 apply 项。
+
+**Actionable Findings recap**
+
+以下均为 P2、`autofix_class:gated_auto`、`suggested_fix:present`、confidence 75、owner `downstream-resolver`，均需修复后验证:
+
+1. **#5** `packages/coding-agent/src/core/tool-usage-binding.ts:130` - 保留内存 fork 原会话的延迟计费接收对象，避免付费回执丢失。响应类型: 代码修复与计费回归。
+2. **#3** `packages/coding-agent/src/core/export-html/template.js:171` - 默认导航排除纯计费终端分支，保持对话尾部可见。响应类型: 导航修复与导出树回归。
+3. **#4** `packages/coding-agent/src/core/model-runtime.ts:789` - 为物理请求接入 Models 遥测，不重复观测虚拟路由。响应类型: 契约修复与 recording-telemetry 集成验证。
+4. **#7** `scripts/issues/ui.html:243` - 解除按钮焦点与 pending decision 刷新的循环等待。响应类型: 状态机修复与真实浏览器时序验证。
+5. **#8** `scripts/issues/ui.html:250` - 后台刷新保护原生文本选区或保留稳定 DOM。响应类型: 交互修复与 selection 回归。
+6. **#1** `packages/agent/src/harness/pico3/chord.ts:347` - 原生镜像保留 append ops，消除反复全前缀比较。响应类型: 增量路径修复与成本回归。
+7. **#2** `packages/chord/test/manager.test.ts:176` - 使用有效 fork IPC 布局和 live-owner 对照，使 parent-loss 测试有区分性。响应类型: 测试修复与 Windows 执行。
+
+可行动产物: `/tmp/compound-engineering-501/ce-code-review/20261104-034547-r3-e61b4049/actionable-findings.json`。**#6 仍为 unresolved verification gate，不在以上修复队列中。**
+
+
+## Round 3 repair disposition and protected-gate resolution
+
+The seven confirmed findings have implementation changes and the focused proof below. Windows launcher execution remains unavailable on this host; #2 is a repaired test-design defect, not a claim of an observed native runtime escape. The initial report above remains an immutable snapshot of the reviewed HEAD and its then-unresolved #6 gate.
+
+| Finding | Disposition | Observed proof |
+|---|---|---|
+| #1 native Pico mirror | Bridge publishes named ordered `ChordViewRevision` frames; native state applies known ops, preserving `appendText` intent and metadata/root fallback. Generic facet/service types accept configured harnesses. | Original source in an isolated scratch copy failed both refined regressions: native 24 reads versus source baseline 8; 414,720 versus 138,240 prefix characters at 16 KiB, and 1,594,368 versus 531,456 at 64 KiB. Fixed native matches the same source-only baseline exactly: zero added scans. Chord/raw-frame files: 21 passed. The original source `ViewManager` baseline work was not changed or relabeled a mirror defect. |
+| #2 Windows parent-loss test | Keep invalid-layout case; add a dedicated marker IPC fixture, separate live/closed jobs, production-equivalent fork descriptors, a real live `launched` handshake, marker/IPC success control and closed-owner exit 125. Message assertions execute after exit, not in event callbacks. | Manager file: 25 passed / 10 platform-skipped. Standalone marker fixture executed on Darwin: marker written, IPC acknowledged, exit 0. **Actual Windows launcher/Job execution and binary-source equivalence remain unverified; no Windows red/green claimed.** `createWindowsJob.close()` is already idempotent; explicit close after child exit does not re-terminate an empty Job. |
+| #3 exported receipt navigation | Iterative subtree eligibility ignores usage-only terminal branches for automatic continuation, retaining state/policy tails, continuation through usage, explicit receipt inspection and deep-tree safety. | Four new export cases failed before repair by selecting `latest-receipt`; complete export file passes. Actual generated 290,366-byte HTML opened in Chromium; clicking the question tree node retained the later conversation, with the late receipt still represented. |
+| #4 retained Models telemetry | Reuse the exported `observeModelRequest` observer at physical stream/simple/poll lazy boundaries; virtual routing wrapper remains unobserved. Root/models export and telemetry docs updated. | Auth-options suite red: 15 failed / 11 passed; green: 26 passed. Assertions cover spans/parentage, events, usage/cost, no-consumption results, authentication, cancellation, provisional polls and exactly-once routed physical telemetry. One new auth-error fixture was corrected to the existing normalized error suffix; span assertions were unchanged. |
+| #5 in-memory fork receipts | Fork a separate deep-cloned manager; retain outgoing identity/selection. Dispatched recorders hold only the in-memory data destination strongly; reusable factories and persisted managers stay weak. Pending failed receipts retain their destination until publication. Historic fork billing semantics remain unchanged. | Runtime red: five failures; GC red: collected destination. Complete runtime/codemode/export files: 86 passed, including delayed classifier/image completion, before/at fork, original attribution, no late-charge inheritance, exactly once and real GC retention. Standalone source-runtime sink smoke observed original identity/parent preserved, one original receipt, zero fork receipts after owner release. |
+| #7 pointer decision focus | After pointer/click handoff, pending decisions flush their disabled render and authoritative snapshot without the ordinary background-focus deferral deadlocking them. | UI red: 48 passed / 24 failed; green: 72 passed, including 12 pointer/focus/order cases. Real native priority click before repair left focused controls enabled and ignored a second decision; clean repaired scenario disabled pending controls, installed issue 20 and accepted the next issue-20 decision without outside blur. |
+| #8 native selection | Background snapshots/renders protect noncollapsed ranges intersecting main, including cross-boundary ranges; `selectionchange` retries after collapse/outside movement. Explicit decision updates retain precedence. | Twelve selection regression cases failed before repair and pass afterward. Actual Chromium with the unchanged 8-second poll: before repair selected `this issue summary` became empty and its node detached; clean repaired atomic scenario retained text/node/issue 10, then installed issue 99 after collapse. Selection was established through the native Range API, not a physical drag; drag/order permutations are unit coverage. |
+
+### #6 protected concurrency gate: rejected by discriminating real-host evidence
+
+No production change was applied for #6. Three real-Host/memory-link tests separately gate A's Models, AgentController and Transcript readiness, supersede A with B, then release/cancel A and positively exercise B's methods and generation-2 state. All three passed with the asserted schedule **A rejected -> B models activated -> B published**. At reviewed revision `1da23c158`, Node 24.15.0 on Darwin arm64, synchronous old-link closure rejects A's pending bindings before B can publish; the proposed B-published-then-A-cleanup interleaving is refuted for this exact candidate. `attachment-resolution.json` records the runtime/configuration, trigger, assertions and source guard trace. This does not claim all conceivable client-management interleavings are safe; it resolves the specific initially unresolved finding without treating lack of disproof as confirmation.
+
+### Integration evidence and limits
+
+Nine complete coding-agent repair/adjacent files passed **237 tests**. The complete native Pico/raw-frame files passed **21 tests**; issue UI **72 tests**; manager **25 passed / 10 skipped**. Offline build completed with exit 0, producing the 76-file, 9.4-MiB coding-agent bundle. `npm run check` completed with exit 0, 1,986 files and **No fixes applied**, including TypeScript and browser-smoke. The first formatter pass touched seven owned source/test paths and a later marker assertion was formatted; the observed dirty set remains the declared 19 tracked repair/report/docs paths plus the new marker fixture, without manifest/lockfile or unrelated changes.
+
+The first authoritative isolated suite ended **13,741 passed / 1 failed / 945 skipped**, exit 1. The only failure was the pre-existing mobile-handoff delta wall-clock complexity ratio (287.5 versus threshold 40). A temporary behavioral replacement was fully reverted; its passing result is not acceptance evidence. The original unchanged file then passed all 60 cases sequentially. Its original threshold and code remain intact and it is excluded from this commit. The failed suite receipt is retained as `initial-suite.log` / `initial-suite-exit.json`; the authoritative rerun with the original unchanged test completed: **13,742 passed / 0 failed / 945 skipped**, exit 0, 366.31 seconds (`suite.log`, `suite-exit.json`, `artifact://522`). A final sequential `npm run check` after suite completion also exited 0 with No fixes applied (35.79 seconds).
+
+Runtime artifacts: `pico-prefix-proof.json`, `attachment-resolution.json`, `browser-smoke.json`, `export-browser-smoke.json`, `memory-receipt-smoke.json`, `timing-guard-disposition.json`, `build-exit.json`, `check-exit.json`. Browser timeouts/mixed-control attempts were discarded and clean scenarios rerun; no failed attempt is represented as passing evidence. Browser tabs/services and temporary smoke/scratch sources were closed/removed. Rust/native binaries were unchanged this round and not newly verified. Existing deployment/Workers/Windows operational gates remain.
+
+The exact decoded Round 3 report was appended before repair, preserving the original 58,536-byte prefix (SHA-256 `1ee18fefc26d4c5e2d6f285ea5d0a9edf7a442a761d3603d73c8bdfd648a5746`). After this round is committed, a fresh full-range review is still required; this is not a zero-finding round.
+

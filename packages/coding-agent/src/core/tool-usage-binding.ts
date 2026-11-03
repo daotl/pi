@@ -30,6 +30,8 @@ interface ToolUsageIdentity {
 
 interface PendingToolUsage {
 	ancestorIds: readonly string[];
+	/** Pending receipts cannot reload an in-memory destination after its recorder is collected. */
+	inMemoryManager: SessionManager | undefined;
 	kind: string;
 	provider: string;
 	model: string;
@@ -126,7 +128,7 @@ function drainToolUsage(ledger: ToolUsageLedger, notify: boolean): void {
 				adopted?.manager ??
 				(ledger.identity.file
 					? SessionManager.open(ledger.identity.file, ledger.identity.sessionDir, ledger.identity.cwd)
-					: ledger.manager.deref());
+					: (receipt.inMemoryManager ?? ledger.manager.deref()));
 			if (!manager || toolUsageIdentity(manager).key !== ledger.identity.key) {
 				throw new Error("Tool usage session is no longer available");
 			}
@@ -164,22 +166,39 @@ export function flushToolUsage(owner: ToolUsageManagerOwner, notify: boolean): v
 	if (ledger) drainToolUsage(ledger, notify);
 }
 
-/** Definitions retain only weak manager references; queued receipts contain data, never runtime callbacks. */
+/** Reusable definitions stay weak; only dispatched recorders retain in-memory session data. */
 export function createToolUsageRecorderFactory(owner: ToolUsageManagerOwner): ToolUsageRecorderFactory {
 	const managerRef = new WeakRef(owner.manager);
 	const notificationId = owner.notification?.id;
 	return () => {
 		const manager = managerRef.deref();
 		if (!manager) throw new Error("Tool usage session is no longer available");
-		const identity = toolUsageIdentity(manager);
-		const ancestorIds = manager
-			.getBranch()
-			.map((entry) => entry.id)
-			.reverse();
-		return (kind, provider, model, usage) => {
-			const ledger = toolUsageLedger(identity, managerRef);
-			ledger.pending.push({ ancestorIds, kind, provider, model, usage: structuredClone(usage), notificationId });
-			drainToolUsage(ledger, true);
-		};
+		return createToolUsageRecorder(manager, managerRef, notificationId);
+	};
+}
+
+function createToolUsageRecorder(
+	manager: SessionManager,
+	managerRef: WeakRef<SessionManager>,
+	notificationId: number | undefined,
+): ToolUsageRecorder {
+	const identity = toolUsageIdentity(manager);
+	const inMemoryManager = identity.file ? undefined : manager;
+	const ancestorIds = manager
+		.getBranch()
+		.map((entry) => entry.id)
+		.reverse();
+	return (kind, provider, model, usage) => {
+		const ledger = toolUsageLedger(identity, managerRef);
+		ledger.pending.push({
+			ancestorIds,
+			inMemoryManager,
+			kind,
+			provider,
+			model,
+			usage: structuredClone(usage),
+			notificationId,
+		});
+		drainToolUsage(ledger, true);
 	};
 }

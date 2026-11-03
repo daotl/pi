@@ -71,7 +71,7 @@ import {
 import { normalizeContext } from "./utils/transcript.ts";
 
 export { ModelsError, type ModelsErrorCode } from "./auth/resolve.ts";
-export { AI_TELEMETRY_SCHEMA } from "./telemetry.ts";
+export { AI_TELEMETRY_SCHEMA, observeModelRequest } from "./telemetry.ts";
 export { getModelType, isModelType } from "./utils/model-operations.ts";
 
 export interface ModelsPublication {

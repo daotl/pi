@@ -1,10 +1,11 @@
 import { lstat, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHost, type Frame, hostNamed, method, remote } from "@earendil-works/chord";
+import { createHost, type Frame, hostNamed, memoryLinkPair, method, remote, type Self } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import { Client, ServerError as ClientServerError } from "@earendil-works/pi-client";
 import { createUnixTransportFactory } from "@earendil-works/pi-client/unix";
+import { Server as NativeServer } from "@earendil-works/pi-server";
 import { ProcessTerminal, TuiMainScreen } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, type Mock, test, vi } from "vitest";
@@ -22,11 +23,13 @@ import {
 	createServerServiceSource,
 	createSessionServiceSource,
 	type SessionAttachmentState,
+	waitForClientHostClose,
 } from "../src/experimental/services/connection.ts";
-import { Models } from "../src/experimental/services/models.ts";
+import { Models, ModelsStateSchema } from "../src/experimental/services/models.ts";
 import { SessionPlugins } from "../src/experimental/services/plugins.ts";
+import { createExperimentalServerServices } from "../src/experimental/services/server.ts";
 import { SessionDirectory, SessionManagement } from "../src/experimental/services/sessions.ts";
-import { Transcript } from "../src/experimental/services/transcript.ts";
+import { Transcript, TranscriptStateSchema } from "../src/experimental/services/transcript.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import {
 	configureExperimentalWorkerModel,
@@ -167,6 +170,190 @@ describe("experimental durable server composition", () => {
 				delayed.resolve();
 				spy.mockRestore();
 				await clientRuntime.dispose();
+			}
+		},
+	);
+
+	test.each([Models, AgentController, Transcript])(
+		"rejects superseded real-host %s acquisition before replacement capabilities publish",
+		async (pending) => {
+			const serverId = "00000000-0000-4000-8000-000000000001";
+			const entered = Promise.withResolvers<void>();
+			const resume = Promise.withResolvers<void>();
+			const schedule: string[] = [];
+			let generation = 0;
+			const unsupported = (): never => {
+				throw new Error("Operation outside the attachment overlap fixture");
+			};
+			const serverServices = await createExperimentalServerServices({
+				list: async () => ["demo-1", "demo-2"].map((sessionId) => ({ serverId, sessionId, createdAt: 1 })),
+				create: unsupported,
+				remove: unsupported,
+				prepareSessionPlugins: async () => ({ packagePaths: [], presentationPlugins: [] }),
+				reloadPresentationPlugins: unsupported,
+			});
+			const nativeServer = new NativeServer(
+				{
+					serverServices: serverServices.host,
+					resolveSession: async (id) => ({ id, createdAt: 1, storageVersion: 1 }),
+					openSession: async ({ id }) => {
+						const currentGeneration = ++generation;
+						const provider = createHost({ name: "session", self: "session" });
+						const gate = (contract: { readonly name: string }, self: Self): void => {
+							if (id !== "demo-1" || contract.name !== pending.name) return;
+							self.resource("capability-readiness", {
+								version: 1,
+								open: ({ signal }) => {
+									entered.resolve();
+									const { promise, resolve, reject } = Promise.withResolvers<void>();
+									const abort = () => reject(signal.reason);
+									signal.addEventListener("abort", abort, { once: true });
+									void resume.promise.then(() => {
+										signal.removeEventListener("abort", abort);
+										resolve();
+									});
+									if (signal.aborted) abort();
+									return promise;
+								},
+							});
+						};
+						provider.serve(SessionPlugins, () => ({ variant: "active", reload: unsupported }));
+						provider.serve(Models, (_input, _principal, self) => {
+							gate(Models, self);
+							if (id === "demo-2") schedule.push("B models activated");
+							return {
+								variant: "active",
+								state: self.state("models", ModelsStateSchema, {
+									catalog: { revision: currentGeneration, availableModels: [] },
+									configuration: { model: null, thinkingLevel: "off" },
+									refresh: { status: "idle" },
+								}),
+								getThinkingLevels: () => ["off"],
+								cycleThinking: unsupported,
+								refresh: unsupported,
+								select: unsupported,
+								selectThinking: unsupported,
+							};
+						});
+						provider.serve(AgentController, (_input, _principal, self) => {
+							gate(AgentController, self);
+							return {
+								variant: "active",
+								prompt: unsupported,
+								requestAbort: unsupported,
+								steer: unsupported,
+								followUp: unsupported,
+								nextRun: unsupported,
+								cancelQueued: () => ({ outcome: "not_found" }),
+								resume: unsupported,
+								compact: unsupported,
+								navigate: unsupported,
+							};
+						});
+						provider.serve(Transcript, (_input, _principal, self) => {
+							gate(Transcript, self);
+							return {
+								variant: "active",
+								state: self.state("transcript", TranscriptStateSchema, {
+									snapshot: null,
+									stream: null,
+									sequence: currentGeneration,
+									events: [],
+								}),
+							};
+						});
+						return {
+							attachClient() {
+								const [link, accepted] = memoryLinkPair();
+								provider.accept(accepted, { principal: "presentation", kind: "client" });
+								return { link, release: () => link.close("attachment released") };
+							},
+							close: () => provider.close(),
+						};
+					},
+				},
+				{ serverId, listeners: [] },
+			);
+			// Only the byte transport is in-process. Client routing, attachment generations,
+			// server mutation serialization, Host.get and downstream reference teardown are real.
+			const client = await Client.connect({
+				serverId,
+				transportFactory: (handlers) => {
+					let closed = false;
+					const handler = nativeServer.accept({
+						get closed() {
+							return closed;
+						},
+						async send(chunk) {
+							handlers.onData(chunk);
+						},
+						close(finalChunk) {
+							if (closed) return;
+							if (finalChunk !== undefined) handlers.onData(finalChunk);
+							closed = true;
+							handlers.onClose();
+						},
+					});
+					return {
+						async send(chunk) {
+							handler.onData(chunk);
+						},
+						close() {
+							if (closed) return;
+							closed = true;
+							handler.onClose();
+						},
+					};
+				},
+			});
+			clients.add(client);
+			const serverSource = createServerServiceSource(client);
+			const sessionSource = createSessionServiceSource(client);
+			try {
+				const server = await activateBuiltinClientServices({
+					route: { transport: "unix", serverId, path: "/unused-in-memory-transport" },
+					client,
+					server: serverSource,
+					session: sessionSource,
+				});
+				const controller = new AbortController();
+				const first = serverSource.host.root((ctx) => server.management.attach("demo-1", ctx), {
+					signal: controller.signal,
+				});
+				const rejected = expect(first).rejects.toMatchObject({ code: "unavailable" });
+				void first.catch(() => schedule.push("A rejected"));
+				await entered.promise;
+				const firstAttachment = client.attachment!;
+				expect(firstAttachment.sessionId).toBe("demo-1");
+				expect(sessionSource.attachment.value).toEqual({ status: "attached", sessionId: "demo-1" });
+				expect(schedule).toEqual([]);
+
+				await serverSource.host.root((ctx) => server.management.attach("demo-2", ctx));
+				schedule.push("B published");
+				const replacement = client.attachment!;
+				expect(replacement.sessionId).toBe("demo-2");
+				expect(replacement.attachmentId).not.toBe(firstAttachment.attachmentId);
+				await rejected;
+				controller.abort(new Error("late cancellation of superseded A"));
+				resume.resolve();
+
+				await expect(serverSource.host.root((ctx) => server.models.getThinkingLevels(ctx))).resolves.toEqual([
+					"off",
+				]);
+				await expect(serverSource.host.root((ctx) => server.agent.cancelQueued("missing", ctx))).resolves.toEqual({
+					outcome: "not_found",
+				});
+				expect(server.models.state.value.catalog.revision).toBe(2);
+				expect(server.transcript.state.value.sequence).toBe(2);
+				expect(client.attachment).toBe(replacement);
+				expect(schedule).toEqual(["A rejected", "B models activated", "B published"]);
+			} finally {
+				resume.resolve();
+				await Promise.all([serverSource.dispose(BACKGROUND_CONTEXT), sessionSource.dispose(BACKGROUND_CONTEXT)]);
+				await client.dispose();
+				await waitForClientHostClose(client);
+				await nativeServer.close();
+				await serverServices.dispose();
 			}
 		},
 	);

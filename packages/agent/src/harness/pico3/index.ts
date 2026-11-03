@@ -10,6 +10,7 @@ export { Bounded } from "./bounded.ts";
 export type {
 	ChordViewBridge,
 	ChordViewBridgeOptions,
+	ChordViewRevision,
 	PublishedConversationView,
 } from "./chord.ts";
 export {

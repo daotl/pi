@@ -1136,6 +1136,8 @@ await telemetry.startSpan({ name: 'application.turn' }, async (span) => {
 
 `Models.stream()` and `streamSimple()` create `pi.ai.request`; `streamDeferred()` creates one `pi.ai.poll` per poll. Their completion helpers use the same spans. These spans include auth/setup, end at the terminal result, and do not require the caller to consume events. Direct provider/API calls are not instrumented.
 
+Custom `Models` implementations can reuse the root/models export `observeModelRequest(model, options, poll)` as the observer passed to `lazyStream`. Observe only physical requests; a routing wrapper that delegates to another observed `Models` request must not add a second observer. Coding-agent's `ModelRuntime` uses this same boundary for requests and deferred polls.
+
 `AI_TELEMETRY_SCHEMA`, exported from the root and `@earendil-works/pi-ai/models`, defines the typed Pi-owned vocabulary:
 
 - Start attributes: `provider`, `api`, `model`, and `reasoning` only when `options.reasoning` is a string. Provider-native reasoning objects are ignored.
