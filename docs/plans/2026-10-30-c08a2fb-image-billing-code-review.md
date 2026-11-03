@@ -260,3 +260,119 @@ All16 original confirmed findings and the concrete repair-edge failures describe
 The requested report did not exist and is ignored by the repository's `plans/` rule, so the user-authorized exact path is explicitly included in the local commit. The previously reviewed25 dirty files were offered together by the user; the final explicit scope includes them, the repaired sources/tests/docs, the older append-only closure and this report. No dependency manifest/lockfile or protected Cargo target is included. This local commit is authorized; no push or PR is authorized or performed.
 
 **Final verdict: all16 validated findings repaired and locally verified, subject to the explicit platform/operational limits.** This supersedes the initial Not ready queue for the repaired local tree, not the disclosed review collection deviations or partial semantic coverage. No unconditional every-hunk or deployment-platform clearance is claimed.
+
+## Code Review Results - Round 2
+
+**Scope:** `98dfe28cbeec4e1f2f61516e227420b2407dcdf9` -> `2b0d2c5bb755c94008494ed4180edecae8c0843f`，覆盖 merge `8322aa1d` 及之后全部修复，非仅审查报告文件。共 1,272 路径、199,311 变更行，其中 73,912 可执行非测试行、47 个删除路径。
+**Intent:** 集成 upstream 1.4.0，同时保留 Crystal 历史编辑、删除、恢复、shred、id0、Harness/experimental/client 消费方及计费、多模态和摘要预算语义。
+**Mode:** `markdown report-only`，`depth:full`。本叶不应用修复；调用方修复、验证并本地提交后仍须继续完整范围审查。
+
+**Reviewers:** 五个 correctness 分区分别检查 models/native/history/execution/surface；security 检查信任与授权，reliability 检查异步生命周期，api-contract 检查保留及发布接口，data-migration 检查 SQLite/v3 转换，testing 检查验证防线，performance 检查执行成本，maintainability 检查集成维护性，agent-native-reviewer 检查工具可达性，julik-frontend-races 检查真实 DOM 交互，deployment-verification-agent 检查破坏性 schema v2 上线，adversarial 提供跨模型失败后的本进程替代视角。15 个本地视角及替代视角均已收集；另一个新验证者检查全部六项。
+
+### Triage Groups
+
+| Group | Findings | Context | Preferred Resolution | Why |
+|---|---|---|---|---|
+| 回执持久化与历史，apply-queue | #1, #2, #4, #5 | 晚到回执同时影响父节点存活、历史选择、持久化成本和 v3 导入 | 先 #2，随后 #5、#4，再以 #1 覆盖实际生产格式；每项保留独立回归 | 同一生命周期的不同缺陷，不能用其中一个修复替代其余项 |
+
+### P1 -- High
+
+| # | File | Issue | Reviewer | Confidence |
+|---|---|---|---|---|
+| 1 | `packages/agent/src/harness/session/jsonl/legacy-v3.ts:228` | 新写入的独立 usage 回执使 v3 会话无法导入 | data-migration | 75 |
+| 2 | `packages/coding-agent/src/core/tool-usage-binding.ts:133` | shred 调用父节点后，晚到回执堵塞后续计费和提示词准入 | correctness-history, reliability, adversarial | 75 |
+
+- **#1:** `appendUsageAt()` 在版本 3 文件中写入 `type: usage`，导入器却拒绝该类型；带有已付费工具回执的会话在打开或 fork 时抛错。**修复:** 完整支持 usage 记录解析、经父节点解析对话谱系和叶节点、累计去重费用，不把回执当作对话节点。增加真实生产者写入后 open/fork/upgrade/reopen 的回归，断言所选上下文不变、费用恰好一次。**validation_status: confirmed；validation_reason:** 已检查生产者和导入路径，触发前提为 v3 文件含此回执；发生率未测量。
+- **#2:** provider 忽略取消而晚到时，用户可能已永久 shred 原 dispatch 父节点。`appendUsageAt()` 因父节点不存在而抛错，FIFO 队首不移除，下一次 prompt 在准入前再次 flush 并失败；费用无法落盘，后续操作持续受阻。**修复:** dispatch 时捕获祖先链，原父节点不存在时附到最近仍存活的原祖先，否则附到 null；不得挂到当前分支或复活已 shred 内容。覆盖 abort -> shred -> provider 返回、同文件 manager adoption、恰好一次计费及后续 prompt 成功。**validation_status: confirmed；validation_reason:** 已检查晚返回测试源码、shred 入口和准入 flush；该交错发生率未测量。三位本地审查者一致指出同一缺陷，不构成跨模型证据。
+
+### P2 -- Moderate
+
+| # | File | Issue | Reviewer | Confidence |
+|---|---|---|---|---|
+| 3 | `packages/chord/src/host.ts:1230` | 安装已关闭连接后，既有远程引用无法随下次重连恢复 | correctness-native | 100 |
+| 4 | `packages/coding-agent/src/core/session-manager.ts:1752` | 每个模型回执都同步重写整份会话 | performance | 75 |
+| 5 | `packages/coding-agent/src/core/session-manager.ts:1752` | 晚到回执分支被 swipe 导航误选为对话尾部 | correctness-history | 75 |
+| 6 | `scripts/issues/ui.html:82` | 轮询替换键盘焦点控件，吞掉 Space 激活 | julik-frontend-races | 75 |
+
+- **#3:** 已断开的 `IpcLink` 在 Connection 构造中同步执行清理，`connect()` 随后仍安装它并重新 hold 绑定。下次正常连接因绑定已有 hold 而跳过，旧引用持续失效。**修复:** `#addConnection()` 返回后，仅在 `connection.open` 时设置 upstream 并重新 hold；失败时保持绑定分离。回归覆盖已有引用 -> 断开 -> 已关闭链接 -> 活链接，验证原引用恢复。**validation_status: confirmed；validation_reason:** 已检查同步关闭及后续重连的 guard，发生率未测量。
+- **#4:** 文档允许逐项 `Promise.all` 分类，每个 usage 回调却调用 `_commitEntries()`，重建全部索引、序列化全部历史和图片、同步写入/fsync/替换文件。成本随完整会话大小和回执数量增长，阻塞主事件循环。**修复:** 将 usage + 保留原选择的 leaf checkpoint 作为可回滚追加事务；沿用写前长度和失败截断纪律，持久化成功后再发布索引及条目，保留所有权、重试和耐久语义。**validation_status: confirmed；validation_reason:** 已检查逐项调用及全文件重写路径；实际延迟和发生率未测量，未做性能基准。
+- **#5:** 晚到回执在 dispatch 父节点下形成较新的 sibling leaf。切回 swipe 版本时，导航按最新叶时间选择，可能选中回执而隐藏实际工具结果、最终答案及后续对话；这不是已证明的磁盘删除。**修复:** 有真实对话延续时，不让 usage-only 侧枝参与对话尾部竞争，同时保留正常状态/策略尾部。覆盖 detached 付费调用、完整后续对话、替代版本、晚到回执以及来回切换。**validation_status: confirmed；validation_reason:** 已检查晚返回支持和无 usage 过滤的导航，发生率未测量。其修复不能替代 #4。
+- **#6:** 八秒轮询只保护活动指针和聚焦的 select。刷新若落在按钮 Space keydown/keyup 之间，会删除激活目标并丢失决策，也会移除其他键盘焦点。**修复:** 对 `#main` 内聚焦的交互后代延迟 snapshot/render，focusout 稳定后再 flush；保留显式提交时禁用控件的 render。用真实 DOM 验证轮询穿插 Space 操作仍只提交一次且空闲轮询不丢焦点。**validation_status: confirmed；validation_reason:** 已检查 render 和键盘处理路径，浏览器发生率未测量；现有普通属性 mock 不验证原生焦点/激活行为。
+
+### Actionable Findings
+
+以下六项全部已确认、均交由调用方处理；本轮没有已应用修复。所有项目均有 `suggested_fix` 且 `requires_verification:true`。
+
+| # | File | Issue | Route | Notes |
+|---|---|---|---|---|
+| 1 | `packages/agent/src/harness/session/jsonl/legacy-v3.ts:228` | P1，接收并正确迁移独立 usage | `gated_auto -> downstream-resolver` | 持久格式兼容；75 |
+| 2 | `packages/coding-agent/src/core/tool-usage-binding.ts:133` | P1，恢复已删除 dispatch 谱系的回执归属 | `manual -> downstream-resolver` | 审核祖先回退方案后修复；75 |
+| 3 | `packages/chord/src/host.ts:1230` | P2，拒绝安装关闭的 upstream | `gated_auto -> downstream-resolver` | 原引用重连回归；100 |
+| 4 | `packages/coding-agent/src/core/session-manager.ts:1752` | P2，以耐久追加取代逐回执全量重写 | `gated_auto -> downstream-resolver` | 验证失败回滚和选择不变；75 |
+| 5 | `packages/coding-agent/src/core/session-manager.ts:1752` | P2，swipe 不选择 usage-only 侧枝 | `gated_auto -> downstream-resolver` | 验证完整对话恢复；75 |
+| 6 | `scripts/issues/ui.html:82` | P2，轮询保护键盘焦点和激活 | `gated_auto -> downstream-resolver` | 真实 DOM 回归；75 |
+
+### Deployment Notes
+
+此处是发布前提，不是额外产品缺陷；目前缺少运维证据，**上线 NO-GO**。
+
+- 打开 SQLite storage 就会自动执行 v1 -> v2 迁移，先停止全部 writer/scheduler/旧实例，记录每个数据库或对象的原 prefix。不得把启动新应用当作无副作用检查。
+- Node 用 SQLite backup 机制取得并校验备份，不能仅复制可能依赖 WAL 的主文件；Cloudflare 需记录对象、恢复点、保留期限并在一次性对象演练恢复。升级前记录 integrity、schema version、metadata、各表及状态计数、task 全部七列和五个索引定义。
+- 先用备份副本测迁移时间、空间/WAL 峰值，并在实际 `DROP TABLE`/rename 序列中注入失败，证明每个部署后端都恢复行、索引及版本。当前审查没有执行这些操作。
+- 仅打开 storage 迁移，保持任务处理关闭；比对 `durable_schema.version = 2`、`PRAGMA integrity_check = ok`、`tasks_v2` 不存在、五个索引及其定义正确。对 task 七列和其他原有表做双向 `EXCEPT`，差异均应为零；counts 和 `next_id`/`next_seq` 不变后再恢复处理。
+- 回退到 1.3.0 或更早需要恢复升级前数据库，不可只回滚代码或降版本号。恢复会丢弃备份之后的写入，且不会撤销外部工具/模型副作用；恢复处理后必须先对账。旧 JSONL runtime 也不能恢复 sleeping task。
+- 启用时及 +1h/+4h/+24h 检查 migration/storage-open、`session_failed`、`migration_failed`、`task_parked`，跟踪 sleeping deadline 和 submission 进度，验证 canary 重启后恢复且无重复副作用。Node `synchronous=NORMAL` 不保证最新提交抗掉电；Cloudflare 依赖平台事务和恢复能力，自定义 adapter 仍须满足事务契约。
+
+完整清单及未执行的查询示例见本轮 `deployment-verification-agent.md`。
+
+### Coverage
+
+- 本轮是独立新一轮完整范围审查，未用历史报告播种。8 个原始候选合并了同一 deleted-parent 缺陷的 2 个重复，剩余 **6 项全部确认**；既有问题 0、confidence suppression 0（anchor 50/25 均 0）、软降级 0、malformed 0、quote gate 降级 0、first-evidence backfill 0。没有遗漏候选或 cap 跳过。
+- 一批验证覆盖 #1-#6，结果在界限内到达：confirmed 6、rejected 0、unresolved 0、malformed 0、failed 0、shortcut-skipped 0。**全部是独立源码验证，发生率均未测量；不是运行复现。** #3 保留本叶事先判定的 concurrency 保护，虽验证者填 null；#5 由验证者增加 concurrency 保护。#1 为 public-contract，#2/#6 为 concurrency；不改变严重度或置信度。
+- 1,272 条路径全部入账，但不是逐 hunk 放行。完整语义审查/证据不足分别为 models 19/248、native 61/109、history 19/91、execution 57/245、surface 39/384；合计 **195/1,077**。过期且未监控的图索引不作完备性证据；使用当前源码检索，未穷尽动态、外部消费方或删除模块的存活性，未执行/比对 Windows 预编译二进制。
+- 本地 15 个视角及 adversarial fallback 均终态收集，无失败、超时或 malformed；并发上限 5。部分研究超过目标时间，但未超过收集界限。适用 AGENTS 仍约束审查，未增加未指定标准；review policy 移除/重分级 0，settlement suppression 未评估。
+- adversarial lens: in-process fallback (cross-model peer not run: Claude ACP authentication failed: OAuth session expired and could not be refreshed)
+- Peer 身份：`model_requested=claude-opus-5-5`、`effort_requested=high`、`receipt_supported=false`、`model_actual=unverified`、`effort_actual=unverified`、`independence_verified=false`。跨模型没有完成审查，也未折入 peer artifact；本进程 fallback 不授权验证捷径。调度方记录 peer job 目录已删除。
+- 本审查及报告叶未运行 tests/build/lint/install/provider/browser，不做源代码或仓库文档修改。本叶只消费本轮交接、合成及六项 verdict；独立验证者读取源码。以往绿色结果不能证明本轮缺陷或修复。
+- Agent-native 抽样的 6/6 高优先级能力可通过 agent 接口使用，未建立新的可执行缺陷，不代表全量清除。测试缺口另有：packed runtime smoke 不编译隔离的 TypeScript SDK 声明消费者；真实 v2 DROP/rename 中途失败的逐后端恢复演练未做。生产备份、容量、恢复证据仍缺失，属于上述发布门槛，不计入新增产品发现。
+- 机器结果位于 `/tmp/compound-engineering-501/ce-code-review/20261104-021452-r2-e6183e7d`：`review.json`、`final-findings.json`、`actionable-findings.json`、`advisory-outputs.json`、`metadata.json`；原始验证理由完整保留。调用方将本报告追加到同一审查文档。
+
+---
+
+### Verdict
+
+> **Not ready.** 本轮新增并确认 2 项 P1、4 项 P2，六项均未修复，尚未满足“新一轮完整范围审查零新增且无未验证遗漏”的收敛条件。
+>
+> **首要动作:** 先修复 #2 的回执队首永久阻塞，并处理 #1 的 v3 导入失败；完成其余四项及相应验证、本地提交后继续完整范围审查。发布另受部署门槛约束。
+
+**Actionable Findings - 优先队列**（全部 `suggested_fix: present`，owner 均为 `downstream-resolver`）：
+
+1. **#2 P1** `packages/coding-agent/src/core/tool-usage-binding.ts:133` - 晚到回执引用已 shred 父节点，持续堵塞准入；`manual`，采用原谱系存活祖先回退并验证，confidence 75。
+2. **#1 P1** `packages/agent/src/harness/session/jsonl/legacy-v3.ts:228` - 独立 usage 破坏 v3 导入；`gated_auto`，补齐解析、谱系和去重计费回归，confidence 75。
+3. **#5 P2** `packages/coding-agent/src/core/session-manager.ts:1752` - swipe 被回执侧枝截短；`gated_auto`，保留真实对话尾部，confidence 75。
+4. **#4 P2** `packages/coding-agent/src/core/session-manager.ts:1752` - 逐回执同步重写整会话；`gated_auto`，改为可回滚耐久追加，confidence 75。
+5. **#3 P2** `packages/chord/src/host.ts:1230` - 关闭链接污染重连绑定；`gated_auto`，仅安装仍 open 的连接，confidence 100。
+6. **#6 P2** `scripts/issues/ui.html:82` - 轮询丢键盘焦点/激活；`gated_auto`，延迟交互中刷新并补真实 DOM 回归，confidence 75。
+
+Artifacts: `/tmp/compound-engineering-501/ce-code-review/20261104-021452-r2-e6183e7d`。
+
+
+## Round 2 repair disposition
+
+All six confirmed findings are implemented. This closes the Round 2 repair queue, not the required subsequent independent full-range review.
+
+| Finding | Repair | Observed local proof |
+|---|---|---|
+| #1 v3 standalone usage | Parse and index usage as state-only nodes, resolve ancestry/selection through them, and include deduplicated charges in the existing import adjustment. | Three producer-written cases failed with `Unsupported legacy v3 record type: usage` before repair. Complete migration file: 55 passed. Standalone source-runtime producer -> importer -> upgrade smoke: version 3, 12 tokens, cost 0.03, two context messages. |
+| #2 shredded dispatch lineage | Capture original ancestor IDs at dispatch; resolve the nearest survivor against the current writer on every drain attempt, otherwise null. | Eight classifier/image, current-manager/same-file adoption cases failed before repair. Complete codemode suite now passes, including exactly-once reopen, no shredded-node resurrection, and subsequent prompt admission. |
+| #3 closed upstream reconnect | Install and re-hold only if the newly constructed connection remains open. | Original reference stayed `loading` in the red regression. Complete link suite: 25 passed. Standalone source runtime: original reference `live`, replacement counter 1 after disconnected IPC then live reconnect. |
+| #4 per-receipt full rewrite | Persist usage plus selected-leaf checkpoint in one rollback-protected fsynced append batch; publish memory only after success. Initial file publication may still serialize setup history. | Five append/rollback tests failed before repair. Transaction suite passes partial receipt/checkpoint/batch writes, fsync failure, rollback quarantine/repair, retries and reopen. Source-runtime smoke appended 100 receipts to 2,000,966 historical bytes, wrote 33,900 additional bytes, serialized zero historical entries, preserved selection and reopened 100 charges; 1,071.5 ms on this machine, not a throughput benchmark. |
+| #5 swipe receipt side branch | Ignore terminal receipt-only branches while retaining state/policy and continuations through receipts; restore selected policy at runtime without appending a new policy child. | Two detached classifier/image swipe cases failed before repair. An intermediate failure was traced to policy restoration appending a child of the correctly selected policy leaf; runtime-only restoration fixed it without changing assertions. Both cases include reopen and full projection/branch equality. |
+| #6 keyboard focus/poll | Defer background snapshot/render/flush while an interactive main descendant is focused; flush after focus settles outside. Explicit decision render still disables controls. | UI red: 37 passed / 10 failed; green: 47 passed. Real Chromium with unchanged production 8,000-ms poll reproduced disconnected/unfocused Space target and zero decisions before repair; after repair original target remained connected/focused and keyup submitted exactly `{number:10, priority:"p0"}` once, with controls disabled. Button -> summary -> link kept issue 10; leaving main installed issue 99. Failed poll displayed 503 while preserving focused button. Native retriage/bulk Space was not separately exercised; unit sequences cover those controls. |
+
+The four complete receipt/codemode/swipe/policy files passed 129 tests. Five adjacent swipe/history persistence files passed 92 tests. `npm run check` completed with exit 0, 1,986 files and **No fixes applied**, including TypeScript and browser-smoke; durable receipts are `check.log` and `check-exit.json` in the Round 2 run directory. Earlier check attempts exposed a TypeScript stale status narrowing; the regression now reads status through a function without weakening equality assertions. The first formatter pass changed five owned Round 2 files; the observed dirty set contains only the 12 declared Round 2 paths, no dependency/lockfile or unrelated user paths.
+
+`npm run build:offline` completed, producing the 76-file, 9.4-MiB coding-agent bundle. Rust was unchanged this round; prior Rust/native checks are not represented as newly rerun. Actual-browser evidence is `browser-smoke.json`; append instrumentation is `receipt-append-smoke.json`. Temporary smoke scripts, browser service and tab were removed/stopped. The authoritative isolated root suite completed: **13,691 passed / 0 failed / 945 skipped**, exit 0, 341.97 seconds. `suite.log` ends with the aggregate and `suite-exit.json` records code 0. The first isolated run also completed with the same totals (400.74 seconds, `artifact://379`); the durable rerun is the authoritative retained receipt (`artifact://387`). A standalone same-file adoption smoke separately observed one receipt on the surviving original ancestor or null, selected branch retained, shredded dispatch parent absent, and a usable subsequent append (`lineage-smoke.json`).
+
+The decoded Markdown report above preserves the original 38,907-byte report prefix (SHA-256 `a16eaaf32ecff4bae478e12246d499f9363a6e96f9ef014072a32eaba24ac8fc`). An initial JSON-wrapped append was corrected by programmatic decoding before further appends. Historical Not ready and intermediate validation receipts remain intact.
+

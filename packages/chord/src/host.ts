@@ -1227,6 +1227,7 @@ export class HostImpl implements Host, HostCore {
 			principal: options.principal,
 			peer: { kind: "host", name: undefined },
 		});
+		if (!connection.open) return;
 		this.upstream = connection;
 		// Bindings that lost their link re-hold over the new one (`again`: they keep their values meanwhile).
 		for (const binding of this.bindings.values())

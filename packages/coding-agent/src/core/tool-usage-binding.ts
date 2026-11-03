@@ -29,7 +29,7 @@ interface ToolUsageIdentity {
 }
 
 interface PendingToolUsage {
-	parentId: string | null;
+	ancestorIds: readonly string[];
 	kind: string;
 	provider: string;
 	model: string;
@@ -130,13 +130,10 @@ function drainToolUsage(ledger: ToolUsageLedger, notify: boolean): void {
 			if (!manager || toolUsageIdentity(manager).key !== ledger.identity.key) {
 				throw new Error("Tool usage session is no longer available");
 			}
-			const entry = manager.appendUsageAt(
-				receipt.parentId,
-				receipt.kind,
-				receipt.provider,
-				receipt.model,
-				receipt.usage,
-			);
+			// Resolve against this attempt's writer: edits may remove more of the original
+			// lineage between failed publications, and replacement branches never own the call.
+			const parentId = receipt.ancestorIds.find((id) => manager.getEntry(id) !== undefined) ?? null;
+			const entry = manager.appendUsageAt(parentId, receipt.kind, receipt.provider, receipt.model, receipt.usage);
 			// Publication owns the charge now, even if refreshing a disposed view or notifying fails.
 			ledger.pending.shift();
 			if (!adopted && ledger.identity.file) {
@@ -175,10 +172,13 @@ export function createToolUsageRecorderFactory(owner: ToolUsageManagerOwner): To
 		const manager = managerRef.deref();
 		if (!manager) throw new Error("Tool usage session is no longer available");
 		const identity = toolUsageIdentity(manager);
-		const parentId = manager.getLeafId();
+		const ancestorIds = manager
+			.getBranch()
+			.map((entry) => entry.id)
+			.reverse();
 		return (kind, provider, model, usage) => {
 			const ledger = toolUsageLedger(identity, managerRef);
-			ledger.pending.push({ parentId, kind, provider, model, usage: structuredClone(usage), notificationId });
+			ledger.pending.push({ ancestorIds, kind, provider, model, usage: structuredClone(usage), notificationId });
 			drainToolUsage(ledger, true);
 		};
 	};

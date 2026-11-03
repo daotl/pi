@@ -2403,7 +2403,7 @@ export class AgentSession {
 		if (changed) {
 			this._discardPrefillRecovery();
 			this._refreshFinalizedContext();
-			this._restoreBaseSystemPromptFromBranch();
+			this._restoreBaseSystemPromptFromBranch(false);
 		}
 		return changed;
 	}
@@ -2422,18 +2422,25 @@ export class AgentSession {
 				childrenByParent.set(entry.parentId, [entry]);
 			}
 		}
-		let leaf: SessionEntry | undefined;
+		// Receipts are accounting side branches, not newer conversational selections.
+		// Keep every other entry type, including state and policy tails, and retain
+		// receipt nodes only when real continuation passes through them.
+		const descendants: SessionEntry[] = [];
 		const stack: SessionEntry[] = [versionRoot];
 		while (stack.length > 0) {
 			const node = stack.pop()!;
+			descendants.push(node);
 			const children = childrenByParent.get(node.id);
-			if (!children || children.length === 0) {
-				if (!leaf || node.timestamp >= leaf.timestamp) {
-					leaf = node;
-				}
-				continue;
-			}
-			stack.push(...children);
+			if (children) stack.push(...children);
+		}
+		const continuing = new Set<string>();
+		let leaf: SessionEntry | undefined;
+		for (let i = descendants.length - 1; i >= 0; i--) {
+			const node = descendants[i];
+			const hasContinuation = continuing.has(node.id);
+			if (node.type === "usage" && !hasContinuation) continue;
+			if (node.parentId !== null) continuing.add(node.parentId);
+			if (!hasContinuation && (!leaf || node.timestamp > leaf.timestamp)) leaf = node;
 		}
 
 		manager.branch((leaf ?? versionRoot).id);

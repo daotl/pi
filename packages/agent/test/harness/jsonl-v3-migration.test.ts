@@ -168,6 +168,145 @@ describe("JSONL v3 migration", () => {
 		},
 	);
 
+	it.each(["conversation", "usage-leaf", "usage-parent"] as const)(
+		"imports producer-written standalone usage with a selected %s across fork, upgrade, and reopen",
+		async (selection) => {
+			const directory = getOrThrow(await fileSystem.absolutePath("usage-producer", BACKGROUND_CONTEXT));
+			const producer = SessionManager.create("/workspace", directory);
+			const usage: Usage = {
+				input: 11,
+				output: 7,
+				cacheRead: 3,
+				cacheWrite: 2,
+				totalTokens: 23,
+				cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 },
+			};
+			producer.appendModelChange("faux", "selected-model");
+			producer.appendThinkingLevelChange("high");
+			const rootMessage = { role: "user", content: "root", timestamp: NOW } satisfies AgentMessage;
+			const selectedMessage = {
+				role: "user",
+				content: "selected request",
+				timestamp: NOW + 1,
+			} satisfies AgentMessage;
+			const answer: AssistantMessage = { ...fauxAssistantMessage("selected answer"), usage };
+			const root = producer.appendMessage(rootMessage);
+			const abandoned = producer.appendMessage(fauxAssistantMessage("abandoned answer"));
+			producer.branch(root);
+			producer.appendMessage(selectedMessage);
+			const selected = producer.appendMessage(answer);
+			const receipt = producer.appendUsageAt(abandoned, "codemode", "faux", "receipt-model", usage);
+			expect(producer.getLeafId()).toBe(selected);
+			const replayed = producer.appendTrailingEntries([receipt, receipt]);
+			expect(replayed).toHaveLength(2);
+			const expectedMessages: AgentMessage[] = [rootMessage, selectedMessage, answer];
+			if (selection === "conversation") {
+				producer.branch(selected);
+			} else if (selection === "usage-parent") {
+				const continuation = {
+					role: "user",
+					content: "continue after usage",
+					timestamp: NOW + 2,
+				} satisfies AgentMessage;
+				producer.appendMessage(continuation);
+				expectedMessages.push(continuation);
+			}
+			const selectedLeaf = producer.getLeafId();
+			// A distinct receipt with identical values must count, while the two replays must not.
+			producer.appendUsageAt(abandoned, "codemode", "faux", "receipt-model", usage);
+			expect(producer.getLeafId()).toBe(selectedLeaf);
+			expect(producer.buildSessionContext().messages).toEqual(expectedMessages);
+			expect(getUsageTotals(producer.getEntries())).toEqual({
+				input: 33,
+				output: 21,
+				cacheRead: 9,
+				cacheWrite: 6,
+				cost: 30,
+			});
+			const expectedUsage: Usage = {
+				input: 33,
+				output: 21,
+				cacheRead: 9,
+				cacheWrite: 6,
+				totalTokens: 69,
+				cost: { input: 3, output: 6, cacheRead: 9, cacheWrite: 12, total: 30 },
+			};
+			const path = producer.getSessionFile()!;
+			const original = getOrThrow(await fileSystem.readTextFile(path, BACKGROUND_CONTEXT));
+			expect(JSON.parse(original.split("\n")[0]!)).toMatchObject({ version: 3 });
+			expect(JSON.parse(original.trimEnd().split("\n").at(-1)!)).toEqual({
+				type: "leaf",
+				leafId: selectedLeaf,
+			});
+			const header = producer.getHeader()!;
+			const metadata: JsonlSessionMetadata = {
+				id: header.id,
+				cwd: header.cwd,
+				path,
+				createdAt: Date.parse(header.timestamp),
+				storageVersion: JSONL_STORAGE_VERSION,
+				modifiedAt: NOW,
+			};
+			const expectedTree = producer
+				.getEntries()
+				.flatMap((entry) => (entry.type === "message" ? [entry.message] : []));
+			const assertSelection = async (session: Session) => {
+				const branch = await mainBranch(session);
+				const entries = await branch.findEntries({ order: "oldestFirst" }, BACKGROUND_CONTEXT);
+				expect(entries.map((entry) => (entry.type === "message" ? entry.message : entry.type))).toEqual(
+					expectedMessages,
+				);
+				expect(entries.map((entry) => entry.parentId)).toEqual([
+					null,
+					...entries.slice(0, -1).map((entry) => entry.id),
+				]);
+				expect(await mainTip(session)).toBe(entries.at(-1)!.id);
+				expect((await session.getValue(storedValues.laneConfig("main"), BACKGROUND_CONTEXT))?.value).toEqual({
+					model: { provider: "faux", modelId: "selected-model" },
+					thinkingLevel: "high",
+					activeToolNames: [],
+				});
+				expect(
+					(await session.findEntries({ order: "asc" }, BACKGROUND_CONTEXT)).map((entry) =>
+						entry.type === "message" ? entry.message : entry.type,
+					),
+				).toEqual(expectedTree);
+			};
+			const fork = await repo.fork(metadata, { scope: "tree", id: `usage-${selection}` }, BACKGROUND_CONTEXT);
+			await assertSelection(fork);
+			// Forks inherit context, not the source session's billing ledger.
+			expect((await fork.getStats(BACKGROUND_CONTEXT)).usage).toEqual({
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			});
+			await fork.close(BACKGROUND_CONTEXT);
+			const session = await repo.open(metadata, BACKGROUND_CONTEXT);
+			await assertSelection(session);
+			expect((await session.getStats(BACKGROUND_CONTEXT)).usage).toEqual(expectedUsage);
+			expect(getOrThrow(await fileSystem.readTextFile(path, BACKGROUND_CONTEXT))).toBe(original);
+			const entries = await session.findEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+			await session.setName("upgraded usage receipts", BACKGROUND_CONTEXT);
+			await assertSelection(session);
+			expect((await session.getStats(BACKGROUND_CONTEXT)).usage).toEqual(expectedUsage);
+			await session.close(BACKGROUND_CONTEXT);
+			const storage = await JsonlStorage.open({ fileSystem, path }, BACKGROUND_CONTEXT);
+			expect(storage.header.v).toBe(JSONL_FORMAT_VERSION);
+			expect(await storage.scanUsage({ order: "asc" }, BACKGROUND_CONTEXT)).toEqual([
+				expect.objectContaining({ usage: expectedUsage, adjustment: true, details: { source: "v3-import" } }),
+			]);
+			await storage.close(BACKGROUND_CONTEXT);
+			const reopened = await repo.open(metadata, BACKGROUND_CONTEXT);
+			await assertSelection(reopened);
+			expect(await reopened.findEntries({ order: "asc" }, BACKGROUND_CONTEXT)).toEqual(entries);
+			expect((await reopened.getStats(BACKGROUND_CONTEXT)).usage).toEqual(expectedUsage);
+			await reopened.close(BACKGROUND_CONTEXT);
+		},
+	);
+
 	it("does not consume a charge identity until a receipt reports usage", async () => {
 		const usage = fauxAssistantMessage("answer").usage;
 		const charged: Usage = { ...usage, input: 11, totalTokens: 11 };

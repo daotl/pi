@@ -39,9 +39,8 @@ vi.mock("fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof fs>();
 	return {
 		...actual,
-		writeFileSync: vi.fn(actual.writeFileSync),
+		appendFileSync: vi.fn(actual.appendFileSync),
 		fsyncSync: vi.fn(actual.fsyncSync),
-		renameSync: vi.fn(actual.renameSync),
 	};
 });
 
@@ -788,9 +787,8 @@ describe("codemode models", () => {
 
 	beforeEach(async () => {
 		const actual = await vi.importActual<typeof fs>("fs");
-		vi.mocked(fs.writeFileSync).mockReset().mockImplementation(actual.writeFileSync);
+		vi.mocked(fs.appendFileSync).mockReset().mockImplementation(actual.appendFileSync);
 		vi.mocked(fs.fsyncSync).mockReset().mockImplementation(actual.fsyncSync);
-		vi.mocked(fs.renameSync).mockReset().mockImplementation(actual.renameSync);
 	});
 
 	afterEach(() => {
@@ -1381,6 +1379,216 @@ describe("codemode models", () => {
 	}
 
 	for (const operation of ["classify", "generateImages"] as const) {
+		for (const replacement of [false, true]) {
+			it.each(["nearest", "none"] as const)(
+				`reattaches late ${operation} usage to %s original ancestor after abort and physical shred (same-file replacement: ${replacement})`,
+				async (survivor) => {
+					const cwd = mkdtempSync(join(tmpdir(), "pi-codemode-shredded-usage-"));
+					const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+					const release = Promise.withResolvers<void>();
+					const started = Promise.withResolvers<void>();
+					let callSignal: AbortSignal | undefined;
+					const {
+						harness: original,
+						observed,
+						imageRequests,
+					} = await setup({
+						classifierRelease: operation === "classify" ? release.promise : undefined,
+						imageRelease: operation === "generateImages" ? release.promise : undefined,
+						onModelCall: (signal) => {
+							callSignal = signal;
+							started.resolve();
+						},
+						harnessOptions: { cwd, sessionManager: manager },
+					});
+					const call =
+						operation === "classify"
+							? `models.classify({ provider: "scorer", id: "judge" }, { state: { text: "good" }, questions: ${questions} })`
+							: 'models.generateImages({ provider: "scorer", id: "painter" }, { input: [{ type: "text", text: "a fox" }] })';
+					const pending = run(original, `await ${call};`);
+					try {
+						await started.promise;
+						const lineage = structuredClone(manager.getBranch());
+						const dispatchParent = lineage.at(-1)!;
+						await original.session.abort();
+						expect((await pending).isError).toBe(true);
+						expect(callSignal?.aborted).toBe(true);
+						const file = manager.getSessionFile()!;
+						let current = original;
+						if (replacement) {
+							original.session.dispose();
+							({ harness: current } = await setup({
+								harnessOptions: { cwd, sessionManager: SessionManager.open(file, undefined, cwd) },
+							}));
+						}
+						const active = current.sessionManager;
+						// Remove an ancestor as well as the dispatch parent, so recovery cannot
+						// reconstruct the original lineage from the surviving tree.
+						const shredRoot = survivor === "none" ? lineage[0] : lineage.at(-2)!;
+						expect(active.removeEntriesWithDescendants([shredRoot.id])).toBeGreaterThan(0);
+						expect(active.getEntry(dispatchParent.id)).toBeUndefined();
+						const expectedParent =
+							[...lineage].reverse().find((entry) => active.getEntry(entry.id) !== undefined)?.id ?? null;
+						if (survivor === "none") expect(expectedParent).toBeNull();
+						else expect(expectedParent).not.toBeNull();
+						current.session.refreshContext();
+						current.setResponses([fauxAssistantMessage("new branch answer")]);
+						await current.session.prompt("new branch question before receipt");
+						const selected = active.getLeafId();
+						const branch = structuredClone(active.getBranch());
+						const projection = structuredClone(active.buildSessionProjection());
+						const removedIds = lineage.filter((entry) => !active.getEntry(entry.id)).map((entry) => entry.id);
+						const expected = operation === "classify" ? usage(300, 0.001) : usage(100, 0.04);
+						const model = operation === "classify" ? scorerModel : painterModel;
+						release.resolve();
+						await vi.waitFor(() => {
+							expect(active.getEntries().filter((entry) => entry.type === "usage")).toEqual([
+								expect.objectContaining({
+									parentId: expectedParent,
+									provider: model.provider,
+									model: model.id,
+									usage: expected,
+								}),
+							]);
+						});
+						for (const owner of [active, SessionManager.open(file, undefined, cwd)]) {
+							for (const id of removedIds) expect(owner.getEntry(id)).toBeUndefined();
+							expect(owner.getLeafId()).toBe(selected);
+							expect(owner.getBranch()).toEqual(branch);
+							expect(owner.buildSessionProjection()).toEqual(projection);
+							expect(owner.getEntries().filter((entry) => entry.type === "usage")).toEqual([
+								expect.objectContaining({
+									parentId: expectedParent,
+									provider: model.provider,
+									model: model.id,
+									usage: expected,
+								}),
+							]);
+						}
+						// Both pre-admission flushing and later receipts must remain usable.
+						current.setResponses([fauxAssistantMessage("prompt after late receipt")]);
+						await expect(current.session.prompt("continue after shred")).resolves.toBeUndefined();
+						expect((await run(current, `await ${call};`)).isError).toBe(false);
+						current.session.flushPendingPersistence();
+						current.session.flushPendingUsage();
+						for (const owner of [active, SessionManager.open(file, undefined, cwd)]) {
+							const receipts = owner.getEntries().filter((entry) => entry.type === "usage");
+							expect(receipts).toHaveLength(2);
+							expect(receipts[0]).toMatchObject({ parentId: expectedParent, usage: expected });
+							expect(receipts[1]).toMatchObject({ provider: model.provider, model: model.id, usage: expected });
+							expect(
+								getUsageCostBreakdown(owner.getEntries()).filter((entry) => entry.key.startsWith("scorer/")),
+							).toEqual([
+								{
+									key: `${model.provider}/${model.id}`,
+									cost: expected.cost.total * 2,
+									tokens: expected.totalTokens * 2,
+								},
+							]);
+						}
+						expect(operation === "classify" ? observed : imageRequests).toHaveLength(replacement ? 1 : 2);
+					} finally {
+						release.resolve();
+						await Promise.allSettled([pending, original.session.abort()]);
+						rmSync(cwd, { recursive: true, force: true });
+					}
+				},
+			);
+		}
+	}
+
+	for (const operation of ["classify", "generateImages"] as const) {
+		it(`restores the conversational swipe tail instead of a detached late ${operation} receipt`, async () => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-codemode-swipe-usage-"));
+			const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+			const release = Promise.withResolvers<void>();
+			const started = Promise.withResolvers<void>();
+			const { harness } = await setup({
+				classifierRelease: operation === "classify" ? release.promise : undefined,
+				imageRelease: operation === "generateImages" ? release.promise : undefined,
+				onModelCall: () => started.resolve(),
+				harnessOptions: {
+					cwd,
+					sessionManager: manager,
+					extensionFactories: [
+						(pi) =>
+							pi.registerTool({
+								name: "wait_for_dispatch",
+								label: "Wait for dispatch",
+								description: "Wait until the model provider has started",
+								parameters: Type.Object({}),
+								exposure: "codemode",
+								execute: async () => {
+									await started.promise;
+									return { content: [{ type: "text", text: "dispatched" }], details: {} };
+								},
+							}),
+					],
+				},
+			});
+			const call =
+				operation === "classify"
+					? `models.classify({ provider: "scorer", id: "judge" }, { state: { text: "good" }, questions: ${questions} })`
+					: 'models.generateImages({ provider: "scorer", id: "painter" }, { input: [{ type: "text", text: "a fox" }] })';
+			try {
+				harness.setResponses([fauxAssistantMessage("original version")]);
+				await harness.session.prompt("versioned question");
+				const originalGroup = harness.session.getSwipeGroup()!;
+				const originalVersion = originalGroup.versions[originalGroup.currentIndex];
+				expect((await run(harness, `${call}; await tools.wait_for_dispatch({}); return "detached";`)).isError).toBe(
+					false,
+				);
+				harness.setResponses([fauxAssistantMessage("later conversational answer")]);
+				await harness.session.prompt("later conversational question");
+				manager.appendCustomEntry("retained-tail-state", { retained: true });
+				manager.appendSystemPrompt("retained tail policy");
+				harness.session.refreshContext();
+				const selected = manager.getLeafId();
+				const branch = structuredClone(manager.getBranch());
+				const projection = structuredClone(manager.buildSessionProjection());
+				const messages = structuredClone(harness.session.messages);
+				expect(branch.some((entry) => entry.type === "message" && entry.message.role === "toolResult")).toBe(true);
+				manager.branch(originalGroup.anchorEntryId);
+				harness.session.refreshContext();
+				harness.setResponses([fauxAssistantMessage("alternative version")]);
+				await harness.session.continue();
+				const group = harness.session.getSwipeGroup()!;
+				const originalIndex = group.versions.findIndex((entry) => entry.id === originalVersion.id);
+				expect(group.versions).toHaveLength(2);
+				expect(originalIndex).toBeGreaterThanOrEqual(0);
+				const alternativeLeaf = manager.getLeafId();
+				// Only Date is faked: provider/sandbox scheduling keeps its real timers.
+				const latest = Math.max(...manager.getEntries().map((entry) => Date.parse(entry.timestamp)));
+				vi.useFakeTimers({ toFake: ["Date"], now: latest + 1000 });
+				release.resolve();
+				await vi.waitFor(() =>
+					expect(manager.getEntries().filter((entry) => entry.type === "usage")).toHaveLength(1),
+				);
+				vi.useRealTimers();
+				expect(manager.getLeafId()).toBe(alternativeLeaf);
+				expect(harness.session.goToSwipeVersion(group, originalIndex)).toBe(true);
+				expect(manager.getLeafId()).toBe(selected);
+				expect(manager.getBranch()).toEqual(branch);
+				expect(manager.buildSessionProjection()).toEqual(projection);
+				expect(harness.session.messages).toEqual(messages);
+				const reopened = SessionManager.open(manager.getSessionFile()!, undefined, cwd);
+				expect(reopened.getEntries().filter((entry) => entry.type === "usage")).toHaveLength(1);
+				const { harness: resumed } = await setup({ harnessOptions: { cwd, sessionManager: reopened } });
+				const resumedGroup = resumed.session.getSwipeGroup()!;
+				expect(resumed.session.goToSwipeVersion(resumedGroup, originalIndex)).toBe(true);
+				expect(reopened.getLeafId()).toBe(selected);
+				expect(reopened.getBranch()).toEqual(branch);
+				expect(reopened.buildSessionProjection()).toEqual(projection);
+			} finally {
+				vi.useRealTimers();
+				release.resolve();
+				await harness.session.abort();
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+	}
+
+	for (const operation of ["classify", "generateImages"] as const) {
 		it(`keeps late ${operation} receipts on the original manager after definition reuse and branch replacement`, async () => {
 			const cwd = mkdtempSync(join(tmpdir(), "pi-codemode-rebound-usage-"));
 			const manager = SessionManager.create(cwd, join(cwd, "sessions"));
@@ -1606,9 +1814,10 @@ describe("codemode models", () => {
 
 	for (const operation of ["classify", "generateImages"] as const) {
 		for (const replacement of [false, true]) {
-			it.each(["write", "fsync", "rename"] as const)(
+			it.each(["partial-append", "complete-append", "fsync"] as const)(
 				`retries delivered late ${operation} usage after one actual %s failure (same-file replacement: ${replacement})`,
 				async (stage) => {
+					const actual = await vi.importActual<typeof fs>("fs");
 					const cwd = mkdtempSync(join(tmpdir(), "pi-codemode-retry-usage-"));
 					const manager = SessionManager.create(cwd, join(cwd, "sessions"));
 					const release = Promise.withResolvers<void>();
@@ -1652,16 +1861,21 @@ describe("codemode models", () => {
 						const selected = manager.getLeafId();
 						const projection = structuredClone(manager.buildSessionProjection());
 						const failure = new Error(`injected actual receipt ${stage} failure`);
-						const fail = vi.fn(() => {
-							failed.resolve();
-							throw failure;
-						});
-						if (stage === "write") vi.mocked(fs.writeFileSync).mockImplementationOnce(fail);
-						else if (stage === "fsync") vi.mocked(fs.fsyncSync).mockImplementationOnce(fail);
-						else vi.mocked(fs.renameSync).mockImplementationOnce(fail);
+						if (stage === "fsync") {
+							vi.mocked(fs.fsyncSync).mockImplementationOnce(() => {
+								failed.resolve();
+								throw failure;
+							});
+						} else {
+							vi.mocked(fs.appendFileSync).mockImplementationOnce((path, data) => {
+								if (typeof data !== "string") throw new Error("Expected a serialized receipt batch");
+								actual.appendFileSync(path, stage === "partial-append" ? data.slice(0, 60) : data);
+								failed.resolve();
+								throw failure;
+							});
+						}
 						release.resolve();
 						await failed.promise;
-						expect(fail).toHaveBeenCalledTimes(1);
 						expect(operation === "classify" ? observed : imageRequests).toHaveLength(1);
 						expect(manager.getEntries()).toEqual(entries);
 						expect(manager.getLeafId()).toBe(selected);

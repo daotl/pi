@@ -442,6 +442,39 @@ describe("links: relay, stamping, lifetime", () => {
 		assert.equal(events[0], "snap");
 		assert.ok(events.includes("reset"));
 	});
+
+	it("keeps existing bindings detached across a disconnected upstream before live reconnect", async () => {
+		const c = cluster();
+		const browser = c.browser({ guest: "g1" });
+		const counter = browser.host.hold(SessionCounter, { session: "S1", name: "retry" });
+		try {
+			assert.equal(await counter.add(2), 2);
+			browser.up.close();
+			await tick();
+			await tick();
+			const channel: IpcChannel = {
+				connected: false,
+				send: () => {
+					assert.fail("disconnected channel must not send");
+				},
+				on: () => undefined,
+				off: () => undefined,
+			};
+			browser.host.connect(ipcLink(channel), { principal: { kind: "server" } });
+			const status = () => counter.status;
+			assert.equal(status(), "loading");
+			browser.reconnect();
+			for (let attempt = 0; attempt < 100 && status() !== "live"; attempt++) await tick();
+			assert.equal(status(), "live", "the original reference must hydrate on the replacement link");
+			assert.equal(await counter.add(1), 1);
+			assert.deepEqual(counter.count.value, { n: 1 });
+		} finally {
+			counter.release();
+			await browser.host.close();
+			await c.server.close();
+			for (const worker of c.workers.values()) await worker.close();
+		}
+	});
 });
 
 const Big = remote("t.big", {

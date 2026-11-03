@@ -1482,6 +1482,49 @@ export class SessionManager {
 		return entries.some((e) => e.type === "message" && (e.message.role === "user" || e.message.role === "assistant"));
 	}
 
+	/** Roll back the whole append before exposing entries; failed rollback quarantines this writer. */
+	private _persistAppend(data: string, durable = false): void {
+		if (!this.sessionFile) return;
+		if (this.appendRollbackError) throw this.appendRollbackError;
+		const size = statSync(this.sessionFile).size;
+		let fd: number | undefined;
+		try {
+			if (durable) fd = openSync(this.sessionFile, "a");
+			appendFileSync(fd ?? this.sessionFile, data);
+			if (fd !== undefined) {
+				fsyncSync(fd);
+				closeSync(fd);
+				fd = undefined;
+			}
+		} catch (error) {
+			if (fd !== undefined) {
+				try {
+					closeSync(fd);
+				} catch {
+					/* Preserve the original append or flush failure. */
+				}
+			}
+			try {
+				truncateSync(this.sessionFile, size);
+				if (durable) {
+					const rollbackFd = openSync(this.sessionFile, "r+");
+					try {
+						fsyncSync(rollbackFd);
+					} finally {
+						closeSync(rollbackFd);
+					}
+				}
+			} catch (rollbackError) {
+				this.appendRollbackError = new AggregateError(
+					[error, rollbackError],
+					`Session append rollback failed; repair the session file before appending: ${this.sessionFile}`,
+				);
+				throw this.appendRollbackError;
+			}
+			throw error;
+		}
+	}
+
 	_persist(entry: SessionEntry, entries: StoredFileEntry[] = this.fileEntries): void {
 		if (!this.persist || !this.sessionFile) return;
 		if (this.appendRollbackError) throw this.appendRollbackError;
@@ -1512,22 +1555,7 @@ export class SessionManager {
 			}
 			this.flushed = true;
 		} else {
-			const data = `${JSON.stringify(entry)}\n`;
-			const size = statSync(this.sessionFile).size;
-			try {
-				appendFileSync(this.sessionFile, data);
-			} catch (error) {
-				try {
-					truncateSync(this.sessionFile, size);
-				} catch (rollbackError) {
-					this.appendRollbackError = new AggregateError(
-						[error, rollbackError],
-						`Session append rollback failed; repair the session file before appending: ${this.sessionFile}`,
-					);
-					throw this.appendRollbackError;
-				}
-				throw error;
-			}
+			this._persistAppend(`${JSON.stringify(entry)}\n`);
 		}
 	}
 
@@ -1749,7 +1777,20 @@ export class SessionManager {
 			model,
 			usage,
 		};
-		this._commitEntries([...this.fileEntries, entry], this.leafId);
+		const checkpoint: LeafCheckpoint = { type: "leaf", leafId: this.leafId };
+		if (this.persist && this.sessionFile) {
+			if (this.appendRollbackError) throw this.appendRollbackError;
+			if (this.flushed) {
+				this._persistAppend(`${JSON.stringify(entry)}\n${JSON.stringify(checkpoint)}\n`, true);
+			} else {
+				// Only the initial file creation needs the staged setup history.
+				this._rewriteFile([...this.fileEntries, entry, checkpoint]);
+				this.flushed = true;
+			}
+		}
+		this.fileEntries.push(entry, checkpoint);
+		this.byId.set(entry.id, entry);
+		this.contextRevision++;
 		return entry;
 	}
 

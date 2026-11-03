@@ -12,21 +12,75 @@ const snapshot = (items) => ({ repo: "owner/repo", items, categories: [{ name: "
 
 function harness() {
 	const listeners = {}, requests = [], nodes = Object.fromEntries(["main", "cat", "status", "sync"].map((id) => [id, { innerHTML: "", value: "" }]));
-	let poll, focusedSelect = null;
+	let poll, focusedSelect = null, focused = null, mainVersion = 0, mainHtml = "";
+	const body = { tagName: "BODY" };
+	Object.defineProperty(nodes.main, "innerHTML", {
+		get: () => mainHtml,
+		set: (value) => { mainHtml = value; mainVersion++; },
+	});
+	nodes.main.contains = (node) => !!node && node.mainVersion === mainVersion;
 	const timers = [];
 	const tabs = ["inbox", "decided", "all"].map((view) => ({ dataset: { view }, classList: { toggle() {} } }));
-	const document = { hidden: false, getElementById: (id) => nodes[id], addEventListener: (name, fn) => { listeners[name] = fn; }, querySelectorAll: (selector) => selector === ".tab" ? tabs : [], querySelector: (selector) => selector === "select:focus" ? focusedSelect : null };
+	const focusedElement = () => nodes.main.contains(focused) ? focused : null;
+	const focusedQuery = (selector) => {
+		const target = focusedElement();
+		if (!target) return null;
+		return selector.split(",").some((part) => {
+			const query = part.trim();
+			return query.endsWith(":focus") && target.matches(query.replace(/^#main\s+/, "").slice(0, -6));
+		}) ? target : null;
+	};
+	nodes.main.querySelector = focusedQuery;
+	const document = { hidden: false, get activeElement() { return focusedElement() ?? body; }, getElementById: (id) => nodes[id], addEventListener: (name, fn) => { listeners[name] = fn; }, querySelectorAll: (selector) => selector === ".tab" ? tabs : [], querySelector: focusedQuery };
 	runInNewContext(script, { document, queueMicrotask, setTimeout: (fn) => timers.push(fn), window: { open() {}, addEventListener() {} }, confirm: () => true, setInterval: (fn) => { poll = fn; }, fetch: (path, options) => new Promise((resolve) => { requests.push({ path, body: options && JSON.parse(options.body), resolve }); }) });
 	const respond = async (request, value) => { request.resolve({ ok: true, json: async () => value }); await tick(); };
 	const key = (key, repeat = false) => listeners.keydown({ key, repeat, target: { tagName: "BODY" } });
 	const click = (dataset) => listeners.click({ target: { closest: (selector) => selector === "[data-act]" ? { dataset } : null } });
 	Object.assign(nodes.sync, { retry: () => nodes.sync.onclick() });
-	const focusCategory = (number) => { focusedSelect = { tagName: "SELECT", dataset: { act: "cat", n: String(number) }, value: "bugs" }; };
-	const blurCategory = async () => { const target = focusedSelect; focusedSelect = null; listeners.focusout?.({ target }); await tick(); };
+	const focusControl = (tagName, dataset = {}) => {
+		const markup = [...mainHtml.matchAll(new RegExp(`<${tagName.toLowerCase()}\\b[^>]*>`, "g"))].find(([tag]) => Object.entries(dataset).every(([name, value]) => tag.includes(`data-${name}="${value}"`)))?.[0];
+		assert.ok(markup, `Rendered ${tagName} control exists`);
+		const control = {
+			tagName, dataset, mainVersion, value: "bugs",
+			get isConnected() { return nodes.main.contains(this); },
+			matches: (selector) => selector.split(",").some((part) => {
+				const tag = part.trim();
+				return tag === "*" || tag === "" || tag.toUpperCase() === tagName || (tag === "a[href]" && tagName === "A");
+			}),
+			closest(selector) {
+				if (selector === "#main") return this.isConnected ? nodes.main : null;
+				if (selector === "[data-act]") return dataset.act ? this : null;
+				return this.matches(selector) ? this : null;
+			},
+		};
+		focused = control;
+		return control;
+	};
+	const focusCategory = (number) => { focusedSelect = focusControl("SELECT", { act: "cat", n: String(number) }); };
+	const blurFocus = async (next) => {
+		const target = focused;
+		focused = null;
+		listeners.focusout?.({ target });
+		if (next) next();
+		await tick();
+	};
+	const blurCategory = blurFocus;
 	const changeCategory = (value) => { focusedSelect.value = value; listeners.change({ target: focusedSelect }); };
 	const pointer = (type, pointerId = 1) => listeners[type]?.({ pointerId });
 	const finishPointer = async (type) => { if (type) pointer(type); timers.splice(0).forEach((fn) => fn()); await tick(); };
-	return { nodes, requests, respond, key, click, pointer, finishPointer, focusCategory, blurCategory, changeCategory, poll: () => poll(), tab: (view) => tabs.find((tab) => tab.dataset.view === view).onclick(), category: (value) => { nodes.cat.value = value; listeners.change({ target: { id: "cat", value, dataset: {} } }); } };
+	// This models the event handoff only; a real browser must prove native Space activation.
+	let spaceTarget = null;
+	const spaceDown = () => {
+		spaceTarget = document.activeElement;
+		listeners.keydown({ key: " ", repeat: false, target: spaceTarget });
+	};
+	const spaceUp = () => {
+		const target = document.activeElement;
+		listeners.keyup?.({ key: " ", target });
+		if (target === spaceTarget && target.isConnected) listeners.click({ target });
+		spaceTarget = null;
+	};
+	return { nodes, requests, respond, key, click, pointer, finishPointer, focusCategory, blurCategory, changeCategory, focusControl, blurFocus, spaceDown, spaceUp, get activeElement() { return document.activeElement; }, poll: () => poll(), tab: (view) => tabs.find((tab) => tab.dataset.view === view).onclick(), category: (value) => { nodes.cat.value = value; listeners.change({ target: { id: "cat", value, dataset: {} } }); } };
 }
 
 for (const view of ["inbox", "decided", "all"]) {
@@ -70,6 +124,58 @@ test("a delayed poll preserves a category selection and installs its snapshot af
 	assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 20/);
 	await ui.blurCategory();
 	assert.match(ui.nodes.main.innerHTML, /Issue 20/);
+});
+
+for (const action of ["prio", "retriage", "allnone"]) {
+	for (const arrival of ["before Space", "during Space"]) {
+		test(`a focused ${action} survives a poll ${arrival} and activates exactly once on keyup`, async () => {
+			const ui = harness();
+			await ui.respond(ui.requests[0], snapshot([issue(10)]));
+			const control = ui.focusControl("BUTTON", action === "prio" ? { act: action, n: "10", p: "p0" } : action === "retriage" ? { act: action, n: "10" } : { act: action });
+			ui.poll();
+			assert.equal(ui.requests[1].path, "/api/state");
+			if (arrival === "during Space") ui.spaceDown();
+			await ui.respond(ui.requests[1], snapshot([issue(99)]));
+			assert.equal(control.isConnected, true, "The poll must not detach the activation target");
+			assert.equal(ui.activeElement, control, "The poll must retain keyboard focus");
+			if (arrival === "before Space") ui.spaceDown();
+			assert.equal(ui.requests.length, 2, "Space keydown must not submit an action");
+			ui.spaceUp();
+			ui.spaceUp();
+			assert.equal(ui.requests.length, 3, "Exactly one action must be submitted");
+			assert.equal(ui.requests[2].path, action === "retriage" ? "/api/retriage" : "/api/decide");
+			assert.deepEqual(ui.requests[2].body, action === "allnone" ? { numbers: [10], priority: "none" } : action === "retriage" ? { number: 10 } : { number: 10, priority: "p0" });
+			assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 99/);
+			if (action !== "retriage") assert.match(ui.nodes.main.innerHTML, /data-act="prio" data-p="p0" data-n="10" disabled/);
+		});
+	}
+}
+
+for (const tagName of ["BUTTON", "SUMMARY", "A"]) {
+	test(`a deferred poll waits for focus to leave a ${tagName} and settle outside main`, async () => {
+		const ui = harness();
+		await ui.respond(ui.requests[0], snapshot([issue(10)]));
+		ui.poll();
+		ui.focusControl(tagName);
+		await ui.respond(ui.requests[1], snapshot([issue(99)]));
+		assert.match(ui.nodes.main.innerHTML, /Issue 10/);
+		await ui.blurFocus(() => ui.focusControl("SUMMARY"));
+		assert.match(ui.nodes.main.innerHTML, /Issue 10/, "Moving focus within main must retain the deferred snapshot");
+		await ui.blurFocus();
+		assert.match(ui.nodes.main.innerHTML, /Issue 99/);
+	});
+}
+
+test("a failed poll reports its error without replacing a keyboard-focused control", async () => {
+	const ui = harness();
+	await ui.respond(ui.requests[0], snapshot([issue(10)]));
+	const control = ui.focusControl("BUTTON", { act: "retriage", n: "10" });
+	ui.poll();
+	ui.requests[1].resolve({ ok: false, status: 503, text: async () => "unavailable" });
+	await tick();
+	assert.match(ui.nodes.status.innerHTML, /State refresh failed/);
+	assert.equal(control.isConnected, true);
+	assert.equal(ui.activeElement, control);
 });
 
 for (const action of ["prio", "retriage", "allnone"]) {

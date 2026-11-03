@@ -30,6 +30,11 @@ interface LegacyV3MessageEntry extends LegacyV3EntryBase {
 	message: AgentMessage;
 }
 
+interface LegacyV3UsageEntry extends LegacyV3EntryBase {
+	type: "usage";
+	usage: Usage;
+}
+
 interface LegacyV3CustomEntry extends LegacyV3EntryBase {
 	type: "custom";
 	customType: string;
@@ -108,6 +113,7 @@ type RetainedLegacyV3Entry =
 	| LegacyV3CompactionEntry;
 
 type DiscardedLegacyV3Entry =
+	| LegacyV3UsageEntry
 	| LegacyV3ModelChangeEntry
 	| LegacyV3ThinkingLevelChangeEntry
 	| LegacyV3ActiveToolsChangeEntry
@@ -146,7 +152,7 @@ type LegacyV3IndexEntry =
 				| Pick<LegacyV3ModelChangeEntry, "type" | "provider" | "modelId">
 				| Pick<LegacyV3ThinkingLevelChangeEntry, "type" | "thinkingLevel">
 				| Pick<LegacyV3ActiveToolsChangeEntry, "type" | "activeToolNames">
-				| { type: "session_info" }
+				| { type: "session_info" | "usage" }
 			));
 
 type LegacyV3CompactionIndexEntry = Extract<RetainedLegacyV3IndexEntry, { type: "compaction" }>;
@@ -218,6 +224,7 @@ function parseLegacyV3Entry(line: string): LegacyV3Record {
 		recordType !== "custom_message" &&
 		recordType !== "branch_summary" &&
 		recordType !== "compaction" &&
+		recordType !== "usage" &&
 		recordType !== "model_change" &&
 		recordType !== "thinking_level_change" &&
 		recordType !== "active_tools_change" &&
@@ -251,7 +258,8 @@ function isRetainedEntry<T extends LegacyV3Entry | LegacyV3IndexEntry>(
 		entry.type !== "thinking_level_change" &&
 		entry.type !== "active_tools_change" &&
 		entry.type !== "session_info" &&
-		entry.type !== "label"
+		entry.type !== "label" &&
+		entry.type !== "usage"
 	);
 }
 
@@ -298,6 +306,7 @@ function projectContextMessage(entry: LegacyV3Entry, resolveLegacyId: ResolveLeg
 		case "active_tools_change":
 		case "session_info":
 		case "label":
+		case "usage":
 			return undefined;
 	}
 }
@@ -445,6 +454,7 @@ function indexLegacyV3Entry(
 			case "active_tools_change":
 				return { ...structure, type: entry.type, activeToolNames: entry.activeToolNames };
 			case "session_info":
+			case "usage":
 				return { ...structure, type: entry.type };
 		}
 	}
@@ -473,6 +483,7 @@ function legacyEntryUsage(entry: LegacyV3Entry): Usage | undefined {
 				: undefined;
 		case "compaction":
 		case "branch_summary":
+		case "usage":
 			return entry.usage;
 		default:
 			return undefined;

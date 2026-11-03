@@ -11,6 +11,8 @@ vi.mock("fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof fs>();
 	return {
 		...actual,
+		appendFileSync: vi.fn(actual.appendFileSync),
+		truncateSync: vi.fn(actual.truncateSync),
 		writeFileSync: vi.fn(actual.writeFileSync),
 		fsyncSync: vi.fn(actual.fsyncSync),
 		closeSync: vi.fn(actual.closeSync),
@@ -38,6 +40,8 @@ describe("assistant continuation storage transactions", () => {
 
 	beforeEach(async () => {
 		const actual = await vi.importActual<typeof fs>("fs");
+		vi.mocked(fs.appendFileSync).mockReset().mockImplementation(actual.appendFileSync);
+		vi.mocked(fs.truncateSync).mockReset().mockImplementation(actual.truncateSync);
 		vi.mocked(fs.writeFileSync).mockReset().mockImplementation(actual.writeFileSync);
 		vi.mocked(fs.fsyncSync).mockReset().mockImplementation(actual.fsyncSync);
 		vi.mocked(fs.closeSync).mockReset().mockImplementation(actual.closeSync);
@@ -134,31 +138,140 @@ describe("assistant continuation storage transactions", () => {
 		if (file && bytes) expect(fs.readFileSync(file)).toEqual(bytes);
 	});
 
-	it.each(["write", "fsync", "rename"] as const)("does not publish historical usage when %s fails", (stage) => {
+	it.each(["partial-receipt", "receipt-only", "partial-checkpoint", "complete-batch", "fsync"] as const)(
+		"rolls back historical receipt and selection after %s failure before retry",
+		async (stage) => {
+			const actual = await vi.importActual<typeof fs>("fs");
+			const session = SessionManager.create(dir, dir);
+			const root = session.appendMessage(userMsg("original question"));
+			const owner = session.appendMessage(response("original answer", 3));
+			session.branch(root);
+			const selected = session.appendMessage(userMsg("new branch"));
+			const file = session.getSessionFile()!;
+			const bytes = fs.readFileSync(file);
+			const held = session.getEntries();
+			const entries = structuredClone(held);
+			const branch = structuredClone(session.getBranch());
+			const projection = structuredClone(session.buildSessionProjection());
+			const revision = session.getContextRevision();
+			const failure = new Error(`historical receipt ${stage} failed`);
+			if (stage === "fsync") {
+				vi.mocked(fs.fsyncSync).mockImplementationOnce(() => {
+					throw failure;
+				});
+			} else {
+				vi.mocked(fs.appendFileSync).mockImplementationOnce((path, data) => {
+					if (typeof data !== "string") throw new Error("Expected a serialized receipt batch");
+					const receiptEnd = data.indexOf("\n") + 1;
+					const end =
+						stage === "partial-receipt"
+							? 60
+							: stage === "receipt-only"
+								? receiptEnd
+								: stage === "partial-checkpoint"
+									? receiptEnd + 10
+									: data.length;
+					actual.appendFileSync(path, data.slice(0, end));
+					throw failure;
+				});
+			}
+			const append = () => session.appendUsageAt(owner, "codemode", "scorer", "judge", response("", 5).usage);
+			expect(append).toThrow(failure);
+			expect(session.getEntries()).toEqual(entries);
+			expect(session.getContextRevision()).toBe(revision);
+			expect(session.getLeafId()).toBe(selected);
+			expect(session.getBranch()).toEqual(branch);
+			expect(session.buildSessionProjection()).toEqual(projection);
+			for (const entry of held) expect(session.getEntry(entry.id)).toBe(entry);
+			expect(fs.readFileSync(file)).toEqual(bytes);
+			const failedReopen = SessionManager.open(file, dir, dir);
+			expect(failedReopen.getEntries()).toEqual(entries);
+			expect(failedReopen.getLeafId()).toBe(selected);
+			const receipt = append();
+			for (const current of [session, SessionManager.open(file, dir, dir)]) {
+				expect(current.getEntries().filter((entry) => entry.type === "usage")).toEqual([receipt]);
+				expect(current.getEntry(receipt.id)?.parentId).toBe(owner);
+				expect(current.getLeafId()).toBe(selected);
+				expect(current.getBranch()).toEqual(branch);
+				expect(current.buildSessionProjection()).toEqual(projection);
+			}
+			const next = session.appendMessage(userMsg("after receipt retry"));
+			const reopened = SessionManager.open(file, dir, dir);
+			expect(reopened.getEntry(next)?.parentId).toBe(selected);
+			expect(reopened.getEntries().filter((entry) => entry.type === "usage")).toEqual([receipt]);
+			expect(reopened.getLeafId()).toBe(next);
+		},
+	);
+
+	it.each(["ancestor", "empty"] as const)(
+		"preserves %s selection across repeated historical receipt appends",
+		(selection) => {
+			const session = SessionManager.create(dir, dir);
+			const root = session.appendMessage(userMsg("original question"));
+			const owner = session.appendMessage(response("original answer", 3));
+			if (selection === "ancestor") session.branch(root);
+			else session.resetLeaf();
+			const selected = session.getLeafId();
+			const branch = structuredClone(session.getBranch());
+			const projection = structuredClone(session.buildSessionProjection());
+			const first = session.appendUsageAt(owner, "codemode", "scorer", "judge", response("", 5).usage);
+			const second = session.appendUsageAt(owner, "codemode", "scorer", "judge", response("", 7).usage);
+			const file = session.getSessionFile()!;
+			for (const current of [session, SessionManager.open(file, dir, dir)]) {
+				expect(current.getLeafId()).toBe(selected);
+				expect(current.getBranch()).toEqual(branch);
+				expect(current.buildSessionProjection()).toEqual(projection);
+				expect(current.getEntries().filter((entry) => entry.type === "usage")).toEqual([first, second]);
+			}
+			const reopened = SessionManager.open(file, dir, dir);
+			const next = reopened.appendMessage(userMsg("next selected conversation"));
+			expect(reopened.getEntry(next)?.parentId).toBe(selected);
+			expect(SessionManager.open(file, dir, dir).getBranch()).toEqual(reopened.getBranch());
+		},
+	);
+
+	it("blocks historical receipt retries after failed rollback until the session is repaired", async () => {
+		const actual = await vi.importActual<typeof fs>("fs");
 		const session = SessionManager.create(dir, dir);
 		const root = session.appendMessage(userMsg("original question"));
 		const owner = session.appendMessage(response("original answer", 3));
 		session.branch(root);
-		const selected = session.appendMessage(userMsg("new branch"));
+		const selected = session.appendMessage(userMsg("selected branch"));
 		const file = session.getSessionFile()!;
 		const bytes = fs.readFileSync(file);
 		const entries = structuredClone(session.getEntries());
 		const projection = structuredClone(session.buildSessionProjection());
 		const revision = session.getContextRevision();
-		const failure = new Error(`historical receipt ${stage} failed`);
-		const fail = () => {
-			throw failure;
-		};
-		if (stage === "write") vi.mocked(fs.writeFileSync).mockImplementationOnce(fail);
-		else if (stage === "fsync") vi.mocked(fs.fsyncSync).mockImplementationOnce(fail);
-		else vi.mocked(fs.renameSync).mockImplementationOnce(fail);
-		expect(() => session.appendUsageAt(owner, "codemode", "scorer", "judge", response("", 5).usage)).toThrow(failure);
+		vi.mocked(fs.appendFileSync).mockImplementationOnce((path, data) => {
+			if (typeof data !== "string") throw new Error("Expected a serialized receipt batch");
+			actual.appendFileSync(path, data.slice(0, 60));
+			throw new Error("receipt append failed");
+		});
+		vi.mocked(fs.truncateSync).mockImplementationOnce(() => {
+			throw new Error("receipt rollback failed");
+		});
+		expect(() => session.appendUsageAt(owner, "codemode", "scorer", "judge", response("", 5).usage)).toThrow(
+			AggregateError,
+		);
+		const damaged = fs.readFileSync(file);
+		expect(damaged).not.toEqual(bytes);
+		expect(() => session.appendUsageAt(owner, "codemode", "scorer", "judge", response("", 5).usage)).toThrow(
+			AggregateError,
+		);
+		expect(() => session.appendMessage(userMsg("blocked while damaged"))).toThrow(AggregateError);
+		expect(fs.readFileSync(file)).toEqual(damaged);
 		expect(session.getEntries()).toEqual(entries);
-		expect(session.getContextRevision()).toBe(revision);
 		expect(session.getLeafId()).toBe(selected);
+		expect(session.getContextRevision()).toBe(revision);
 		expect(session.buildSessionProjection()).toEqual(projection);
+		session.editMessages(() => {});
 		expect(fs.readFileSync(file)).toEqual(bytes);
-		expect(SessionManager.open(file, dir, dir).getEntries()).toEqual(entries);
+		const receipt = session.appendUsageAt(owner, "codemode", "scorer", "judge", response("", 5).usage);
+		for (const current of [session, SessionManager.open(file, dir, dir)]) {
+			expect(current.getEntries().filter((entry) => entry.type === "usage")).toEqual([receipt]);
+			expect(current.getLeafId()).toBe(selected);
+			expect(current.buildSessionProjection()).toEqual(projection);
+		}
 	});
 
 	it("replaces the canonical position, remaps only cloned references, and charges the new response once", () => {
