@@ -478,10 +478,12 @@ One raw envelope = one change = one Chord sequence while the bridge is live.
 `ChordViewBridge.revisions` provides an immediate `ChordViewRevision` snapshot
 (`ops: null`), then ordered immutable frames with the revision, value and known
 publication ops, including `commit.events`. The native facet applies each frame
-in one state change instead of diffing complete values again. String appends use
-`appendText()` in both publication trackers; snapshot/rebind reconciliation does
-not perform structural diffing. Root replacements retain publication metadata
-and apply any trailing operations before publishing their commit events.
+in one state change instead of diffing complete values again. The bridge and
+native facet apply known string appends with `appendText()`; snapshot/rebind
+reconciliation does not perform structural diffing. This avoids additional mirror
+prefix scans; it does not eliminate the upstream `ViewManager`'s existing work.
+Root replacements retain publication metadata and apply any trailing operations
+before publishing their commit events.
 
 The bridge consumes the raw watch's terminal notification. A projection failure,
 unexpected watch stop, or queue overflow closes the bridge and publishes
