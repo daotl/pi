@@ -943,6 +943,143 @@ describe("codemode models", () => {
 
 	const questions = `{ approved: { type: "bool", instructions: "Approval?", criteria: { true: "yes", false: "no" } } }`;
 
+	for (const operation of ["classify", "generateImages"] as const) {
+		it(`isolates ${operation} receipts and notifications for independent in-memory managers with the same custom ID across re-adoption`, async () => {
+			const id = `same-memory-${operation}`;
+			const managerA = SessionManager.inMemory(process.cwd(), { id });
+			const managerB = SessionManager.inMemory(process.cwd(), { id });
+			expect(managerA).not.toBe(managerB);
+			expect(managerA.getSessionId()).toBe(managerB.getSessionId());
+			for (const manager of [managerA, managerB]) {
+				expect(manager.isPersisted()).toBe(false);
+				expect(manager.getSessionFile()).toBeUndefined();
+			}
+			const release = Promise.withResolvers<void>();
+			const started = Promise.withResolvers<void>();
+			const parentsA: string[] = [];
+			const parentsB: string[] = [];
+			const captureParent = (manager: SessionManager, parents: string[]) => {
+				const parent = manager.getLeafId();
+				if (!parent) throw new Error("Expected a model dispatch parent");
+				parents.push(parent);
+			};
+			const expected = operation === "classify" ? usage(300, 0.001) : usage(100, 0.04);
+			const model = operation === "classify" ? scorerModel : painterModel;
+			const call =
+				operation === "classify"
+					? `models.classify({ provider: "scorer", id: "judge" }, { state: { text: "good" }, questions: ${questions} })`
+					: 'models.generateImages({ provider: "scorer", id: "painter" }, { input: [{ type: "text", text: "a fox" }] })';
+			const checkOwner = (harness: Harness, parents: string[], previousReceipts = 0) => {
+				const receipts = harness.sessionManager.getEntries().filter((entry) => entry.type === "usage");
+				expect(receipts).toEqual(
+					parents.map((parentId) =>
+						expect.objectContaining({
+							parentId,
+							kind: "codemode",
+							provider: model.provider,
+							model: model.id,
+							usage: expected,
+						}),
+					),
+				);
+				expect(getUsageTotals(harness.sessionManager.getEntries()).cost).toBeCloseTo(
+					expected.cost.total * parents.length,
+					10,
+				);
+				expect(
+					getUsageCostBreakdown(harness.sessionManager.getEntries()).filter((entry) =>
+						entry.key.startsWith("scorer/"),
+					),
+				).toEqual([
+					{
+						key: `${model.provider}/${model.id}`,
+						cost: expected.cost.total * parents.length,
+						tokens: expected.totalTokens * parents.length,
+					},
+				]);
+				expect(harness.eventsOfType("entry_appended").filter((event) => event.entry.type === "usage")).toEqual(
+					receipts.slice(previousReceipts).map((entry) => ({ type: "entry_appended", entry })),
+				);
+			};
+			const { harness: originalA } = await setup({
+				classifierRelease: operation === "classify" ? release.promise : undefined,
+				imageRelease: operation === "generateImages" ? release.promise : undefined,
+				onModelCall: () => {
+					captureParent(managerA, parentsA);
+					started.resolve();
+				},
+				harnessOptions: { sessionManager: managerA },
+			});
+			const pendingA = run(originalA, `await ${call};`);
+			try {
+				await started.promise;
+				// B is adopted only after A has dispatched, and receives its own charge first.
+				const { harness: originalB } = await setup({
+					onModelCall: () => captureParent(managerB, parentsB),
+					harnessOptions: { sessionManager: managerB },
+				});
+				expect((await run(originalB, `await ${call};`)).isError).toBe(false);
+				expect(parentsA).toHaveLength(1);
+				expect(parentsB).toHaveLength(1);
+				expect(managerA.getEntry(parentsB[0])).toBeUndefined();
+				expect(managerB.getEntry(parentsA[0])).toBeUndefined();
+				checkOwner(originalB, parentsB);
+				const branchB = structuredClone(managerB.getBranch());
+				const projectionB = structuredClone(managerB.buildSessionProjection());
+				const messagesB = structuredClone(originalB.session.messages);
+				release.resolve();
+				const resultA = await pendingA;
+				expect(resultA.isError).toBe(false);
+				expect(resultA.usage).toBeUndefined();
+				checkOwner(originalA, parentsA);
+				checkOwner(originalB, parentsB);
+				expect(managerB.getBranch()).toEqual(branchB);
+				expect(managerB.buildSessionProjection()).toEqual(projectionB);
+				expect(originalB.session.messages).toEqual(messagesB);
+
+				originalA.session.dispose();
+				originalB.session.dispose();
+				const { harness: resumedA } = await setup({
+					onModelCall: () => captureParent(managerA, parentsA),
+					harnessOptions: { sessionManager: managerA },
+				});
+				const { harness: resumedB } = await setup({
+					onModelCall: () => captureParent(managerB, parentsB),
+					harnessOptions: { sessionManager: managerB },
+				});
+				// Re-adopting B still must not claim A's new receipts or its notifications.
+				expect((await run(resumedA, `await ${call};`)).isError).toBe(false);
+				checkOwner(resumedA, parentsA, 1);
+				checkOwner(resumedB, parentsB, 1);
+				// Releasing A must not release the unrelated, same-ID owner B.
+				resumedA.session.dispose();
+				expect((await run(resumedB, `await ${call};`)).isError).toBe(false);
+				for (const harness of [resumedA, resumedB]) {
+					harness.session.flushPendingPersistence();
+					harness.session.flushPendingUsage();
+					harness.session.flushPendingUsage();
+				}
+				expect(parentsA).toHaveLength(2);
+				expect(parentsB).toHaveLength(2);
+				checkOwner(resumedA, parentsA, 1);
+				checkOwner(resumedB, parentsB, 1);
+				for (const [original, manager, parents] of [
+					[originalA, managerA, parentsA],
+					[originalB, managerB, parentsB],
+				] as const) {
+					const firstReceipt = manager.getEntries().find((entry) => entry.type === "usage");
+					expect(firstReceipt?.parentId).toBe(parents[0]);
+					expect(original.eventsOfType("entry_appended").filter((event) => event.entry.type === "usage")).toEqual([
+						{ type: "entry_appended", entry: firstReceipt },
+					]);
+				}
+			} finally {
+				release.resolve();
+				await Promise.allSettled([pendingA, originalA.session.abort()]);
+			}
+		});
+	}
+
 	it("strongly retains an in-flight in-memory receipt sink after its session owner is released", async () => {
 		setFlagsFromString("--expose-gc");
 		let collect: () => void;

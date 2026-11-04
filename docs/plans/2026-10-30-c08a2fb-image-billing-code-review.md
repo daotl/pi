@@ -997,3 +997,146 @@ Repaired actual Chrome trace reaches focus/focusin on the original p1, which rem
 
 The exact initial Round 6 report was appended before runtime investigation, preserving the original 129,480-byte prefix (SHA-256 `32621613a6a1ca031c8921b03fad233b822b39632a94892d46812a0c9dafa35a`). Its unresolved status records the evidence then available; this appended runtime disposition supersedes that gate for the repaired tree. A fresh full-range review is required after verified local commit.
 
+
+## Code Review Results -- Round 7
+
+**Verdict: Not ready. Two new P2 regressions were independently confirmed; neither has been fixed.**
+
+**Scope:** Fixed first-parent base `98dfe28cbeec4e1f2f61516e227420b2407dcdf9` -> reviewed HEAD `7dfe4d5626b2902afd54ed25d187c5ca929ee5ed`, on `fix/full-merge-review-8322aa1d`. This covers merge `8322aa1d` and all subsequent repairs through that HEAD, not just the latest commit: 1,274 changed paths, 202,655 changed lines, 74,260 executable non-test changed lines, and 47 whole-file deletions.
+
+**Intent:** Integrate upstream 1.4.0 while preserving Crystal history/edit/delete/restore/shred/`id="0"`, billing, multimodal and summary budgets, and Harness, experimental, client, and published contracts.
+
+**Mode:** `depth:full`, markdown report-only. Local apply is disabled for this leaf. No source edits, tests, builds, runtime checks, network calls, or commits were performed. Fixing and verifying the findings remains the parent's responsibility.
+
+**Review team:**
+
+| Reviewers | Reason |
+|---|---|
+| correctness-models, correctness-native, correctness-history, correctness-execution, correctness-surface | Provider/model behavior, native processes, history/accounting, execution lifecycle, and client/public surfaces |
+| security | Trust and authentication boundaries |
+| reliability | Asynchronous lifecycle and ownership |
+| api-contract | Published consumer contracts |
+| data-migration | Actual storage migrations |
+| testing | Whether regression guards exercise the claimed behavior |
+| performance | Bounded work and complexity |
+| maintainability | Structural integration |
+| agent-native-reviewer | Agent/programmatic capability reachability |
+| frontend-races | DOM ordering and event races |
+| deployment-verification-agent | Destructive storage cutovers and recovery |
+| adversarial | In-process fallback after cross-model authentication failed |
+
+### P2 -- Moderate
+
+| # | File | Issue | Reviewer | Confidence |
+|---|---|---|---|---|
+| 1 | `packages/ai/src/providers/openrouter.ts:61` | Catalog personalization removes the supported short Auto alias | correctness-models | 75 |
+| 2 | `packages/coding-agent/src/core/tool-usage-binding.ts:75` | Independent in-memory sessions can receive each other's usage receipts | correctness-history | 75 |
+
+**#1 -- Preserve the built-in Auto alias during catalog personalization.**
+
+When a successful authenticated `/models/user` response contains `openrouter/auto` but not `auto`, the exact-ID lookup at lines 61-62 filters out the shipped short alias. The generator deliberately provides that alias (`packages/ai/scripts/generate-models.ts:3292-3295`), and an existing consumer uses it (`packages/ai/test/openai-completions-prompt-cache.test.ts:222`). The personalized catalog is persisted by `remote-catalog-provider.ts:259-263`; saved sessions using the short ID can then reach the missing-model restoration path in `model-resolver.ts:627-640` and fall back to another selection.
+
+**Fix:** Prefer an exact allowed-map match, then resolve the known local `auto` alias to `openrouter/auto`. Apply the canonical entry's availability, limits, and prices without changing the local `model.id`. Add a regression with both local IDs and a user catalog containing only `openrouter/auto`.
+
+**Validation:** `confirmed`; protected subject `public-contract`. A fresh validator independently inspected the alias, filtering, persistence, and restore paths. Reachability is code-confirmed; the incidence of that upstream response and affected saved selections was not measured. Confidence remains 75; this is not cross-model corroboration.
+
+**#2 -- Keep independent in-memory receipt ledgers separate.**
+
+Two independently constructed in-memory `SessionManager` instances may use the same supported custom session ID. Both then receive the key `[null, sessionId]`. Adopting the second session replaces the shared ledger owner, and a pending model receipt dispatched by the first session is later appended to the second session. If its original ancestors are absent there, the receipt receives a null parent.
+
+The supported construction is evidenced by `session-manager.ts:3197-3199` and `test/session-manager/custom-session-id.test.ts:16-20`. The owner replacement and receipt routing are at `tool-usage-binding.ts:95-98,124-138`; codemode's recorder callback supplies a concrete completion route.
+
+**Fix:** Give each in-memory manager a stable private ledger identity, such as a `WeakMap<SessionManager, string>`. Retain canonical file plus session ID for persisted managers so runtime replacement of the same stored session can still adopt pending receipts. Add a regression with two live in-memory managers sharing a custom ID; adopt the second before the first receipt completes and assert that each history receives only its own usage.
+
+**Validation:** `confirmed`; protected subject `concurrency`. A fresh validator independently inspected construction, adoption, callback, and append paths. Runtime incidence was not measured. Confidence remains 75; this is not cross-model corroboration.
+
+### Actionable Findings
+
+Both findings remain unapplied and require targeted verification after the parent implements them.
+
+| # | Severity and location | Required response | Route | Verification |
+|---|---|---|---|---|
+| 1 | P2 -- `packages/ai/src/providers/openrouter.ts:61` | Preserve `auto` through canonical alias lookup without changing its local ID | `gated_auto -> downstream-resolver` | Suggested fix present; cover canonical-only user catalogs and saved short-alias restoration |
+| 2 | P2 -- `packages/coding-agent/src/core/tool-usage-binding.ts:75` | Separate in-memory ledgers by manager identity while retaining persisted-session adoption | `gated_auto -> downstream-resolver` | Suggested fix present; cover overlapping receipts for duplicate custom IDs and persisted-manager replacement |
+
+### Deployment Notes
+
+The operational review identified no additional product defect. **Release readiness remains unverified:** no database migration, corpus conversion, restore, Workers deployment, or canary was executed.
+
+- **Before opening production stores:** Record physical paths, backend, schema/header version, prefix, session IDs, and writable owner. For Workers, record namespace, class binding, existing object identity, deployment version, and alarms. Drain the old writer before baseline capture; these backends do not enforce cross-process ownership.
+- **Backup and rehearse restoration:** Use SQLite's backup facility rather than copying only a live WAL database's main file. Require `PRAGMA integrity_check;` to return `ok`, and prove the isolated backup opens with the previous release. Preserve whole JSONL files and permissions; durable JSONL requires the whole directory, including sidecars and `.reclaim` files. Workers recovery requires the deployment owner's actual backup/PITR and restoration receipt.
+- **Audit durable SQLite v1 -> v2:** Before accepting new writes, require one `durable_schema` row with `singleton=1, version=2`, unchanged allocator metadata, unchanged counts/status distributions, all five expected task indexes, and no `tasks_v2` object. Use bidirectional `EXCEPT` comparisons for all seven task columns and the other stored records; equal counts alone do not prove equality. Verify `pi.provider` session identities against baseline.
+- **Keep storage formats distinct:** Crystal remains JSONL v3. Agent-core imports v3 and replaces it with format 4 on the first non-empty commit; entry IDs are remapped, so compare semantic ancestry and content rather than literal legacy IDs. Durable JSONL has its own directory/sidecar recovery procedure. SQLite SessionRepo has a separate schema and needs its own integrity, metadata, usage, orphan-parent, and checkpoint checks.
+- **Canaries on disposable copies:** Exercise branched Crystal history, `id="0"`, edit/delete/restore/shred/swipe and restart; agent-core v3 import and first commit; durable sidecar completion/retirement; and SQLite reopen/commit allocation. For Workers, use an existing object and exercise eviction/alarm wakeup, interrupted-turn recovery, repeat `requestId`, and terminal alarm cleanup.
+- **Rollback:** Stop writers and preserve the failed candidate store. Restore the verified pre-deployment data before starting the old release; code rollback alone does not reverse schema v2 or format-4 replacement. Never relabel a schema version. Reconcile successful post-backup writes and intentionally shredded data before restoring an older backup.
+- **Monitoring:** Inspect `session_failed`, `migration_failed`, `task_faulted`, `task_parked`, queued submissions, overdue sleeps, alarms, and identity/allocation mismatches after rollout. Stop on integrity/equality mismatch, duplicate completed side effects, lost selected history, missing required alarms, or unexpected provider/session identity changes.
+
+Exact SQL comparisons, backend-specific commands, canary steps, and rollback details are preserved in `deployment-verification-agent.md` under the run directory. These are release-owned proof obligations, not additional code findings.
+
+### Coverage
+
+**Coverage is partial semantic review of the full fixed-base scope, not approval of every hunk.**
+
+| Path ledger | Semantically inspected | Insufficient evidence |
+|---|---:|---:|
+| correctness-models | 141 | 93 |
+| correctness-native | 134 | 99 |
+| correctness-execution | 69 | 191 |
+| correctness-surface | 82 | 403 |
+| correctness-history | 62 | 0 |
+| **Total** | **488** | **786** |
+
+- The ledgers account for all **1,274 paths once**. The four Windows binary paths are already included in native's 99 insufficient-evidence paths; they are not additional paths.
+- All 15 selected views plus the mandatory adversarial fallback returned terminal results within the per-reviewer collection bound. None failed or remained outstanding. Some exceeded the shorter target duration. The history coverage artifact was supplied on the completion request without further research.
+- **Candidate accounting:** 2 submitted candidates -> 2 primary P2 findings. No semantic duplicates, pre-existing findings, confidence suppressions, malformed findings/returns, policy removals/regrades, or mode-aware demotions. Two missing compact evidence quotes were recovered from originating artifacts.
+- **Independent validation:** Both candidates were selected and individually confirmed. Confirmed: **2**; rejected: **0**; unresolved: **0**; malformed: **0**; failed: **0**; shortcut-skipped: **0**; cap omissions: **0**. No degraded blocker or protected-subject reclassification. Both findings retain their original severity, confidence, and action route. Neither finding's runtime incidence was measured.
+- adversarial lens: in-process fallback (cross-model peer not run: OAuth session expired and could not be refreshed)
+- The requested peer route targeted `claude-opus-5-5` with high effort, but no completed peer receipt or artifact exists. Actual serving model/effort and cross-model independence are unverified. No peer artifact was folded in; the persisted peer job directory was deleted.
+- Active global/root `AGENTS` instructions remained binding. No designated `CODING_STANDARDS`, base review policy, or Compound Pack criteria were routed. Historical report bodies were excluded from reviewer diff seeds.
+- Agent-native inspection retained no concrete capability gap in the inspected MCP, codemode, discovery, SDK, RPC, or service routes. External implementations and runtime parity were not exercised.
+- The repository graph was stale, dated 2026-10-09, and unwatched; review used current-source fallback. Lexical searches do not prove exhaustive deleted-module liveness or completeness for dynamic/plugin/external consumers.
+
+**Residual risks and testing gaps:**
+
+- Windows arm64/x64 prebuilt `windows-job.node` and `windows-launcher.exe` source equivalence and runtime compatibility remain unverified. Process-tree termination, Job attachment/launcher ordering, and shutdown tests were inspected, not executed.
+- Chord reload/retirement/cleanup, environment daemon/client conformance, and TUI Kitty image overlay/transcript restoration scenarios were not executed.
+- `scripts/issues/ui.test.mjs:130-140` models Space activation, and pointer tests invoke a listener manually. Native held-Space activation and select-to-button pointer handoff during deferred polling remain unverified.
+- `packages/coding-agent/test/export-html-tools.test.ts:20-38,375-379` renders branches in fresh VMs without mounting the viewer. It does not directly cover consecutive `navigateTo` calls and branch-sensitive cache invalidation at `template.js:1655-1658`.
+- Actual-data migration duration/locking, restored-data equivalence, production Workers recovery, and shipped-artifact canaries remain unexercised. Missing receipts do not establish another product defect.
+
+**Artifacts:** `/tmp/compound-engineering-501/ce-code-review/20261104-100402-r7-4bf424fa`
+
+The run contains `synthesized-findings.json`, `validator-input.json`, `validator-verdicts.json`, `validator-outcome.json`, `final-findings.json`, `actionable-findings.json`, `advisory-outputs.json`, `validation-summary.json`, and `metadata.json`, together with reviewer evidence and path ledgers. Report-stage logging and metadata cost summarization completed. The parent persists this returned Markdown as `report.md` and appends it to `docs/plans/2026-10-30-c08a2fb-image-billing-code-review.md`, preserving history before applying fixes.
+
+---
+
+### Verdict
+
+> **Not ready.** Two new independently validated P2 regressions remain unfixed: OpenRouter Auto alias removal and cross-session in-memory usage attribution. This round has not met the requested zero-new-findings stopping condition.
+>
+> **Next action:** Preserve this report, implement and verify #1 and #2, commit verified repairs locally, then repeat the full review against the same first-parent base. No push or PR. The findings have independent fix paths; neither depends on the other.
+
+**Prioritized actionable recap**
+
+1. **#1 -- P2 -- `packages/ai/src/providers/openrouter.ts:61`:** Preserve the supported `auto` alias during personalization. **Response:** concrete code fix plus alias/restore regression. `autofix_class=gated_auto`; `suggested_fix` present; confidence **75**; independently **confirmed**, incidence unmeasured.
+2. **#2 -- P2 -- `packages/coding-agent/src/core/tool-usage-binding.ts:75`:** Prevent usage receipts crossing independent in-memory sessions with the same custom ID. **Response:** manager-specific ledger identity plus overlapping-receipt regression. `autofix_class=gated_auto`; `suggested_fix` present; confidence **75**; independently **confirmed**, incidence unmeasured.
+
+**Machine handoff:** `/tmp/compound-engineering-501/ce-code-review/20261104-100402-r7-4bf424fa/actionable-findings.json
+`
+
+
+## Round 7 repair disposition
+
+Both independently confirmed P2 findings are implemented. The initial report remains a historical snapshot; this round is not convergence.
+
+| Finding | Repair | Observed proof |
+|---|---|---|
+| #1 OpenRouter Auto | Exact account-catalog ID wins; only local `auto` may fall back to canonical `openrouter/auto`. Canonical availability, prices and limits apply without changing the local model ID. Other aliases are not inferred. | Catalog regression red: 1 failed / 9 passed, missing short `auto`. Saved-session restoration red explicitly fell back because the short ID disappeared. Catalog file green: 10 passed, including exact-entry precedence and no arbitrary/reverse alias inference. Full resolver file passes after persisted personalized catalog reopen offline. |
+| #2 duplicate in-memory IDs | A private WeakMap assigns a stable manager-specific ledger component for in-memory sessions; canonical-file/session-ID keys remain unchanged for persisted adoption. The session ID remains in the identity, so actual session replacement still changes ownership. | Classifier/image isolation red: both failed with A's receipt missing. Four complete resolver/codemode/runtime/custom-ID files green: 158 passed, including receipt lineage, notifications, B's own charge, release/re-adoption, persisted same-file transfer, late fork receipts and GC lifetime. Actual source-runtime smoke with asserted identical custom IDs observed one A receipt only in A, one B receipt only in B, with both dispatch parents preserved. |
+
+The new saved-catalog test uses only fake fetch responses and persists/reopens actual catalog and session files. Its environment changes occur inside `try` and restore the exact previous values in `finally`, preventing automatic stub restoration from clobbering existing nested-suite setup. An initial helper-based run exposed three subsequent auth-fixture failures; the final complete file passes without modifying those existing assertions or production authentication. The final test uses `isModelType` and has no unused helper imports. One initial smoke used an unsupported string options argument and did not create matching IDs; it was corrected to `{ id }` with an explicit equality assertion before being accepted. Temporary smoke source was removed; `memory-ledger-smoke.json` records the valid result.
+
+`npm run check` completed exit 0, 1,986 files, **No fixes applied**, including TypeScript/browser-smoke. Offline build exited 0 and produced the 76-file, 9.4-MiB coding-agent bundle. Documentation records exact Auto fallback and independent in-memory accounting; no public signature, compatibility shim, dependency or lockfile changed. The authoritative isolated root suite completed **13,782 passed / 0 failed / 945 skipped**, exit 0, 267.79 seconds (`suite.log`, `suite-exit.json`, `artifact://787`). Existing Windows/Workers/deployment evidence limits remain; native binaries were unchanged and not newly executed.
+
+The exact Round 7 report was appended before repair, preserving the original 145,600-byte prefix (SHA-256 `6b2eada732c16576ba845bff9dbbed4340c55389f75cd6140b36c6b327d651f0`). A fresh full-range review remains required after verification and local commit.
+

@@ -1,8 +1,8 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { type Api, isModelType, type Model } from "@earendil-works/pi-ai";
 import { getModel, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "vitest";
@@ -16,7 +16,10 @@ import {
 	resolveModelReference,
 	resolveModelScope,
 	resolveModelScopeWithDiagnostics,
+	restoreModelFromSession,
 } from "../src/core/model-resolver.ts";
+import { ModelRuntime } from "../src/core/model-runtime.ts";
+import { FileModelsStore } from "../src/core/models-store.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
@@ -800,6 +803,100 @@ describe("default model selection", () => {
 
 		expect(result.model?.provider).toBe("spark-two");
 		expect(result.model?.id).toBe("deepseek-v4-flash");
+	});
+
+	test("restores a persisted short Auto selection after reopening its personalized catalog offline", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pi-openrouter-auto-restore-"));
+		const modelsStorePath = join(tempDir, "models-store.json");
+		const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = String(input);
+			if (url === "https://catalog.test/api/models/providers/openrouter?types=chat%2Cimage%2Cclassifier") {
+				return new Response("missing", { status: 404 });
+			}
+			if (url === "https://openrouter.ai/api/v1/models/user") {
+				return Response.json({
+					data: [
+						{
+							id: "openrouter/auto",
+							top_provider: { context_length: 262_144, max_completion_tokens: 32_768 },
+							pricing: { prompt: "0.000003", completion: "0.000015" },
+						},
+					],
+				});
+			}
+			throw new Error(`Unexpected fixture request: ${url}`);
+		});
+		const previousCloudDisabled = process.env.PI_DISABLE_CLOUD_PROVIDERS;
+		const previousOffline = process.env.PI_OFFLINE;
+		try {
+			process.env.PI_DISABLE_CLOUD_PROVIDERS = "0";
+			delete process.env.PI_OFFLINE;
+			const credentials = AuthStorage.inMemory({ openrouter: { type: "api_key", key: "test-key" } });
+			const runtime = await ModelRuntime.create({
+				credentials,
+				modelsPath: null,
+				modelsStore: new FileModelsStore(modelsStorePath),
+				catalogBaseUrl: "https://catalog.test",
+				refreshOnCreate: false,
+			});
+			const selected = runtime.getModel("openrouter", "auto");
+			expect(selected).toBeDefined();
+			if (!selected) throw new Error("Missing built-in short Auto alias");
+			const manager = SessionManager.create(tempDir, join(tempDir, "sessions"));
+			manager.appendModelChange(selected.provider, selected.id);
+			manager.appendMessage({ role: "user", content: "Remember this model selection", timestamp: 1 });
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Missing persisted session file");
+
+			const refresh = await runtime.refresh({ allowNetwork: true, force: true, providers: ["openrouter"] });
+			expect([...refresh.errors]).toEqual([]);
+			expect(fetch).toHaveBeenCalledTimes(2);
+			fetch.mockClear();
+			fetch.mockImplementation(async () => {
+				throw new Error("Reopening the persisted catalog must not fetch");
+			});
+
+			const reopenedStore = new FileModelsStore(modelsStorePath);
+			const reopenedRuntime = await ModelRuntime.create({
+				credentials,
+				modelsPath: null,
+				modelsStore: reopenedStore,
+				catalogBaseUrl: "https://catalog.test",
+				allowModelNetwork: false,
+			});
+			const saved = SessionManager.open(sessionFile).buildSessionContext().model;
+			expect(saved).toEqual({ provider: "openrouter", modelId: "auto" });
+			if (!saved) throw new Error("Missing persisted model selection");
+			const restored = await restoreModelFromSession(
+				saved.provider,
+				saved.modelId,
+				reopenedRuntime.getModel("openrouter", "openrouter/auto"),
+				false,
+				reopenedRuntime,
+			);
+
+			expect(restored.fallbackMessage).toBeUndefined();
+			expect(restored.model).toMatchObject({
+				provider: "openrouter",
+				id: "auto",
+				contextWindow: 262_144,
+				maxTokens: 32_768,
+				cost: { input: 3, output: 15, cacheRead: 0, cacheWrite: 0 },
+			});
+			const storedChatIds = (await reopenedStore.read("openrouter"))?.models
+				.filter((model) => isModelType(model, "chat"))
+				.map((model) => model.id);
+			expect(storedChatIds).toEqual(expect.arrayContaining(["auto", "openrouter/auto"]));
+			expect(storedChatIds).toHaveLength(2);
+			expect(fetch).not.toHaveBeenCalled();
+		} finally {
+			fetch.mockRestore();
+			if (previousCloudDisabled === undefined) delete process.env.PI_DISABLE_CLOUD_PROVIDERS;
+			else process.env.PI_DISABLE_CLOUD_PROVIDERS = previousCloudDisabled;
+			if (previousOffline === undefined) delete process.env.PI_OFFLINE;
+			else process.env.PI_OFFLINE = previousOffline;
+			rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	describe("persisted default model scoping", () => {

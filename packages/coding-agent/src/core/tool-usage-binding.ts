@@ -57,6 +57,8 @@ interface ToolUsageLedger {
 }
 
 const toolUsageLedgers = new Map<string, ToolUsageLedger>();
+const inMemoryLedgerIds = new WeakMap<SessionManager, number>();
+let nextInMemoryLedgerId = 0;
 let nextToolUsageOwnerId = 0;
 let nextToolUsageNotificationId = 0;
 const toolUsageOwnerCleanup = new FinalizationRegistry<{ key: string; ownerId: number }>(({ key, ownerId }) => {
@@ -71,8 +73,16 @@ function toolUsageIdentity(manager: SessionManager): ToolUsageIdentity {
 	const path = manager.isPersisted() ? manager.getSessionFile() : undefined;
 	const file = path ? canonicalizePath(join(canonicalizePath(dirname(path)), basename(path))) : undefined;
 	const sessionId = manager.getSessionId();
+	let inMemoryId: number | undefined;
+	if (!file) {
+		inMemoryId = inMemoryLedgerIds.get(manager);
+		if (inMemoryId === undefined) {
+			inMemoryId = ++nextInMemoryLedgerId;
+			inMemoryLedgerIds.set(manager, inMemoryId);
+		}
+	}
 	return {
-		key: JSON.stringify([file ?? null, sessionId]),
+		key: JSON.stringify(file ? [file, sessionId] : [null, sessionId, inMemoryId]),
 		file,
 		sessionId,
 		cwd: manager.getCwd(),

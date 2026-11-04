@@ -123,6 +123,103 @@ describe("personalizeOpenRouterCatalog", () => {
 		expect(result[4]).toBe(classifierModel);
 	});
 
+	it("keeps both Auto spellings with canonical prices and limits when only openrouter/auto is allowed", async () => {
+		stubUserModels(
+			Response.json({
+				data: [
+					{
+						id: "openrouter/auto",
+						context_length: 1_000_000,
+						top_provider: { context_length: 262_144, max_completion_tokens: 32_768 },
+						pricing: { prompt: "0.000003", completion: "0.000015" },
+					},
+				],
+			}),
+		);
+		const shortAuto = { ...chatModel("auto"), name: "Auto (short alias)" };
+		const canonicalAuto = { ...chatModel("openrouter/auto"), name: "Auto (canonical)" };
+
+		const result = await personalizeOpenRouterCatalog(
+			[shortAuto, canonicalAuto, chatModel("blocked")],
+			refreshContext(),
+		);
+
+		expect(result).toEqual([
+			{
+				...shortAuto,
+				contextWindow: 262_144,
+				maxTokens: 32_768,
+				cost: { input: 3, output: 15, cacheRead: 0, cacheWrite: 0 },
+			},
+			{
+				...canonicalAuto,
+				contextWindow: 262_144,
+				maxTokens: 32_768,
+				cost: { input: 3, output: 15, cacheRead: 0, cacheWrite: 0 },
+			},
+		]);
+	});
+
+	it.each(["short-first", "canonical-first"] as const)(
+		"prefers an exact allowed auto entry over its canonical fallback (%s)",
+		async (order) => {
+			const shortEntry: OpenRouterModel = {
+				id: "auto",
+				top_provider: { context_length: 64_000, max_completion_tokens: 4_000 },
+				pricing: { prompt: "0.000001", completion: "0.000002" },
+			};
+			const canonicalEntry: OpenRouterModel = {
+				id: "openrouter/auto",
+				top_provider: { context_length: 262_144, max_completion_tokens: 32_768 },
+				pricing: { prompt: "0.000003", completion: "0.000015" },
+			};
+			const data = order === "short-first" ? [shortEntry, canonicalEntry] : [canonicalEntry, shortEntry];
+			stubUserModels(Response.json({ data }));
+
+			const result = await personalizeOpenRouterCatalog(
+				[chatModel("auto"), chatModel("openrouter/auto")],
+				refreshContext(),
+			);
+
+			expect(result).toMatchObject([
+				{
+					id: "auto",
+					contextWindow: 64_000,
+					maxTokens: 4_000,
+					cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+				},
+				{
+					id: "openrouter/auto",
+					contextWindow: 262_144,
+					maxTokens: 32_768,
+					cost: { input: 3, output: 15, cacheRead: 0, cacheWrite: 0 },
+				},
+			]);
+		},
+	);
+
+	it("does not infer aliases for arbitrary IDs or reverse the built-in Auto alias", async () => {
+		stubUserModels(
+			Response.json({
+				data: [{ id: "openrouter/arbitrary" }, { id: "vendor/model" }, { id: "auto" }],
+			}),
+		);
+
+		const result = await personalizeOpenRouterCatalog(
+			[
+				chatModel("arbitrary"),
+				chatModel("openrouter/arbitrary"),
+				chatModel("model"),
+				chatModel("vendor/model"),
+				chatModel("auto"),
+				chatModel("openrouter/auto"),
+			],
+			refreshContext(),
+		);
+
+		expect(result.map((model) => model.id)).toEqual(["openrouter/arbitrary", "vendor/model", "auto"]);
+	});
+
 	it.each([401, 403, 404])(
 		"returns the catalog unchanged when the endpoint rejects the key or is missing (%i)",
 		async (status) => {

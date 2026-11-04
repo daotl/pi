@@ -107,6 +107,8 @@ Candidate prompt sections and tool-loadout changes publish only after that same 
 
 Hosts replacing or disposing a Session directly can call `flushPendingPersistence()` after aborting/settling it to publish retained deferred bash/custom output and usage receipts without outgoing subscriber notifications. Runtime replacement and interactive shutdown use this drain before invalidation. Records are consumed after successful storage, even if later projection refresh fails, so retry does not append them twice. `flushPendingUsage()` remains the narrower usage-only operation.
 
+Independent in-memory `SessionManager` instances own separate tool-usage ledgers even when they share a custom session ID. Persisted managers for the same canonical file and session ID can still adopt pending receipts during runtime replacement; matching a display/session ID alone does not transfer in-memory accounting ownership.
+
 `incomingMessagePrefix` is read from the supplied `SettingsManager` on each SDK context conversion. Historical and new string/array user text receive the current prefix without changing stored history, text metadata or images. The SDK uses the shared `prefixUserMessages` helper in its converter so direct summaries and token counts follow the same setting. Do not also set the Agent prefix to the same value; that would apply it twice. Cache warming replays the already converted original request, not a newly prefixed one.
 
 ## Subscribing to events

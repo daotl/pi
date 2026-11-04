@@ -58,7 +58,7 @@ export async function personalizeOpenRouterCatalog(
 	}
 	return catalog.flatMap((model): AnyModel[] => {
 		if (!isModelType(model, "chat")) return [model];
-		const entry = allowed.get(model.id);
+		const entry = allowed.get(model.id) ?? (model.id === "auto" ? allowed.get("openrouter/auto") : undefined);
 		if (!entry) return [];
 		return [
 			{
