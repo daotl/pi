@@ -1140,3 +1140,145 @@ The new saved-catalog test uses only fake fetch responses and persists/reopens a
 
 The exact Round 7 report was appended before repair, preserving the original 145,600-byte prefix (SHA-256 `6b2eada732c16576ba845bff9dbbed4340c55389f75cd6140b36c6b327d651f0`). A fresh full-range review remains required after verification and local commit.
 
+
+## Code Review Results
+
+**Round 8: two confirmed P2 findings remain open. No fixes applied.**
+
+**Scope:** Fixed first-parent base `98dfe28cbeec4e1f2f61516e227420b2407dcdf9` -> reviewed HEAD `367cfbda09f9b59f4f54d26fbb863a9aa71c6337`, branch `fix/full-merge-review-8322aa1d`. This covers merge `8322aa1d` and all subsequent repairs through that HEAD, not just the latest commit: 1,274 changed paths, 203,145 changed lines, 74,270 executable non-test changed lines, and 47 deletions.
+
+**Intent:** Integrate upstream 1.4.0 while preserving Crystal history, edit/delete/restore/shred and id0 behavior; billing, multimodal and summary budgets; and Harness, experimental, client and published contracts. Findings concern current, concrete consumer regressions.
+
+**Mode:** markdown report-only, `depth:full`, `apply_local:false`. The parent owns implementation, verification and local commits. This report must be persisted and appended to `docs/plans/2026-10-30-c08a2fb-image-billing-code-review.md` with its history retained before fixes are applied. No push or PR.
+
+**Reviewers:** correctness-models, correctness-native, correctness-history, correctness-execution, correctness-surface, security, reliability, api-contract, data-migration, testing, performance, maintainability, agent-native-reviewer, frontend-races, deployment-verification-agent, and adversarial fallback.
+
+- The five correctness views cover model/billing behavior, native/platform boundaries, history/storage semantics, execution lifecycle and consumer-facing surfaces.
+- Security covers trust and authentication; reliability covers asynchronous lifecycle; api-contract covers published interfaces; data-migration covers actual migrations.
+- Testing covers guard fidelity; performance covers bounded complexity; maintainability covers structural integration.
+- Agent-native covers capability reachability; frontend-races covers DOM ordering; deployment verification covers destructive storage cutovers.
+- The in-process adversarial view replaces the cross-model review that could not authenticate. It is not independent cross-model corroboration.
+
+### Triage Groups
+
+| Group | Findings | Context | Preferred Resolution | Why |
+|---|---|---|---|---|
+| Model-usage accounting across persistence boundaries -- apply-queue | #1, #2 | Export loses model receipts; Durable aggregation loses billed-versus-estimated provenance | Fix receipt inclusion and selected-leaf preservation in #1, then neutral-zero provenance handling in #2 | Both affect persisted accounting, but have distinct causes, fixes and acceptance cases; neither fix resolves the other |
+
+### P2 -- Moderate
+
+| # | File | Issue | Reviewer | Confidence |
+|---|---|---|---|---|
+| 1 | `packages/coding-agent/src/core/tool-usage-binding.ts:148` | JSONL exports and Radius shares omit classifier/image usage receipts | correctness-history | 100 |
+| 2 | `packages/durable/src/harness/usage.ts:57` | Interrupted zero-usage responses mislabel provider-billed totals as estimates | correctness-execution | 75 |
+
+**#1 -- Preserve model receipts in branch exports.** A session-bound `models.classify` or `models.generateImages` call with returned usage records its charge through `appendUsageAt` without changing the selected leaf. `serializeSessionBranch` exports only selected ancestry, so that receipt is absent from the exported JSONL and Radius share. Ordinary awaited completion is sufficient; navigation or a late completion is not required. The imported conversation retains the model work but loses its model-attributed receipt and reports a smaller cost.
+
+- **Evidence:** `tool-usage-binding.ts:148` records through `appendUsageAt`; `session-manager.ts:1768-1794` appends without selecting the receipt; `session-manager.ts:2197-2206` walks only selected ancestry. `session-export.ts:23-27` serializes that ancestry, and `modes/interactive/session-share.ts:49-71` uses the same JSONL for Radius sharing. `extensions/codemode/execute.ts:518-520` routes these charges to the recorder rather than retaining them on the tool result.
+- **Response:** Include usage-only side entries owned by the selected dispatch lineage, including required usage-only ancestor chains, deduplicated by entry ID and retaining original ancestry. Finish with a selected-leaf checkpoint so receipt inclusion does not change conversation selection. Add awaited classifier/image export-and-reopen cases for both `exportToJsonl` and `exportSessionForShare`, checking receipts, model breakdown, total cost and selected leaf.
+- **Validation:** `validation_status: confirmed`; protected subject `data-loss`. The independent validator confirmed the newly introduced routing and export omission from source. Reachability is code-confirmed; **runtime incidence was not measured**. Confidence remains 100. This is not cross-model corroboration.
+
+**#2 -- Keep zero-usage interruptions neutral in billing provenance.** A content-bearing OpenRouter stream partial can be persisted before its final usage chunk arrives. If interrupted then, it carries all-zero usage without `totalFromProvider`. Abort/recovery records that partial. Combining it with a provider-billed response for the same model ANDs the provenance flag to false in either operand order. The numeric cost remains unchanged, but `Harness.usage()` incorrectly presents the billed aggregate as an estimate. Cross-conversation aggregation can combine the same operand shapes.
+
+- **Evidence:** `packages/ai/src/api/openai-completions.ts:328-334` initializes the unmarked zero usage; `packages/durable/src/harness/generation.ts:465-508` persists progress and `437-441,766-772` records interrupted/recovered usage. `packages/durable/src/harness/usage.ts:55-57` applies the AND rule. The result is exposed through `packages/durable/src/harness/harness.ts:359-369` under the published `Usage.cost` contract at `packages/ai/src/types.ts:510-513`. The agent-core accumulator already handles neutral zero usage at `packages/agent/src/harness/utils/usage.ts:14-19`.
+- **Response:** Determine whether either operand is unmarked all-zero usage before mutating the total. Preserve the other operand's provenance when one is neutral; otherwise retain the AND rule. Do not treat explicit estimates as neutral. Cover both operand orders and a persisted interrupted partial followed by a billed response.
+- **Validation:** `validation_status: confirmed`; protected subject `public-contract`. The independent validator confirmed the reachable persistence/aggregation path and exposed contract mismatch from source. **Runtime incidence was not measured.** Confidence remains 75. This is not cross-model corroboration.
+
+### Actionable Findings
+
+| # | File | Required response | Route | Notes |
+|---|---|---|---|---|
+| 1 | `packages/coding-agent/src/core/tool-usage-binding.ts:148` | Preserve branch-owned classifier/image receipts in JSONL and Radius exports without changing selected leaf; add export/reopen regression coverage | `gated_auto -> downstream-resolver` | P2; confidence 100; `suggested_fix` present; confirmed; targeted verification required |
+| 2 | `packages/durable/src/harness/usage.ts:57` | Port neutral-zero provenance handling before mutation; cover both orders and interrupted-partial persistence | `gated_auto -> downstream-resolver` | P2; confidence 75; `suggested_fix` present; confirmed; targeted verification required |
+
+### Deployment Notes
+
+These are release-owner gates, not additional proven code defects. No deployment, backup, query, canary or test below was executed by this review.
+
+- **Before upgrade:** Record exact old/new versions, original storage roots and prefixes, session/conversation identities, task versions, and Workers account/environment/namespace/routing. A prefix change selects another namespace; it does not migrate data. Obtain coherent SQLite backups and full Durable JSONL-directory backups, including sidecars. Back up Crystal and AgentHarness histories separately; an active-transcript export is not an all-branch backup. Prove restoration on isolated copies before production migration. Workers needs its actual Durable Object backup/PITR procedure, not a D1 substitute.
+- **Storage-only canary:** Durable SQLite upgrades schema 1 -> 2 and rebuilds the task table in one transaction. Before Harness recovery changes state, compare complete stored rows and metadata against the backup, verify schema 2, absence of `tasks_v2`, and all five task indexes. Measure lock duration, file/WAL growth and disk headroom on representative data. Crystal remains session format 3; legacy AgentHarness publishes v4 backing on its first nonempty commit. Keep these formats distinct.
+- **Verification queries:** On the correct, deployed Durable table prefix, require `PRAGMA integrity_check` -> `ok`; inspect `durable_schema`, `durable_metadata`, task/submission status counts and task indexes. Compare complete task rows, require scalar task fields to match their JSON records, and check for orphan entries/tasks/revisions and duplicate current document addresses. Do not run Durable-table queries against the separate SQLite-node AgentHarness schema. Full SQL and comparison recipes are preserved in the deployment artifact.
+- **Semantic canary:** Compare before upgrade, after the first accepted write and after reopening: original/parent identity; selected ancestor and empty branch; all message/tool/image payloads; soft-deleted units still hidden but restorable; shredded units still absent; summaries and retained boundaries; id0 editing without provider dispatch; deduplicated charges and model/tool totals. Account for intentional legacy AgentHarness ID remapping rather than requiring raw ID equality.
+- **Runtime gates for the parent/release owner:** Run the affected Durable SQLite/JSONL/Harness tests, explicit Workers tests, AgentHarness v3 migration tests, SQLite-node backend tests, Crystal session/edit/delete/swipe tests and SDK identity tests. Node coverage does not substitute for workerd execution. Add and run the targeted #1/#2 regressions before retaining fixes.
+- **Post-deploy:** On one isolated owner/object, verify stable identity on reopen and new identity on fork, repeated `requestId` admission without duplicate answers, sleeping-task wake/alarm behavior after restart/eviction, interrupted-task recovery without replaying completed non-replay-safe effects, and history/usage equivalence. Stop expansion on corruption, identity drift, missing receipts, missed wake, duplicate effects or failed restore.
+- **Rollback:** Do not reopen migrated schema-2 SQLite with the schema-1 base. Older runtimes cannot safely resume new sleeping JSONL tasks; do not confuse AgentHarness v4 with Crystal v3. Roll forward or stop writers and restore a coherent pre-upgrade backup into a clean destination. Restoration loses post-backup writes and cannot undo external effects; reconcile them before resuming.
+- **Monitoring:** At +5 minutes, +1 hour, +4 hours and +24 hours, inspect `session_failed`, `migration_failed`, `task_parked`, `task_faulted`, `host_error`, task/submission status distributions, overdue sleepers, Workers alarm/reset errors, storage growth and committed token/cost totals.
+
+### Coverage
+
+**Review extent and limits**
+
+All 1,274 paths are accounted for once in the five domain ledgers. The following are **reviewer-reported semantic classifications**, not independent proof of exhaustive review or approval of every hunk:
+
+| Domain ledger | Semantic classification | Insufficient evidence |
+|---|---:|---:|
+| correctness-models | 234 | 0 |
+| correctness-native | 165 | 68 |
+| correctness-history | 62 | 0 |
+| correctness-execution | 125 | 135 |
+| correctness-surface | 233 | 252 |
+| Total | 819 | 455 |
+
+- The four changed Windows x64/arm64 `windows-job.node` and `windows-launcher.exe` binaries are already included in the native ledger's 68 insufficient-evidence paths, not additional paths. Neither Windows runtime behavior nor equivalence of binaries to matching source was established. Source and Windows-only test assertions do not clear those platforms.
+- Insufficient paths include inventory-only tests, documentation not substantively examined, and some deleted legacy paths whose former import-time behavior was not fully reconstructed. No all-path or all-hunk clean-review claim is made.
+- The code graph was stale as of 2026-10-09 and unwatched. Current-source/text tracing was used instead; completeness for dynamic dispatch, external consumers, third-party extensions and platform deployment remains unproven.
+- All 15 selected views plus the mandatory adversarial fallback reached terminal collection within the 20-minute per-reviewer bound, with at most five concurrent reviewers. Some exceeded the eight-minute target. Failed/timed-out reviewers: 0.
+- Historical report bodies were excluded from reviewer diff seeds. Active global/root `AGENTS` instructions remained binding; no designated `CODING_STANDARDS`, base review policy, Compound Packs or selected past-solution outputs were supplied for this round.
+
+**Independent validation and peer outcome**
+
+- All **2 actual candidates** entered one deterministic fresh validator batch, with no cap omission. Results: **confirmed 2, rejected 0, unresolved 0, malformed 0, failed 0, shortcut-skipped 0**. Both findings retain their original P2 severity, confidence and actionable route. There are no degraded validation gates.
+- Protected-subject classification independently agrees with the validator: #1 `data-loss`, #2 `public-contract`. No protected-subject reclassification was needed. Both confirmations establish code-permitted reachability, not measured runtime incidence.
+- adversarial lens: in-process fallback (cross-model peer not run: OAuth session expired and could not be refreshed)
+- The requested peer was `claude-opus-5-5` at high effort. Authentication failed; actual serving model/effort and cross-model independence were not verified. No external peer artifact was folded in, and its persisted job directory was deleted. The local fallback supplies an adversarial lens, not cross-model agreement or a validator shortcut.
+
+**Accounting and remaining evidence**
+
+- Primary/actionable findings: 2/2. Pre-existing findings: 0. Suppressed findings: 0 at all confidence anchors. Soft-bucket demotions: 0. Malformed findings/returns: 0/0. First evidence backfilled from source artifacts: 2. Semantic duplicate merges, settled-decision conflicts, and review-policy removals/regradings: 0.
+- The agent-native view retained no significant concrete capability gap. That does not establish exhaustive dynamic-extension or external-consumer coverage.
+- The experimental Radius relay relies on the external gateway for connection admission (`packages/coding-agent/src/experimental/radius-relay.ts:256-266`). The gateway is outside this checkout. No bypass was established, and that external authorization boundary was not verified.
+- Testing gaps remain for Windows Job containment, fork IPC/stdio inheritance and snapshot/preload behavior on both Windows architectures, and actual Cloudflare SQLite rollback/queue/multi-statement behavior. Node-backed structural inspection is not a workerd or production receipt.
+- Production cardinality/lock duration, coherent backup/restore, Workers namespace/routing/PITR, deployed artifacts and live-provider identity/cache behavior remain unverified release evidence.
+- **No tests, builds, checks, installs, network/provider calls or browser sessions ran in this review.** Reading test source establishes intended scenarios, not passing verification. No fixes were applied, and no commit, push or PR was made by the report leaf. Parent repair verification is separate.
+
+**Artifacts:** `/tmp/compound-engineering-501/ce-code-review/20261104-111914-r8-e66a1a3c`
+
+- `final-findings.json`: hydrated final findings, matched validation reasons, action routes, coverage and advisory detail.
+- `actionable-findings.json`: both confirmed downstream-resolver findings with full evidence and suggested fixes.
+- `advisory-outputs.json`, `coverage.json`: retained deployment, residual-risk, testing-gap and coverage details.
+- `synthesized-findings.json`, `validator-input.json`, `validator-verdicts.json`, `validator-outcome.json`: synthesis and independent-validation audit trail.
+- `metadata.json`, `stages.jsonl`: reviewed branch/HEAD, verdict and stage/cost receipt; summary status `complete` means the recorded stages ended, not that semantic or runtime coverage was exhaustive.
+- Per-reviewer JSON/Markdown and `correctness-*-coverage.json` retain source details and path classifications. `deployment-verification-agent.md` contains the full release checklist and queries.
+- The parent persists this returned text as `report.md` and appends it to the existing historical report before implementing fixes.
+
+---
+
+### Verdict
+
+> **Not ready.** Two independently source-confirmed P2 accounting defects remain open at reviewed HEAD `367cfbda09f9b59f4f54d26fbb863a9aa71c6337`: exports discard classifier/image charge receipts, and Durable aggregation mislabels provider-billed totals after interrupted zero-usage responses. Neither has been fixed or runtime-verified in this report-only round.
+>
+> **Next action:** Persist and append this report, fix #1 then #2, run their targeted regressions and affected checks, and commit locally after verification. Continue the next full fixed-base review as requested; this is not a zero-new-findings round. Platform and deployment evidence limits above remain separate from these confirmed defects.
+
+**Prioritized Actionable Findings recap**
+
+1. **#1 [P2] `packages/coding-agent/src/core/tool-usage-binding.ts:148` -- Preserve model receipts in branch exports.** Mechanical fix: include branch-owned usage side entries in JSONL/Radius exports while preserving selected leaf, then verify export/reopen receipts and cost. `autofix_class:gated_auto`; owner `downstream-resolver`; `suggested_fix` present; confidence **100**; confirmed, runtime incidence unmeasured.
+2. **#2 [P2] `packages/durable/src/harness/usage.ts:57` -- Keep zero-usage interruptions neutral in billing provenance.** Mechanical fix: mirror neutral-zero handling before mutation, preserving actual billed provenance; verify both operand orders and persisted interruption recovery. `autofix_class:gated_auto`; owner `downstream-resolver`; `suggested_fix` present; confidence **75**; confirmed, runtime incidence unmeasured.
+
+Actionable artifact: `/tmp/compound-engineering-501/ce-code-review/20261104-111914-r8-e66a1a3c/actionable-findings.json`.
+
+
+## Round 8 repair disposition
+
+Both confirmed accounting findings are implemented; this is not a zero-new-findings round.
+
+| Finding | Repair | Observed proof |
+|---|---|---|
+| #1 branch receipt export | Serialize selected ancestry and usage-only descendant chains rooted on that lineage, excluding unrelated conversational branches. Preserve IDs and receipt ancestry, linearize the selected branch as before, deduplicate entries by ID, and add a selection checkpoint only when side entries would change the inferred leaf. Radius metadata remains the final selected child. | Complete export file red: 10 failed / 3 passed, including real awaited classifier/image producers and JSONL/Radius reopen. Four complete export/share/selected-leaf/bug-report files green: 38 passed. Conversation, ancestor, usage and empty selection, duplicate-valued independent charges, usage chains, unrelated branches, source immutability and subsequent append ancestry are covered. Existing no-marker exports without extra receipts remain unchanged. |
+| #2 neutral-zero provenance | Determine unmarked all-zero operands before mutating totals; preserve the nonneutral operand's `totalFromProvider`, otherwise retain the AND rule. Explicit estimates and optional nonzero counters remain contributing usage. | Usage/recovery red: 9 failed / 41 passed, including a persisted content partial without a usage chunk followed by billed recovery. Both complete files green: 50 passed in each of two retention modes. Coverage includes both operand orders, model/tool and cross-conversation buckets, optional zeros, explicit false and nonzero-only optional counters. Exact provider-billed cost 0.17 remains unchanged. |
+
+Actual source-runtime smoke exported a detached model receipt, reopened it with one receipt/cost 0.17 and the original selection, and confirmed provider provenance with neutral zero in both operand orders (`accounting-smoke.json`). Temporary smoke source was removed. The exporter now uses named `UsageEntry` buckets, not a consumer `ReturnType` contract. Existing share mocks were updated for the real SessionManager reads; their notification/error expectations were not weakened. An initial unconditional checkpoint was narrowed before final proof so ordinary branch exports preserve their no-marker behavior; receipt-bearing exports explicitly document selection restoration.
+
+`npm run check` completed exit 0 with 1,986 files and **No fixes applied**, including TypeScript/browser-smoke. Offline build exited 0 and produced the 76-file, 9.4-MiB coding-agent bundle. Formatter changes were confined to owned source/test files; no manifest or lockfile changed. The authoritative isolated root suite completed **13,850 passed / 0 failed / 945 skipped**, exit 0, 262.77 seconds (`suite.log`, `suite-exit.json`, `artifact://848`). Native binaries and deployment operations were unchanged and not newly executed; existing Windows/Workers/deployment limits remain.
+
+The exact initial Round 8 report was appended before repairs, preserving the original 163,702-byte prefix (SHA-256 `9d294ffa2d971a7583693ebfdafea5ec4fe6275e5b8ed2972dab33f3b9f3d751`). Another fresh full-range review remains required after verified local commit.
+

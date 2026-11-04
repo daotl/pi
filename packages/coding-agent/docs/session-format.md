@@ -62,11 +62,13 @@ interface SessionEntryBase {
 
 Token/cost totals and model breakdowns count each `usageSourceId ?? id` once across all history. Context-only tail clones and restored prefixes keep their usage for display without adding another charge; separate actual responses remain separate charges even when their reported usage values are identical. Message statistics use the same logical identity. Existing entries without the optional field retain their own entry ID as identity.
 
-Successful destructive rewrites preserve the selected branch even when retained history ends on another branch or the selected branch becomes empty. The JSONL file may contain an internal record `{"type":"leaf","leafId":"entry-id"}` or `{"type":"leaf","leafId":null}` after its tree entries. It has no entry ID or parent and is not a transcript/tree entry. `SessionManager` applies it while loading; a later appended tree entry becomes the new selection. Public `FileEntry`, `getEntries()`, public file parsers, usage totals and branch exports exclude this storage bookkeeping. Raw file import/fork preserves it. Existing files without a marker select their last physical tree entry as before.
+Successful destructive rewrites preserve the selected branch even when retained history ends on another branch or the selected branch becomes empty. The JSONL file may contain an internal record `{"type":"leaf","leafId":"entry-id"}` or `{"type":"leaf","leafId":null}` after its tree entries. It has no entry ID or parent and is not a transcript/tree entry. `SessionManager` applies it while loading; a later appended tree entry becomes the new selection. Public `FileEntry`, `getEntries()`, public file parsers and usage totals exclude this storage bookkeeping. Raw file import/fork preserves it. Existing files without a marker select their last physical tree entry as before.
 
 This bookkeeping does not create a cloned swipe version, supersede a retained ancestor or renumber historical entries. Standalone `branch()` and `resetLeaf()` still move the in-memory pointer; the destructive rewrite transaction persists its resulting selection.
 
 Malformed selection values or IDs not present before a marker are ignored, preserving the last valid selection. A valid `null` deliberately selects the empty branch; it is not treated as malformed.
+
+Branch JSONL and Radius exports include usage-only side chains whose dispatch ancestry belongs to the selected branch, without importing unrelated conversational branches. Distinct receipt IDs remain distinct charges. Exports add a selection checkpoint only when appended accounting side entries would otherwise change the selected leaf; ordinary branch exports need none. Radius presentation metadata remains the final selected child of the original selection.
 
 ## Entry Types
 

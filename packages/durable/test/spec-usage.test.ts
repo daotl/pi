@@ -472,3 +472,94 @@ it("does not turn reported billing into an estimate when other conversations hav
 		await harness.close(callContext);
 	}
 });
+
+function uncharged(): Usage {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+const zeroProvenanceCases = [
+	{ name: "unmarked all-zero usage", usage: uncharged(), expected: charge(true) },
+	{
+		name: "unmarked all-zero optional counters",
+		usage: { ...uncharged(), reasoning: 0, cacheWrite1h: 0 },
+		expected: { ...charge(true), reasoning: 0, cacheWrite1h: 0 },
+	},
+	{
+		name: "explicitly estimated all-zero usage",
+		usage: { ...uncharged(), cost: { ...uncharged().cost, totalFromProvider: false } },
+		expected: charge(false),
+	},
+	{
+		name: "explicitly estimated nonzero usage",
+		usage: {
+			...uncharged(),
+			output: 1,
+			totalTokens: 1,
+			cost: { ...uncharged().cost, totalFromProvider: false },
+		},
+		expected: { ...charge(false), output: 3, totalTokens: 4 },
+	},
+	{
+		name: "unmarked nonzero usage",
+		usage: { ...uncharged(), output: 1, totalTokens: 1 },
+		expected: { ...charge(false), output: 3, totalTokens: 4 },
+	},
+	{
+		name: "unmarked reasoning-only usage",
+		usage: { ...uncharged(), reasoning: 1 },
+		expected: { ...charge(false), reasoning: 1 },
+	},
+	{
+		name: "unmarked one-hour-cache-write-only usage",
+		usage: { ...uncharged(), cacheWrite1h: 1 },
+		expected: { ...charge(false), cacheWrite1h: 1 },
+	},
+].flatMap(({ name, usage, expected }) => [
+	{ name, order: "before", first: usage, second: charge(true), expected },
+	{ name, order: "after", first: charge(true), second: usage, expected },
+]);
+
+it.each(zeroProvenanceCases)(
+	"combines $name $order provider billing in a conversation",
+	async ({ first, second, expected }) => {
+		const { harness, root } = await openChat(new MemoryStorage(), chatSetup());
+		try {
+			for (const bucket of ["models", "tools"] as const) {
+				await root.commit((tx) => recordUsage(tx, root.id, bucket, "charged", first), callContext);
+				await root.commit((tx) => recordUsage(tx, root.id, bucket, "charged", second), callContext);
+			}
+			const totals = (await harness.snapshot(UsageDoc, root.id, callContext))!;
+			for (const bucket of ["models", "tools"] as const) expect(totals[bucket].charged).toEqual(expected);
+		} finally {
+			await harness.close(callContext);
+		}
+	},
+);
+
+it.each(zeroProvenanceCases)(
+	"combines $name $order provider billing across conversations",
+	async ({ first, second, expected }) => {
+		const { harness, root } = await openChat(new MemoryStorage(), chatSetup());
+		try {
+			const child = await root.commit(
+				async (tx) => (await tx.createConversation({ ownership: { kind: "ownerless" } })).id,
+				callContext,
+			);
+			for (const bucket of ["models", "tools"] as const) {
+				await root.commit((tx) => recordUsage(tx, root.id, bucket, "charged", first), callContext);
+				await root.commit((tx) => recordUsage(tx, child, bucket, "charged", second), callContext);
+			}
+			const totals = await harness.usage(callContext);
+			for (const bucket of ["models", "tools"] as const) expect(totals[bucket].charged).toEqual(expected);
+		} finally {
+			await harness.close(callContext);
+		}
+	},
+);

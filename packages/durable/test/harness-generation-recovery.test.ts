@@ -2,13 +2,21 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { type AssistantMessage, createModels, fauxAssistantMessage, type Message } from "@earendil-works/pi-ai";
-import { AssistantEntry, type Harness, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
+import {
+	type AssistantMessage,
+	createAssistantMessageEventStream,
+	createModels,
+	fauxAssistantMessage,
+	type Message,
+	type Models,
+	type Usage,
+} from "@earendil-works/pi-ai";
+import { AssistantEntry, type Harness, LiveDoc, type TaskId, UsageDoc } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { allEntries, type ChatSetup, chatSetup, openChat, textOf, unanswered, waitFor } from "./chat-support.ts";
 import { addSection } from "./harness-support.ts";
-import { context } from "./session-support.ts";
+import { ControlledStorage, context } from "./session-support.ts";
 import { aborted, deferred, eventually } from "./task-support.ts";
 
 const directories = new Set<string>();
@@ -160,6 +168,88 @@ describe("generation recovery", () => {
 		expect(textOf(converted)).toBe(partial);
 		expect(await opened.harness.snapshot(LiveDoc, opened.root.id, context)).toEqual({});
 		await opened.harness.close(context);
+	});
+
+	it("preserves provider billing after reopening a content partial with no usage", async () => {
+		const setup = chatSetup();
+		setup.settings.progress = { partialIntervalMs: 1, persistWithinMs: 0 };
+		const zero: Usage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const partial: AssistantMessage = {
+			...fauxAssistantMessage("before usage", { stopReason: "pending" }),
+			usage: zero,
+		};
+		const billed: AssistantMessage = {
+			...fauxAssistantMessage("billed answer"),
+			usage: {
+				input: 1,
+				output: 2,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 3,
+				cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.17, totalFromProvider: true },
+			},
+		};
+		const sent: string[][] = [];
+		const streamSimple: Models["streamSimple"] = (_model, request, options) => {
+			sent.push(request.messages.map((message) => message.role));
+			const stream = createAssistantMessageEventStream();
+			if (sent.length === 1) {
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "before usage", partial });
+				options?.signal?.addEventListener("abort", () => stream.end({ ...partial, stopReason: "aborted" }), {
+					once: true,
+				});
+			} else {
+				stream.push({ type: "done", reason: "stop", message: billed });
+			}
+			return stream;
+		};
+		const models: Models = new Proxy(setup.models, {
+			get(target, property) {
+				if (property === "streamSimple") return streamSimple;
+				const value = Reflect.get(target, property, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const storage = new ControlledStorage();
+		let opened = await openChat(storage, { ...setup, models });
+		try {
+			opened.harness.resume();
+			const submission = await opened.root.submit({ type: "input", content: "hi" }, context);
+			await waitFor(async () => {
+				const live = await opened.harness.snapshot(LiveDoc, opened.root.id, context);
+				return textOf(live?.generation?.message as Message) === "before usage";
+			});
+			await opened.harness.close(context);
+
+			opened = await openChat(storage.reopen(), { ...setup, models });
+			const stored = await opened.harness.snapshot(LiveDoc, opened.root.id, context);
+			expect(stored?.generation?.message?.content).toEqual(partial.content);
+			expect(stored?.generation?.message?.usage).toEqual(zero);
+			expect(stored?.generation?.message?.usage.cost).not.toHaveProperty("totalFromProvider");
+			opened.harness.resume();
+			expect((await (await opened.harness.submission(submission.id, context))!.wait(context)).status).toBe("done");
+			expect(sent).toEqual([["user"], ["user"]]);
+			const entries = await allEntries(opened.root);
+			expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant", "pi.assistant"]);
+			expect(entries[1]?.model?.[0]).toMatchObject({
+				content: partial.content,
+				stopReason: "aborted",
+				usage: zero,
+			});
+			expect(entries[2]?.model?.[0]).toMatchObject({ content: billed.content, usage: billed.usage });
+			const conversationUsage = (await opened.harness.snapshot(UsageDoc, opened.root.id, context))!;
+			expect(conversationUsage.models["faux/faux-1"]).toEqual(billed.usage);
+			expect(await opened.harness.usage(context)).toEqual({ models: { "faux/faux-1": billed.usage }, tools: {} });
+		} finally {
+			await opened.harness.close(context);
+		}
 	});
 
 	it("resumes a retry backoff after reopen", async () => {

@@ -40,6 +40,11 @@ export async function recordUsage(
 
 /** Add every counter of `usage` to `total`; optional counters are added once either side reports them. */
 export function addUsage(total: Draft<Usage> | Usage, usage: Usage): void {
+	let totalFromProvider: boolean | undefined;
+	if (isEmptyUsage(total)) totalFromProvider = usage.cost.totalFromProvider;
+	else if (isEmptyUsage(usage)) totalFromProvider = total.cost.totalFromProvider;
+	else if (total.cost.totalFromProvider !== undefined || usage.cost.totalFromProvider !== undefined)
+		totalFromProvider = total.cost.totalFromProvider === true && usage.cost.totalFromProvider === true;
 	total.input += usage.input;
 	total.output += usage.output;
 	total.cacheRead += usage.cacheRead;
@@ -52,9 +57,26 @@ export function addUsage(total: Draft<Usage> | Usage, usage: Usage): void {
 	total.cost.cacheRead += usage.cost.cacheRead;
 	total.cost.cacheWrite += usage.cost.cacheWrite;
 	total.cost.total += usage.cost.total;
-	// A sum is provider-reported only when every contributing charge is.
-	if (total.cost.totalFromProvider !== undefined || usage.cost.totalFromProvider !== undefined)
-		total.cost.totalFromProvider = total.cost.totalFromProvider === true && usage.cost.totalFromProvider === true;
+	if (totalFromProvider !== undefined) total.cost.totalFromProvider = totalFromProvider;
+}
+
+/** Only unmarked zero usage is neutral; explicit estimates still contribute provenance. */
+function isEmptyUsage(usage: Usage): boolean {
+	return (
+		usage.cost.totalFromProvider === undefined &&
+		usage.input === 0 &&
+		usage.output === 0 &&
+		usage.cacheRead === 0 &&
+		usage.cacheWrite === 0 &&
+		(usage.cacheWrite1h ?? 0) === 0 &&
+		(usage.reasoning ?? 0) === 0 &&
+		usage.totalTokens === 0 &&
+		usage.cost.input === 0 &&
+		usage.cost.output === 0 &&
+		usage.cost.cacheRead === 0 &&
+		usage.cost.cacheWrite === 0 &&
+		usage.cost.total === 0
+	);
 }
 
 /** Add every bucket of `state` into `sum`. */

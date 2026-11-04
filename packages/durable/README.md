@@ -799,6 +799,8 @@ Each conversation keeps token and cost totals in `docs["pi.usage"]`: per `provid
 const usage = await harness.usage(context); // { models: { "openai/gpt-6-sol": Usage }, tools: {...} }
 ```
 
+An unmarked all-zero usage record, such as an interrupted partial before its first usage chunk, is neutral when combining billed-cost provenance. Explicit estimates and any nonzero counter still contribute: an aggregate is provider-reported only when every contributing charge is provider-reported.
+
 ## Storage
 
 | Backend | Import | Notes |
