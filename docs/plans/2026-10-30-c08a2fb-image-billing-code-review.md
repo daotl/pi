@@ -1397,3 +1397,129 @@ A standalone source-runtime clone smoke exercised persisted and in-memory extrac
 
 The exact initial Round 9 report was appended before repairs/gate investigation, preserving the original 185,484-byte prefix (SHA-256 `8e42e1328209b7b57839c9ba317efcc47b6a4ea44b952c811e29c8229823216c`). Its initial unresolved status is preserved as history; the runtime evidence above supersedes that gate for the repaired tree. Another fresh full-range review remains required after verified local commit.
 
+
+## Code Review Results
+
+**Round:**10  
+**Scope:** Fixed base `98dfe28cbeec4e1f2f61516e227420b2407dcdf9` -> full current committed HEAD `2fdab7057fab52d8933f202d75edc74c4676d8ef`, including merge `8322aa1d6808711a6e46bfbe67d8a788ca8cbd1e` and every subsequent repair through that HEAD. This is not a latest-commit-only review.  
+**Branch:** `fix/full-merge-review-8322aa1d`  
+**Size:** 1,277 changed paths; 204,535 changed lines; 74,456 executable non-test changed lines.  
+**Intent:** Integrate upstream 1.4.0 while preserving Crystal history/edit/delete/restore/shred/id=0 behavior, billing and multimodal summary budgets, Harness behavior, experimental services, and published client/package contracts.  
+**Mode:** markdown report-only; `depth:full`; no apply authority.
+
+**Reviewers:** Five domain correctness views plus ten specialist views and an in-process adversarial fallback.
+
+| Review view | Selection reason |
+|---|---|
+| Correctness: models, native, history, execution, surface | Fixed-base integration behavior and cross-domain consumers |
+| Security | Authentication, MCP bearer/OAuth, trust gates, external input, and command boundaries |
+| Reliability | Shutdown/recovery, streaming errors, asynchronous receipt ownership |
+| API contract | Published SDK, protocol, client/server, and package artifact contracts |
+| Data migration | SQLite migrations and retained session/usage transformations |
+| Testing | Harness isolation, package guards, CI gates, behavioral test fidelity |
+| Performance | Event projection, retained history scans, catalog and batching complexity |
+| Maintainability | Structural cutover and inconsistent or duplicated consumer behavior |
+| Agent-native | Agent-facing tools, discovery, MCP commands, capability reachability |
+| Frontend races | Input, timer, lifecycle, and state-response ordering |
+| Deployment verification | Data migrations, daemon assets, packaging, rollout and rollback boundaries |
+| Adversarial fallback | Local adversarial inspection after the cross-model route failed authentication |
+
+### Findings
+
+No current material regression was retained from the inspected source.
+
+Candidate accounting is complete: all 14 structured reviewer artifacts and both sanctioned prose returns were consumed. All structured finding arrays and both prose candidate sets were empty.
+
+| Disposition | Count |
+|---|---:|
+| Candidate inputs | 0 |
+| Primary findings | 0 |
+| Pre-existing findings | 0 |
+| Actionable findings | 0 |
+| Suppressed findings | 0 |
+| Malformed findings / returns | 0 / 0 |
+| Semantic merges | 0 |
+| Detail-hydration drops | 0 |
+| Mode-aware demotions | 0 |
+
+No stable finding numbers or triage groups were needed.
+
+### Actionable Findings
+
+None. No source changes, fixes, or commits were made by this report-only review.
+
+### Deployment Notes
+
+The following are **proposed, unexecuted release gates**, not confirmed defects or evidence that deployment succeeded. The complete checklist, suite commands, SQL, expected results, and monitoring conditions are preserved in [`deployment-verification-agent.md`](/tmp/compound-engineering-501/ce-code-review/20261104-134947-r10-f5a429b6/deployment-verification-agent.md).
+
+- **Before migration:** Quiesce every database/session writer. Capture restorable SQLite and JSONL backups, verify backup integrity, and record the exact revision and configured table prefix. Do not permit old and new storage writers to mutate the same files concurrently.
+- **Baseline and migration:** Capture namespace-correct schema version, allocator values, record counts, full task rows, status distribution, and indexes. On copies, exercise SQLite version-1-to-2 migration and transaction rollback, Harness v3 read-only opening and first format-4 commit, Crystal history mutations and selected/empty branches, logical receipt accounting, and bounded multimodal summaries.
+- **Published artifacts:** Require isolated built-package consumers, the exact-ref environment workflow, all eight packed daemon assets, publication provenance checks, and Windows x64/arm64 lifecycle execution against the actual shipped prebuilds. Asset presence or a successful rebuild alone does not establish shipped-binary behavior or source equivalence.
+- **Canary checks:** Before resuming writes, require integrity `ok`, schema version `2`, unchanged baseline records and allocators, no `tasks_v2` staging table, valid task JSON, and the five expected task indexes: `tasks_by_abort_requested`, `tasks_by_background`, `tasks_by_conversation`, `tasks_by_kind`, and `tasks_by_status`. Then observe task suspend/wake/termination and an edited session reopening with the expected selection and charges.
+- **Rollback:** Treat rollback as compatible-data restoration, not merely a binary swap. No supported down migration was identified; the first nonempty Harness v3 commit replaces the session with format 4. Stop writers, preserve forensic copies and post-snapshot operations, restore compatible backups without stale WAL/SHM sidecars, then restore the older binary and reconcile accepted operations.
+- **Partial publication:** Reconcile each immutable npm version and integrity before retrying. Removing a draft GitHub release does not undo already-published npm packages.
+- **Monitoring:** Use existing startup/task/session logs and database observations for schema errors, integrity failures, task wake/termination, history selection and receipt totals, summary/checkpoint failures, and missing release assets. No dashboard or production threshold was exercised in this round.
+
+### Coverage
+
+**Collection is complete; semantic coverage is not exhaustive.** All 15 selected local views and the mandatory adversarial fallback reached terminal outcomes within the 20-minute per-reviewer bound, with no more than five concurrent reviewers. No local reviewer failed, timed out, or remained uncollected.
+
+Every changed path was assigned exactly once in the five-domain ledger:
+
+| Domain | Complete semantic-read classification | Insufficient evidence | Total assigned |
+|---|---:|---:|---:|
+| Models | 137 | 97 | 234 |
+| Native | 121 | 112 | 233 |
+| History | 65 | 0 | 65 |
+| Execution | 111 | 149 | 260 |
+| Surface | 91 | 394 | 485 |
+| **Total** | **525** | **752** | **1,277** |
+
+Specialist sampling does not upgrade the 752 insufficient-evidence paths. Zero findings is not every-hunk approval or a correctness certification for those paths. Historical `docs/plans` bodies were excluded as review seeds but remain in the full inventory and diff.
+
+**Cross-model outcome:** adversarial lens: in-process fallback (cross-model peer not run: OAuth session expired and could not be refreshed)
+
+- Claude was requested as `claude-opus-5-5` with high effort, but authentication failed before a usable review artifact was produced.
+- Actual peer model and effort remain unverified; no supported receipt or verified independence was available. No cross-model corroboration was claimed, and the consumed peer job directory was removed.
+- The local adversarial fallback completed. Same-serving-model agreement was not treated as independent corroboration or used to increase confidence.
+
+**Validation:** `empty-batch`. No primary findings survived synthesis, so no validator was launched. Confirmed: 0; rejected: 0; unresolved: 0; malformed: 0; failed: 0; shortcut-skipped: 0; protected-subject reclassifications: 0. This is not a successful independent validation result, and no candidate was omitted to avoid validation.
+
+**Synthesis controls:** Suppression at anchors 50 and 25: 0 each; first-evidence backfills: 0; missing-quote demotions: 0. Policy removals/regrades and settlement removals: 0. No discovered plan supplied settlement decisions, so settlement suppression was not evaluated. No designated standards or base review policy was staged; active global/root instructions remained binding.
+
+**Evidence limits:**
+
+- The repository graph was stale, generated `2026-10-09T02:02:57Z`, with unwatched, metadata-changed, excluded, and untracked-source limitations. Related-code and deletion-liveness conclusions used current-source inspection and lexical searches instead. Dynamic registrations, external consumers, and deleted import-time side effects were not exhaustively resolved.
+- The four shipped Windows ARM64/x64 `windows-job.node` and `windows-launcher.exe` prebuilds were neither executed nor proven equivalent to their C sources. Inspected CI and asset-checker source is not a passing platform result.
+- No tests, builds, linters, formatters, installations, provider/network requests, browser sessions, database migrations, native-platform execution, or release operations were performed in this review round. Crash recovery, Cloudflare/IndexedDB behavior, packed consumers, live-provider billing and summary behavior, performance incidence, and remote-host behavior remain unexercised.
+- Agent-native inspection found all eight explicitly inspected capability groups reachable through tools or the corresponding programmatic service surface. That denominator is not every application feature.
+- No material residual product risks or missing-test findings were admitted. Unexercised behavior and incomplete inspection remain coverage limits rather than being repackaged as defects.
+- The dispatch snapshot reported a clean committed reviewed tree and no excluded untracked files. Parent verification, repairs, and any local commit remain separate from this report.
+
+**Artifacts:** [`/tmp/compound-engineering-501/ce-code-review/20261104-134947-r10-f5a429b6`](/tmp/compound-engineering-501/ce-code-review/20261104-134947-r10-f5a429b6). Final `metadata.json`, `findings.json`, `actionable-findings.json`, and `advisory.json` were written. Report start/end were recorded, and the stage summary reported complete logging. The parent persists this exact Markdown as `report.md`.
+
+---
+
+### Verdict
+
+> **Ready to merge** on the evidence of this static, risk-selected review: no supported current finding remains against fixed base `98dfe28cbeec4e1f2f61516e227420b2407dcdf9` through full HEAD `2fdab7057fab52d8933f202d75edc74c4676d8ef`.
+>
+> This verdict is not exhaustive every-hunk approval, runtime verification, or deployment approval. The principal next action is parent-owned verification of the affected behavior and release/data gates, especially actual shipped Windows binaries and migration/session preservation.
+>
+> **Fix order:** None identified in Round 10.
+
+**Actionable findings: none.**  
+**Run artifacts:** `/tmp/compound-engineering-501/ce-code-review/20261104-134947-r10-f5a429b6`
+
+## Round 10 parent closure and convergence
+
+The fresh fixed-base review collected all 16 local views, consumed all structured and sanctioned prose returns, and retained **0 candidates / 0 actionable findings / 0 unresolved gates**. The loop's zero-new-valid-finding stopping condition is met. This is risk-selected full-range review, not exhaustive semantic approval: the per-path ledger retains 752 insufficient-evidence classifications and the platform limits above.
+
+The parent removed an unmatched premature validation-end log event; the remaining validation start/end pair preserves the observed timestamps. The CE summarizer was rerun and returned `status: complete`; regenerated metadata contains exactly one validation stage. The report above is the report leaf's exact Markdown, not a parent-generated substitute. The pre-Round-10 document prefix remains unchanged: 207,183 bytes, SHA-256 `9421759d738cc92b866ba5a72ed1bc4c1c22f0199c51efde43cb7387df48d307`.
+
+No source changed after repair commit `2fdab7057fab52d8933f202d75edc74c4676d8ef`. Its observed verification remains: check exit 0 with 1,986 files and No fixes applied; seven focused files 175 passed; UI 74 passed; isolated root suite 13,858 passed / 0 failed / 945 skipped; final offline build exit 0. The normal repair-commit hook also passed without formatter changes. These are prior repair verification, not newly executed Round 10 reviewer checks.
+
+After the static review, the parent attempted an additional native Space replay against the final HTML. The throwaway request-interception fixture timed out; one diagnostic incorrectly queried page lexical bindings through an isolated execution world. No successful final-tree native replay is claimed. The earlier Round 9 Chrome red/green trace predates the last render-guard narrowing; final UI tests cover immediate decision disabling. The additional replay does not establish a new product defect. Its managed tab was closed; no server was started, and no fixture source was added to the repository.
+
+Only this review record is changed for the zero-finding receipt commit. No push, PR, production migration, deployment, provider request, or Windows-binary execution is authorized or claimed by this closure.
+
