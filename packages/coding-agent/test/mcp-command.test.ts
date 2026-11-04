@@ -1,9 +1,12 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { isJsonRpcNotification, isJsonRpcRequest, LATEST_PROTOCOL_VERSION } from "@earendil-works/pi-mcp";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ENV_AGENT_DIR } from "../src/config.ts";
 import { runMcpCommand } from "../src/extensions/mcp/cli.ts";
+import { McpOAuthCredentialStore } from "../src/extensions/mcp/runtime.ts";
 
 const FIXTURE = resolve(import.meta.dirname, "../../mcp/test/fixtures/stdio-server.mjs");
 
@@ -61,6 +64,188 @@ describe("pi mcp", () => {
 			{ name: "fixture", state: "connected", tools: ["echo"] },
 			{ name: "parked", state: "disabled", tools: [] },
 		]);
+	});
+
+	it("lists global Radius tools with agentDir provider credentials resolved again after rotation, without session startup", async () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-mcp-provider-command-"));
+		dirs.push(root);
+		const agentDir = join(root, "agent");
+		const cwd = join(root, "project");
+		const defaultAgentDir = join(root, "default-agent");
+		for (const dir of [join(agentDir, "extensions"), join(cwd, ".pi"), defaultAgentDir]) {
+			mkdirSync(dir, { recursive: true });
+		}
+		vi.stubEnv(ENV_AGENT_DIR, defaultAgentDir);
+		vi.stubEnv("RADIUS_API_KEY", undefined);
+		// A network guard, rather than offline mode, must catch accidental catalog discovery.
+		vi.stubEnv("PI_OFFLINE", undefined);
+		vi.stubEnv("PI_DISABLE_CLOUD_PROVIDERS", undefined);
+		const initialToken = "radius-command-initial";
+		const rotatedToken = "radius-command-rotated-longer";
+		const authPath = join(agentDir, "auth.json");
+		const credential = (access: string) => ({
+			type: "oauth",
+			access,
+			refresh: "radius-command-refresh",
+			expires: Date.now() + 3_600_000,
+		});
+		writeFileSync(authPath, JSON.stringify({ radius: credential(initialToken) }));
+		writeFileSync(
+			join(defaultAgentDir, "auth.json"),
+			JSON.stringify({ radius: credential("wrong-default-directory-token") }),
+		);
+		const extensionMarker = join(root, "extension-loaded");
+		writeFileSync(
+			join(agentDir, "extensions", "sentinel.ts"),
+			`import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(extensionMarker)}, "loaded");
+export default function () { throw new Error("MCP list must not load extensions"); }
+`,
+		);
+		const requests: { method: string; authorization: string | undefined }[] = [];
+		let expectedToken: string | undefined = initialToken;
+		const server = createServer((request, response) => {
+			if (request.url !== "/mcp") {
+				request.resume();
+				response.writeHead(404).end();
+				return;
+			}
+			if (request.method !== "POST") {
+				request.resume();
+				response.writeHead(405).end();
+				return;
+			}
+			let body = "";
+			request.setEncoding("utf8");
+			request.on("data", (chunk: string) => {
+				body += chunk;
+			});
+			request.on("end", () => {
+				const message: unknown = JSON.parse(body);
+				if (!isJsonRpcRequest(message) && !isJsonRpcNotification(message)) {
+					response.writeHead(400).end();
+					return;
+				}
+				requests.push({ method: message.method, authorization: request.headers.authorization });
+				if (!expectedToken || request.headers.authorization !== `Bearer ${expectedToken}`) {
+					response.writeHead(401, { "WWW-Authenticate": "Bearer" }).end();
+					return;
+				}
+				if (!isJsonRpcRequest(message)) {
+					response.writeHead(202).end();
+					return;
+				}
+				let result: unknown;
+				if (message.method === "initialize") {
+					// Rotate before replying: the same connection's next request needs the new credential.
+					expectedToken = rotatedToken;
+					writeFileSync(authPath, JSON.stringify({ radius: credential(rotatedToken) }));
+					result = {
+						protocolVersion: LATEST_PROTOCOL_VERSION,
+						capabilities: { tools: {} },
+						serverInfo: { name: "radius-command-fixture", version: "1.0.0" },
+					};
+				} else if (message.method === "tools/list") {
+					result = { tools: [{ name: "radius_search", inputSchema: { type: "object" } }] };
+				} else {
+					response.writeHead(400).end();
+					return;
+				}
+				response.writeHead(200, { "Content-Type": "application/json" });
+				response.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
+			});
+		});
+		const listening = Promise.withResolvers<void>();
+		server.once("error", listening.reject);
+		server.listen(0, "127.0.0.1", listening.resolve);
+		await listening.promise;
+		server.off("error", listening.reject);
+		const address = server.address();
+		if (address === null || typeof address === "string") throw new Error("Expected loopback address");
+		const url = `http://127.0.0.1:${address.port}/mcp`;
+		writeFileSync(
+			join(agentDir, "mcp.json"),
+			JSON.stringify({ mcpServers: { radius: { url, auth: { provider: "radius" } } } }),
+		);
+		writeFileSync(
+			join(cwd, ".pi", "mcp.json"),
+			JSON.stringify({ mcpServers: { untrusted: { command: "pi-mcp-must-not-start-untrusted-project" } } }),
+		);
+		const unexpectedNetwork: string[] = [];
+		const originalFetch = globalThis.fetch;
+		const fetch = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+			const requestUrl = input instanceof Request ? input.url : String(input);
+			if (requestUrl !== url) {
+				unexpectedNetwork.push(requestUrl);
+				return Promise.reject(new Error(`Unexpected non-MCP network request: ${requestUrl}`));
+			}
+			return originalFetch(input, init);
+		});
+		const mcpOAuth = vi.spyOn(McpOAuthCredentialStore.prototype, "forServer");
+		const openUrl = vi.fn(() => {
+			throw new Error("MCP list must not start interactive sign-in");
+		});
+		const list = async () => {
+			const output: string[] = [];
+			const exitCode = await runMcpCommand(["list", "--json"], {
+				cwd,
+				agentDir,
+				openUrl,
+				log: (line) => output.push(line),
+				error: (line) => output.push(line),
+			});
+			const report = JSON.parse(output.join("\n")) as {
+				servers: { name: string; scope: string; source: string; state: string; tools: string[] }[];
+				errors: string[];
+				note?: string;
+			};
+			return { exitCode, report, output: output.join("\n") };
+		};
+		try {
+			const ready = await list();
+			expect(ready.exitCode, ready.output).toBe(0);
+			expect(ready.report.errors).toEqual([]);
+			expect(ready.report.servers).toMatchObject([
+				{
+					name: "radius",
+					scope: "global",
+					source: join(agentDir, "mcp.json"),
+					state: "connected",
+					tools: ["radius_search"],
+				},
+			]);
+			expect(ready.report.servers).toHaveLength(1);
+			expect(ready.report.note).toContain("ignored because the project is not trusted");
+			expect(requests).toEqual([
+				{ method: "initialize", authorization: `Bearer ${initialToken}` },
+				{ method: "notifications/initialized", authorization: `Bearer ${rotatedToken}` },
+				{ method: "tools/list", authorization: `Bearer ${rotatedToken}` },
+			]);
+			expect(ready.output).not.toContain(initialToken);
+			expect(ready.output).not.toContain(rotatedToken);
+
+			writeFileSync(authPath, "{}");
+			expectedToken = undefined;
+			requests.length = 0;
+			const missing = await list();
+			expect(missing.exitCode).toBe(1);
+			expect(missing.report.errors).toEqual([]);
+			expect(missing.report.servers).toMatchObject([{ name: "radius", state: "needs-auth", tools: [] }]);
+			expect(requests).toEqual([{ method: "initialize", authorization: undefined }]);
+			expect(unexpectedNetwork).toEqual([]);
+			expect(openUrl).not.toHaveBeenCalled();
+			expect(mcpOAuth).not.toHaveBeenCalled();
+			expect(existsSync(extensionMarker)).toBe(false);
+			expect(existsSync(join(agentDir, "mcp-auth.json"))).toBe(false);
+			expect(existsSync(join(defaultAgentDir, "mcp-auth.json"))).toBe(false);
+		} finally {
+			fetch.mockRestore();
+			mcpOAuth.mockRestore();
+			server.closeAllConnections();
+			const closed = Promise.withResolvers<void>();
+			server.close((error) => (error ? closed.reject(error) : closed.resolve()));
+			await closed.promise;
+		}
 	});
 
 	it.each(["0.05", "1.001", "0.0001"])(

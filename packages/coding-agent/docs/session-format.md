@@ -70,6 +70,8 @@ Malformed selection values or IDs not present before a marker are ignored, prese
 
 Branch JSONL and Radius exports include usage-only side chains whose dispatch ancestry belongs to the selected branch, without importing unrelated conversational branches. Distinct receipt IDs remain distinct charges. Exports add a selection checkpoint only when appended accounting side entries would otherwise change the selected leaf; ordinary branch exports need none. Radius presentation metadata remains the final selected child of the original selection.
 
+Branch cloning and forking retain already-completed usage-only side chains owned by the selected ancestry, including model-attributed classifier/image charges. Recreated labels and accounting side entries do not change the requested conversational selection. Calls that have not yet completed still belong to the outgoing session and are not transferred to the clone.
+
 ## Entry Types
 
 ### SessionHeader

@@ -627,6 +627,26 @@ for (const action of ["prio", "allnone"]) {
 	}
 }
 
+test("a decision refresh preserves another issue's held Space retriage activation", async () => {
+	const ui = harness();
+	await ui.respond(ui.requests[0], snapshot([issue(10), issue(20)]));
+	ui.click({ act: "prio", n: "10", p: "p0" });
+	await ui.respond(ui.requests[1]);
+	const target = ui.focusControl("BUTTON", { act: "retriage", n: "20" });
+	ui.spaceDown();
+	const decided = issue(10); decided.decision = { priority: "p0" };
+	await ui.respond(ui.requests[2], snapshot([decided, issue(20)]));
+	assert.equal(target.isConnected, true, "Authoritative decision refresh must retain native keyboard activation");
+	assert.equal(ui.activeElement, target);
+	ui.spaceUp();
+	assert.equal(ui.requests[3].path, "/api/retriage");
+	assert.deepEqual(ui.requests[3].body, { number: 20 });
+	await ui.runTimers();
+	await ui.respond(ui.requests[3]);
+	await ui.respond(ui.requests[4], snapshot([decided, issue(20)]));
+	assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 10|data-n="20" disabled/);
+});
+
 for (const arrival of ["during drag", "after drag"]) {
 	for (const position of ["inside", "entering", "leaving"]) {
 		for (const release of ["collapse", "outside selection"]) {

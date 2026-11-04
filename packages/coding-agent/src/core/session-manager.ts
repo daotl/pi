@@ -540,6 +540,29 @@ function buildSessionPath(
 	return path;
 }
 
+/** Select only usage-only side chains descending from the selected ancestry, once in storage order. */
+export function getBranchUsageEntries(path: readonly SessionEntry[], entries: readonly SessionEntry[]): UsageEntry[] {
+	const included = new Set(path.map((entry) => entry.id));
+	const usageByParent = new Map<string | null, UsageEntry[]>();
+	for (const entry of entries) {
+		if (entry.type !== "usage") continue;
+		const siblings = usageByParent.get(entry.parentId);
+		if (siblings) siblings.push(entry);
+		else usageByParent.set(entry.parentId, [entry]);
+	}
+	const parents: (string | null)[] = path.length > 0 ? path.map((entry) => entry.id) : [null];
+	const sideIds = new Set<string>();
+	for (let index = 0; index < parents.length; index++) {
+		for (const entry of usageByParent.get(parents[index]) ?? []) {
+			if (included.has(entry.id)) continue;
+			included.add(entry.id);
+			sideIds.add(entry.id);
+			parents.push(entry.id);
+		}
+	}
+	return entries.filter((entry): entry is UsageEntry => entry.type === "usage" && sideIds.has(entry.id));
+}
+
 function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "thinkingLevel" | "model"> {
 	let thinkingLevel = "off";
 	let model: { provider: string; modelId: string } | null = null;
@@ -3018,8 +3041,8 @@ export class SessionManager {
 	}
 
 	/**
-	 * Create a new session file containing only the path from root to the specified leaf.
-	 * Useful for extracting a single conversation path from a branched session.
+	 * Create a new session containing the selected ancestry and its usage-only side chains.
+	 * Preserve the selected leaf independently of trailing receipts and recreated labels.
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
 	createBranchedSession(leafId: string): string | undefined {
@@ -3028,17 +3051,20 @@ export class SessionManager {
 		if (path.length === 0) {
 			throw new Error(`Entry ${leafId} not found`);
 		}
+		const sideUsageEntries = getBranchUsageEntries(path, this.getEntries());
 
 		// Filter out LabelEntry from path - we'll recreate them from the resolved map.
 		// Because labels are real tree entries, later entries can be children of labels;
 		// removing labels requires re-chaining the retained path to avoid orphaned subtrees.
 		const pathWithoutLabels: SessionEntry[] = [];
 		const replacementByLabelId = new Map<string, string>();
+		const parentByLabelId = new Map<string, string | null>();
 		const pendingLabelIds: string[] = [];
 		let pathParentId: string | null = null;
 		for (const entry of path) {
 			if (entry.type === "label") {
 				pendingLabelIds.push(entry.id);
+				parentByLabelId.set(entry.id, pathParentId);
 				continue;
 			}
 			for (const labelId of pendingLabelIds) {
@@ -3074,8 +3100,8 @@ export class SessionManager {
 			parentSession: this.persist ? previousSessionFile : undefined,
 		};
 
-		// Collect labels for entries in the path
-		const pathEntryIds = new Set(pathWithoutLabels.map((e) => e.id));
+		// Preserve resolved labels for both the selected path and its retained receipts.
+		const pathEntryIds = new Set([...pathWithoutLabels, ...sideUsageEntries].map((entry) => entry.id));
 		const labelsToWrite: Array<{ targetId: string; label: string; timestamp: string }> = [];
 		for (const [targetId, label] of this.labelsById) {
 			if (pathEntryIds.has(targetId)) {
@@ -3083,32 +3109,39 @@ export class SessionManager {
 			}
 		}
 
+		const labelEntries: LabelEntry[] = [];
+		let parentId = pathParentId;
+		const selectedEntry = path.at(-1)!;
+		let selectedLeafId = selectedEntry.type === "label" ? pathParentId : leafId;
+		for (const { targetId, label, timestamp: labelTimestamp } of labelsToWrite) {
+			const labelEntry: LabelEntry = {
+				type: "label",
+				id: generateId(pathEntryIds),
+				parentId,
+				timestamp: labelTimestamp,
+				targetId,
+				label,
+			};
+			pathEntryIds.add(labelEntry.id);
+			labelEntries.push(labelEntry);
+			parentId = labelEntry.id;
+			if (selectedEntry.type === "label" && selectedEntry.targetId === targetId) selectedLeafId = labelEntry.id;
+		}
+		const retainedUsageEntries = sideUsageEntries.map((entry) =>
+			entry.parentId !== null && parentByLabelId.has(entry.parentId)
+				? { ...entry, parentId: parentByLabelId.get(entry.parentId)! }
+				: entry,
+		);
+		const forkEntries: FileEntry[] = [header, ...pathWithoutLabels, ...labelEntries, ...retainedUsageEntries];
+		this.fileEntries = forkEntries;
+		if (forkEntries.at(-1)?.id !== selectedLeafId) {
+			this.fileEntries.push({ type: "leaf", leafId: selectedLeafId });
+		}
+		this.sessionId = newSessionId;
+		if (this.persist) this.sessionFile = newSessionFile;
+		this._buildIndex();
 		if (this.persist) {
-			// Build label entries
-			const lastEntryId = pathWithoutLabels[pathWithoutLabels.length - 1]?.id || null;
-			let parentId = lastEntryId;
-			const labelEntries: LabelEntry[] = [];
-			for (const { targetId, label, timestamp: labelTimestamp } of labelsToWrite) {
-				const labelEntry: LabelEntry = {
-					type: "label",
-					id: generateId(new Set(pathEntryIds)),
-					parentId,
-					timestamp: labelTimestamp,
-					targetId,
-					label,
-				};
-				pathEntryIds.add(labelEntry.id);
-				labelEntries.push(labelEntry);
-				parentId = labelEntry.id;
-			}
-
-			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
-			this.sessionId = newSessionId;
-			this.sessionFile = newSessionFile;
-			this._buildIndex();
-
-			// Use the same rule as _persist(): write now if the branched path already
-			// has a conversation, otherwise let _persist() create the file later.
+			// Setup-only forks remain buffered until their first conversation entry.
 			if (this._hasConversation()) {
 				this._rewriteFile();
 				this.flushed = true;
@@ -3116,28 +3149,8 @@ export class SessionManager {
 				this.flushed = false;
 				this.appendRollbackError = undefined;
 			}
-
 			return newSessionFile;
 		}
-
-		// In-memory mode: replace current session with the path + labels
-		const labelEntries: LabelEntry[] = [];
-		let parentId = pathWithoutLabels[pathWithoutLabels.length - 1]?.id || null;
-		for (const { targetId, label, timestamp: labelTimestamp } of labelsToWrite) {
-			const labelEntry: LabelEntry = {
-				type: "label",
-				id: generateId(new Set([...pathEntryIds, ...labelEntries.map((e) => e.id)])),
-				parentId,
-				timestamp: labelTimestamp,
-				targetId,
-				label,
-			};
-			labelEntries.push(labelEntry);
-			parentId = labelEntry.id;
-		}
-		this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
-		this.sessionId = newSessionId;
-		this._buildIndex();
 		return undefined;
 	}
 

@@ -3,9 +3,9 @@ import { dirname } from "node:path";
 import { resolvePath } from "../utils/paths.ts";
 import {
 	CURRENT_SESSION_VERSION,
+	getBranchUsageEntries,
 	type SessionHeader,
 	type SessionManager,
-	type UsageEntry,
 } from "./session-manager.ts";
 
 type TrailingEntries = (parentId: string | null, timestamp: string) => readonly object[];
@@ -25,24 +25,7 @@ export function serializeSessionBranch(
 	};
 	const entries: object[] = [header];
 	const branch = sessionManager.getBranch();
-	const storedEntries = sessionManager.getEntries();
-	const included = new Set(branch.map((entry) => entry.id));
-	const usageByParent = new Map<string | null, UsageEntry[]>();
-	for (const entry of storedEntries) {
-		if (entry.type !== "usage") continue;
-		const siblings = usageByParent.get(entry.parentId);
-		if (siblings) siblings.push(entry);
-		else usageByParent.set(entry.parentId, [entry]);
-	}
-	// Only usage-only descendants of the selected lineage belong to this branch's export.
-	const parents: (string | null)[] = branch.length > 0 ? branch.map((entry) => entry.id) : [null];
-	for (let index = 0; index < parents.length; index++) {
-		for (const entry of usageByParent.get(parents[index]) ?? []) {
-			if (included.has(entry.id)) continue;
-			included.add(entry.id);
-			parents.push(entry.id);
-		}
-	}
+	const usageEntries = getBranchUsageEntries(branch, sessionManager.getEntries());
 	let parentId: string | null = null;
 	const written = new Set<string>();
 	for (const entry of branch) {
@@ -50,8 +33,8 @@ export function serializeSessionBranch(
 		written.add(entry.id);
 		parentId = entry.id;
 	}
-	for (const entry of storedEntries) {
-		if (!included.has(entry.id) || written.has(entry.id)) continue;
+	for (const entry of usageEntries) {
+		if (written.has(entry.id)) continue;
 		entries.push(entry);
 		written.add(entry.id);
 		parentId = entry.id;

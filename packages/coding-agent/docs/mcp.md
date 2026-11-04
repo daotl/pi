@@ -91,6 +91,8 @@ Exposure and enabled-state changes are saved to the file that defines the server
 
 Shell commands work without a session: `pi mcp add`, `pi mcp remove`, `pi mcp list`, `pi mcp login`, and `pi mcp logout`. Shell commands do not load extensions.
 
+Standalone MCP connections with `auth: { provider: "<provider-id>" }` (for example `"radius"`) resolve that provider's current credential from the selected agent directory, just like interactive connections. Resolution is lazy and repeated per request so token rotation is honored; it does not load extensions or refresh model catalogs over the network. Use `/login <provider>` for provider credentials, not `pi mcp login`, which is for MCP OAuth.
+
 ### Diagnose connection problems
 
 Run `pi mcp list` to connect to every enabled server and print its state, tools, and errors. It exits with status 1 when an entry is invalid or an enabled server is not connected. `/mcp` shows the full connection error and the tail of stderr from a failed stdio server.

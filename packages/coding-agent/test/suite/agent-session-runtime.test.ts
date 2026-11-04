@@ -12,7 +12,7 @@ import {
 	createAgentSessionServices,
 } from "../../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
-import { SessionManager } from "../../src/core/session-manager.ts";
+import { buildSessionContext, SessionManager } from "../../src/core/session-manager.ts";
 import { getUsageCostBreakdown, getUsageTotals } from "../../src/core/usage-totals.ts";
 import { createCodemodeExtension } from "../../src/extensions/codemode/index.ts";
 import type {
@@ -588,6 +588,186 @@ describe("AgentSessionRuntime characterization", () => {
 			})),
 		).toEqual(beforeMessages);
 	});
+
+	for (const inMemory of [false, true]) {
+		for (const action of ["clone", "earlier fork"] as const) {
+			it(`copies completed classify/image receipts once for ${inMemory ? "in-memory" : "persisted"} ${action}`, async () => {
+				const usage: Usage = {
+					input: 8,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 8,
+					cost: { input: 0.125, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.125 },
+				};
+				const classifier: ClassifierModel<"completed-classifier"> = {
+					type: "classifier",
+					id: "judge",
+					name: "Judge",
+					api: "completed-classifier",
+					provider: "completed-paid",
+					baseUrl: "https://classifier.test/v1",
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 1000,
+				};
+				const image: ImageModel<"completed-images"> = {
+					type: "image",
+					id: "painter",
+					name: "Painter",
+					api: "completed-images",
+					provider: "completed-paid",
+					baseUrl: "https://images.test/v1",
+					input: ["text"],
+					output: ["image"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				};
+				const { runtime, faux } = await createRuntimeForTest(
+					(pi) => {
+						createCodemodeExtension()(pi);
+						pi.registerProvider("completed-paid", {
+							apiKey: "offline-test-key",
+							models: [classifier, image],
+							classifiers: {
+								"completed-classifier": {
+									classify: async (model): Promise<ClassifierResult> => ({
+										api: model.api,
+										provider: model.provider,
+										model: model.id,
+										answers: { approved: { type: "bool", probability: 0.9 } },
+										usage,
+										stopReason: "stop",
+										timestamp: 0,
+									}),
+								},
+							},
+							images: {
+								"completed-images": {
+									generateImages: async (model): Promise<AssistantImages> => ({
+										api: model.api,
+										provider: model.provider,
+										model: model.id,
+										output: [],
+										usage,
+										stopReason: "stop",
+										timestamp: 0,
+									}),
+								},
+							},
+						});
+					},
+					{ inMemory },
+				);
+				const original = runtime.session;
+				const manager = original.sessionManager;
+				original.setActiveToolsByName(["codemode"]);
+				const code = [
+					'await models.classify({ provider: "completed-paid", id: "judge" }, { state: { text: "good" }, questions: { approved: { type: "bool", instructions: "Approval?", criteria: { true: "yes", false: "no" } } } });',
+					'await models.generateImages({ provider: "completed-paid", id: "painter" }, { input: [{ type: "text", text: "a fox" }] });',
+				].join("\n");
+				const completePaidTurn = async (question: string) => {
+					faux.setResponses([
+						fauxAssistantMessage(fauxToolCall("codemode", { code }), { stopReason: "toolUse" }),
+						fauxAssistantMessage("paid work complete"),
+					]);
+					await original.prompt(question);
+				};
+				await completePaidTurn("selected paid work");
+				const receipts = structuredClone(manager.getEntries().filter((entry) => entry.type === "usage"));
+				expect(receipts).toHaveLength(2);
+				expect(receipts.map((entry) => entry.model).sort()).toEqual(["judge", "painter"]);
+				const answer = manager.getLeafId()!;
+				const root = original.getUserMessagesForForking()[0]!.entryId;
+				manager.appendLabelChange(answer, "selected bookmark");
+				const compaction = manager.appendCompaction("selected paid-work summary", root, 100);
+				original.refreshContext();
+				faux.setResponses([fauxAssistantMessage("kept answer"), fauxAssistantMessage("later answer")]);
+				await original.prompt("kept continuation");
+				await original.prompt("fork boundary");
+				const boundary = original.getUserMessagesForForking().find((entry) => entry.text === "fork boundary")!;
+				const selectedLeaf = manager.getLeafId()!;
+				manager.branch(answer);
+				original.refreshContext();
+				await completePaidTurn("unrelated paid branch");
+				const unrelatedIds = manager
+					.getEntries()
+					.filter((entry) => entry.type === "usage" && !receipts.some((receipt) => receipt.id === entry.id))
+					.map((entry) => entry.id);
+				expect(unrelatedIds).toHaveLength(2);
+				manager.branch(selectedLeaf);
+				original.refreshContext();
+				const target = action === "clone" ? selectedLeaf : manager.getEntry(boundary.entryId)!.parentId!;
+				const expectedContext = structuredClone(buildSessionContext(manager.getEntries(), target));
+				const ancestralTotals = getUsageTotals(manager.getBranch(target));
+				const expectedTotals = { ...ancestralTotals, input: ancestralTotals.input + 16, cost: 0.25 };
+				const originalId = manager.getSessionId();
+				const sourceEntries = structuredClone(manager.getEntries());
+				const sourceMessages = structuredClone(original.messages);
+				const sourceProjection = structuredClone(manager.buildSessionProjection());
+				const sourceFile = manager.getSessionFile();
+				const sourceBytes = sourceFile ? readFileSync(sourceFile, "utf8") : undefined;
+
+				await expect(
+					runtime.fork(action === "clone" ? target : boundary.entryId, {
+						position: action === "clone" ? "at" : "before",
+					}),
+				).resolves.toEqual({
+					cancelled: false,
+					selectedText: action === "clone" ? undefined : "fork boundary",
+				});
+				const fork = runtime.session.sessionManager;
+				const assertFork = (copied: SessionManager) => {
+					expect(copied.getEntries().filter((entry) => entry.type === "usage")).toEqual(
+						expect.arrayContaining(receipts),
+					);
+					expect(copied.getEntries().filter((entry) => entry.type === "usage")).toHaveLength(2);
+					for (const id of unrelatedIds) expect(copied.getEntry(id)).toBeUndefined();
+					expect(copied.getLeafId()).toBe(target);
+					expect(copied.getLabel(answer)).toBe("selected bookmark");
+					expect(copied.getEntry(compaction)).toMatchObject({ firstKeptEntryId: root, parentId: answer });
+					expect(copied.buildSessionContext()).toEqual(expectedContext);
+					expect(getUsageTotals(copied.getEntries())).toEqual(expectedTotals);
+					expect(
+						getUsageCostBreakdown(copied.getEntries()).filter((entry) => entry.key.startsWith("completed-paid/")),
+					).toEqual(
+						expect.arrayContaining([
+							{ key: "completed-paid/judge", cost: 0.125, tokens: 8 },
+							{ key: "completed-paid/painter", cost: 0.125, tokens: 8 },
+						]),
+					);
+				};
+				assertFork(fork);
+				expect(runtime.session.getSessionStats()).toMatchObject({
+					cost: 0.25,
+					tokens: {
+						input: expectedTotals.input,
+						total:
+							expectedTotals.input +
+							expectedTotals.output +
+							expectedTotals.cacheRead +
+							expectedTotals.cacheWrite,
+					},
+				});
+				for (let attempt = 0; attempt < 2; attempt++) {
+					original.flushPendingUsage();
+					runtime.session.flushPendingPersistence();
+					runtime.session.flushPendingUsage();
+				}
+				assertFork(fork);
+				if (!inMemory) {
+					assertFork(SessionManager.open(runtime.session.sessionFile!));
+					expect(readFileSync(sourceFile!, "utf8")).toBe(sourceBytes);
+				}
+				expect(fork).not.toBe(manager);
+				expect(fork.getSessionId()).not.toBe(originalId);
+				expect(manager.getSessionId()).toBe(originalId);
+				expect(manager.getLeafId()).toBe(selectedLeaf);
+				expect(manager.getEntries()).toEqual(sourceEntries);
+				expect(manager.buildSessionProjection()).toEqual(sourceProjection);
+				expect(original.messages).toEqual(sourceMessages);
+			});
+		}
+	}
 
 	for (const operation of ["classify", "generateImages"] as const) {
 		for (const position of ["before", "at"] as const) {

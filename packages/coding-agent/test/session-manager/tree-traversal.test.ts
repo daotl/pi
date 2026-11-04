@@ -1,8 +1,10 @@
+import type { Usage } from "@earendil-works/pi-ai";
 import { existsSync, mkdirSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { describe, expect, it } from "vitest";
 import { type CustomEntry, SessionManager } from "../../src/core/session-manager.ts";
+import { getUsageCostBreakdown, getUsageTotals } from "../../src/core/usage-totals.ts";
 import { assistantMsg, readSessionFileRoles, userMsg } from "../utilities.ts";
 
 describe("SessionManager append and tree traversal", () => {
@@ -479,6 +481,74 @@ describe("createBranchedSession", () => {
 		expect(entries).toHaveLength(4);
 		expect(entries.map((e) => e.id)).toEqual([id1, id2, id4, id5]);
 	});
+
+	for (const persisted of [false, true]) {
+		it(`retains selected ancestry side-receipt chains once when branching ${persisted ? "persisted" : "in-memory"} history`, () => {
+			const tempDir = join(tmpdir(), `session-fork-side-usage-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+			mkdirSync(tempDir, { recursive: true });
+			try {
+				const session = persisted ? SessionManager.create(tempDir, tempDir) : SessionManager.inMemory(tempDir);
+				const usage: Usage = {
+					input: 8,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 8,
+					cost: { input: 0.125, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.125 },
+				};
+				const root = session.appendMessage(userMsg("selected question"));
+				const answer = session.appendMessage(assistantMsg("selected answer"));
+				session.appendLabelChange(answer, "selected bookmark");
+				const compaction = session.appendCompaction("selected summary", root, 100);
+				const selectedLeaf = session.appendMessage(userMsg("selected continuation"));
+				const onPath = session.appendUsage("classify", "paid", "judge", usage);
+				const onPathLeaf = session.getLeafId()!;
+				const first = session.appendUsageAt(answer, "classify", "paid", "judge", usage);
+				const second = session.appendUsageAt(first.id, "generate_images", "paid", "painter", usage);
+				session.branch(answer);
+				const sibling = session.appendMessage(userMsg("unrelated branch"));
+				const excluded = session.appendUsageAt(sibling, "classify", "paid", "judge", usage);
+				session.branch(onPathLeaf);
+				const sourceEntries = structuredClone(session.getEntries());
+				const sourceContext = structuredClone(session.buildSessionContext());
+				const sourceFile = session.getSessionFile();
+				const forkFile = session.createBranchedSession(onPathLeaf);
+
+				const assertFork = (fork: SessionManager) => {
+					expect(
+						fork
+							.getEntries()
+							.filter((entry) => entry.type === "usage")
+							.map((entry) => entry.id)
+							.sort(),
+					).toEqual([onPath.id, first.id, second.id].sort());
+					expect(fork.getEntry(first.id)?.parentId).toBe(answer);
+					expect(fork.getEntry(second.id)?.parentId).toBe(first.id);
+					expect(fork.getEntry(onPath.id)?.parentId).toBe(selectedLeaf);
+					expect(fork.getEntry(sibling)).toBeUndefined();
+					expect(fork.getEntry(excluded.id)).toBeUndefined();
+					expect(fork.getLeafId()).toBe(onPathLeaf);
+					expect(fork.getLabel(answer)).toBe("selected bookmark");
+					expect(fork.getEntry(compaction)).toMatchObject({ firstKeptEntryId: root, parentId: answer });
+					expect(fork.buildSessionContext()).toEqual(sourceContext);
+					expect(getUsageTotals(fork.getEntries()).cost).toBe(0.375);
+					expect(
+						getUsageCostBreakdown(fork.getEntries()).filter((entry) => entry.key.startsWith("paid/")),
+					).toEqual([
+						{ key: "paid/judge", cost: 0.25, tokens: 16 },
+						{ key: "paid/painter", cost: 0.125, tokens: 8 },
+					]);
+				};
+				assertFork(session);
+				if (persisted) {
+					assertFork(SessionManager.open(forkFile!, tempDir));
+					expect(SessionManager.open(sourceFile!, tempDir).getEntries()).toEqual(sourceEntries);
+				}
+			} finally {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		});
+	}
 
 	it("does not duplicate entries when forking from before the first user message", () => {
 		const tempDir = join(tmpdir(), `session-fork-dedup-${Date.now()}`);

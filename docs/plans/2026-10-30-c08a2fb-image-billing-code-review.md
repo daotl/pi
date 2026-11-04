@@ -1282,3 +1282,118 @@ Actual source-runtime smoke exported a detached model receipt, reopened it with 
 
 The exact initial Round 8 report was appended before repairs, preserving the original 163,702-byte prefix (SHA-256 `9d294ffa2d971a7583693ebfdafea5ec4fe6275e5b8ed2972dab33f3b9f3d751`). Another fresh full-range review remains required after verified local commit.
 
+
+## Code Review Results
+
+**Round:** 9  
+**Scope:** fixed first parent `98dfe28cbeec4e1f2f61516e227420b2407dcdf9` -> `89f6e749101e36b215b3be07606d270c8bd17166` on `fix/full-merge-review-8322aa1d`. Includes merge `8322aa1d` and every subsequent repair through the reviewed head, not merely the latest commit. Inventory: **1,276 changed paths**, 203,828 changed lines, 74,335 executable non-test changed lines, and 47 deletions. The earlier 1,274-path figure was stale.
+
+**Intent:** Integrate upstream 1.4.0 while preserving Crystal history/edit/delete/restore/shred/index-0 behavior, billing and multimodal accounting, summary budgets, and Harness/experimental/client/published contracts.
+
+**Mode:** markdown report-only. No fixes, source edits, tests, builds, checks, network calls, or commits were performed by this round's reviewers or finish leaves. Parent repair verification is separate.
+
+**Review team:** five correctness views covering models, native integration, history/accounting, execution, and public surfaces; security for trust/authentication; reliability for asynchronous lifecycle; api-contract for published consumers; data-migration for storage transitions; testing for guard fidelity; performance for bounded complexity; maintainability for structural integration; agent-native-reviewer for agent capability reachability; frontend-races for DOM ordering; deployment-verification-agent for destructive schema cutovers; and an in-process adversarial fallback. All 15 selected local lenses plus the fallback were collected. No cross-model review completed.
+
+### P2 -- Moderate
+
+| # | File | Issue | Reviewer | Confidence |
+|---|------|-------|----------|------------|
+| 1 | `packages/coding-agent/src/extensions/mcp/cli.ts:122` | Standalone MCP diagnostics omit provider credentials | agent-native-reviewer | 100 |
+| 2 | `packages/coding-agent/src/core/tool-usage-binding.ts:148` | Cloning a branch drops completed classifier/image usage receipts | correctness-history | 75 |
+| 3 | `scripts/issues/ui.html:93` | Decision refresh may swallow native Space activation on another issue | frontend-races | 75 |
+
+- **#1 - Confirmed; authentication.** After `/login radius` offers and saves an `auth.provider` MCP server, the interactive connection obtains provider credentials, but standalone `pi mcp list --json` does not. `createConnection()` at `cli.ts:121-129` never supplies `providerToken`; `runtime.ts:185-198` therefore cannot return the credential, and the HTTP transport at `packages/mcp/src/transports/streamable-http.ts:319-330` sends no bearer token. For an authentication-requiring server without an explicit Authorization header, the diagnostic reports `needs-auth` and exits 1 despite an available provider credential. `pi mcp login <server>` cannot repair it because this configuration excludes MCP OAuth (`cli.ts:237-241`, `runtime.ts:83-86`). The unchanged connection helper is newly exposed by the Radius setup producer at `interactive-mode.ts:8857-8872`, so this is not unrelated pre-existing behavior. **Response:** provide a lazy, shared provider-token resolver backed by `ModelRuntime`, honoring the supplied `agentDir`, without extension loading or network catalog refresh; add a standalone provider-authenticated listing regression. Independent validation confirmed the code-permitted failure; **incidence was not measured**. No cross-model corroboration.
+
+- **#2 - Confirmed; accounting data loss.** Completed session-bound classifier/image calls store charges as detached usage receipts through `tool-usage-binding.ts:147-148` and `session-manager.ts:1768-1794`. The new `execute.ts:518-520` path no longer leaves those charges in the tool result. `/clone` reaches `createBranchedSession()`, whose ancestry-only selection at `session-manager.ts:3027-3039` and replacements at `:3105` and `:3138` omit the receipts while retaining the call/result and ordinary ancestral charges. The resulting session loses the completed calls' tokens and cost. Pending-recorder ownership guards do not preserve already-completed receipts. **Response:** copy branch-owned usage-only descendants using the existing branch-export selection pattern, preserve the requested conversational leaf with a selection checkpoint, exclude unrelated branches, and leave outstanding recorder ownership on the outgoing session. Cover persisted and in-memory clone/earlier-fork cases, reopened totals, and unrelated receipts. Independent validation confirmed the source-level loss; **incidence was not measured**. No cross-model corroboration.
+
+- **#3 - Unresolved verification gate; concurrency. Do not apply as a confirmed defect.** The alleged ordering is: a decision is outstanding for issue A; the user presses Space on issue B's still-enabled **Triage again** button; the decision's authoritative state GET resolves before Space keyup. `installSnapshot()` at `ui.html:91-101` bypasses ordinary focus protection while `decisionPending` is true, and rendering replaces `main` at `:233`. Pointer activation has a separate guard; keyboard activation does not. However, `scripts/issues/ui.test.mjs:130-140` models native Space behavior rather than proving the browser's click outcome. **Evidence needed:** browser/version-specific observation at the reviewed revision of this exact ordering, including the native click and `/api/retriage` result. If reproduced, protect the native keyboard activation interval through keyup and click dispatch, then flush deferred state without making ordinary focus block decision completion indefinitely. Independent validation could not establish native behavior under the no-browser/no-test constraint; **incidence was not measured**. Stable severity and confidence are preserved, but this item is `advisory -> human`, `requires_verification: true`, and excluded from the apply queue.
+
+### Actionable Findings
+
+Only confirmed findings #1 and #2 are assigned to the downstream resolver. All proposed changes require targeted verification; this review grants no local apply authority.
+
+| # | File | Required response | Route | Validation |
+|---|------|-------------------|-------|------------|
+| 2 | `packages/coding-agent/src/core/tool-usage-binding.ts:148` | Preserve completed branch-owned usage receipts during cloning/forking; retain selection and recorder ownership; add persistence/accounting regressions | `gated_auto -> downstream-resolver` | Confirmed; confidence 75; `suggested_fix` present; incidence unmeasured |
+| 1 | `packages/coding-agent/src/extensions/mcp/cli.ts:122` | Supply standalone provider credentials through lazy shared resolution using `agentDir`; add provider-authenticated listing regression | `gated_auto -> downstream-resolver` | Confirmed; confidence 100; `suggested_fix` present; incidence unmeasured |
+
+Finding #3 remains a separate verification gate, not an implementation instruction.
+
+### Agent-Native Gaps
+
+The standalone MCP authentication gap is finding **#1**, already counted above. It was fully extracted from the sanctioned agent-native prose return, including its impact, evidence, and suggested fix, then included in the independent validator batch. Prose extraction is not a malformed return and supplies no additional reviewer agreement or confidence promotion. No other significant agent-parity regression was established by that lens.
+
+### Deployment Notes
+
+**Rollout is not certified.** These are proposed operational gates from static inspection, not executed checks or additional product findings. Full commands and queries are retained in `deployment-verification-agent.md` under the run directory.
+
+- **Before migration:** inventory the exact executable/runtime, SQLite files and table prefixes, session roots, durable JSONL directories, and actual Workers namespace/bindings/object identities. Stop on unintended identity changes. Changing a durable SQLite prefix opens a different namespace; it does not migrate data.
+- **Backup and restore:** quiesce writers and prove a restorable snapshot. Node SQLite uses WAL, so copying only the live database file is insufficient. Snapshot complete durable JSONL directories, including task/document sidecars. Preserve original coding-agent and AgentHarness session bytes. Workers require a host-supported, rehearsed data-restore procedure; none was exercised here.
+- **Durable SQLite 1 -> 2:** rehearse on a copy before canary writes. Verify `PRAGMA integrity_check`, schema version 2, unchanged metadata counters and relation counts, exact two-way task-row comparisons, absence of `tasks_v2`, and all five task indexes. Unexpected differences are stop conditions. The migration rebuilds the task table inside the shared transaction.
+- **Keep the JSONL formats distinct:** coding-agent SessionManager remains version 3; AgentHarness reads legacy v3 unchanged until the first nonempty commit converts it to format 4/storage version 1; durable JSONL remains format 1 with sidecars. For AgentHarness conversion, compare logical relationships, selection, policy, configuration, and accounting rather than requiring unchanged IDs or bytes. Open-only legacy reads should not rewrite bytes.
+- **Canary acceptance:** exercise sleeping-task restart/eviction recovery, heartbeat recovery after interrupted streaming, request-ID rejoin without duplicate work, shared host/Pi SQL ordering, and SQLite compaction reopen preserving `systemMessage` and tool checkpoints. Run Workers coverage explicitly after any focused durable invocation; source test presence is not a passing receipt.
+- **Crystal history/accounting:** on copied representative histories, compare before open, after open, first write, and reopen: non-tail/root selections, tool-call/result relationships, labels and compaction policy, message index 0 edits, swipe/edit history, soft-delete/restore, individual tool-call deletion/restoration, shred persistence, receipt identity/deduplication, and imported token/cost totals. Finding #2 must be repaired before treating cloned accounting as preserved.
+- **Identity canary:** capture outbound headers without credentials. Check artifact version, attribution defaults, `PI_TELEMETRY=0`, configured overrides/null suppression, and custom OpenCode session routing.
+- **Rollback:** the reviewed base cannot reopen durable schema 2; code rollback alone is insufficient. Restore a complete pre-upgrade snapshot or use a separately validated compatible build. Older AgentHarness consumers may require original v3 files. Restoration after new writes loses those writes; pre-shred backups may resurrect intentionally removed content. Coordinate Workers data, executable version, and alarm state.
+- **Monitoring:** inspect `session_failed`, `migration_failed`, `task_outdated`, `task_faulted`, and `host_error` during canary and at +1h, +4h, and +24h. Stop for unexplained content/selection changes, duplicate charges/requests, migration or unsupported-version errors, stranded sleeping work, repeated alarm failures, or storage-open failures. No snapshots, restores, deployed canaries, or monitoring receipts were exercised.
+
+### Coverage
+
+- **Full-depth but partial semantic coverage:** all **1,276 paths** were inventoried exactly once. Domain ledgers record **646 semantically inspected** paths and **630 insufficient-evidence** paths. Cross-cutting lenses are risk-selected, not clearance of every hunk.
+
+  | Correctness domain | Semantically inspected | Insufficient evidence |
+  |--------------------|------------------------|-----------------------|
+  | Models | 138 | 96 |
+  | Native | 229 | 4 |
+  | History | 64 | 0 |
+  | Execution | 111 | 149 |
+  | Surface | 104 | 381 |
+
+- **Platforms and consumers:** the four changed Windows binaries are already included in the four native insufficient-evidence paths. Windows runtime behavior and binary/source equivalence remain unverified. The supplied symbol graph is stale as of 2026-10-09 and unwatched; current-source/lexical fallback does not prove completeness for dynamic or external SDK/plugin consumers or deleted-API liveness. External `pkg.earendil.com` worker authorization and deployed reverse-proxy boundaries were unavailable. These limits are not additional vulnerability findings.
+- **Review collection:** all 15 selected local lenses plus the mandatory fallback returned within the 20-minute per-reviewer bound; none failed or remained uncollected. Some exceeded the 8-minute target. The configured balanced selector was unavailable; inherited session routing was used. No designated scoped standards file or review policy was staged; active global/root AGENTS instructions remained binding.
+- **Cross-model outcome:** adversarial lens: in-process fallback (cross-model peer not run: OAuth session expired and could not be refreshed). The requested route was `claude-opus-5-5` with high effort, but no actual peer model/effort receipt or independence proof exists. No peer artifact was folded in; the persisted peer job directory was deleted. The fallback does not count as cross-model corroboration.
+- **Independent validation:** one deterministic batch inspected **all three candidates**, with no cap omission or shortcut: **2 confirmed (#1, #2), 0 rejected, 1 unresolved (#3), 0 malformed, 0 failed, 0 shortcut-skipped**. Before consuming verdicts, the claims were classified as authentication (#1), data loss (#2), and concurrency (#3). Validator classifications matched; no protected-subject reclassification was needed. #3 remains report-only because native browser ordering evidence is missing, not because it was disproven. Neither confirmed finding has measured incidence.
+- **Synthesis accounting:** 0 confidence-suppressed findings, 0 mode-aware demotions, 0 malformed findings/returns, 0 semantic merges, 0 pre-existing findings, and 0 policy removals/regrades. Two first-evidence quotes were backfilled. No confidence was promoted. No admitted additional residual product risks or testing-gap findings remain. Distinct fix paths did not justify decorative single-item triage groups.
+- **Execution limits:** source and test definitions were inspected; no tests, builds, checks, browser actions, provider/network calls, migrations, backups, restores, or runtime scenarios were executed. Test presence is not a passing result. Historical report prose was excluded from review/domain patch seeds; this does not narrow the fixed-base code scope.
+- **Artifacts:** `/tmp/compound-engineering-501/ce-code-review/20261104-122600-r9-8eeed75a`. Final machine artifacts are `findings.json`, `actionable-findings.json`, `advisory-outputs.json`, `validation-results.json`, and `metadata.json`; synthesis, validator input/verdicts/outcome, reviewer artifacts, coverage ledgers, diffs, and `stages.jsonl` are retained. Stage logging and metadata summarization completed. The parent persists this exact return as `report.md` and appends it to `docs/plans/2026-10-30-c08a2fb-image-billing-code-review.md`, preserving history, before repairs and resolution of the native activation gate.
+
+---
+
+### Verdict
+
+> **Not ready.** Round 9 retains two independently confirmed P2 defects and one protected concurrency verification gate. No fixes were applied, and this is not a zero-new-findings round or evidence of convergence.
+>
+> **Next action:** persist and append this report, then repair completed-receipt copying (#2) and standalone MCP provider authentication (#1). Resolve #3 with native browser/version-specific evidence before deciding whether to change activation handling. The parent must verify and commit fixes locally, then review the entire scope again against the same fixed base until a fresh round has zero new findings. No push or PR.
+
+**Prioritized Actionable Findings recap**
+
+1. **#2 - P2 - `packages/coding-agent/src/core/tool-usage-binding.ts:148`** - cloned/forked sessions lose completed classifier/image charges. **Response: code + regression tests**, `gated_auto`, owner `downstream-resolver`, `suggested_fix` present, confidence **75**, independently confirmed; incidence unmeasured.
+2. **#1 - P2 - `packages/coding-agent/src/extensions/mcp/cli.ts:122`** - standalone MCP listing omits available provider credentials. **Response: code + regression test**, `gated_auto`, owner `downstream-resolver`, `suggested_fix` present, confidence **100**, independently confirmed; incidence unmeasured.
+
+**Separate verification gate:** **#3 - P2 - `scripts/issues/ui.html:93`** - determine whether decision refresh suppresses native Space activation. **Response: native browser ordering evidence, not an authorized fix**, `advisory -> human`, confidence **75**, unresolved and excluded from `actionable-findings.json`.
+
+**Run artifacts:** `/tmp/compound-engineering-501/ce-code-review/20261104-122600-r9-8eeed75a`.
+
+
+## Round 9 repair disposition and native activation gate
+
+The two confirmed findings are implemented. The initially unresolved #3 was confirmed with actual native-browser evidence and repaired as a third valid P2; this round is not convergence.
+
+| Finding | Repair | Observed proof |
+|---|---|---|
+| #1 standalone MCP provider auth | Standalone connections share a lazy ModelRuntime resolver using supplied `agentDir/auth.json` and `models.json`, without sessions/extensions or catalog network refresh. Each request resolves current provider auth, not a cached token. | MCP command file red: 1 failed / 13 passed, local authenticated Radius fixture reported needs-auth/exit 1. Green: 14 passed, actual loopback initialize, initialized notification and tools/list use the expected credential and rotated credential; supplied directory wins, untrusted project ignored, no non-MCP network/extension/OAuth ceremony, missing credential remains exit 1. |
+| #2 completed receipts in clone/fork | Fork and branch export share a named selector for usage-only descendants of selected ancestry. Retain each completed receipt once, exclude unrelated branches, reconnect children of filtered labels, preserve labels/compaction refs and requested selection with a checkpoint when needed. Outstanding recorder ownership stays outgoing. | Valid red: 6 failed (persisted/in-memory manager plus runtime clone/earlier-fork cases). Six complete clone/runtime/codemode/leaf/labels/export files passed 161 tests; with MCP included, seven complete files passed 175. Actual source-runtime persisted and memory clones each reopened/retained one receipt, cost 0.17 and the selected conversation. |
+| #3 Space during decision refresh | Track enabled main button/summary Space activation independently of ordinary focus; authoritative snapshots and deferred flushing wait through keyup/native click dispatch, then release in a macrotask. Explicit decision-start rendering still disables controls immediately; existing disabled assertions were not delayed. | UI red: 73 passed / 1 failed, specifically the held retriage target detached. Final UI suite: 74 passed. Real Chrome trace described below confirms the failure and repaired click, not merely the VM model. |
+
+### #3 verification gate resolved by runtime evidence
+
+At reviewed HEAD `89f6e749101e36b215b3be07606d270c8bd17166`, managed headless **Chrome 150.0.7871.24** loaded the actual HTML with the production polling interval unchanged. Issue 10's decision POST completed and its authoritative GET was held. With Space down on issue 20's enabled Triage again button, releasing the GET disconnected/unfocused that original target; keyup emitted no native click and no retriage request. `native-space-before.json` records the trigger, engine/version, reviewed revision and observed action list.
+
+The repaired same scenario retained the original target connected/focused through the response and keyup emitted exactly one native retriage click/request `{number:20}` alongside the original `{number:10,priority:"p0"}` decision (`native-space-after.json`). This confirms the original concurrency candidate, rather than treating uncertainty as confirmation. An intermediate early click-handler ownership clear was removed; final ownership releases through the keyup task. A temporary render deferral was narrowed so explicit disabling retains its original timing. Browser service/tab and temporary fixture sources were stopped/removed.
+
+A standalone source-runtime clone smoke exercised persisted and in-memory extraction/reopen (`clone-smoke.json`); its temporary source was removed. Public clone and MCP command callers were traced with LSP; signatures are unchanged. Documentation generalizes provider auth and distinguishes completed copied receipts from still-outstanding calls. The agent-native prose candidate was consumed through its sanctioned unstructured contract, not lost or promoted as extra agreement.
+
+`npm run check` completed exit 0, 1,986 files and **No fixes applied**, including TypeScript/browser-smoke. Offline build completed exit 0, producing the 76-file, 9.4-MiB coding-agent bundle. The authoritative isolated root suite completed **13,858 passed / 0 failed / 945 skipped**, exit 0, 355.07 seconds (`suite.log`, `suite-exit.json`, `artifact://948`). Final offline build on the stable source tree also exited 0 (13.27 seconds). Formatter changes stayed within owned source/tests; no manifest or lockfile changed. Existing Windows/Workers/deployment limits remain; native binaries were unchanged and not newly executed.
+
+The exact initial Round 9 report was appended before repairs/gate investigation, preserving the original 185,484-byte prefix (SHA-256 `8e42e1328209b7b57839c9ba317efcc47b6a4ea44b952c811e29c8229823216c`). Its initial unresolved status is preserved as history; the runtime evidence above supersedes that gate for the repaired tree. Another fresh full-range review remains required after verified local commit.
+

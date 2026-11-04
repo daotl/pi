@@ -69,6 +69,7 @@ let loadError = "", mutationError = "";
 let deferredSnapshot = null;
 let deferredRender = false;
 const activePointers = new Set();
+let spaceActivation = null;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 const gh = (n) => `https://github.com/${data.repo}/issues/${n}`;
@@ -90,7 +91,7 @@ const hasProtectedSelection = () => {
 
 function installSnapshot(snapshot, generation) {
 	if (generation !== loadGeneration || pendingMutations) return false;
-	if (activePointers.size || (!decisionPending && (hasProtectedFocus() || hasProtectedSelection()))) {
+	if (activePointers.size || spaceActivation || (!decisionPending && (hasProtectedFocus() || hasProtectedSelection()))) {
 		deferredSnapshot = { snapshot, generation };
 		return false;
 	}
@@ -250,7 +251,7 @@ document.addEventListener("click", (e) => {
 	if (c) { selectedNumber = Number(c.dataset.n); document.querySelectorAll(".card").forEach((x) => x.classList.toggle("sel", x === c)); }
 });
 function flushDeferred() {
-	if (activePointers.size) return;
+	if (activePointers.size || spaceActivation) return;
 	// A decision's disabled render owns the activation; ordinary focus must not strand it.
 	if (decisionPending && deferredRender) render();
 	if (pendingMutations) return;
@@ -263,11 +264,17 @@ document.addEventListener("pointerup", (e) => {
 	setTimeout(() => { activePointers.delete(e.pointerId); flushDeferred(); }, 0);
 }, true);
 document.addEventListener("pointercancel", (e) => { activePointers.delete(e.pointerId); flushDeferred(); }, true);
-window.addEventListener("blur", () => { activePointers.clear(); flushDeferred(); });
+window.addEventListener("blur", () => { activePointers.clear(); spaceActivation = null; flushDeferred(); });
 document.addEventListener("focusout", () => {
 	// Native focus transfer can checkpoint microtasks before focusing its destination.
 	setTimeout(flushDeferred, 0);
 });
+document.addEventListener("keyup", (e) => {
+	if (e.key !== " " || !spaceActivation) return;
+	const target = spaceActivation;
+	// Native Space click follows keyup; defer replacement until that activation has dispatched.
+	setTimeout(() => { if (spaceActivation === target) spaceActivation = null; flushDeferred(); }, 0);
+}, true);
 document.addEventListener("selectionchange", () => {
 	queueMicrotask(flushDeferred);
 });
@@ -290,6 +297,7 @@ $("sync").onclick = () => loadError ? load() : post("/api/sync", {});
 
 // Keyboard: j/k select, 0/1/n decide, o open on GitHub.
 document.addEventListener("keydown", (e) => {
+	if (e.key === " " && !e.repeat && !e.target.disabled && $("main").contains(e.target) && e.target.matches("button, summary")) spaceActivation = e.target;
 	if (!data || e.target.tagName === "SELECT" || e.metaKey || e.ctrlKey) return;
 	const list = flat(), index = list.findIndex((it) => it.number === selectedNumber), it = list[index];
 	if (e.key === "j") selectedNumber = list[Math.min(index + 1, list.length - 1)]?.number ?? null;

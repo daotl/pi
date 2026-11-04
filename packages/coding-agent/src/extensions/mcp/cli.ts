@@ -11,6 +11,7 @@ import { createInterface } from "node:readline/promises";
 import chalk from "chalk";
 import { APP_NAME, CONFIG_DIR_NAME } from "../../config.ts";
 import { validateMcpServerConfig } from "../../core/mcp-servers.ts";
+import { ModelRuntime } from "../../core/model-runtime.ts";
 import { ProjectTrustStore } from "../../core/trust-manager.ts";
 import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
@@ -118,12 +119,38 @@ function describeTransport(entry: McpServerEntry): string {
 	return "url" in config ? config.url : [config.command, ...(config.args ?? [])].join(" ");
 }
 
-function createConnection(entry: McpServerEntry, options: McpCommandOptions, credentials: McpOAuthCredentialStore) {
+type ProviderTokenResolver = (provider: string) => Promise<string | undefined>;
+
+/** Share the runtime, not the token: each MCP request resolves the provider's current auth. */
+function createProviderTokenResolver(agentDir: string): ProviderTokenResolver {
+	let runtime: Promise<ModelRuntime> | undefined;
+	return async (provider) => {
+		try {
+			runtime ??= ModelRuntime.create({
+				authPath: join(agentDir, "auth.json"),
+				modelsPath: join(agentDir, "models.json"),
+				allowModelNetwork: false,
+				refreshOnCreate: false,
+			});
+			return (await (await runtime).getAuth(provider))?.auth.apiKey;
+		} catch {
+			return undefined;
+		}
+	};
+}
+
+function createConnection(
+	entry: McpServerEntry,
+	options: McpCommandOptions,
+	credentials: McpOAuthCredentialStore,
+	providerToken: ProviderTokenResolver,
+) {
 	return new McpServerConnection({
 		entry,
 		cwd: options.cwd,
 		createTransport: createDefaultTransport,
 		credentials,
+		providerToken,
 		log: new McpServerLog(join(options.agentDir, "mcp.log")),
 		onTools: () => {},
 	});
@@ -207,6 +234,7 @@ export async function runMcpCommand(args: string[], options: McpCommandOptions):
 			? `${projectConfig} is ignored because the project is not trusted. Start ${APP_NAME} in the project to trust it.`
 			: undefined;
 	const credentials = options.credentials ?? new McpOAuthCredentialStore();
+	const providerToken = createProviderTokenResolver(options.agentDir);
 
 	switch (command) {
 		case "list": {
@@ -216,7 +244,7 @@ export async function runMcpCommand(args: string[], options: McpCommandOptions):
 				error(`Usage: ${APP_NAME} mcp list [--json]\n${HELP_HINT}`);
 				return 1;
 			}
-			return list(loaded, parsed.values.has("json"), untrustedNote, options, credentials, log);
+			return list(loaded, parsed.values.has("json"), untrustedNote, options, credentials, providerToken, log);
 		}
 		case "login":
 		case "logout": {
@@ -234,7 +262,7 @@ export async function runMcpCommand(args: string[], options: McpCommandOptions):
 				);
 				return 1;
 			}
-			const connection = createConnection(entry, options, credentials);
+			const connection = createConnection(entry, options, credentials, providerToken);
 			const url = connection.oauthUrl;
 			if (!url) {
 				error(`MCP server "${name}" does not use OAuth. Only HTTP servers without an Authorization header do.`);
@@ -454,6 +482,7 @@ async function list(
 	untrustedNote: string | undefined,
 	options: McpCommandOptions,
 	credentials: McpOAuthCredentialStore,
+	providerToken: ProviderTokenResolver,
 	log: (line: string) => void,
 ): Promise<number> {
 	const reports = await Promise.all(
@@ -470,7 +499,7 @@ async function list(
 				tools: [],
 			};
 			if (!report.enabled) return report;
-			const connection = createConnection(entry, options, credentials);
+			const connection = createConnection(entry, options, credentials, providerToken);
 			try {
 				await connection.getClient();
 			} catch {
