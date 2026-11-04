@@ -861,3 +861,139 @@ The authoritative isolated root suite completed **13,774 passed / 0 failed / 945
 
 The exact decoded Round 5 report was appended before repair, preserving the original 111,291-byte prefix (SHA-256 `add05d6103f070fb59709c418b850f35a7452aacbac8e1a8cccce19a1d761dd5`). After verification and local commit, another fresh full-range review remains required.
 
+
+## Code Review Results
+
+**Round:** 6  
+**Scope:** Fixed first-parent base `98dfe28cbeec4e1f2f61516e227420b2407dcdf9` -> reviewed HEAD `92dd50d0753d2703c50a34d4a80044ecfd211bb3`, including merge `8322aa1d` and all subsequent repairs through that HEAD. Branch: `fix/full-merge-review-8322aa1d`. Scope comprises 1,274 changed paths, 202,489 changed lines, 74,260 executable non-test changed lines, and 47 deletions. Dispatch recorded a clean, committed tree with no excluded untracked files.
+
+**Intent:** Integrate upstream 1.4.0 while preserving Crystal history/edit/delete/restore/shred/id0 behavior, billing, multimodal handling, summary budgets, and retained Harness, experimental, client, and published contracts. Review current consumer regressions across the full base-to-HEAD change, not only the latest commit.
+
+**Mode:** Markdown report-only, full depth. No fixes applied.
+
+**Reviewers:** Five correctness views covered models, native components, history, execution, and public surfaces. Additional views covered security (trust/authentication), reliability (asynchronous lifecycle), API contracts (published consumers), data migration (storage changes), testing (guard fidelity), performance (bounded complexity), maintainability (structural integration), agent-native reachability, frontend races (DOM ordering), and deployment verification (schema cutovers). An in-process adversarial fallback covered the lens after cross-model authentication failed.
+
+**Result:** Zero confirmed findings; one rejected candidate; one unresolved protected concurrency verification gate. **This round has not converged.**
+
+### P2 -- Moderate
+
+| # | File | Issue | Reviewer | Confidence |
+|---|------|-------|----------|------------|
+| 2 | `scripts/issues/ui.html:269` | Native Tab focus transfer may permit a deferred refresh to replace its destination; verification unresolved | frontend-races | 75 |
+
+- **#2 - Verification gate, not a confirmed defect.** A successful poll can remain deferred while an issue control has focus. The `focusout` handler queues `flushDeferred` as a microtask; snapshot installation checks current focus and can replace `main.innerHTML`. The alleged failure requires that microtask to run after outgoing focus clears but before the incoming protected control receives focus. If that ordering occurs, keyboard navigation can lose its destination.
+- **Evidence limit:** `scripts/issues/ui.test.mjs:80-85,204-215` installs incoming focus synchronously before yielding. That synthetic test does not establish native browser ordering. Neither ordering nor incidence was demonstrated.
+- **Required response:** Obtain a discriminating browser trace at reviewed HEAD, recording browser version and configuration, a deferred successful poll, native Tab movement between protected controls, no active pointer/selection/mutation, event and microtask ordering, and whether the destination remains mounted and focused. An applicable runtime specification establishing the exact ordering could also resolve the gate. A timer-based flush is only a candidate repair if the race is established; do not apply it on this report alone.
+- **Status:** `validation_status: unresolved`; protected subject `concurrency`; route `advisory -> human`; `requires_verification: true`. Confidence remains 75. There is no verified cross-model corroboration.
+
+### Actionable Findings
+
+Actionable findings: none. Gate **#2** remains report-only pending evidence; its absence from the apply queue does not clear it.
+
+### Deployment Notes
+
+The deployment reviewer established no additional product defect. Release approval remains conditional on operational evidence not obtained in this review:
+
+- **Before migration:** Freeze all writers and schedulers; record artifact versions, storage locations, identities, and prefixes. Capture consistent SQLite backups and complete JSONL directories, then demonstrate isolated restoration with the previous artifact. Missing restore evidence, unknown writers, or unacceptable rollback loss is a no-go.
+- **SQLite equivalence:** Durable schema 1 -> 2 rebuilds `tasks`. On frozen restored copies, require integrity `ok`, preserved metadata/high-water marks, counts and status distributions, the five expected task indexes, no remaining `tasks_v2`, and bidirectional row equality. Apply the actual configured prefix. Changing prefixes does not migrate data.
+- **History compatibility:** Separately exercise Crystal session version 3, AgentHarness format 4/storageVersion 1, and Durable JSONL plus sidecars. Cover Crystal root/id0 edits, alternatives, delete/restore/shred, branches, compaction, and usage. AgentHarness v3 must remain byte-unchanged on open; its first non-empty commit intentionally converts storage and remaps identities.
+- **Runtime and Workers:** Retain results on the actual shipped runtime; package engines require Node `>=22.19.0`. Run Workers coverage separately from Node coverage. Confirm the existing SQLite-backed Durable Object namespace and host recovery/alarm wiring; D1 procedures are not a substitute. No production restoration receipt was available.
+- **Rollout and rollback:** Canary a restored store, verify close/reopen and pending-work recovery, and monitor migration failures, stranded tasks, alarms, history, usage, and duplicate effects. Rollback requires stopping writers and restoring matching data plus code, not merely downgrading code or a schema marker. Reconcile external actions after the snapshot. Process-restart evidence does not establish zero-loss power-failure durability.
+
+Detailed queries, commands, pass conditions, and monitoring checkpoints are retained in the run's `deployment-verification-agent.md`; none were executed here.
+
+### Coverage
+
+**Independent validation**
+
+Both candidates were independently evaluated in one batch. None was omitted by a cap or skipped through a cross-model shortcut.
+
+| Outcome | Count |
+|---------|-------|
+| Confirmed | 0 |
+| Rejected | 1 |
+| Unresolved | 1 |
+| Malformed | 0 |
+| Failed | 0 |
+| Shortcut-skipped | 0 |
+
+**#1 rejected - public contract.** Exact validator reason:
+
+> The alleged misleading migration requires the imported 1.0.0 notice to govern this fork, but README.md:68-70 explicitly retains the harness/subpaths and states that imported released changelogs describe upstream and fork retention takes precedence, consistent with packages/agent/package.json:13-19 and src/index.ts:43,73-80; upstream removal provenance 7fd478a2e and the immutable-release rule in AGENTS.md:113 establish intentional historical context rather than a current compatibility regression.
+
+The report leaf independently read `README.md:68-70` and `AGENTS.md:113`. Those lines substantiate the rejection: upstream release history does not override this fork's explicit retention contract, and released changelog sections are immutable. The report leaf did not independently inspect commit `7fd478a2e` and does not rely on it. Do not modify the historical release notice. This rejected claim is not retained as a residual risk or testing gap.
+
+**#2 unresolved - concurrency.** Exact validator reason:
+
+> The required trigger is a deferred successful poll followed by native Tab movement between protected main controls, with no active pointer, selection, or mutation and a microtask checkpoint before incoming focus: scripts/issues/ui.html:79,91-101,233,252-269 permits replacement if that ordering occurs, but ui.test.mjs:80-85,204-215 installs incoming focus before yielding and the available historical Chromium summary does not establish the exact trigger, engine version, or reviewed revision, leaving native ordering and incidence unestablished without a discriminating browser trace or applicable runtime specification, neither obtainable under the no-browser/no-network/no-test constraints.
+
+Both candidates were classified as protected before consuming their verdicts: #1 `public-contract`, #2 `concurrency`. No protected-subject reclassification was needed. Gate #2 preserves P2/confidence 75 and is excluded from actionable findings.
+
+**Review breadth and limitations**
+
+All 15 selected views plus the mandatory fallback reached terminal collection within the recorded 20-minute per-reviewer bound, with at most five concurrent. Some exceeded the eight-minute target; none was recorded failed, late, or uncollected.
+
+| Correctness view | Semantic evidence | Insufficient evidence |
+|------------------|------------------:|----------------------:|
+| Models | 119 | 115 |
+| Native | 97 | 136 |
+| History | 60 | 2 |
+| Execution | 62 | 198 |
+| Surface | 76 | 409 |
+| **Total** | **414** | **860** |
+
+The ledgers account for all 1,274 distinct assigned paths once. Assignment accounting is not whole-diff semantic approval: **860 paths retain insufficient evidence**. The four Windows binaries are already included in the native insufficient-evidence count, not additional paths.
+
+- Windows Chord binary execution and source equivalence remain unverified, including supported Windows/Node/architecture behavior.
+- Vendored Markdown parsers were traced through embedding and tokenizer registration, but complete parser semantics and source-to-bundle equivalence remain unproven.
+- JSONL recovery and MemoryStorage inspection covered relevant changed regions, not every behavior.
+- The unwatched graph snapshot is stale as of 2026-10-09. Current-source and lexical tracing do not establish exhaustive dynamic/external consumer coverage or complete deleted-module liveness.
+- Agent-native inspection established no significant new reachability/discovery defect; it does not establish exhaustive parity across all changed paths.
+- Historical report bodies were excluded from reviewer patch seeds. No additional designated coding-standards criterion was supplied; active global/root `AGENTS` instructions remained binding.
+
+**Cross-model outcome**
+
+adversarial lens: in-process fallback (cross-model peer not run: OAuth session expired and could not be refreshed)
+
+The requested route was `claude-opus-5-5` with high effort. No successful peer receipt established the actual serving model, effort, or independence; no peer artifact was folded in. Dispatch recorded the peer job directory as deleted. The fallback is not independent cross-model corroboration.
+
+**Synthesis and execution**
+
+- Two candidates entered validation. Suppressed findings: 0; mode-aware demotions: 0; semantic duplicates: 0; malformed findings/returns: 0; pre-existing findings: 0; policy removals/regrades: 0.
+- Both first-evidence fields were backfilled from source evidence. No confidence promotion by agreement occurred. No triage group remains.
+- Reviewers and validator performed static, read-only inspection. No tests, builds, checks, browser runs, network requests, or provider calls established runtime behavior in this review. Parent repair verification is separate.
+- `apply_local` was false. No source or historical-document edits, fixes, commits, push, or PR were made by the report leaf. Only run artifacts and stage bookkeeping were written.
+
+**Artifacts:** `/tmp/compound-engineering-501/ce-code-review/20261104-082101-r6-09f6ed55`
+
+Final machine artifacts are `final-findings.json`, `actionable-findings.json` (empty), `validation-summary.json`, `advisory-outputs.json`, and `metadata.json`. Report-stage logging and summarization completed. Dispatch persists this markdown to `report.md` and appends it to `docs/plans/2026-10-30-c08a2fb-image-billing-code-review.md`, preserving prior history.
+
+---
+
+### Verdict
+
+> **Not ready - verification gate remains.**
+>
+> There are **zero confirmed findings**, but this is **not a converged zero-new-findings round**. **#2, P2, `scripts/issues/ui.html:269`**, remains an unresolved protected concurrency claim. Resolve native Tab/microtask ordering with evidence tied to the reviewed revision before declaring convergence. Do not implement the proposed timer change merely because the claim remains unresolved.
+>
+> **Next response:** Verify #2 in a real browser or resolve it through an applicable runtime specification. Preserve the rejected #1 historical changelog unchanged.
+
+**Actionable findings: none.** Verification-only handoff: **#2 | P2 | `scripts/issues/ui.html:269` | Possible deferred-refresh loss of native Tab destination | `advisory -> human` | candidate `suggested_fix` present, not authorized | confidence 75 | unresolved.**
+
+**Run artifacts:** `/tmp/compound-engineering-501/ce-code-review/20261104-082101-r6-09f6ed55`
+
+
+## Round 6 verification-gate resolution and repair
+
+Candidate #1 remains rejected. The root README explicitly says this fork retains Harness/subpaths and that imported released changelogs describe upstream; the released removal notice is immutable historical context, not a current API removal. No changelog modification was made.
+
+The initially unresolved concurrency candidate #2 was **confirmed by a discriminating actual-browser trace** at reviewed HEAD `92dd50d0753d2703c50a34d4a80044ecfd211bb3`. Chrome **150.0.7871.24**, managed headless on this Darwin host, loaded the actual issue HTML with its production 8,000-ms polling interval unchanged. With a successful issue-99 snapshot deferred behind focused issue-10 p0, no active pointer, no selection or mutation, native Tab targeted the original p1 control. The trace recorded blur and focusout plus their microtask checkpoints while `activeElement` remained BODY; the focusout microtask installed the snapshot, detached p1 and prevented incoming focus. The final state was destination disconnected/unfocused and issue 99 installed. `native-tab-proof.json` retains the browser version, reviewed revision, preconditions, event order and observed result. Thus this is one new valid P2, not a zero-new-findings round.
+
+The fix changes only the `focusout` deferred flush from a microtask to `setTimeout(..., 0)`, allowing the native focus transfer to finish. Selection, pointer ownership, decision precedence, mutation and generation guards are unchanged. A dedicated `tabFocus` fixture models the observed microtask-before-incoming-focus checkpoint; the unrelated `blurFocus` and category semantics remain unchanged. Focus assertions explicitly advance the queued task through `runTimers`, separate from pointer completion. Valid red was **72 passed / 1 failed**, specifically the original Tab destination becoming disconnected; green is **73 passed**. An initial broad helper experiment was narrowed before valid red; no assertion was lowered.
+
+Repaired actual Chrome trace reaches focus/focusin on the original p1, which remains mounted and active while issue 10 is retained. An atomic fresh scenario then leaves protected focus and installs issue 99. `native-tab-after.json` records this result. A delayed outside-focus attempt was discarded because a later poll had invalidated the older deferred generation; the clean atomic scenario supplies the acceptance evidence. Browser service/tab and temporary fixture source were stopped/removed.
+
+`npm run check` and `npm run build:offline` completed with exit 0; check examined 1,986 files with **No fixes applied**, including TypeScript/browser-smoke. Offline build produced the 76-file, 9.4-MiB coding-agent bundle. The first isolated suite overlapped the test-helper naming refinement, so it is retained only as an intermediate run, not final-tree acceptance. The authoritative stable-tree isolated rerun completed **13,775 passed / 0 failed / 945 skipped**, exit 0, 327.70 seconds (`suite.log`, `suite-exit.json`, `artifact://711`). A final-tree check after the fixture naming refinement also exited 0 with No fixes applied (27.66 seconds). Rust/native binaries and deployment operations were unchanged and not newly executed.
+
+The exact initial Round 6 report was appended before runtime investigation, preserving the original 129,480-byte prefix (SHA-256 `32621613a6a1ca031c8921b03fad233b822b39632a94892d46812a0c9dafa35a`). Its unresolved status records the evidence then available; this appended runtime disposition supersedes that gate for the repaired tree. A fresh full-range review is required after verified local commit.
+

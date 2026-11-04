@@ -265,8 +265,8 @@ document.addEventListener("pointerup", (e) => {
 document.addEventListener("pointercancel", (e) => { activePointers.delete(e.pointerId); flushDeferred(); }, true);
 window.addEventListener("blur", () => { activePointers.clear(); flushDeferred(); });
 document.addEventListener("focusout", () => {
-	// Wait for focus to settle; moves between protected controls must stay deferred.
-	queueMicrotask(flushDeferred);
+	// Native focus transfer can checkpoint microtasks before focusing its destination.
+	setTimeout(flushDeferred, 0);
 });
 document.addEventListener("selectionchange", () => {
 	queueMicrotask(flushDeferred);

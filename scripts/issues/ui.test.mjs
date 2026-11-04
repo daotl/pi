@@ -84,10 +84,19 @@ function harness() {
 		if (next) next();
 		await tick();
 	};
+	const tabFocus = async (next) => {
+		const target = focused;
+		focused = null;
+		listeners.focusout?.({ target });
+		await tick();
+		if (next) next();
+		await runTimers();
+	};
 	const blurCategory = blurFocus;
 	const changeCategory = (value) => { focusedSelect.value = value; listeners.change({ target: focusedSelect }); };
 	const pointer = (type, pointerId = 1) => listeners[type]?.({ pointerId });
-	const finishPointer = async (type) => { if (type) pointer(type); timers.splice(0).forEach((fn) => fn()); await tick(); };
+	const runTimers = async () => { timers.splice(0).forEach((fn) => fn()); await tick(); };
+	const finishPointer = async (type) => { if (type) pointer(type); await runTimers(); };
 	const clickControl = (control) => {
 		assert.equal(control.isConnected, true, "Native click must still have its mounted target");
 		listeners.click({ target: control });
@@ -130,7 +139,7 @@ function harness() {
 		if (target === spaceTarget && target.isConnected) listeners.click({ target });
 		spaceTarget = null;
 	};
-	return { nodes, requests, respond, key, click, clickControl, pointer, finishPointer, focusCategory, blurCategory, changeCategory, focusControl, blurFocus, spaceDown, spaceUp, selectText, collapseSelection, selection, get mainVersion() { return mainVersion; }, get activeElement() { return document.activeElement; }, poll: () => poll(), tab: (view) => tabs.find((tab) => tab.dataset.view === view).onclick(), category: (value) => { nodes.cat.value = value; listeners.change({ target: { id: "cat", value, dataset: {} } }); } };
+	return { nodes, requests, respond, key, click, clickControl, pointer, finishPointer, runTimers, focusCategory, blurCategory, changeCategory, focusControl, blurFocus, tabFocus, spaceDown, spaceUp, selectText, collapseSelection, selection, get mainVersion() { return mainVersion; }, get activeElement() { return document.activeElement; }, poll: () => poll(), tab: (view) => tabs.find((tab) => tab.dataset.view === view).onclick(), category: (value) => { nodes.cat.value = value; listeners.change({ target: { id: "cat", value, dataset: {} } }); } };
 }
 
 for (const view of ["inbox", "decided", "all"]) {
@@ -173,6 +182,7 @@ test("a delayed poll preserves a category selection and installs its snapshot af
 	assert.match(ui.nodes.main.innerHTML, /Issue 10/);
 	assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 20/);
 	await ui.blurCategory();
+	await ui.runTimers();
 	assert.match(ui.nodes.main.innerHTML, /Issue 20/);
 });
 
@@ -210,11 +220,30 @@ for (const tagName of ["BUTTON", "SUMMARY", "A"]) {
 		await ui.respond(ui.requests[1], snapshot([issue(99)]));
 		assert.match(ui.nodes.main.innerHTML, /Issue 10/);
 		await ui.blurFocus(() => ui.focusControl("SUMMARY"));
+		await ui.runTimers();
 		assert.match(ui.nodes.main.innerHTML, /Issue 10/, "Moving focus within main must retain the deferred snapshot");
 		await ui.blurFocus();
+		await ui.runTimers();
 		assert.match(ui.nodes.main.innerHTML, /Issue 99/);
 	});
 }
+
+test("a deferred poll preserves the original Tab destination across the focusout microtask checkpoint", async () => {
+	const ui = harness();
+	await ui.respond(ui.requests[0], snapshot([issue(10)]));
+	const destination = ui.focusControl("BUTTON", { act: "prio", n: "10", p: "p1" });
+	ui.focusControl("BUTTON", { act: "prio", n: "10", p: "p0" });
+	ui.poll();
+	await ui.respond(ui.requests[1], snapshot([issue(99)]));
+	await ui.tabFocus(() => {
+		assert.equal(destination.isConnected, true, "Native Tab must not lose its destination between focus events");
+		ui.focusControl("BUTTON", { act: "prio", n: "10", p: "p1" });
+	});
+	assert.match(ui.nodes.main.innerHTML, /Issue 10/);
+	await ui.blurFocus();
+	await ui.runTimers();
+	assert.match(ui.nodes.main.innerHTML, /Issue 99/);
+});
 
 test("a failed poll reports its error without replacing a keyboard-focused control", async () => {
 	const ui = harness();
@@ -290,6 +319,7 @@ test("only the newest deferred snapshot can install after focus leaves a select"
 	await ui.respond(ui.requests[2], snapshot([issue(20)]));
 	await ui.respond(ui.requests[1], snapshot([issue(30)]));
 	await ui.blurCategory();
+	await ui.runTimers();
 	assert.match(ui.nodes.main.innerHTML, /Issue 20/);
 	assert.doesNotMatch(ui.nodes.main.innerHTML, /Issue 30/);
 });
