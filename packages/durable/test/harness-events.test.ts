@@ -22,10 +22,12 @@ import {
 	MemoryStorage,
 	type MessageChange,
 	type SnapshotEvent,
+	type TaskId,
 	UsageDoc,
 	watchEvents,
 } from "@earendil-works/pi-durable";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { type ConversationView, conversationViews } from "../src/harness/view.ts";
 import { type ChatSetup, chatSetup, openChat, textOf, waitFor } from "./chat-support.ts";
 import { addTool } from "./harness-support.ts";
 import { context, documentChanges, observeCommits } from "./session-support.ts";
@@ -608,6 +610,222 @@ describe("agent events", () => {
 		]);
 		await stream.stop();
 		await harness.close(context);
+	});
+
+	it.each(["remove", "replace"] as const)(
+		"emits nested lifecycle events exactly once, children first, when live slots %s",
+		async (ending) => {
+			const { harness, root } = await openChat(new MemoryStorage(), chatSetup());
+			const { stream, batches } = await listen(harness, root);
+			const change = (edit: (live: Draft<LiveState>) => void) =>
+				root.commit(async (tx) => edit(await tx.doc(LiveDoc, root.id)), context);
+			const nested = (callId: string, parentCallId: string, taskId: number, parentTaskId: number) => ({
+				callId,
+				parentCallId,
+				taskId: taskId as TaskId,
+				parentTaskId: parentTaskId as TaskId,
+				name: "nested",
+				arguments: { callId },
+				status: "pending" as const,
+			});
+			try {
+				await change((live) => {
+					live.tools = [{ callId: "outer", taskId: 101 as TaskId, name: "outer", status: "pending" }];
+					live.nestedTools = [
+						nested("branch", "outer", 102, 101),
+						nested("sibling", "outer", 103, 101),
+						nested("deep", "branch", 104, 102),
+					];
+				});
+				await change((live) => {
+					live.tools![0]!.status = "running";
+					for (const slot of live.nestedTools!) slot.status = "running";
+				});
+				await change((live) => {
+					live.nestedTools![2]!.output = "first";
+					live.nestedTools![2]!.details = { step: 1 };
+				});
+				await change((live) => {
+					live.nestedTools![1]!.status = "done";
+				});
+				// Removing a completed sibling shifts the update's view index, but must not repeat its end.
+				await change((live) => {
+					live.nestedTools!.splice(1, 1);
+					live.nestedTools!.push(nested("pending", "outer", 105, 101));
+				});
+				await change((live) => {
+					live.nestedTools![1]!.output += " second";
+				});
+				if (ending === "remove") {
+					await change((live) => {
+						delete live.nestedTools;
+						delete live.tools;
+					});
+				} else {
+					// A new incarnation replaces the whole mounted pi.live document, not an individual slot.
+					await root.commit(async (tx) => {
+						await tx.retireDoc(LiveDoc, root.id);
+						const live = await tx.doc(LiveDoc, root.id);
+						live.tools = [{ callId: "next", taskId: 201 as TaskId, name: "outer", status: "running" }];
+						live.nestedTools = [{ ...nested("next-child", "next", 202, 201), status: "running" }];
+					}, context);
+					await root.commit((tx) => tx.retireDoc(LiveDoc, root.id), context);
+				}
+				await drained();
+				const tools = batches.map((batch) =>
+					batch.filter(
+						(event) =>
+							event.type === "tool_execution_start" ||
+							event.type === "tool_execution_update" ||
+							event.type === "tool_execution_end",
+					),
+				);
+				const call = (toolCallId: string, taskId: number, parentToolCallId?: string, parentTaskId?: number) => ({
+					toolCallId,
+					toolName: parentToolCallId === undefined ? "outer" : "nested",
+					taskId,
+					...(parentToolCallId === undefined ? {} : { parentToolCallId, parentTaskId }),
+				});
+				const outer = call("outer", 101);
+				const branch = call("branch", 102, "outer", 101);
+				const deep = call("deep", 104, "branch", 102);
+				const sibling = call("sibling", 103, "outer", 101);
+				const oldEnds = [
+					{ type: "tool_execution_end", ...call("pending", 105, "outer", 101) },
+					{ type: "tool_execution_end", ...deep },
+					{ type: "tool_execution_end", ...branch },
+					{ type: "tool_execution_end", ...outer },
+				];
+				expect(tools).toEqual([
+					[
+						{ type: "tool_execution_start", ...outer, args: {} },
+						{ type: "tool_execution_start", ...branch, args: { callId: "branch" } },
+						{ type: "tool_execution_start", ...sibling, args: { callId: "sibling" } },
+						{ type: "tool_execution_start", ...deep, args: { callId: "deep" } },
+					],
+					[{ type: "tool_execution_update", ...deep, output: { set: "first" }, details: { step: 1 } }],
+					[{ type: "tool_execution_end", ...sibling }],
+					[{ type: "tool_execution_update", ...deep, output: { append: " second" } }],
+					...(ending === "remove"
+						? [oldEnds]
+						: [
+								[
+									{ type: "tool_execution_start", ...call("next", 201), args: {} },
+									{
+										type: "tool_execution_start",
+										...call("next-child", 202, "next", 201),
+										args: { callId: "next-child" },
+									},
+									...oldEnds,
+								],
+								[
+									{ type: "tool_execution_end", ...call("next-child", 202, "next", 201) },
+									{ type: "tool_execution_end", ...call("next", 201) },
+								],
+							]),
+				]);
+			} finally {
+				await stream.stop();
+				await harness.close(context);
+			}
+		},
+	);
+
+	it("visits nested slots linearly as progress-disabled siblings are admitted, run, and settled", async () => {
+		const measure = async (calls: number): Promise<number> => {
+			const setup = chatSetup();
+			addTool(
+				setup.registry,
+				defineTool({
+					name: "leaf",
+					description: "Return without progress",
+					parameters: Type.Object({}),
+					execute: async (_args, api) => {
+						api.output("not published");
+						return {};
+					},
+				}),
+			);
+			addTool(
+				setup.registry,
+				defineTool({
+					name: "fan",
+					description: "Retain finished sibling slots until the caller settles",
+					parameters: Type.Object({}),
+					execute: async (_args, api, callContext) => {
+						for (let index = 0; index < calls; index++) {
+							const result = await api.executeTool("leaf", {}, callContext, { progress: false });
+							if (result.isError) throw new Error("Nested leaf failed");
+						}
+						return {};
+					},
+				}),
+			);
+			setup.faux.setResponses([
+				fauxAssistantMessage([fauxToolCall("fan", {}, { id: "fan" })], { stopReason: "toolUse" }),
+				fauxAssistantMessage([fauxText("done")]),
+			]);
+			const { harness, root } = await openChat(new MemoryStorage(), setup);
+			let visits = 0;
+			const counted = new WeakMap<ConversationView, ConversationView>();
+			const countSlots = (view: ConversationView): ConversationView => {
+				const cached = counted.get(view);
+				if (cached !== undefined) return cached;
+				const live = view.docs["pi.live"];
+				if (!Array.isArray(live?.nestedTools)) return view;
+				const nestedTools = new Proxy(live.nestedTools, {
+					get(target, key, receiver) {
+						if (typeof key === "string" && /^(0|[1-9]\d*)$/.test(key)) visits++;
+						return Reflect.get(target, key, receiver);
+					},
+				});
+				const result = { ...view, docs: { ...view.docs, "pi.live": { ...live, nestedTools } } };
+				counted.set(view, result);
+				return result;
+			};
+			const views = conversationViews(harness);
+			const attach = views.attach.bind(views);
+			// Count the real translator's indexed reads without changing the source view or its publication values.
+			const instrumentedAttach: typeof views.attach = (id, create, callContext) =>
+				attach(
+					id,
+					async (value, release, storage) => {
+						const observer = await create(countSlots(value), release, storage);
+						const publication = observer.publication;
+						if (publication !== undefined) {
+							observer.publication = (before, after, ops, commit, commitContext) =>
+								publication(countSlots(before), countSlots(after), ops, commit, commitContext);
+						}
+						return observer;
+					},
+					callContext,
+				);
+			const spy = vi.spyOn(views, "attach").mockImplementation(instrumentedAttach);
+			let stream: AgentEventStream | undefined;
+			try {
+				const listener = await listen(harness, root);
+				stream = listener.stream;
+				const settled = await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
+				await harness.waitForIdle(context);
+				await stream.stop();
+				expect(settled.status).toBe("done");
+				expect(listener.events().filter((event) => event.type === "tool_execution_start")).toHaveLength(calls + 1);
+				expect(listener.events().filter((event) => event.type === "tool_execution_end")).toHaveLength(calls + 1);
+				expect(listener.events().filter((event) => event.type === "tool_execution_update")).toEqual([]);
+				expect(setup.reports).toEqual([]);
+				return visits;
+			} finally {
+				spy.mockRestore();
+				await stream?.stop();
+				await harness.close(context);
+			}
+		};
+		const small = await measure(32);
+		const large = await measure(128);
+		expect(small).toBeGreaterThan(0);
+		// Four times as many siblings allows six times the visits, not the sixteen of a retained-list rescan.
+		expect(large).toBeLessThanOrEqual(small * 6);
+		expect(large).toBeLessThanOrEqual(128 * 80);
 	});
 
 	it("ends the stream with the Harness", async () => {

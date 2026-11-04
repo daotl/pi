@@ -249,6 +249,54 @@ describe("contracts", () => {
 		}
 	});
 
+	for (const name of ["toString", "constructor", "__proto__"] as const) {
+		for (const policy of ["properties", "patternProperties"] as const) {
+			for (const member of ["result", "state"] as const) {
+				const offered =
+					policy === "properties"
+						? Type.Object({ [name]: Type.Number() }, { additionalProperties: false })
+						: Type.Object({}, { patternProperties: { [name]: Type.Number() }, additionalProperties: false });
+				const contract = (schema: TSchema) =>
+					remote(`t.inherited-schema-${policy}-${name}-${member}`, {
+						version: 1,
+						input: Type.Object({}),
+						host: hostNamed("server"),
+						variants: {
+							main:
+								member === "result"
+									? { methods: { read: method(undefined, schema) } }
+									: { state: { value: schema } },
+						},
+					});
+
+				it(`closed ${member} coverage rejects undeclared ${policy} named ${name}`, () => {
+					const wanted = Type.Object({}, { additionalProperties: false });
+					const value = { [policy === "properties" ? name : `${name}-extra`]: 1 };
+					assert.equal(Value.Check(offered, value), true);
+					assert.equal(Value.Check(wanted, value), false);
+					const provider = contract(offered);
+					const consumer = contract(wanted);
+					assert.match(coverage(provider.description, consumer.description) ?? "", new RegExp(member));
+					assert.throws(
+						() => bind(provider, undefined, consumer),
+						(error) => isChordError(error, "contract_mismatch") && error.message.includes(member),
+					);
+				});
+
+				it(`closed ${member} coverage accepts explicitly identical ${policy} named ${name}`, () => {
+					const wanted =
+						policy === "properties"
+							? Type.Object({ [name]: Type.Number() }, { additionalProperties: false })
+							: Type.Object({}, { patternProperties: { [name]: Type.Number() }, additionalProperties: false });
+					const provider = contract(offered);
+					const consumer = contract(wanted);
+					assert.equal(coverage(provider.description, consumer.description), undefined);
+					assert.equal(bind(provider, undefined, consumer), undefined);
+				});
+			}
+		}
+	}
+
 	it("closed object patterns remain conservative while accepting identical compatible name policies", () => {
 		const wanted = Type.Object({}, { patternProperties: { "^x": Type.Number() }, additionalProperties: false });
 		const offered = Type.Object(

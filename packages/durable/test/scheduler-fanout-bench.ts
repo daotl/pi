@@ -1,7 +1,7 @@
 /**
  * Scheduler fan-out benchmark. One model-issued tool makes `calls` parallel nested calls of a tool that returns at
- * once, on in-memory storage, so the time is the Harness's and the scheduler's own. Quadratic work shows as four times
- * the time per doubling of `calls`.
+ * once, with an attached event consumer on in-memory storage, so the time includes the Harness, scheduler, and event
+ * projection. Quadratic work shows as four times the time per doubling of `calls`.
  *
  *   node --conditions=source --experimental-strip-types test/scheduler-fanout-bench.ts [calls...]
  */
@@ -9,10 +9,12 @@ import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { Type } from "typebox";
-import { createRegistry, defineExtension, defineTool, Harness, ToolResultEntry } from "../src/index.ts";
+import { createRegistry, defineExtension, defineTool, Harness, ToolResultEntry, watchEvents } from "../src/index.ts";
 import { MemoryStorage } from "../src/storage/memory.ts";
 
-async function run(calls: number): Promise<{ ms: number; commits: number }> {
+async function run(
+	calls: number,
+): Promise<{ ms: number; commits: number; events: number; starts: number; ends: number }> {
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
@@ -51,24 +53,45 @@ async function run(calls: number): Promise<{ ms: number; commits: number }> {
 		fauxAssistantMessage([fauxToolCall("fan", { count: calls }, { id: "fan" })], { stopReason: "toolUse" }),
 		fauxAssistantMessage([fauxText("done")]),
 	]);
-	const started = performance.now();
-	const settled = await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
-	if (settled.status !== "done") throw new Error(`run: ${settled.status}`);
-	await harness.waitForIdle(context);
-	const ms = Math.round(performance.now() - started);
-	// A run whose nested calls failed measures nothing.
-	const page = await root.entries({}, 10, undefined, context);
-	const result = page.items.find((entry) => ToolResultEntry.is(entry))?.model?.[0];
-	if (result?.role !== "toolResult" || result.isError) throw new Error(`run: nested calls failed`);
-	await harness.close(context);
-	return { ms, commits };
+	const stream = await watchEvents(harness, root.id, context);
+	let events = 0;
+	let starts = 0;
+	let ends = 0;
+	let updates = 0;
+	stream.start(async (batch) => {
+		events += batch.length;
+		for (const event of batch) {
+			if (event.type === "tool_execution_start") starts++;
+			if (event.type === "tool_execution_end") ends++;
+			if (event.type === "tool_execution_update") updates++;
+		}
+	});
+	try {
+		const started = performance.now();
+		const settled = await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
+		if (settled.status !== "done") throw new Error(`run: ${settled.status}`);
+		await harness.waitForIdle(context);
+		await stream.stop();
+		const ms = Math.round(performance.now() - started);
+		// A run whose nested calls failed, or whose attached consumer missed calls, measures nothing.
+		const page = await root.entries({}, 10, undefined, context);
+		const result = page.items.find((entry) => ToolResultEntry.is(entry))?.model?.[0];
+		if (result?.role !== "toolResult" || result.isError) throw new Error(`run: nested calls failed`);
+		if (starts !== calls + 1 || ends !== calls + 1 || updates !== 0) {
+			throw new Error(`run: tool events ${starts} starts, ${ends} ends, ${updates} updates for ${calls} calls`);
+		}
+		return { ms, commits, events, starts, ends };
+	} finally {
+		await stream.stop();
+		await harness.close(context);
+	}
 }
 
 const sizes = process.argv.slice(2).map(Number);
-console.log("calls | ms     | commits | ms per call");
+console.log("calls | ms     | commits | events | starts | ends   | ms per call");
 for (const calls of sizes.length > 0 ? sizes : [250, 500, 1000, 2000, 4000]) {
-	const { ms, commits } = await run(calls);
+	const { ms, commits, events, starts, ends } = await run(calls);
 	console.log(
-		`${String(calls).padEnd(5)} | ${String(ms).padEnd(6)} | ${String(commits).padEnd(7)} | ${(ms / calls).toFixed(2)}`,
+		`${String(calls).padEnd(5)} | ${String(ms).padEnd(6)} | ${String(commits).padEnd(7)} | ${String(events).padEnd(6)} | ${String(starts).padEnd(6)} | ${String(ends).padEnd(6)} | ${(ms / calls).toFixed(2)}`,
 	);
 }

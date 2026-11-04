@@ -630,6 +630,8 @@ stream.start(async (events) => {
 
 Events are derived from commits, one batch per commit, and apply on top of the snapshot. Message and tool updates carry deltas: text and thinking appends, appended tool-call argument text, and output trims and appends. When a consumer falls more than 100 batches behind, it receives a fresh `snapshot` event instead. See `test/examples/18-json.ts` for the full stream of one run.
 
+Nested-tool event projection tracks changed slots by task ID and view operation index, so observing a sibling's admission, progress, or settlement does not rescan retained siblings. Whole-list replacement or removal reconciles the list once; nested end events remain ordered children before parents.
+
 ## Hooks
 
 Hooks let extensions observe or adjust the built-in tasks, in the conversations that select them:

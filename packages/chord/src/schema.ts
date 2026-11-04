@@ -222,7 +222,7 @@ function objectFits(sub: Schema, sup: Schema, mode: "value" | "cleaned-input"): 
 	const subRequired = new Set((sub.required as string[] | undefined) ?? []);
 	for (const key of (sup.required as string[] | undefined) ?? []) if (!subRequired.has(key)) return false;
 	for (const [key, property] of Object.entries(supProperties)) {
-		if (key in subProperties) {
+		if (Object.hasOwn(subProperties, key)) {
 			if (!fits(subProperties[key], property, mode)) return false;
 		} else {
 			let matched = false;
@@ -246,12 +246,12 @@ function objectFits(sub: Schema, sup: Schema, mode: "value" | "cleaned-input"): 
 	if (sup.additionalProperties === false) {
 		if (sub.additionalProperties !== false) return false;
 		for (const key of Object.keys(subProperties)) {
-			if (key in supProperties) continue;
+			if (Object.hasOwn(supProperties, key)) continue;
 			if (!Object.keys(supPatterns).some((pattern) => new RegExp(pattern, "u").test(key))) return false;
 		}
 		// A source pattern permits names beyond its explicit properties. Regex containment is not modeled: require
 		// the same name policy, whose value constraints are checked below, rather than silently admitting extra keys.
-		if (Object.keys(subPatterns).some((pattern) => !(pattern in supPatterns))) return false;
+		if (Object.keys(subPatterns).some((pattern) => !Object.hasOwn(supPatterns, pattern))) return false;
 	}
 	if (Object.keys(supPatterns).length > 0) {
 		// Every value the consumer may put under a matching name must fit, and the consumer must not allow arbitrary
@@ -265,12 +265,12 @@ function objectFits(sub: Schema, sup: Schema, mode: "value" | "cleaned-input"): 
 			}
 			if (
 				Object.keys(subPatterns).length > 0 &&
-				(!(pattern in subPatterns) || !fits(subPatterns[pattern], property, mode))
+				(!Object.hasOwn(subPatterns, pattern) || !fits(subPatterns[pattern], property, mode))
 			) {
 				return false;
 			}
 		}
-		for (const pattern of Object.keys(subPatterns)) if (!(pattern in supPatterns)) return false;
+		for (const pattern of Object.keys(subPatterns)) if (!Object.hasOwn(supPatterns, pattern)) return false;
 	}
 	return true;
 }

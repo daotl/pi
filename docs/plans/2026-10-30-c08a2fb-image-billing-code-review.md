@@ -712,3 +712,152 @@ A deterministic regression in the existing `harness-tasks.test.ts` gates actual 
 
 The exact Round 4 report was appended before repair, preserving the original 94,759-byte prefix (SHA-256 `f8eccd8d69d050fdad233d6f7bcd40c20657f8e5abecb13300ad5b61d01d9e4e`). This round found a new confirmed defect, so a fresh full-range review is required after the verified local commit; it is not convergence.
 
+
+## Code Review Results -- Round 5
+
+**Scope:** Fixed first-parent base `98dfe28cbeec4e1f2f61516e227420b2407dcdf9` -> reviewed HEAD `0b0f63df8ecf34aee0cf5680458065b3a80e4768` on `fix/full-merge-review-8322aa1d`. This round covers merge `8322aa1d` and all subsequent repairs through that HEAD, not just the latest commit.
+
+**Intent:** Integrate upstream 1.4.0 while preserving Crystal history, edit/delete/restore/shred/id0 behavior, billing, multimodal handling, summary budgets, Harness behavior, experimental/client surfaces, and published contracts.
+
+**Mode:** Markdown report-only, `depth:full`, `apply_local:false`. No fixes were applied. Parent repair, verification, and local commits remain separate from this review.
+
+**Reviewers and reasons:**
+- `correctness-models`, `correctness-native`, `correctness-history`, `correctness-execution`, `correctness-surface` -- five domain views of the full base-to-HEAD scope.
+- `security` -- trust and authentication boundaries; `reliability` -- asynchronous lifecycle; `api-contract` -- published compatibility.
+- `data-migration` -- actual storage migrations; `testing` -- regression-guard fidelity; `performance` -- bounded work; `maintainability` -- structural integration.
+- `agent-native-reviewer` -- capability reachability; `frontend-races` -- DOM ordering; `deployment-verification-agent` -- destructive storage cutovers.
+- `adversarial` -- in-process fallback after cross-model authentication failed.
+
+### P2 -- Moderate
+
+| # | File | Issue | Reviewer | Confidence |
+|---|------|-------|----------|------------|
+| 1 | `packages/chord/src/schema.ts:249` | Closed-schema binding accepts properties the consumer forbids | correctness-native | 100 |
+| 2 | `packages/durable/src/harness/events.ts:268` | Attached event streams add quadratic work to nested-tool fan-out | performance | 75 |
+
+**#1 -- Check own properties when comparing closed schemas.**
+
+A same-version provider can bind a closed result or state schema containing an own `toString` or `constructor` property to a consumer whose closed schema allows no properties. At line 249, `key in supProperties` treats inherited `Object.prototype` names as declared consumer properties.
+
+For example, the compatibility check accepts `Type.Object({ toString: Type.String() }, { additionalProperties: false })` against `Type.Object({}, { additionalProperties: false })`. Contract coverage uses that result for method results and state (`contract.ts:367-370`). Direct dispatch and snapshots validate against the provider schema, not the consumer schema, so subsequent validation does not repair the accepted incompatibility.
+
+**Response:** Replace inherited membership checks with `Object.hasOwn` for the relevant `properties` and `patternProperties` lookups in `objectFits`. Add coverage/bind regressions for own `toString`, `constructor`, and computed `__proto__` properties: incompatible closed result/state schemas must fail binding, while identical explicit schemas must bind.
+
+**Validation:** `confirmed`; protected subject `public-contract`. The independent validator traced same-version binding, TypeBox property-object preservation, provider-only validation, and result delivery without consumer validation at reviewed HEAD. This confirms the code-permitted defect; **actual incidence was not measured**. Confidence remains 100.
+
+**#2 -- Translate nested events from changed slots instead of rescanning all slots.**
+
+With `watchEvents` attached, every nested admission, running transition, and settlement publishes synchronously into event translation. The new code rebuilds nested-slot maps and walks the full retained list for starts, updates, and ends (`events.ts:268-270`, `294-300`, `337-344`). Completed siblings remain in that list until their caller settles.
+
+The repository explicitly supports fan-outs of thousands of calls. Across that workload, these per-commit full scans produce quadratic slot visits and temporary map entries on the Session mutation path. Setting `progress:false` does not remove admission, running, or settlement commits. This adds unrelated synchronous work before other commits and event delivery can proceed.
+
+**Response:** Maintain a per-projection task-ID index and process the nested task IDs or view indices changed by each publication. Reconcile the full list once for whole-list replacement/removal, preserving children-before-parents end ordering. Extend the existing scheduler fan-out benchmark with an attached event stream.
+
+**Validation:** `confirmed`; no protected subject. The independent validator traced the synchronous observer chain, retained completed siblings, separate nested-call commits, and an existing test that attaches an event stream. The supported benchmark range is 250-4,000 calls. **Large-fan-out incidence and elapsed-time impact were not measured**. Confidence remains 75; no measured latency claim is made.
+
+### Actionable Findings
+
+| # | File | Issue | Route | Notes |
+|---|------|-------|-------|-------|
+| 1 | `packages/chord/src/schema.ts:249` | Closed-schema comparison accepts inherited property names | `gated_auto -> downstream-resolver` | Concrete `suggested_fix` present; confirmed public-contract defect; targeted compatibility/binding verification required |
+| 2 | `packages/durable/src/harness/events.ts:268` | Nested event projection rescans retained siblings on individual commits | `gated_auto -> downstream-resolver` | Concrete `suggested_fix` present; verify event ordering and attached-stream fan-out behavior |
+
+Both remain unapplied. They have unrelated causes and fix paths, so `grouping:auto` produces no decorative single-finding triage groups.
+
+### Deployment Notes
+
+**Deployment readiness is not proven.** The deployment reviewer found no additional product defect; the following are proposed release gates, not executed results:
+
+- Inventory each persisted store, schema/version, owner, backup, and rollback path. Keep durable SQLite schema 2/root conversation ID 1 distinct from Crystal id0 behavior and Agent Harness JSONL v3-to-v4 upgrades.
+- Quiesce writers before backup and cutover. Durable storage documents one-process ownership without cross-process locking; do not overlap old and new writers.
+- Restore-test complete SQLite backups and complete JSONL directories, including sidecars and Crystal selection/deletion metadata. Opening JSONL may truncate unconfirmed tails and reclaim sidecars.
+- Verify SQLite migration integrity and preservation before resuming writers: schema 1 -> 2, unchanged allocator metadata and record counts, unchanged task columns/status distribution, all five task indexes present, no leftover `tasks_v2`, and zero differences in both directions against the backed-up task rows.
+- Rehearse migration duration and disk/WAL headroom on a representative backup. Run durable migration/storage/JSONL coverage, real Workers coverage, and Agent Harness legacy JSONL upgrade coverage. Focused durable test runs do not automatically include Workers.
+- Before a Workers deployment, establish the actual application binding, namespace, migration tags, compatibility settings, recovery point, restore procedure, and alarm/recovery behavior. The test fixture is not a production deployment configuration; those production prerequisites were not established here.
+- Roll back compatible code and the complete pre-deploy store together. Do not change only a schema number or JSONL header, and do not restore shredded content into service without a retention/deletion decision.
+- Stop rollout for corruption, failed migration, or unexplained history loss/duplication. Monitor session/migration failures, parked tasks, JSONL poison errors, SQLite locks, failed appends/renames, overdue sleeps, and recovery alarms without progress.
+
+The complete proposed commands, SQL comparisons, runtime gates, and rollback checklist are preserved in `deployment-verification-agent.md` and `advisory-outputs.json` under the run directory.
+
+### Coverage
+
+**Full scope, partial semantic coverage.** The scope contains **1,274 changed paths**, **201,945 changed lines**, **74,159 executable non-test changed lines**, and **47 whole-file deletions**. Every path is accounted for once in the five domain ledgers; that accounting is not an all-path or all-hunk correctness approval.
+
+| Domain | Semantically reviewed paths | Insufficient-evidence paths | Total |
+|--------|-----------------------------|-----------------------------|-------|
+| Models | 119 | 115 | 234 |
+| Native | 81 | 152 | 233 |
+| History | 60 | 2 | 62 |
+| Execution | 91 | 169 | 260 |
+| Surface | 78 | 407 | 485 |
+| **Total** | **429** | **845** | **1,274** |
+
+The **four Windows binaries are already included in Native's 152 insufficient-evidence paths**, not four additional paths.
+
+- All 15 selected views plus the mandatory in-process fallback reached terminal collection within the recorded 20-minute per-reviewer bound. None failed or remained uncollected; some exceeded the eight-minute target. Concurrency was capped at five.
+- All 14 structured reviewer artifacts and both prose advisory artifacts were consumed during synthesis. Both actual candidates were retained, hydrated, and independently validated. No candidate was omitted because of a cap.
+- **Validation:** one batch, 2 selected, **2 confirmed**, 0 rejected, 0 unresolved, 0 malformed, 0 failed, **0 shortcut-skipped**, and 0 cap omissions. #1 remains protected as `public-contract`; #2 has no protected subject. No protection reclassification or degraded blocker remains.
+- **Mechanics:** 2 primary findings, 2 actionable, 0 pre-existing, 0 confidence suppressions at any anchor, 0 soft-bucket demotions, 0 malformed findings/returns, and 2 first-evidence quotes backfilled. No semantic merges, admission rejections, settled-decision removals, or policy removals/regrades occurred.
+- **Cross-model outcome:** adversarial lens: in-process fallback (cross-model peer not run: OAuth session expired and could not be refreshed).
+- The requested peer route was Claude with `claude-opus-5-5` and effort `high`. Authentication failed before a usable peer review. The receipt does not attest actual model or effort, independence is not verified, and no external peer artifact was folded in. The persisted peer job directory was deleted. The in-process fallback is not cross-model corroboration.
+- Active global/root `AGENTS` instructions remained binding. No separate designated standards reviewer or base review-policy criteria were supplied by the recorded routing. Historical report bodies were excluded from reviewer seed diffs.
+- The agent-native pass found no significant concrete gap in the inspected MCP, discovery, codemode, SDK-selection, prompt, and authentication routes. It did not establish exhaustive coverage of all changed paths.
+- **Platform limits:** Windows native binaries were not executed or proved source-equivalent or correctly linked. Packaged daemon/source linkage, real-shell SSH bootstrap, and terminal graphics behavior remain runtime-unverified.
+- **Other residual boundaries:** the two changed minified Marked assets were not independently audited for parser correctness/source equivalence. Deleted Chord modules received surviving-export/reference inspection, not exhaustive base-body or external/dynamic-consumer inspection.
+- The supplied graph was stale as of 2026-10-09 and was not treated as current authority. Source reads and textual caller searches do not establish exhaustive third-party extension, context-converter, or external SDK consumer coverage.
+- **No tests, builds, checks, formatters, installations, network operations, provider/browser exercises, or source edits were performed in the review or validation.** Both confirmations are source-based, with incidence unmeasured. Parent repair verification is separate. No additional standalone testing-gap finding was retained.
+
+**Artifacts**
+
+Run directory: `/tmp/compound-engineering-501/ce-code-review/20261104-071109-r5-d82508db`
+
+- Scope and collection: `finish-input.json`, `scope-facts.json`, `files.txt`, `full.diff`, `review.diff`, domain file lists/diffs, `deleted-files.json`, `selected-reviewers.json`, `raw-returns.json`, and per-reviewer results/coverage ledgers.
+- Synthesis and independent validation: `mechanical-findings.json`, `synthesized-findings.json`, `validator-input.json`, `validator-verdicts.json`, and `validator-outcome.json`.
+- Final machine-readable handoff: **`final-findings.json`**, **`actionable-findings.json`**, and **`advisory-outputs.json`**. Both final findings retain their evidence, impact, fix, route, confidence, protected-subject classification where applicable, and exact validation reasons.
+- Peer audit: `peer-outcome.json`, adversarial constraints/brief, and the in-process `adversarial.json`; no external peer finding artifact exists.
+- Stage/cost receipt: `stages.jsonl` and `metadata.json`; report stage closed and cost summarization returned `complete`.
+- The dispatch context persists this exact return as `report.md` and appends it to `docs/plans/2026-10-30-c08a2fb-image-billing-code-review.md`, preserving history **before fixes**.
+
+---
+
+### Verdict
+
+> **Not ready.**
+>
+> Two confirmed P2 defects remain unapplied: a closed-schema public-contract incompatibility and quadratic nested-event translation. This is not a zero-new-findings round, and partial static coverage does not establish release readiness.
+>
+> **Fix order:** #1 own-property schema comparison -> #2 incremental nested-event projection. The parent should verify and locally commit the repairs, then review the complete fixed-base scope again. No push or PR.
+
+**Actionable Findings recap**
+
+1. **#1 -- P2 -- `packages/chord/src/schema.ts:249`:** Closed-schema binding accepts inherited property names. **Response:** code fix plus compatibility/binding regressions. `autofix_class:gated_auto`; owner `downstream-resolver`; `suggested_fix` present; confidence **100**; independently confirmed, incidence unmeasured.
+2. **#2 -- P2 -- `packages/durable/src/harness/events.ts:268`:** Attached streams make nested-tool fan-out quadratic. **Response:** incremental event projection plus ordering and attached-stream fan-out verification. `autofix_class:gated_auto`; owner `downstream-resolver`; `suggested_fix` present; confidence **75**; independently confirmed, runtime impact unmeasured.
+
+Machine-readable apply queue: `/tmp/compound-engineering-501/ce-code-review/20261104-071109-r5-d82508db/actionable-findings.json`.
+
+
+## Round 5 repair disposition
+
+Both confirmed findings are implemented; the initial report above remains the reviewed-HEAD snapshot. This is not a zero-new-findings round.
+
+| Finding | Repair | Observed proof |
+|---|---|---|
+| #1 closed object schemas | `objectFits` uses own-key membership for explicit property and pattern dictionaries. Inherited prototype names do not constitute consumer declarations. | Complete contract test red: 12 failed / 43 passed. Twelve result/state rejection cases cover `toString`, `constructor`, computed `__proto__` and both property/pattern policies; matching explicit-policy positive controls remain valid. After repair, contract/bindings/link/types files: 114 passed. Actual source-runtime Host calls rejected incompatible closed results synchronously for all three names and returned `value` under matching contracts. |
+| #2 nested event fan-out | Each attached event projection indexes current nested slots by task ID and index. Ordinary publications inspect changed indices only; splices adjust the shifted suffix; whole-list/document replacement/removal reconciles once. Removed slots leave the index. | Complete events file red: 20 passed / 1 failed; actual numeric array visits grew from 10,560 at 32 calls to 165,120 at 128 calls (15.64x for 4x calls). The repaired linear-growth and absolute-work bounds pass. Events/nested-tools/tools/codemode files: 143 passed in each of two retention modes, including exact starts/updates/ends, child-before-parent ends, removal, shifted progress, replacement and retirement. |
+
+The attached-stream benchmark executes actual source Harness calls with `progress:false`, consumes and closes `watchEvents`, and validates lifecycle counts. Local baseline versus repaired runs, same Node 24.15.0 process style:
+
+| Calls | Before ms | After ms | Commits | Events | Starts/ends |
+|---|---:|---:|---:|---:|---:|
+| 250 | 507 | 215 | 767 | 522 | 251 each |
+| 500 | 910 | 225 | 1,517 | 1,022 | 501 each |
+| 1,000 | 1,787 | 344 | 3,017 | 2,022 | 1,001 each |
+
+These are single local elapsed-time runs, not a stable throughput or latency SLA. Event counts are unchanged; deterministic numeric-read regression is the complexity guard. Results are retained in `repair-baselines.json` and `fanout-after.json`. The schema runtime smoke's temporary source was removed.
+
+The first check/build exposed an `Op` discriminant error in the new internal index: root `r` carries a JSON value, not a path. The final implementation handles root replacement before path access and narrows the actual non-root union without `any` or path casts. No assertions were reduced to pass it. `npm run check` then completed exit 0, 1,986 files, **No fixes applied**, including TypeScript/browser-smoke; `npm run build:offline` exited 0 and produced the 76-file, 9.4-MiB coding-agent bundle. Formatter changes were confined to owned events/test files. No dependency or lockfile changed.
+
+The authoritative isolated root suite completed **13,774 passed / 0 failed / 945 skipped**, exit 0, 408.58 seconds (`suite.log`, `suite-exit.json`, `artifact://646`). Rust/native binaries and platform operations were unchanged and not newly executed; existing Windows/Workers/deployment limits remain. Public `watchEvents` and schema contracts were traced with LSP before changes; no public signature or compatibility shim was added. Documentation describes own schema names and incremental event observation.
+
+The exact decoded Round 5 report was appended before repair, preserving the original 111,291-byte prefix (SHA-256 `add05d6103f070fb59709c418b850f35a7452aacbac8e1a8cccce19a1d761dd5`). After verification and local commit, another fresh full-range review remains required.
+

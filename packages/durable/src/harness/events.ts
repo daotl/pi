@@ -178,6 +178,7 @@ export async function watchEvents(
 			const held = new Set<TaskId>(completing.map((record) => record.id));
 			let current = initial;
 			snapshot = snapshotOf(initial);
+			const nestedSlots = new NestedSlots(snapshot.nestedTools);
 			// Batches are the watch's values, each delivered (folding would drop events); an overflow delivers a snapshot of
 			// the newest view instead.
 			watch = new NativeWatch<readonly AgentEvent[]>(
@@ -189,7 +190,7 @@ export async function watchEvents(
 			return {
 				publication: (before, after, ops, publication, commitContext) => {
 					current = after;
-					const events = translate(conversationId, before, after, ops, publication, held);
+					const events = translate(conversationId, before, after, ops, publication, held, nestedSlots);
 					if (events.length > 0) watch.advance(events, commitContext);
 				},
 				end: (failure) => watch.end(failure),
@@ -214,6 +215,102 @@ export async function watchEvents(
 
 type TaskChange = Extract<CommitChange, { type: "task" }>;
 
+type IndexedNestedSlot = { index: number; value: NestedToolSlot };
+
+/** Per attachment, retain only current slots; ordinary commits visit only their changed indices. */
+class NestedSlots {
+	private readonly slots: IndexedNestedSlot[] = [];
+	private readonly byTask = new Map<TaskId, IndexedNestedSlot>();
+
+	constructor(initial: readonly NestedToolSlot[]) {
+		for (const value of initial) {
+			const slot = { index: this.slots.length, value };
+			this.slots.push(slot);
+			this.byTask.set(value.taskId, slot);
+		}
+	}
+
+	advance(ops: readonly Op[], current: readonly NestedToolSlot[]) {
+		const path = ["docs", "pi.live", "nestedTools"];
+		const before = new Map<TaskId, IndexedNestedSlot>();
+		const touched = new Set<IndexedNestedSlot>();
+		const created = new Set<IndexedNestedSlot>();
+		const remember = (slot: IndexedNestedSlot): void => {
+			if (!created.has(slot) && !before.has(slot.value.taskId)) before.set(slot.value.taskId, { ...slot });
+		};
+		let reconcile = false;
+		const relevant: Exclude<Op, readonly ["r", JsonValue]>[] = [];
+		for (const op of ops) {
+			if (op[0] === "r") {
+				reconcile = true;
+				continue;
+			}
+			const opPath: Path = op[1];
+			if (!startsWith(opPath, path) && !startsWith(path, opPath)) continue;
+			relevant.push(op);
+			if (opPath.length < path.length || (opPath.length === path.length && op[0] !== "p")) reconcile = true;
+		}
+		if (reconcile) {
+			for (const slot of this.slots) remember(slot);
+			this.slots.length = 0;
+			this.byTask.clear();
+			for (const value of current) {
+				const slot = { index: this.slots.length, value };
+				this.slots.push(slot);
+				this.byTask.set(value.taskId, slot);
+				touched.add(slot);
+			}
+		} else {
+			for (const op of relevant) {
+				if (op[0] === "p" && op[1].length === path.length) {
+					const inserted = (op[4] as unknown as NestedToolSlot[]).map((value, offset) => {
+						const previous = this.byTask.get(value.taskId);
+						if (previous !== undefined) remember(previous);
+						const slot = { index: op[2] + offset, value };
+						created.add(slot);
+						touched.add(slot);
+						return slot;
+					});
+					for (const slot of this.slots.splice(op[2], op[3], ...inserted)) {
+						remember(slot);
+						this.byTask.delete(slot.value.taskId);
+						touched.delete(slot);
+					}
+					for (const slot of inserted) this.byTask.set(slot.value.taskId, slot);
+					// Appending has no shifted suffix; do not revisit retained siblings.
+					if (inserted.length !== op[3]) {
+						for (let index = op[2] + inserted.length; index < this.slots.length; index++) {
+							this.slots[index]!.index = index;
+						}
+					}
+				} else {
+					const slot = this.slots[op[1][path.length] as number];
+					if (slot === undefined) continue;
+					remember(slot);
+					touched.add(slot);
+				}
+			}
+			for (const slot of touched) {
+				this.byTask.delete(slot.value.taskId);
+				slot.value = current[slot.index]!;
+				this.byTask.set(slot.value.taskId, slot);
+			}
+		}
+		const after = new Map<TaskId, IndexedNestedSlot>();
+		for (const id of before.keys()) {
+			const slot = this.byTask.get(id);
+			if (slot !== undefined) after.set(id, slot);
+		}
+		for (const slot of touched) after.set(slot.value.taskId, slot);
+		return {
+			before: new Map(
+				[...before.values()].sort((a, b) => a.index - b.index).map((slot) => [slot.value.taskId, slot.value]),
+			),
+			after: [...after.values()].sort((a, b) => a.index - b.index),
+		};
+	}
+}
+
 /** The tool result for `callId` among `entries`. */
 function resultOf(entries: readonly EntryRecord[], callId: string): EntryRecord | undefined {
 	return entries.find((entry) => {
@@ -230,6 +327,7 @@ function translate(
 	viewOps: readonly Op[],
 	publication: ObservedCommit,
 	held: Set<TaskId>,
+	nestedSlots: NestedSlots,
 ): AgentEvent[] {
 	const entries: EntryRecord[] = [];
 	const tasks = new Map<TaskId, TaskChange["value"]>();
@@ -265,8 +363,9 @@ function translate(
 	// Progress: tool starts, the in-flight message, tool updates, retry and deferred state.
 	const slotsBefore = new Map((was.live.tools ?? []).map((slot) => [slot.callId, slot]));
 	const slots = now.live.tools ?? [];
-	const nestedBefore = new Map((was.live.nestedTools ?? []).map((slot) => [slot.taskId, slot]));
-	const nested = now.live.nestedTools ?? [];
+	const nestedChanges = nestedSlots.advance(viewOps, now.live.nestedTools ?? []);
+	const nestedBefore = nestedChanges.before;
+	const nested = nestedChanges.after.map((slot) => slot.value);
 	for (const slot of [...slots, ...nested]) {
 		const previous = "parentCallId" in slot ? nestedBefore.get(slot.taskId) : slotsBefore.get(slot.callId);
 		if (slot.status !== "running" || previous?.status === "running") continue;
@@ -291,7 +390,7 @@ function translate(
 		if (update === undefined) continue;
 		events.push({ type: "tool_execution_update", ...callOf(slot), ...update });
 	}
-	for (const [index, slot] of nested.entries()) {
+	for (const { index, value: slot } of nestedChanges.after) {
 		const previous = nestedBefore.get(slot.taskId);
 		if (slot.status !== "running" || previous?.status !== "running") continue;
 		const update = toolUpdate(viewOps, ["nestedTools", index], slot, previous);

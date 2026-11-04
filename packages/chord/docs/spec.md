@@ -65,6 +65,7 @@ A consumer built against version M binds to a provider at version N iff N = M an
 
 Covers: every consumer member exists with the same kind; methods: both take arguments or neither does, the provider accepts every argument the consumer can send (new fields optional, nothing newly required or retyped), and the provider's result fits the consumer's expected result (extra fields fine; a void consumer accepts any); state: provider value fits consumer schema (extra fields fine); opaque: same name@version.
 Finite `const` and `enum` container schemas must also satisfy structural object-property and array-item compatibility; finite membership alone does not bypass nested output checks.
+Object property and pattern declarations use own keys only. Prototype names such as `toString`, `constructor`, and `__proto__` do not count as allowed fields unless explicitly declared; closed consumer schemas still reject undeclared provider fields.
 
 Additive changes need no bump. Breaking changes (remove/rename/retype, newly required, or a change of meaning with the same shape) bump the number. Same version + non-covering description = forgotten bump, refused. Meaning changes without a bump are undetectable (author's responsibility, as with Durable document versions).
 
