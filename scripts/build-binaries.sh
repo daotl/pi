@@ -136,6 +136,16 @@ for platform in "${PLATFORMS[@]}"; do
     else
         bun build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv --compile-autoload-package-json --target="$bun_target" ./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/extensions/codemode/worker.ts --outfile "$OUTPUT_DIR/$platform/pi"
     fi
+
+    if [[ "$platform" == darwin-* && "$(uname -s)" == "Darwin" ]]; then
+        echo "Repairing and verifying macOS signature for $platform..."
+        # Bun may leave malformed signature metadata that --force alone cannot replace.
+        codesign --remove-signature "$OUTPUT_DIR/$platform/pi"
+        codesign --force --sign - "$OUTPUT_DIR/$platform/pi"
+        codesign --verify --strict --verbose=2 "$OUTPUT_DIR/$platform/pi"
+    elif [[ "$platform" == darwin-* ]]; then
+        echo "Warning: $platform was cross-compiled without macOS signature or startup verification; verify it on macOS before distribution." >&2
+    fi
 done
 
 echo "==> Creating release archives..."
@@ -159,6 +169,13 @@ for platform in "${PLATFORMS[@]}"; do
     native_path="native/${native_platform%-*}/prebuilds"
     mkdir -p "$OUTPUT_DIR/$platform/$native_path"
     cp -R "../tui/$native_path/$native_platform" "$OUTPUT_DIR/$platform/$native_path/"
+
+    if [[ "$platform" == darwin-* && "$(uname -s)" == "Darwin" ]]; then
+        host_arch="$(uname -m)"
+        if [[ "$platform" == "darwin-$host_arch" || "$platform:$host_arch" == "darwin-x64:x86_64" ]]; then
+            "$OUTPUT_DIR/$platform/pi" --version
+        fi
+    fi
 done
 
 # Create archives
@@ -184,6 +201,13 @@ for platform in "${PLATFORMS[@]}"; do
         mkdir -p "$platform" && (cd "$platform" && unzip -q ../pi-$platform.zip)
     else
         tar -xzf pi-$platform.tar.gz && mv pi "$platform"
+    fi
+    if [[ "$platform" == darwin-* && "$(uname -s)" == "Darwin" ]]; then
+        codesign --verify --strict --verbose=2 "$OUTPUT_DIR/$platform/pi"
+        host_arch="$(uname -m)"
+        if [[ "$platform" == "darwin-$host_arch" || "$platform:$host_arch" == "darwin-x64:x86_64" ]]; then
+            "$OUTPUT_DIR/$platform/pi" --version
+        fi
     fi
 done
 
