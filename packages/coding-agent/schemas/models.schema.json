@@ -536,6 +536,11 @@
           "description": "Whether the provider supports stream_options.include_usage for token usage in streaming responses.",
           "default": true
         },
+        "supportsPrefillContinuation": {
+          "type": "boolean",
+          "description": "Whether the endpoint supports llama-server return_prefill with byte-identical reasoning, text, and tool-call echo. Enables automatic continuation of interrupted assistant messages; otherwise failed attempts are retried from the last complete request boundary.",
+          "default": false
+        },
         "supportsFinishReason": {
           "type": "boolean",
           "description": "Whether streamed responses include finish_reason. When false, pi infers stop or toolUse when the stream ends.",

@@ -113,6 +113,8 @@ export interface HarnessOptions {
 	models?: FauxModelDefinition[];
 	/** Override the faux provider API (e.g. "openai-completions" for prefill tests). */
 	fauxApi?: string;
+	/** Compat settings of the faux models (e.g. `{ supportsPrefillContinuation: true }` for prefill tests). */
+	compat?: Model<"openai-completions">["compat"];
 	settings?: Partial<Settings>;
 	tools?: AgentTool[];
 	initialActiveToolNames?: string[];
@@ -172,7 +174,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		api: options.fauxApi,
 	});
 	fauxProvider.setResponses([]);
-	const model = fauxProvider.getModel();
+	const model = options.compat ? { ...fauxProvider.getModel(), compat: options.compat } : fauxProvider.getModel();
 	const toolMap = options.tools ? Object.fromEntries(options.tools.map((tool) => [tool.name, tool])) : undefined;
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
@@ -205,6 +207,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 				contextWindow: registeredModel.contextWindow,
 				maxTokens: registeredModel.maxTokens,
 				baseUrl: registeredModel.baseUrl,
+				compat: options.compat,
 			})),
 		});
 	}

@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxThinking, fauxToolCall, type Message } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { createHarness, type Harness } from "./harness.ts";
@@ -50,6 +50,80 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.eventsOfType("agent_end").map((event) => event.willRetry)).toEqual([true, false]);
 		expect(harness.faux.state.callCount).toBe(2);
 		expect(harness.session.isRetrying).toBe(false);
+	});
+
+	it("retries a disconnected OpenAI-compatible thinking stream without assuming prefill echo support", async () => {
+		const harness = await createHarness({
+			fauxApi: "openai-completions",
+			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 0 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage([fauxThinking("interrupted reasoning prefix")], {
+				stopReason: "error",
+				errorMessage: "ECONNRESET: The socket connection was closed unexpectedly.",
+			}),
+			fauxAssistantMessage([
+				fauxThinking("a different regenerated reasoning prefix"),
+				{ type: "text", text: "recovered" },
+			]),
+		]);
+
+		await expect(harness.session.prompt("test")).resolves.toBeUndefined();
+
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.session.messages.at(-1)).toMatchObject({ stopReason: "stop" });
+		expect(harness.eventsOfType("auto_retry_end").at(-1)).toMatchObject({ success: true });
+		const failed = harness.sessionManager
+			.getEntries()
+			.find(
+				(entry) =>
+					entry.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "error",
+			);
+		expect(failed).toBeDefined();
+		expect(
+			harness.session.messages.some((message) => message.role === "assistant" && message.stopReason === "error"),
+		).toBe(false);
+	});
+
+	it("preserves partial reasoning when the endpoint explicitly supports prefill continuation", async () => {
+		const harness = await createHarness({
+			fauxApi: "openai-completions",
+			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 0 } },
+		});
+		harnesses.push(harness);
+		harness.session.agent.state.model = {
+			...harness.session.agent.state.model,
+			compat: { supportsPrefillContinuation: true },
+		};
+		let retryReturnPrefill: boolean | undefined;
+		let retryLastMessage: Message | undefined;
+		harness.setResponses([
+			fauxAssistantMessage([fauxThinking("partial reasoning")], {
+				stopReason: "error",
+				errorMessage: "ECONNRESET: The socket connection was closed unexpectedly.",
+			}),
+			(context, options) => {
+				retryReturnPrefill = options?.returnPrefill;
+				retryLastMessage = context.messages.at(-1);
+				return fauxAssistantMessage([
+					fauxThinking("partial reasoning continued"),
+					{ type: "text", text: "recovered" },
+				]);
+			},
+		]);
+
+		await harness.session.prompt("test");
+
+		expect(harness.faux.state.callCount).toBe(2);
+		// The retry is a prefill continuation: the partial is the last request message, not omitted.
+		expect(retryReturnPrefill).toBe(true);
+		expect(retryLastMessage).toMatchObject({ role: "assistant", content: [fauxThinking("partial reasoning")] });
+		expect(harness.session.messages.at(-1)).toMatchObject({ stopReason: "stop" });
+		const last = harness.session.messages.at(-1);
+		expect(last?.role).toBe("assistant");
+		if (last?.role !== "assistant") throw new Error("Expected assistant response");
+		expect(last.content).toContainEqual(fauxThinking("partial reasoning continued"));
 	});
 
 	it("retries multiple transient failures and succeeds on the final attempt", async () => {

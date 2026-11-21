@@ -2,7 +2,7 @@ import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import { createHarness, getMessageText, type Harness } from "../harness.ts";
+import { createHarness, getMessageText, type Harness, type HarnessOptions } from "../harness.ts";
 
 describe("retry with unlimited attempts and backoff cap", () => {
 	const harnesses: Harness[] = [];
@@ -216,6 +216,12 @@ describe("retry prefill continuation", () => {
 		}
 	});
 
+	/** An openai-completions endpoint that opted in to prefill continuation (e.g. llama-server). */
+	const prefillEndpoint: HarnessOptions = {
+		fauxApi: "openai-completions",
+		compat: { supportsPrefillContinuation: true },
+	};
+
 	function getAssistantText(message: AgentMessage): string {
 		if (message.role !== "assistant") return "";
 		return message.content
@@ -238,7 +244,7 @@ describe("retry prefill continuation", () => {
 
 	it("continues a partial assistant message during retry for openai-completions providers", async () => {
 		const harness = await createHarness({
-			fauxApi: "openai-completions",
+			...prefillEndpoint,
 			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
 		});
 		harnesses.push(harness);
@@ -267,7 +273,7 @@ describe("retry prefill continuation", () => {
 
 	it("preserves the original partial prefill across multiple retry failures", async () => {
 		const harness = await createHarness({
-			fauxApi: "openai-completions",
+			...prefillEndpoint,
 			settings: { retry: { enabled: true, maxRetries: 5, baseDelayMs: 1 } },
 		});
 		harnesses.push(harness);
@@ -300,7 +306,7 @@ describe("retry prefill continuation", () => {
 
 	it("restores the partial message when a prefill continuation fails", async () => {
 		const harness = await createHarness({
-			fauxApi: "openai-completions",
+			...prefillEndpoint,
 			settings: { retry: { enabled: true, maxRetries: 5, baseDelayMs: 1 } },
 		});
 		harnesses.push(harness);
@@ -339,7 +345,7 @@ describe("retry prefill continuation", () => {
 
 	it("clears 503-style harness errors and continues the original partial prefill", async () => {
 		const harness = await createHarness({
-			fauxApi: "openai-completions",
+			...prefillEndpoint,
 			settings: { retry: { enabled: true, maxRetries: 5, baseDelayMs: 1 } },
 		});
 		harnesses.push(harness);
@@ -428,7 +434,7 @@ describe("retry prefill continuation", () => {
 			},
 		};
 		const harness = await createHarness({
-			fauxApi: "openai-completions",
+			...prefillEndpoint,
 			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
 			tools: [echoTool],
 		});
@@ -482,7 +488,7 @@ describe("retry prefill continuation", () => {
 		// queued a steering message, the prefill continuation of the original
 		// partial should take priority over delivering the steering message.
 		const harness = await createHarness({
-			fauxApi: "openai-completions",
+			...prefillEndpoint,
 			settings: { retry: { enabled: true, maxRetries: 5, baseDelayMs: 1 } },
 		});
 		harnesses.push(harness);

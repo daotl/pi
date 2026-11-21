@@ -2,12 +2,18 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Continuing an interrupted response with prefill (`return_prefill`) is now opt-in. Previously every `openai-completions` model sent the partial message back on `/continue` and on retries, which failed or duplicated output on gateways that do not echo it. The built-in llama.cpp provider opts in; for another llama-server endpoint, set `compat.supportsPrefillContinuation: true` for that model in `models.json`. Other models retry a dropped stream from the last complete request, and `/continue` generates the response again
+
 ### Added
 
 - Added `compat.supportsStrictMode` for `google-generative-ai` and `google-vertex` models in `models.json`, so Gemini 3+ models served under IDs without the version can use strict tools ([#12321](https://github.com/earendil-works/pi/issues/12321))
 
 ### Fixed
 
+- `/continue` no longer erases an interrupted response on models without prefill support. It becomes an earlier version of the regenerated response (see `/swipe`), or, when a compaction or another entry follows it, is soft-deleted so that entry stays in effect (`/restore` brings it back). Queued steering and follow-up messages are sent without the interrupted response, and when there is nothing to regenerate from, the message is left in place and the status line says that resuming needs prefill support
+- Fixed compaction being undone when its first kept message was soft-deleted, for example with `/delete`: the session sent the compaction summary followed by the full history it had summarized, which could overflow the context window. The kept range now starts at the next visible message
 - Fixed sessions with very many entries after the last compaction (about 120k or more) failing to load with `RangeError: Maximum call stack size exceeded` when building the context ([#12154](https://github.com/earendil-works/pi/issues/12154))
 - Fixed `ctx.ui.pasteToEditor()` and `ctx.ui.setEditorText()` not repainting the editor when called outside terminal input handling, such as after an `await` in a command handler ([#12295](https://github.com/earendil-works/pi/issues/12295))
 - Fixed the bash tool returning `(no output)` when the output ended with a line over 50KB followed by an empty line; it now shows the end of that line ([#12350](https://github.com/earendil-works/pi/issues/12350))

@@ -215,6 +215,11 @@ const OpenAICompletionsCompatProperties = {
 			default: true,
 		}),
 	),
+	supportsPrefillContinuation: optionalCompatBoolean({
+		description:
+			"Whether the endpoint supports llama-server return_prefill with byte-identical reasoning, text, and tool-call echo. Enables automatic continuation of interrupted assistant messages; otherwise failed attempts are retried from the last complete request boundary.",
+		default: false,
+	}),
 	supportsFinishReason: opt(
 		bool({
 			description:

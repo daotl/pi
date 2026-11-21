@@ -106,6 +106,37 @@ describe("AgentSession virtual models", () => {
 		expect(harness.session.getContextUsage()?.contextWindow).toBe(50_000);
 	});
 
+	it("retries fresh when the routed physical model supports prefill continuation", async () => {
+		// Agent.continue() sends a prefill through the selected model and rejects the virtual one,
+		// so a failed attempt must be retried from the user message instead of captured as a prefill.
+		const { harness, reasons } = await createRoutedHarness(defaultRoute, {
+			fauxApi: "openai-completions",
+			compat: { supportsPrefillContinuation: true },
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+		});
+		let retryReturnPrefill: boolean | undefined;
+		let retryLastRole: string | undefined;
+		harness.setResponses([
+			fauxAssistantMessage("partial content", { stopReason: "error", errorMessage: "Connection error." }),
+			(context, options) => {
+				retryReturnPrefill = options?.returnPrefill;
+				retryLastRole = context.messages.at(-1)?.role;
+				return fauxAssistantMessage("fresh answer");
+			},
+		]);
+
+		await expect(harness.session.prompt("hello")).resolves.toBeUndefined();
+
+		expect(harness.session.modelRuntime.getPhysicalModel("faux", "large")?.compat).toMatchObject({
+			supportsPrefillContinuation: true,
+		});
+		expect(reasons()).toEqual(["user", "retry"]);
+		expect(retryReturnPrefill).toBeFalsy();
+		expect(retryLastRole).toBe("user");
+		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([true]);
+		expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+	});
+
 	it("retries the first request of a turn on the model routed for that turn", async () => {
 		const { harness, requests, reasons, dispatched } = await createRoutedHarness(defaultRoute, {
 			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },

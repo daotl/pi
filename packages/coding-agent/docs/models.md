@@ -139,6 +139,8 @@ Pi first clamps unsupported thinking levels, then merges model `samplingParams`,
 
 Compatibility settings should describe verified differences in the endpoint's request or response behavior. Do not enable them based only on an endpoint advertising OpenAI or Anthropic compatibility.
 
+For a llama-server endpoint that supports byte-identical `return_prefill` echo, set `compat.supportsPrefillContinuation: true` to resume interrupted assistant output automatically. Leave it unset for ordinary cloud gateways: Pi retries a disconnected request from the last complete boundary instead of requiring the gateway to echo partial reasoning.
+
 ## Use classifier models
 
 Classifier models do not chat. They answer typed questions about JSON state: pick one of several choices, answer yes or no, or give a score, each with probabilities. Pi includes TypeSafe's Jev model from these providers, Cloudflare's Clef, Clef Flash, and Clef Omni models from Workers AI and OpenRouter, OpenAI's GPT-6 Luna through the [Decisions API](https://developers.openai.com/api/docs/guides/decisions), and Microsoft-Decision-1 through GitHub Copilot:

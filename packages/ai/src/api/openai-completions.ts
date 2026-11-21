@@ -184,6 +184,7 @@ type ResolvedOpenAICompletionsCompat = Omit<
 	| "supportsMidConvoSystemMessages"
 	| "supportsMidConvoToolAdditions"
 	| "vllmPriority"
+	| "supportsPrefillContinuation"
 > & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
 	promptCacheKeyMode?: OpenAICompletionsCompat["promptCacheKeyMode"];

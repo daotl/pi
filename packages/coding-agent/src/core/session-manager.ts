@@ -632,6 +632,15 @@ export function buildContextEntries(
 
 	let keptStart = visiblePath.findIndex((entry) => entry.id === latestCompaction.firstKeptEntryId);
 	if (keptStart < 0) {
+		// A soft-deleted first kept entry: the kept range starts at the next
+		// visible entry after it, as when the entry is removed for good.
+		const pathIndex = path.findIndex((entry) => entry.id === latestCompaction.firstKeptEntryId);
+		if (pathIndex >= 0 && path[pathIndex].deletedAt !== undefined) {
+			const follower = path.slice(pathIndex + 1).find((entry) => entry.deletedAt === undefined);
+			keptStart = follower ? visiblePath.indexOf(follower) : visiblePath.length;
+		}
+	}
+	if (keptStart < 0) {
 		// Corrupt/missing firstKeptEntryId: keep everything after the first
 		// compaction so no verbatim history is lost.
 		keptStart = 0;

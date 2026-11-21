@@ -96,10 +96,13 @@ describe("llama.cpp extension", () => {
 				contextWindow: 65536,
 				maxTokens: 65536,
 				input: ["text", "image"],
+				// llama-server supports return_prefill, so its models opt in to prefill continuation.
+				compat: expect.objectContaining({ supportsPrefillContinuation: true }),
 			}),
 			expect.objectContaining({
 				id: "sleeping",
 				baseUrl: "http://localhost:9931/v1",
+				compat: expect.objectContaining({ supportsPrefillContinuation: true }),
 			}),
 		]);
 	});

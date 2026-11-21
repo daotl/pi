@@ -116,6 +116,7 @@ See [Describe model input and caching](models.md#describe-model-input-and-cachin
 | `supportsDeveloperRole` | boolean |  | Whether to send system messages of reasoning models (the system prompt and mid-conversation system messages) with the developer role instead of system. Default: true only for api.openai.com. |
 | `supportsReasoningEffort` | boolean |  | Whether the provider supports reasoning_effort. Default: auto-detected from URL. |
 | `supportsUsageInStreaming` | boolean | `true` | Whether the provider supports stream_options.include_usage for token usage in streaming responses. |
+| `supportsPrefillContinuation` | boolean | `false` | Whether the endpoint supports llama-server return_prefill with byte-identical reasoning, text, and tool-call echo. Enables automatic continuation of interrupted assistant messages; otherwise failed attempts are retried from the last complete request boundary. |
 | `supportsFinishReason` | boolean | `true` | Whether streamed responses include finish_reason. When false, pi infers stop or toolUse when the stream ends. |
 | `maxTokensField` | `"max_completion_tokens" \| "max_tokens"` |  | Which field to use for max tokens. Default: auto-detected from URL. |
 | `requiresToolResultName` | boolean |  | Whether tool results require the name field. Default: auto-detected from URL. |

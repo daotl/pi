@@ -122,6 +122,23 @@ describe("SessionManager soft delete", () => {
 		expect(session.getEntries().find((entry) => entry.id === compaction!.id)?.deletedAt).toBeDefined();
 	});
 
+	it("keeps the compaction when its first kept entry is soft-deleted", () => {
+		const session = SessionManager.inMemory();
+		session.appendMessage(userMessage("old question", 1));
+		session.appendMessage(assistantMessage("old answer", 2));
+		session.appendMessage(userMessage("kept question", 3));
+		const firstKeptId = session.appendMessage(assistantMessage("first kept answer", 4));
+		session.appendCompaction("summary of old", firstKeptId, 100);
+		session.appendMessage(userMessage("after compaction", 5));
+
+		session.softDeleteUnits([{ entryId: firstKeptId }]);
+
+		// The summarized range stays summarized; the kept range starts after the deleted entry.
+		const roles = session.buildSessionContext().messages.map((message) => message.role);
+		expect(roles).toEqual(["compactionSummary", "user"]);
+		expect(contextTexts(session)).toEqual(["after compaction"]);
+	});
+
 	it("restores the latest deleted units first", () => {
 		const session = SessionManager.inMemory();
 		session.appendMessage(userMessage("a", 1));

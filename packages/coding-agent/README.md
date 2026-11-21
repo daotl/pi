@@ -239,7 +239,7 @@ Configure delivery in [settings](docs/settings.md): `steeringMode` and `followUp
 
 ### `/continue`
 
-`/continue` resumes the session without adding a message: when the last assistant message was aborted mid-thought (or edited), it is sent back as a prefill so the model continues exactly where it stopped, instead of re-generating from scratch. The prefill is sent on the first streamed turn only; later tool loops in the same continuation are normal turns.
+`/continue` resumes the session without adding a message: when the last assistant message was aborted mid-thought (or edited), it is sent back as a prefill so the model continues exactly where it stopped, instead of re-generating from scratch. The prefill is sent on the first streamed turn only; later tool loops in the same continuation are normal turns. Prefill needs an endpoint that echoes it back unchanged: the built-in llama.cpp provider does, and other `openai-completions` models opt in with [`compat.supportsPrefillContinuation`](docs/models-configuration.md#openai-completions). On any other model, `/continue` generates the reply again and keeps the interrupted message: it becomes an earlier version of the response (see `/swipe`), or, when entries such as a compaction follow it, it is soft-deleted (`/restore` brings it back).
 
 ### `/edit`
 

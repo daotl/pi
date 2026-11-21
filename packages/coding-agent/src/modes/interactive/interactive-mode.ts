@@ -7125,10 +7125,12 @@ export class InteractiveMode {
 	/**
 	 * Continue the session by sending the LLM the existing messages.
 	 *
-	 * Prefill continuation (for openai-completions providers) is handled inside
+	 * Prefill continuation (for openai-completions models with
+	 * compat.supportsPrefillContinuation, such as llama.cpp) is handled inside
 	 * AgentSession.continue(): the last assistant message is removed from the
 	 * transcript and re-sent with return_prefill, and restored if the
-	 * continuation fails.
+	 * continuation fails. On other models an interrupted message is set aside
+	 * and the response is generated again.
 	 */
 	private async handleContinueCommand(): Promise<void> {
 		if (this.session.isCompacting) {
@@ -7157,8 +7159,16 @@ export class InteractiveMode {
 			if (errorMessage.includes("No messages to continue from")) {
 				this.showStatus("No messages to continue from");
 			} else if (errorMessage.includes("Cannot continue from message role: assistant")) {
-				if (last !== undefined && last.role === "assistant" && agent.state.model.api !== "openai-completions") {
-					this.showStatus("Continuation is only supported for llama-server");
+				const model = agent.state.model;
+				const prefill =
+					model.api === "openai-completions" &&
+					(model as Model<"openai-completions">).compat?.supportsPrefillContinuation === true;
+				// A completed response needs a new message, not prefill support.
+				const interrupted = last?.role === "assistant" && last.stopReason !== "stop";
+				if (interrupted && !prefill) {
+					this.showStatus(
+						"Resuming a response needs prefill support (llama.cpp or compat.supportsPrefillContinuation). Send a message to continue.",
+					);
 				} else {
 					this.showStatus("Last message is from assistant. Send a message first or use /new to start fresh.");
 				}

@@ -10,7 +10,11 @@ import {
 } from "@earendil-works/pi-ai/compat";
 
 function setOpenaiCompletions(harness: Harness): void {
-	harness.session.agent.state.model = { ...harness.session.agent.state.model, api: "openai-completions" };
+	harness.session.agent.state.model = {
+		...harness.session.agent.state.model,
+		api: "openai-completions",
+		compat: { supportsPrefillContinuation: true },
+	};
 }
 
 function pushAbortedResult(
@@ -76,7 +80,7 @@ describe("AgentSession continue with prefill", () => {
 			});
 			return stream;
 		}) as StreamFn;
-		harness.session.agent.state.model = { ...harness.session.agent.state.model, api: "openai-completions" };
+		setOpenaiCompletions(harness);
 
 		// Delete the prefill (last assistant message) from the session log and agent state.
 		const removed = harness.session.deleteLastMessages(1);
@@ -313,6 +317,241 @@ describe("AgentSession continue with prefill", () => {
 		await harness.session.continue();
 		expect(capturedReturnPrefill).toBe(true);
 		expect(getMessageText(harness.session.messages.at(-1)!)).toBe("edited answer continued");
+	});
+
+	it("regenerates instead of prefilling a partial that another model produced", async () => {
+		const compat = { supportsPrefillContinuation: true };
+		const harness = await createHarness({
+			fauxApi: "openai-completions",
+			compat,
+			models: [{ id: "first" }, { id: "second" }],
+		});
+		harnesses.push(harness);
+
+		harness.setResponses([fauxAssistantMessage("Partial response", { stopReason: "aborted" })]);
+		await harness.session.prompt("Hello");
+		expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", model: "first" });
+
+		// The selected model also supports prefill continuation, but it did not produce the partial,
+		// so its echo of another model's reasoning and text cannot be assumed byte-identical.
+		harness.session.agent.state.model = { ...harness.getModel("second")!, compat };
+		let capturedReturnPrefill: boolean | undefined;
+		let capturedLastRole: string | undefined;
+		harness.setResponses([
+			(context, options) => {
+				capturedReturnPrefill = options?.returnPrefill;
+				capturedLastRole = context.messages.at(-1)?.role;
+				return fauxAssistantMessage("Fresh response");
+			},
+		]);
+
+		await harness.session.continue();
+
+		expect(capturedReturnPrefill).toBeFalsy();
+		expect(capturedLastRole).toBe("user");
+		expect(getMessageText(harness.session.messages.at(-1)!)).toBe("Fresh response");
+	});
+
+	it("regenerates on an endpoint without prefill support, keeping the partial as an earlier version", async () => {
+		// An ordinary OpenAI-compatible gateway: same model, no supportsPrefillContinuation.
+		const harness = await createHarness({ fauxApi: "openai-completions" });
+		harnesses.push(harness);
+
+		harness.setResponses([fauxAssistantMessage("Partial response", { stopReason: "aborted" })]);
+		await harness.session.prompt("Hello");
+
+		let capturedReturnPrefill: boolean | undefined;
+		let capturedLastRole: string | undefined;
+		harness.setResponses([
+			(context, options) => {
+				capturedReturnPrefill = options?.returnPrefill;
+				capturedLastRole = context.messages.at(-1)?.role;
+				return fauxAssistantMessage("Fresh response");
+			},
+		]);
+
+		await harness.session.continue();
+
+		expect(capturedReturnPrefill).toBeFalsy();
+		expect(capturedLastRole).toBe("user");
+		const chat = harness.session.messages.filter((m) => m.role === "user" || m.role === "assistant");
+		expect(chat.map(getMessageText)).toEqual(["Hello", "Fresh response"]);
+		// The partial is not erased: it stays in the file as an earlier version of the response.
+		const partial = harness.sessionManager
+			.getEntries()
+			.find((entry) => entry.type === "message" && getMessageText(entry.message) === "Partial response");
+		expect(partial).toBeDefined();
+		expect(harness.sessionManager.getBranch().some((entry) => entry.id === partial!.id)).toBe(false);
+		const group = harness.session.getSwipeGroup()!;
+		expect(group.versions.map((entry) => getMessageText(entry.message))).toEqual([
+			"Partial response",
+			"Fresh response",
+		]);
+		expect(group.currentIndex).toBe(1);
+	});
+
+	it("regenerates a partial that followed an empty aborted response without prefill support", async () => {
+		const harness = await createHarness({ fauxApi: "openai-completions" });
+		harnesses.push(harness);
+
+		// Aborted before any output (a harness message), then continued into a partial that was aborted too.
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "aborted" }),
+			fauxAssistantMessage("Partial response", { stopReason: "aborted" }),
+			fauxAssistantMessage("Fresh response"),
+		]);
+		await harness.session.prompt("Hello");
+		await harness.session.continue();
+
+		await expect(harness.session.continue()).resolves.toBeUndefined();
+
+		const chat = harness.session.messages.filter((m) => m.role === "user" || m.role === "assistant");
+		expect(chat.map(getMessageText)).toEqual(["Hello", "Fresh response"]);
+	});
+
+	it("announces the transcript change before regenerating, so the UI drops the set-aside partial", async () => {
+		const harness = await createHarness({ fauxApi: "openai-completions" });
+		harnesses.push(harness);
+
+		harness.setResponses([fauxAssistantMessage("Partial response", { stopReason: "aborted" })]);
+		await harness.session.prompt("Hello");
+		const order: string[] = [];
+		harness.session.subscribe((event) => {
+			if (event.type === "transcript_changed" || event.type === "agent_start") order.push(event.type);
+		});
+		harness.setResponses([fauxAssistantMessage("Fresh response")]);
+
+		await harness.session.continue();
+
+		expect(order).toEqual(["transcript_changed", "agent_start"]);
+	});
+
+	it("leaves a partial that follows a completed response in place when it cannot be regenerated", async () => {
+		const harness = await createHarness({ fauxApi: "openai-completions" });
+		harnesses.push(harness);
+
+		// After a compaction the kept range can start at a completed response, directly before the partial.
+		harness.sessionManager.appendMessage({ role: "user", content: "Hello", timestamp: Date.now() });
+		harness.sessionManager.appendMessage(fauxAssistantMessage("Complete response"));
+		harness.sessionManager.appendMessage(fauxAssistantMessage("Partial response", { stopReason: "length" }));
+		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+
+		await expect(harness.session.continue()).rejects.toThrow("Cannot continue from message role: assistant");
+
+		// Nothing to regenerate from: the partial stays where it was, not set aside.
+		const partial = harness.sessionManager
+			.getBranch()
+			.find((entry) => entry.type === "message" && getMessageText(entry.message) === "Partial response");
+		expect(partial).toBeDefined();
+		expect(partial).not.toHaveProperty("deletedAt");
+		expect(getMessageText(harness.session.messages.at(-1)!)).toBe("Partial response");
+	});
+
+	it("sets aside a partial that follows a completed response when a follow-up is queued", async () => {
+		const harness = await createHarness({ fauxApi: "openai-completions" });
+		harnesses.push(harness);
+
+		harness.sessionManager.appendMessage({ role: "user", content: "Hello", timestamp: Date.now() });
+		harness.sessionManager.appendMessage(fauxAssistantMessage("Complete response"));
+		harness.sessionManager.appendMessage(fauxAssistantMessage("Partial response", { stopReason: "length" }));
+		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+		// The queued follow-up is delivered after the completed response, without the partial in its context.
+		harness.session.agent.followUp({ role: "user", content: "Next question", timestamp: Date.now() });
+		let sent: string[] = [];
+		harness.setResponses([
+			(context) => {
+				sent = context.messages
+					.filter((m) => m.role === "user" || m.role === "assistant")
+					.map((m) => getMessageText(m));
+				return fauxAssistantMessage("Answer");
+			},
+		]);
+
+		await harness.session.continue();
+
+		expect(sent).toEqual(["Hello", "Complete response", "Next question"]);
+	});
+
+	it("keeps a model switch made after the partial when regenerating it", async () => {
+		const harness = await createHarness({
+			fauxApi: "openai-completions",
+			models: [{ id: "first" }, { id: "second" }],
+		});
+		harnesses.push(harness);
+
+		harness.setResponses([fauxAssistantMessage("Partial response", { stopReason: "aborted" })]);
+		await harness.session.prompt("Hello");
+		// Interrupted, then the user switches models before continuing.
+		await harness.session.setModel(harness.getModel("second")!);
+		let requestedModel: string | undefined;
+		harness.setResponses([
+			(_context, _options, _state, model) => {
+				requestedModel = model.id;
+				return fauxAssistantMessage("Fresh response");
+			},
+		]);
+
+		await harness.session.continue();
+
+		expect(requestedModel).toBe("second");
+		const branch = harness.sessionManager.getBranch();
+		expect(branch.some((entry) => entry.type === "model_change" && entry.modelId === "second")).toBe(true);
+		const chat = harness.session.messages.filter((m) => m.role === "user" || m.role === "assistant");
+		expect(chat.map(getMessageText)).toEqual(["Hello", "Fresh response"]);
+		// The partial is soft-deleted: /restore brings it back.
+		const partial = harness.sessionManager
+			.getEntries()
+			.find((entry) => entry.type === "message" && getMessageText(entry.message) === "Partial response");
+		expect(partial).toMatchObject({ deletedAt: expect.any(String) });
+	});
+
+	it("keeps earlier swipe versions when regenerating an interrupted version without prefill support", async () => {
+		const harness = await createHarness({ fauxApi: "openai-completions" });
+		harnesses.push(harness);
+
+		harness.setResponses([fauxAssistantMessage("answer v1")]);
+		await harness.session.prompt("question");
+		harness.appendResponses([fauxAssistantMessage("partial v2", { stopReason: "aborted" })]);
+		await harness.session.regenerateSwipe(harness.session.getSwipeGroup()!);
+		harness.appendResponses([fauxAssistantMessage("answer v3")]);
+
+		await harness.session.continue();
+
+		const group = harness.session.getSwipeGroup()!;
+		expect(group.versions.map((entry) => getMessageText(entry.message))).toEqual([
+			"answer v1",
+			"partial v2",
+			"answer v3",
+		]);
+		expect(group.currentIndex).toBe(2);
+	});
+
+	it("continues the partial via prefill when the model that produced it is selected", async () => {
+		const harness = await createHarness({
+			fauxApi: "openai-completions",
+			compat: { supportsPrefillContinuation: true },
+			models: [{ id: "first" }, { id: "second" }],
+		});
+		harnesses.push(harness);
+
+		harness.setResponses([fauxAssistantMessage("Partial response", { stopReason: "aborted" })]);
+		await harness.session.prompt("Hello");
+
+		let capturedReturnPrefill: boolean | undefined;
+		let capturedLastRole: string | undefined;
+		harness.setResponses([
+			(context, options) => {
+				capturedReturnPrefill = options?.returnPrefill;
+				capturedLastRole = context.messages.at(-1)?.role;
+				return fauxAssistantMessage("Partial response continued");
+			},
+		]);
+
+		await harness.session.continue();
+
+		expect(capturedReturnPrefill).toBe(true);
+		expect(capturedLastRole).toBe("assistant");
+		expect(getMessageText(harness.session.messages.at(-1)!)).toBe("Partial response continued");
 	});
 
 	it("continues successfully after a previous run was aborted", async () => {

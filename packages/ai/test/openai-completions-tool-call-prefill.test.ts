@@ -18,6 +18,7 @@ const compat = {
 	supportsReasoningEffort: true,
 	supportsUsageInStreaming: true,
 	supportsFinishReason: true,
+	supportsPrefillContinuation: true,
 	maxTokensField: "max_completion_tokens",
 	requiresToolResultName: false,
 	requiresAssistantAfterToolResult: false,

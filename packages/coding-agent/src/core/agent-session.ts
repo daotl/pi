@@ -3574,13 +3574,13 @@ export class AgentSession {
 				this._pendingPrefill = undefined;
 				this._prefillRestorePoint = undefined;
 				this._prefillTrailingEntries = [];
-				// A non-continuable assistant message (e.g., a partial error on a
-				// chat provider) would make Agent.continue() throw. Remove it from
-				// the transcript and continue from the last user/tool-result
-				// message instead.
+				// A non-continuable assistant message (e.g., a partial on an endpoint
+				// without prefill support) would make Agent.continue() throw. Continue
+				// from the last user/tool-result message instead, keeping the message
+				// (a partial or a user edit) recoverable.
 				const last = this.agent.state.messages[this.agent.state.messages.length - 1];
 				if (last?.role === "assistant" && !isHarnessMessage(last)) {
-					this.deleteLastMessages(1);
+					this._setAsideForRegeneration(last);
 				}
 			}
 		}
@@ -3596,6 +3596,45 @@ export class AgentSession {
 			}
 			throw error;
 		}
+	}
+
+	/**
+	 * Take a non-continuable trailing assistant message out of the context so
+	 * the response is generated again, without erasing it. When only harness
+	 * messages follow it, branch at its parent like a swipe regeneration: it
+	 * stays an earlier version of the response. When other entries follow it
+	 * (a compaction, a context edit), soft-delete it instead so they stay in
+	 * the context; /restore brings it back. When a completed response precedes
+	 * it and no message is queued, there is nothing to regenerate from: it
+	 * stays, and Agent.continue() reports that the session cannot continue from
+	 * an assistant message. (With queued messages, Agent.continue() delivers
+	 * them after the completed response, so the message is set aside first.)
+	 */
+	private _setAsideForRegeneration(message: AgentMessage): void {
+		const messages = this.agent.state.messages;
+		const previous = stripTrailingHarnessMessages(messages.slice(0, messages.lastIndexOf(message))).at(-1);
+		if (previous?.role === "assistant" && !this.agent.hasQueuedMessages()) return;
+
+		const entryId = this._findPersistedMessageEntryId(message);
+		const branch = this.sessionManager.getBranch();
+		const index = entryId === undefined ? -1 : branch.findIndex((entry) => entry.id === entryId);
+		const parentId = index < 0 ? undefined : branch[index].parentId;
+		const laterState =
+			index >= 0 &&
+			branch.slice(index + 1).some((entry) => !(entry.type === "message" && isHarnessMessage(entry.message)));
+		if (index < 0) {
+			this.deleteLastMessages(1);
+		} else if (parentId && !laterState) {
+			this.sessionManager.branch(parentId);
+			this._refreshFinalizedContext();
+			this._restoreToolsFromTranscript();
+		} else {
+			this.softDeleteMessage(branch[index].id);
+			// The rebuild brings back trailing harness messages stripped before.
+			this.agent.state.messages = stripTrailingHarnessMessages(this.agent.state.messages);
+		}
+		// The UI re-renders from the session, dropping the set-aside message before the new response streams.
+		this._emit({ type: "transcript_changed" });
 	}
 
 	/**
@@ -5958,7 +5997,8 @@ export class AgentSession {
 
 	/**
 	 * Check whether an assistant message can be continued via prefill
-	 * continuation on the current provider.
+	 * continuation: the selected model must be the openai-completions model
+	 * that produced it, with `compat.supportsPrefillContinuation` set.
 	 */
 	private _canPrefillContinue(message: AgentMessage): boolean {
 		if (message.role !== "assistant") {
@@ -5967,7 +6007,14 @@ export class AgentSession {
 		if (isHarnessMessage(message)) {
 			return false;
 		}
+		// Agent.continue() sends the prefill through the selected model and rejects any other API.
+		// A virtual selection is therefore never prefill-continued, even when the physical model
+		// that produced the message supports it; the attempt is retried fresh instead.
 		if (this.agent.state.model.api !== "openai-completions") {
+			return false;
+		}
+		const model: Model<"openai-completions"> | undefined = this._modelForMessage(message as AssistantMessage);
+		if (model?.api !== "openai-completions" || model.compat?.supportsPrefillContinuation !== true) {
 			return false;
 		}
 		// A message that completed on its own (stopReason "stop") needs no prefill

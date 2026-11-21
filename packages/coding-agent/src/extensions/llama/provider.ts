@@ -153,6 +153,8 @@ function toPiModel(
 			supportsStore: false,
 			supportsReasoningEffort: false,
 			supportsUsageInStreaming: true,
+			// llama-server echoes return_prefill byte-identically, so interrupted output is resumed.
+			supportsPrefillContinuation: true,
 			supportsStrictMode: false,
 			maxTokensField: "max_tokens",
 			...(reasoning && { thinkingFormat: "qwen-chat-template" }),
