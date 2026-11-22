@@ -354,6 +354,26 @@ describe("AgentSession actionable boundaries", () => {
 		expect(summaries()).toEqual(["latest summary"]);
 	});
 
+	it("caps the summary limit so the summaries block cannot fill the model window", async () => {
+		// 40k window - 16k reserve leaves 24k; summaries may use at most half of that (12k).
+		const harness = await createHarness({
+			models: [{ id: "small-window", contextWindow: 40_000 }],
+			settings: { compaction: { summaryBlockMaxTokens: 1_000_000, reserveTokens: 16_000 } },
+		});
+		harnesses.push(harness);
+		const kept = harness.sessionManager.appendMessage({ role: "user", content: "kept", timestamp: 1 });
+		harness.sessionManager.appendCompaction("x".repeat(60_000), kept, 100);
+		harness.sessionManager.appendCompaction("latest summary", kept, 100);
+
+		const summaries = harness.sessionManager
+			.buildSessionProjection()
+			.messages.filter((message) => message.role === "compactionSummary")
+			.map((message) => message.summary);
+
+		// The ~15k-token older summary exceeds the cap even though the setting allows 1M.
+		expect(summaries).toEqual(["latest summary"]);
+	});
+
 	it("persists custom context queued by agent_end before pre-settlement continuation", async () => {
 		let firstRun = true;
 		let continued = false;

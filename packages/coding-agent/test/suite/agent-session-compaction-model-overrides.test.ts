@@ -86,7 +86,8 @@ describe("AgentSession compaction model overrides", () => {
 				enabled: path !== "manual",
 				reserveTokens: 2000,
 				keepRecentTokens: 150,
-				summaryBlockMaxTokens: 16384,
+				// Capped at half of the 4000-token window left after the 2000-token reserve.
+				summaryBlockMaxTokens: 1000,
 			});
 			expect(preparations[0]?.reason).toBe(
 				path === "manual" ? "manual" : path === "overflow" ? "overflow" : "threshold",

@@ -80,7 +80,7 @@ What the LLM sees:
     prompt   from cmp          messages from firstKeptEntryId
 ```
 
-On repeated compactions, each new compaction summarizes only the messages being cut. Every prior summary is kept as its own message in the context prefix (oldest first), so no summary is ever re-summarized into a summary-of-summaries. The LLM sees `system prompt + [summary 1, summary 2, ...] + [kept messages]`. Because the summaries block grows with each compaction, its size is bounded by `summaryBlockMaxTokens` (default 16384); when the block exceeds the limit, the oldest summaries are dropped from the context view (never the most recent). A limit of `0` keeps only the most recent summary, matching the pre-feature single-summary behavior. Dropped summaries remain in the JSONL file; only the context view is filtered.
+On repeated compactions, each new compaction summarizes only the messages being cut. Every prior summary is kept as its own message in the context prefix (oldest first), so no summary is ever re-summarized into a summary-of-summaries. The LLM sees `system prompt + [summary 1, summary 2, ...] + [kept messages]`. Because the summaries block grows with each compaction, its size is bounded by `summaryBlockMaxTokens` (default 16384); when the block exceeds the limit, the oldest summaries are dropped from the context view (never the most recent). The limit is capped at half of what the model's context window leaves after `reserveTokens`: compaction never shrinks the summaries block, so a block that filled the window could not be recovered by compacting. A limit of `0` keeps only the most recent summary, matching the pre-feature single-summary behavior. Dropped summaries remain in the JSONL file; only the context view is filtered.
 
 The summarization request stays byte-identical to the normal chat prefix (system prompt plus the summaries block and the messages being cut, minus the preserved tail) so the provider KV cache is reused; only the summarization instruction is appended at the end.
 
@@ -442,7 +442,7 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 | `enabled` | `true` | Enable auto-compaction |
 | `reserveTokens` | `16384` | Free context tokens below which auto-compaction starts |
 | `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
-| `summaryBlockMaxTokens` | `16384` | Max tokens for the summaries block in the prefix; oldest summaries are dropped beyond this (the most recent is always kept). `0` keeps only the most recent summary |
+| `summaryBlockMaxTokens` | `16384` | Max tokens for the summaries block in the prefix; oldest summaries are dropped beyond this (the most recent is always kept). `0` keeps only the most recent summary. It is also capped at half of what the model's context window leaves after `reserveTokens`, so the summaries block cannot fill the window. |
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.
 

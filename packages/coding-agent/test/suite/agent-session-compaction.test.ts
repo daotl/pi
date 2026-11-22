@@ -671,7 +671,8 @@ describe("AgentSession compaction characterization", () => {
 				enabled: true,
 				reserveTokens: 400,
 				keepRecentTokens: 1750,
-				summaryBlockMaxTokens: 16384,
+				// Capped at half of the 2600-token window left after the 400-token reserve.
+				summaryBlockMaxTokens: 1100,
 			});
 			expect(harness.eventsOfType("agent_start")).toHaveLength(agentStartsBefore + 1);
 			expect(harness.eventsOfType("compaction_start").at(-1)).toEqual({

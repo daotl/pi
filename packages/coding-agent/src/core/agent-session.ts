@@ -687,10 +687,9 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
-		// Read the summaries-block limit live from settings so the LLM context, TUI views
-		// and compaction (which reads the same setting) agree on which summaries are visible,
-		// even when the setting changes without a reload.
-		this.sessionManager.setSummaryBlockMaxTokens(() => this.settingsManager.getSummaryBlockMaxTokens());
+		// Read the summaries-block limit live so the LLM context, TUI views and compaction
+		// agree on which summaries are visible, even when the setting or model changes.
+		this.sessionManager.setSummaryBlockMaxTokens(() => this._getSummaryBlockMaxTokens());
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
@@ -1004,8 +1003,30 @@ export class AgentSession {
 		return shouldCompact(
 			estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens,
 			model.contextWindow,
-			this.settingsManager.getCompactionSettings(this.model),
+			this._getCompactionSettings(this.model),
 		);
+	}
+
+	/**
+	 * The summaries-block limit actually applied: the configured value, capped at half
+	 * of what the current model's window leaves after the compaction reserve. Compaction
+	 * never shrinks the summaries block, so a block that fills the window could not be
+	 * recovered by compacting; the cap keeps room for the kept tail and the next request.
+	 */
+	private _getSummaryBlockMaxTokens(): number {
+		const configured = this.settingsManager.getSummaryBlockMaxTokens();
+		const model = this.model;
+		if (!model || model.contextWindow <= 0) return configured;
+		const available = model.contextWindow - this.settingsManager.getCompactionReserveTokens(model);
+		return Math.min(configured, Math.max(0, Math.floor(available / 2)));
+	}
+
+	/** Compaction settings with the summaries-block limit the projection applies. */
+	private _getCompactionSettings(model: Model<any> | undefined): CompactionSettings {
+		return {
+			...this.settingsManager.getCompactionSettings(model),
+			summaryBlockMaxTokens: this._getSummaryBlockMaxTokens(),
+		};
 	}
 
 	/**
@@ -1295,7 +1316,7 @@ export class AgentSession {
 		if (!header) throw new Error("Session header is missing");
 		const manager = SessionManager.inMemory(this._cwd, undefined, [header, ...this.sessionManager.getBranch()]);
 		// Preview the same summaries block the real request will send.
-		manager.setSummaryBlockMaxTokens(() => this.settingsManager.getSummaryBlockMaxTokens());
+		manager.setSummaryBlockMaxTokens(() => this._getSummaryBlockMaxTokens());
 		this._applyBoundaryDrafts(manager, drafts);
 		return manager;
 	}
@@ -4897,7 +4918,7 @@ export class AgentSession {
 			}
 
 			const opts: CompactOptions = typeof options === "string" ? { customInstructions: options } : (options ?? {});
-			const settings = this.settingsManager.getCompactionSettings(model);
+			const settings = this._getCompactionSettings(model);
 			const {
 				model: requestModel,
 				apiKey,
@@ -5094,7 +5115,7 @@ export class AgentSession {
 	 * @returns Whether the post-run loop should call `agent.continue()` for overflow recovery or queued messages
 	 */
 	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
-		const settings = this.settingsManager.getCompactionSettings(this.model);
+		const settings = this._getCompactionSettings(this.model);
 		if (!settings.enabled) return false;
 
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
@@ -5241,7 +5262,7 @@ export class AgentSession {
 	 */
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const model = this.model;
-		const settings = this.settingsManager.getCompactionSettings(model);
+		const settings = this._getCompactionSettings(model);
 		let abortController: AbortController | undefined;
 		let started = false;
 		let fromExtension = false;

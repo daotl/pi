@@ -73,7 +73,7 @@ CLI tool options override this setting for one invocation. `--tools` with only `
 | `compaction.enabled` | boolean | `true` | Enable automatic compaction. |
 | `compaction.reserveTokens` | number | `16384` | Free context tokens below which automatic compaction starts. |
 | `compaction.keepRecentTokens` | number | `20000` | Recent tokens retained without summarization. |
-| `compaction.summaryBlockMaxTokens` | number | `16384` | Max tokens for the summaries block in the prefix; oldest summaries are dropped beyond this (the most recent is always kept). `0` keeps only the most recent summary. |
+| `compaction.summaryBlockMaxTokens` | number | `16384` | Max tokens for the summaries block in the prefix; oldest summaries are dropped beyond this (the most recent is always kept). `0` keeps only the most recent summary. It is also capped at half of what the model's context window leaves after `reserveTokens`, so the summaries block cannot fill the window. |
 | `compaction.modelOverrides` | object | None | Per-model token settings keyed by exact `provider/modelId`. |
 
 <a id="per-model-compaction-overrides"></a>
