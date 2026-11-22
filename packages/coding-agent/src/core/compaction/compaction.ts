@@ -24,7 +24,7 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
-import { convertToLlm } from "../messages.ts";
+import { convertToLlm, createCompactionSummaryMessage } from "../messages.ts";
 import {
 	buildSessionProjection,
 	type CompactionEntry,
@@ -1102,7 +1102,11 @@ export async function prepareCompaction(
 		return undefined;
 	}
 
-	const projection = buildSessionProjection(pathEntries);
+	// Project with the same summary limit the summarization request applies below,
+	// so size estimates and the cut point do not count summaries that are never sent.
+	const projection = buildSessionProjection(pathEntries, undefined, undefined, {
+		summaryBlockMaxTokens: settings.summaryBlockMaxTokens,
+	});
 	const projectedEntries = projection.entries;
 	const sourceEntries = projectedEntries.map((entry) => entry.sourceEntry);
 	// The newest compaction is projected first. Older compaction entries can still
@@ -1184,9 +1188,11 @@ export async function prepareCompaction(
 		(entry): entry is CompactionEntry => entry.type === "compaction" && entry.deletedAt === undefined,
 	);
 	const visibleCompactions = filterSummariesToBlockLimit(compactions, settings.summaryBlockMaxTokens);
-	const summaryMessages = visibleCompactions
-		.map((c) => sessionEntryToContextMessages(c)[0])
-		.filter((m): m is AgentMessage => m !== undefined);
+	// Take the summary itself: a compaction carrying a checkpoint yields
+	// [systemMessage, summary], and the checkpoint must not stand in for the summary.
+	const summaryMessages: AgentMessage[] = visibleCompactions.map((c) =>
+		createCompactionSummaryMessage(c.summary, c.tokensBefore, c.timestamp),
+	);
 	messagesToSummarize.unshift(...summaryMessages);
 
 	// Extract file operations from edited model-visible messages and the previous compaction.

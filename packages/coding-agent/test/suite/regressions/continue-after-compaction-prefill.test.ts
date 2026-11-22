@@ -205,7 +205,8 @@ describe("continue after compaction preserves the compaction entry", () => {
 
 		let sent: string[] = [];
 		harness.session.agent.streamFunction = (_model, context) => {
-			sent = context.messages.map((m) => getMessageText(m));
+			// Prompt/tool updates after the checkpoint stay in the request; check the conversation only.
+			sent = context.messages.filter((m) => m.role !== "system").map((m) => getMessageText(m));
 			const stream = createAssistantMessageEventStream();
 			queueMicrotask(() => {
 				stream.push({ type: "done", reason: "stop", message: fauxAssistantMessage("fresh response") });
@@ -243,7 +244,8 @@ describe("continue after compaction preserves the compaction entry", () => {
 
 		let sent: string[] = [];
 		harness.session.agent.streamFunction = (_model, context) => {
-			sent = context.messages.map((m) => getMessageText(m));
+			// Prompt/tool updates after the checkpoint stay in the request; check the conversation only.
+			sent = context.messages.filter((m) => m.role !== "system").map((m) => getMessageText(m));
 			const stream = createAssistantMessageEventStream();
 			queueMicrotask(() => {
 				stream.push({ type: "done", reason: "stop", message: fauxAssistantMessage("fresh response") });

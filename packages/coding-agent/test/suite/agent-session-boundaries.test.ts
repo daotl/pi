@@ -309,6 +309,51 @@ describe("AgentSession actionable boundaries", () => {
 		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
 	});
 
+	it("previews boundary context with the configured summary limit", async () => {
+		let previewed: string[] = [];
+		const harness = await createHarness({
+			settings: { compaction: { summaryBlockMaxTokens: 0 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_before_settle", (event) => {
+						previewed = event.context.contextMessages
+							.filter((message) => message.role === "compactionSummary")
+							.map((message) => message.summary);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		const kept = harness.sessionManager.appendMessage({ role: "user", content: "kept", timestamp: 1 });
+		harness.sessionManager.appendCompaction("older summary", kept, 100);
+		harness.sessionManager.appendCompaction("latest summary", kept, 100);
+		harness.setResponses([fauxAssistantMessage("done")]);
+
+		await harness.session.prompt("start");
+
+		// The request itself keeps only the latest summary under a zero limit; the preview must agree.
+		expect(previewed).toEqual(["latest summary"]);
+	});
+
+	it("applies a summary limit changed without a reload to the session projection", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const kept = harness.sessionManager.appendMessage({ role: "user", content: "kept", timestamp: 1 });
+		harness.sessionManager.appendCompaction("older summary", kept, 100);
+		harness.sessionManager.appendCompaction("latest summary", kept, 100);
+		const summaries = () =>
+			harness.sessionManager
+				.buildSessionProjection()
+				.messages.filter((message) => message.role === "compactionSummary")
+				.map((message) => message.summary);
+		expect(summaries()).toEqual(["older summary", "latest summary"]);
+
+		// Compaction reads the setting directly, so the live projection must follow it too.
+		harness.settingsManager.setSummaryBlockMaxTokens(0);
+
+		expect(summaries()).toEqual(["latest summary"]);
+	});
+
 	it("persists custom context queued by agent_end before pre-settlement continuation", async () => {
 		let firstRun = true;
 		let continued = false;

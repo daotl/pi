@@ -584,6 +584,72 @@ describe("prepareCompaction", () => {
 	});
 });
 
+describe("prepareCompaction summary block limit", () => {
+	it("does not size the kept tail by summaries excluded from the summarization request", async () => {
+		const older = createCompactionEntry("older summary", "missing");
+		const latest = createCompactionEntry("latest summary", "missing");
+		const tail: SessionEntry[] = [];
+		for (let i = 0; i < 20; i++) {
+			tail.push(createMessageEntry(createUserMessage(`user message ${i}`)));
+			tail.push(createMessageEntry(createAssistantMessage(`assistant message ${i}`, createMockUsage(0, 0))));
+		}
+		older.firstKeptEntryId = tail[0].id;
+		latest.firstKeptEntryId = tail[0].id;
+		// The older summary is huge but excluded by a zero limit; everything else costs 5000 tokens.
+		const tokenCounter = async (messages: AgentMessage[]) =>
+			messages.reduce(
+				(sum, message) =>
+					sum + (message.role === "compactionSummary" && message.summary === "older summary" ? 100000 : 5000),
+				0,
+			);
+		const settings: CompactionSettings = {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 10000,
+			summaryBlockMaxTokens: 0,
+		};
+		const window = { contextWindow: 96384, maxSummaryTokens: 16384 };
+
+		const preparation = await prepareCompaction([older, latest, ...tail], settings, undefined, tokenCounter, window);
+
+		// Sent: latest summary + 40 messages = 205000. Head budget 71808, so the tail keeps 27 entries (135000).
+		// Counting the excluded 100k summary demands more tail than exists, so the cut fell back to the
+		// 10k keep-recent budget and sent ~195k tokens to a summary model with a 71808-token head budget.
+		expect(preparation).toBeDefined();
+		expect(preparation?.keptMessages).toHaveLength(27);
+		expect(
+			preparation?.messagesToSummarize.map((message) => message.role === "compactionSummary" && message.summary),
+		).not.toContain("older summary");
+	});
+});
+
+describe("prepareCompaction with checkpointed compactions", () => {
+	it("passes previous summaries, not their checkpoints, as messages to summarize", async () => {
+		const u1 = createMessageEntry(createUserMessage("user msg 1"));
+		const a1 = createMessageEntry(createAssistantMessage("assistant msg 1"));
+		const first = createCompactionEntry("First summary", u1.id);
+		first.systemMessage = { role: "system", content: "old prompt", timestamp: 1 };
+		const u2 = createMessageEntry(createUserMessage("user msg 2 ".repeat(12)));
+		const a2 = createMessageEntry(createAssistantMessage("assistant msg 2 ".repeat(12)));
+		const u3 = createMessageEntry(createUserMessage("user msg 3 ".repeat(12)));
+		const a3 = createMessageEntry(createAssistantMessage("assistant msg 3 ".repeat(12), createMockUsage(5000, 1000)));
+		const latest = createCompactionEntry("Second summary", u3.id);
+		latest.systemMessage = { role: "system", content: "current prompt", timestamp: 2 };
+		const u4 = createMessageEntry(createUserMessage("user msg 4 ".repeat(12)));
+		const a4 = createMessageEntry(createAssistantMessage("assistant msg 4 ".repeat(12), createMockUsage(8000, 2000)));
+		const settings: CompactionSettings = { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 100 };
+
+		const preparation = await prepareCompaction([u1, a1, first, u2, a2, u3, a3, latest, u4, a4], settings);
+
+		expect(preparation).toBeDefined();
+		const summarized = preparation!.messagesToSummarize;
+		expect(summarized.slice(0, 2)).toMatchObject([
+			{ role: "compactionSummary", summary: "First summary" },
+			{ role: "compactionSummary", summary: "Second summary" },
+		]);
+		expect(summarized.some((message) => message.role === "system")).toBe(false);
+	});
+});
+
 describe("prepareCompaction with previous compaction", () => {
 	it("should skip repeated compactions when kept messages still fit", async () => {
 		const u1 = createMessageEntry(createUserMessage("user msg 1 (summarized by compaction1)"));

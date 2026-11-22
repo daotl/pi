@@ -687,9 +687,10 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
-		// Keep the session's summaries-block limit in sync with the configured value so
-		// the LLM context and TUI views agree on which summaries are visible.
-		this.sessionManager.setSummaryBlockMaxTokens(this.settingsManager.getSummaryBlockMaxTokens());
+		// Read the summaries-block limit live from settings so the LLM context, TUI views
+		// and compaction (which reads the same setting) agree on which summaries are visible,
+		// even when the setting changes without a reload.
+		this.sessionManager.setSummaryBlockMaxTokens(() => this.settingsManager.getSummaryBlockMaxTokens());
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
@@ -1293,6 +1294,8 @@ export class AgentSession {
 		const header = this.sessionManager.getHeader();
 		if (!header) throw new Error("Session header is missing");
 		const manager = SessionManager.inMemory(this._cwd, undefined, [header, ...this.sessionManager.getBranch()]);
+		// Preview the same summaries block the real request will send.
+		manager.setSummaryBlockMaxTokens(() => this.settingsManager.getSummaryBlockMaxTokens());
 		this._applyBoundaryDrafts(manager, drafts);
 		return manager;
 	}
@@ -5849,7 +5852,6 @@ export class AgentSession {
 				: [];
 		const previousDefaultTools = new Set(getDefaultTools());
 		await this.settingsManager.reload();
-		this.sessionManager.setSummaryBlockMaxTokens(this.settingsManager.getSummaryBlockMaxTokens());
 		this.syncQueueModesFromSettings();
 		resetApiProviders();
 		await this._resourceLoader.reload();

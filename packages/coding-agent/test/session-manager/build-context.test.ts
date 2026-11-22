@@ -1,13 +1,17 @@
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { getCurrentSystemMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import {
 	type BranchSummaryEntry,
 	buildContextEntries,
 	buildSessionContext,
+	buildSessionProjection,
 	type CompactionEntry,
 	type CustomEntry,
 	filterSummariesToBlockLimit,
 	type ModelChangeEntry,
 	type SessionEntry,
+	SessionManager,
 	type SessionMessageEntry,
 	type ThinkingLevelChangeEntry,
 } from "../../src/core/session-manager.ts";
@@ -227,6 +231,113 @@ describe("buildSessionContext", () => {
 			expect(allSummaries).toEqual([first, second]);
 		});
 
+		it("replays only the current checkpoint, ordered summaries, edits and later system deltas", () => {
+			const first = compaction("2", "1", "older history", "1");
+			first.systemMessage = { role: "system", content: "old prompt", timestamp: 1 };
+			const latest = compaction("5", "4", "newer history", "3");
+			latest.systemMessage = {
+				role: "system",
+				content: "current prompt",
+				sections: { skills: "current skills" },
+				timestamp: 2,
+			};
+			const foldedPatch: SessionMessageEntry = {
+				type: "message",
+				id: "4",
+				parentId: "3",
+				timestamp: first.timestamp,
+				message: { role: "system", content: "already folded", timestamp: 2 },
+			};
+			const laterPatch: SessionMessageEntry = {
+				type: "message",
+				id: "6",
+				parentId: "5",
+				timestamp: first.timestamp,
+				message: { role: "system", content: "later delta", sections: { skills: "later skills" }, timestamp: 3 },
+			};
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "summarized"),
+				first,
+				msg("3", "2", "user", "kept"),
+				foldedPatch,
+				latest,
+				laterPatch,
+				{
+					type: "context_edit",
+					id: "7",
+					parentId: "6",
+					timestamp: first.timestamp,
+					targetId: "3",
+					replacement: { content: "kept edited" },
+				},
+			];
+
+			expect(buildSessionProjection(entries).messages).toEqual([
+				latest.systemMessage,
+				expect.objectContaining({ role: "compactionSummary", summary: "older history" }),
+				expect.objectContaining({ role: "compactionSummary", summary: "newer history" }),
+				expect.objectContaining({ role: "user", content: "kept edited" }),
+				laterPatch.message,
+			]);
+
+			latest.deletedAt = "2025-01-02T00:00:00Z";
+			expect(buildSessionContext(entries).messages).toEqual([
+				first.systemMessage,
+				expect.objectContaining({ role: "compactionSummary", summary: "older history" }),
+				expect.objectContaining({ role: "user", content: "summarized" }),
+				expect.objectContaining({ role: "user", content: "kept edited" }),
+				foldedPatch.message,
+				laterPatch.message,
+			]);
+		});
+
+		it("retains system messages when a legacy compaction has no checkpoint", () => {
+			const patch: SessionMessageEntry = {
+				type: "message",
+				id: "2",
+				parentId: "1",
+				timestamp: "2025-01-01T00:00:00Z",
+				message: { role: "system", content: "legacy prompt", timestamp: 1 },
+			};
+			const entries = [msg("1", null, "user", "kept"), patch, compaction("3", "2", "history", "1")];
+			expect(buildSessionContext(entries).messages).toEqual([
+				expect.objectContaining({ role: "compactionSummary", summary: "history" }),
+				expect.objectContaining({ role: "user", content: "kept" }),
+				patch.message,
+			]);
+		});
+
+		it("uses the manager summary limit unless projection options pass a numeric override", () => {
+			const session = SessionManager.inMemory();
+			const kept = session.appendMessage({ role: "user", content: "kept", timestamp: 1 });
+			session.appendCompaction("x".repeat(70000), kept, 20000);
+			session.appendCompaction("latest", kept, 20000);
+			const summaries = (messages: AgentMessage[]) =>
+				messages.filter((message) => message.role === "compactionSummary").map((message) => message.summary);
+
+			expect(summaries(session.buildSessionProjection().messages)).toEqual(["latest"]);
+			expect(summaries(session.buildSessionProjection({}).messages)).toEqual(["latest"]);
+			session.setSummaryBlockMaxTokens(0);
+			expect(summaries(session.buildSessionProjection().messages)).toEqual(["latest"]);
+			// An undefined option falls back to the session limit instead of silently disabling it.
+			expect(summaries(session.buildSessionProjection({ summaryBlockMaxTokens: undefined }).messages)).toEqual([
+				"latest",
+			]);
+			expect(summaries(session.buildSessionProjection({ summaryBlockMaxTokens: 1_000_000 }).messages)).toEqual([
+				"x".repeat(70000),
+				"latest",
+			]);
+			session.setSummaryBlockMaxTokens(undefined);
+			expect(summaries(session.buildSessionProjection().messages)).toEqual(["x".repeat(70000), "latest"]);
+			expect(summaries(session.buildSessionContext().messages)).toEqual(["x".repeat(70000), "latest"]);
+			expect(
+				session
+					.buildContextEntries()
+					.filter((entry) => entry.type === "compaction")
+					.map((entry) => entry.summary),
+			).toEqual(["x".repeat(70000), "latest"]);
+		});
+
 		it("buildContextEntries returns compaction-aware entries including custom entries", () => {
 			const entries: SessionEntry[] = [
 				msg("1", null, "user", "first"),
@@ -271,6 +382,27 @@ describe("buildSessionContext", () => {
 			const ctx = buildSessionContext(entries);
 			expect(ctx.messages.map((message) => message.role)).toEqual(["compactionSummary", "user", "user"]);
 		});
+	});
+
+	it("folds a delta into the next checkpoint across successive compactions and keeps later deltas", () => {
+		const session = SessionManager.inMemory();
+		session.appendMessage({ role: "system", content: "base", sections: { a: "A" }, timestamp: 1 });
+		const kept = session.appendMessage({ role: "user", content: "u1", timestamp: 2 });
+		session.appendCompaction("first summary", kept, 100);
+		session.appendMessage({ role: "system", content: "", sections: { a: "A2" }, timestamp: 4 });
+		session.appendMessage({ role: "user", content: "u2", timestamp: 5 });
+		session.appendCompaction("second summary", kept, 100);
+		session.appendMessage({ role: "system", content: "", sections: { b: "B" }, timestamp: 7 });
+
+		const messages = session.buildSessionProjection().messages;
+		const systems = messages.filter((message) => message.role === "system");
+
+		// One checkpoint (folding the A2 delta) plus the later B delta; the folded delta is not replayed.
+		expect(systems).toHaveLength(2);
+		expect(systems[0]).toMatchObject({ sections: { a: "A2" } });
+		expect(systems[1]).toMatchObject({ sections: { b: "B" } });
+		expect(messages.findIndex((message) => message.role === "system")).toBe(0);
+		expect(getCurrentSystemMessage(messages)?.sections).toEqual({ a: "A2", b: "B" });
 	});
 
 	describe("with branches", () => {
